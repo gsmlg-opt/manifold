@@ -30,22 +30,21 @@ defmodule ManifoldWeb.MixProject do
       {:phoenix_html, "~> 4.3"},
       {:phoenix_live_reload, "~> 1.6", only: :dev},
       {:phoenix_live_view, "~> 1.2"},
-      {:lazy_html, "~> 0.1", only: :test},
+      {:lazy_html, "~> 0.1"},
       {:phoenix_pubsub, "~> 2.2"},
       {:phoenix_duskmoon, "~> 9.9"},
       {:jason, "~> 1.4"},
       {:bandit, "~> 1.8"},
-      {:bun, "~> 1.4", runtime: Mix.env() == :dev},
-      {:tailwind, "~> 0.2", runtime: Mix.env() == :dev}
+      {:duskmoon_bundler_runtime, "~> 9.9"},
+      {:duskmoon_bundler, "~> 9.9", runtime: Mix.env() == :dev}
     ]
   end
 
   defp aliases do
     [
-      "assets.setup": ["cmd bun install"],
+      "assets.setup": ["npm.install"],
       "assets.deploy": [
-        "tailwind manifold_web --minify",
-        "bun manifold_web --minify",
+        "duskmoon_bundler.build manifold_web --tailwind",
         "phx.digest"
       ]
     ]

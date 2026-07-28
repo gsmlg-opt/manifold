@@ -1,0 +1,73 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MIX_ENV: test
+  DATABASE_URL: postgres://manifold_dev:manifold_dev@localhost:5432/manifold_dev
+  TEST_DATABASE_URL: postgres://manifold_dev:manifold_dev@localhost:5432/manifold_test
+
+jobs:
+  test:
+    name: ExUnit
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: manifold_dev
+          POSTGRES_PASSWORD: manifold_dev
+          POSTGRES_DB: manifold_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup BEAM
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.18.4"
+
+      - name: Restore Mix cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            ~/.hex
+            ~/.mix
+          key: ${{ runner.os }}-mix-test-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-test-
+            ${{ runner.os }}-mix-
+
+      - name: Fetch dependencies
+        run: mix deps.get
+
+      - name: Create test database
+        run: psql "$DATABASE_URL" -c 'CREATE DATABASE manifold_test;' || true
+
+      - name: Run tests
+        run: mix test

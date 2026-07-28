@@ -54,19 +54,43 @@ config :manifold_web, ManifoldWeb.Endpoint,
 
 config :phoenix, :json_library, Jason
 
-config :bun,
-  version: "1.3.13",
-  manifold_web: [
-    args:
-      ~w(build assets/js/app.js --outdir=priv/static/assets --external /fonts/* --external /images/*),
-    cd: Path.expand("../apps/manifold_web", __DIR__)
+config :duskmoon_bundler,
+  root: Path.expand("../apps/manifold_web/assets", __DIR__),
+  sources: ["**/*.{js,ts,jsx,tsx}"]
+
+config :duskmoon_bundler, :manifold_web,
+  root: Path.expand("../apps/manifold_web/assets", __DIR__),
+  entry: Path.expand("../apps/manifold_web/assets/js/app.js", __DIR__),
+  outdir: Path.expand("../apps/manifold_web/priv/static/assets", __DIR__),
+  resolve_dirs: [
+    Path.expand("../apps", __DIR__),
+    Path.expand("../deps", __DIR__),
+    Path.expand("..", __DIR__)
+  ],
+  sourcemap: :hidden,
+  target: :es2020,
+  tailwind: [
+    css: Path.expand("../apps/manifold_web/assets/css/app.css", __DIR__),
+    sources: [
+      %{base: Path.expand("../apps/manifold_web/lib", __DIR__), pattern: "**/*.{ex,exs,heex}"},
+      %{
+        base: Path.expand("../apps/manifold_web/assets", __DIR__),
+        pattern: "**/*.{css,js,ts,jsx,tsx}"
+      }
+    ]
   ]
 
-config :tailwind,
-  version: "4.3.3",
-  manifold_web: [
-    args: ~w(--input=assets/css/app.css --output=priv/static/assets/app.css),
-    cd: Path.expand("../apps/manifold_web", __DIR__)
-  ]
+config :duskmoon_bundler, :format,
+  print_width: 100,
+  semi: true,
+  single_quote: false,
+  trailing_comma: :es5,
+  arrow_parens: :always
+
+config :duskmoon_bundler, :lint,
+  rules: %{
+    "no-debugger" => :deny,
+    "eqeqeq" => :deny
+  }
 
 import_config "#{config_env()}.exs"

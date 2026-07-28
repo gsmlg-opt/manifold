@@ -1,0 +1,11 @@
+{
+  "dependencies": {
+    "marked": "18.0.0",
+    "tailwindcss": "4.3.2"
+  },
+  "name": "manifold",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ]
+}

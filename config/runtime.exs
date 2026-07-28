@@ -1,29 +1,21 @@
 import Config
 
-if System.get_env("MIX_BUN_PATH") do
-  config :bun, path: System.fetch_env!("MIX_BUN_PATH")
-end
+unless config_env() == :test do
+  if database_url = System.get_env("DATABASE_URL") do
+    repo_config = [
+      url: database_url,
+      pool_size: String.to_integer(System.get_env("POOL_SIZE", "10"))
+    ]
 
-if System.get_env("MIX_TAILWIND_PATH") do
-  config :tailwind, path: System.fetch_env!("MIX_TAILWIND_PATH")
-end
+    repo_config =
+      if socket_dir = System.get_env("POSTGRES_SOCKET_DIR") do
+        Keyword.put(repo_config, :socket_dir, socket_dir)
+      else
+        repo_config
+      end
 
-database_url = System.get_env("DATABASE_URL")
-
-if database_url do
-  repo_config = [
-    url: database_url,
-    pool_size: String.to_integer(System.get_env("POOL_SIZE", "10"))
-  ]
-
-  repo_config =
-    if socket_dir = System.get_env("POSTGRES_SOCKET_DIR") do
-      Keyword.put(repo_config, :socket_dir, socket_dir)
-    else
-      repo_config
-    end
-
-  config :manifold_data, Manifold.Repo, repo_config
+    config :manifold_data, Manifold.Repo, repo_config
+  end
 end
 
 config :manifold_smtp,

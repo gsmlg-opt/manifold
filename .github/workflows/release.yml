@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.2.3)"
+        required: true
+        type: string
+      git_ref:
+        description: "Git ref to release from"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MIX_ENV: prod
+  RELEASE_VERSION: ${{ inputs.version }}
+
+jobs:
+  release:
+    name: Build Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref }}
+          fetch-depth: 0
+
+      - name: Setup BEAM
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.18.4"
+
+      - name: Restore Mix cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            ~/.hex
+            ~/.mix
+            node_modules
+            apps/manifold_web/node_modules
+          key: ${{ runner.os }}-release-${{ hashFiles('mix.lock', 'package-lock.json', 'package.json', 'apps/manifold_web/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-release-
+            ${{ runner.os }}-mix-
+
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Update Mix project versions
+        run: |
+          perl -0pi -e 's/version: "[^"]+"/version: "$ENV{RELEASE_VERSION}"/g' mix.exs apps/*/mix.exs
+
+      - name: Fetch dependencies
+        run: mix deps.get --only prod
+
+      - name: Install npm packages
+        run: mix npm.ci
+
+      - name: Build assets
+        run: mix assets.deploy
+
+      - name: Build release artifact
+        env:
+          SECRET_KEY_BASE: release-build-secret-key-base-release-build-secret-key-base-not-runtime
+        run: |
+          mix release manifold --overwrite
+          tar -C _build/prod/rel -czf manifold-${RELEASE_VERSION}.tar.gz manifold
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifold-${{ inputs.version }}
+          path: manifold-${{ inputs.version }}.tar.gz
+          if-no-files-found: error
+
+      - name: Commit version bump
+        run: |
+          git add mix.exs apps/*/mix.exs mix.lock
+          git commit -m "chore(release): v${RELEASE_VERSION}"
+
+      - name: Tag release
+        run: git tag "v${RELEASE_VERSION}"
+
+      - name: Push commit and tag
+        run: |
+          git push origin HEAD
+          git push origin "v${RELEASE_VERSION}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${RELEASE_VERSION}" \
+            --generate-notes \
+            --title "v${RELEASE_VERSION}" \
+            manifold-${RELEASE_VERSION}.tar.gz

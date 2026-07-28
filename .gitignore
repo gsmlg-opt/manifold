@@ -6,11 +6,13 @@
 /.devenv/
 /.direnv/
 /node_modules/
+/apps/manifold_web/.duskmoon_bundler/
 /apps/manifold_web/node_modules/
 /apps/manifold_web/assets/node_modules/
 /apps/*/tmp/
 /apps/manifold_web/priv/static/assets/
 /apps/manifold_web/priv/static/cache_manifest.json
+/apps/manifold_web/priv/static/favicon-*.ico
 /priv/spool/
 /priv/raw_store/
 erl_crash.dump

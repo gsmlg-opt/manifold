@@ -4,10 +4,6 @@ let
   root = builtins.toString ./.;
 in
 {
-  env.MIX_BUN_PATH = lib.getExe pkgs.bun;
-  env.MIX_TAILWIND_PATH = lib.getExe pkgs.tailwindcss_4;
-  env.NODE_PATH = "${root}/deps";
-
   env.DATABASE_URL = "postgres://manifold_dev:manifold_dev@localhost/manifold_dev";
   env.TEST_DATABASE_URL = "postgres://manifold_dev:manifold_dev@localhost/manifold_test";
   env.PGHOST = "${config.env.DEVENV_RUNTIME}/postgres";
@@ -29,7 +25,6 @@ in
     openssl
     pkg-config
     postgresql_16
-    tailwindcss_4
     beam28Packages.elixir-ls
   ] ++ lib.optionals stdenv.isLinux [
     inotify-tools
@@ -37,10 +32,6 @@ in
 
   languages.elixir.enable = true;
   languages.elixir.package = pkgs.beam28Packages.elixir;
-
-  languages.javascript.enable = true;
-  languages.javascript.bun.enable = true;
-  languages.javascript.bun.package = pkgs.bun;
 
   services.postgres = {
     enable = true;

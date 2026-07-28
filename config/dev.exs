@@ -29,8 +29,7 @@ config :manifold_web, ManifoldWeb.Endpoint,
   secret_key_base:
     "dev-secret-key-base-dev-secret-key-base-dev-secret-key-base-dev-secret-key-base",
   watchers: [
-    tailwind: {Tailwind, :install_and_run, [:manifold_web, ~w(--watch)]},
-    bun: {Bun, :install_and_run, [:manifold_web, ~w(--sourcemap=inline --watch)]}
+    duskmoon_bundler: {Mix.Tasks.DuskmoonBundler.Dev, :run, [["manifold_web"]]}
   ]
 
 config :phoenix, :stacktrace_depth, 20

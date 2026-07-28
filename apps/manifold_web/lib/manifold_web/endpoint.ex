@@ -24,6 +24,12 @@ defmodule ManifoldWeb.Endpoint do
     socket("/phoenix/live_reload/socket", Phoenix.LiveReloader.Socket)
     plug(Phoenix.LiveReloader)
     plug(Phoenix.CodeReloader)
+
+    plug(DuskmoonBundler.DevServer,
+      profile: :manifold_web,
+      root: "apps/manifold_web/assets",
+      prefix: "/assets"
+    )
   end
 
   plug(Plug.RequestId)

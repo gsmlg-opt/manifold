@@ -11,6 +11,7 @@ defmodule Manifold.Umbrella.MixProject do
       elixir: "~> 1.18",
       elixirc_options: [warnings_as_errors: Mix.env() in [:dev, :test]],
       listeners: [Phoenix.CodeReloader],
+      releases: releases(),
       preferred_cli_env: [
         format: :dev,
         "format --check-formatted": :dev,
@@ -29,11 +30,45 @@ defmodule Manifold.Umbrella.MixProject do
       setup: ["deps.get", "ecto.setup", "assets.setup"],
       "ecto.setup": ["ecto.create", "ecto.migrate", "run apps/manifold_data/priv/repo/seeds.exs"],
       "ecto.reset": ["ecto.drop", "ecto.setup"],
-      "assets.setup": ["do --app manifold_web cmd bun install"],
+      "assets.setup": ["npm.install"],
       "assets.deploy": [
-        "do --app manifold_web tailwind manifold_web --minify + bun manifold_web --minify + phx.digest"
+        "duskmoon_bundler.build manifold_web --tailwind",
+        &digest_web_assets/1
       ],
       "test.all": ["format --check-formatted", "compile --warnings-as-errors", "test"]
+    ]
+  end
+
+  defp digest_web_assets(_args) do
+    {:ok, _} = Application.ensure_all_started(:phoenix)
+    static_path = Path.expand("apps/manifold_web/priv/static", __DIR__)
+
+    case Phoenix.Digester.compile(static_path, static_path, true) do
+      :ok ->
+        Mix.Project.in_project(:manifold_web, Path.expand("apps/manifold_web", __DIR__), fn _ ->
+          Mix.Project.build_structure()
+        end)
+
+        Mix.shell().info([:green, "Check your digested files at #{inspect(static_path)}"])
+
+      {:error, :invalid_path} ->
+        Mix.raise("The input path #{inspect(static_path)} does not exist")
+    end
+  end
+
+  defp releases do
+    [
+      manifold: [
+        applications: [
+          manifold_core: :permanent,
+          manifold_data: :permanent,
+          manifold_accounts: :permanent,
+          manifold_storage: :permanent,
+          manifold_ingest: :permanent,
+          manifold_smtp: :permanent,
+          manifold_web: :permanent
+        ]
+      ]
     ]
   end
 end

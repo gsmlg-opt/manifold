@@ -4,53 +4,110 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MIX_ENV: test
+
 jobs:
-  test:
+  format:
+    name: Format
     runs-on: ubuntu-latest
 
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: manifold_dev
-          POSTGRES_PASSWORD: manifold_dev
-          POSTGRES_DB: manifold_dev
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    env:
-      DATABASE_URL: postgres://manifold_dev:manifold_dev@localhost:5432/manifold_dev
-      TEST_DATABASE_URL: postgres://manifold_dev:manifold_dev@localhost:5432/manifold_test
-      MIX_ENV: test
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: erlef/setup-beam@v1
+      - name: Setup BEAM
+        uses: erlef/setup-beam@v1
         with:
           otp-version: "28"
           elixir-version: "1.18.4"
 
-      - name: Create test database
-        run: |
-          psql "$DATABASE_URL" -c 'CREATE DATABASE manifold_test;' || true
+      - name: Restore Mix cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            ~/.hex
+            ~/.mix
+          key: ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-
 
       - name: Fetch dependencies
         run: mix deps.get
 
-      - name: Migrate
-        run: mix ecto.migrate
-
-      - name: Format
+      - name: Check formatting
         run: mix format --check-formatted
 
-      - name: Compile
+  compile:
+    name: Compile
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup BEAM
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.18.4"
+
+      - name: Restore Mix cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            ~/.hex
+            ~/.mix
+          key: ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-
+
+      - name: Fetch dependencies
+        run: mix deps.get
+
+      - name: Compile with warnings as errors
         run: mix compile --warnings-as-errors
 
-      - name: Test
-        run: mix test
+  js-check:
+    name: JS Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup BEAM
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.18.4"
+
+      - name: Restore Mix cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            ~/.hex
+            ~/.mix
+          key: ${{ runner.os }}-mix-js-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-js-
+            ${{ runner.os }}-mix-
+
+      - name: Fetch dependencies
+        run: mix deps.get
+
+      - name: Check JavaScript
+        run: mix duskmoon_bundler.js.check

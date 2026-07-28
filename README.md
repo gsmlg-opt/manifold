@@ -34,6 +34,9 @@ Set up dependencies, PostgreSQL, migrations, seed owner, and sample mailbox:
 mix setup
 ```
 
+Frontend assets use Duskmoon Bundler and `duskmoon_npm`; `mix setup` runs
+`mix npm.install`, and production assets are built with `MIX_ENV=prod mix assets.deploy`.
+
 The development seed creates:
 
 - Owner: `owner@example.test`

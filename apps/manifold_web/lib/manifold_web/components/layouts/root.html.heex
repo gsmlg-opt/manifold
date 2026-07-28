@@ -5,8 +5,28 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="csrf-token" content={get_csrf_token()} />
     <.live_title suffix=" - Manifold">{assigns[:page_title] || "Manifold"}</.live_title>
-    <link phx-track-static rel="stylesheet" href={~p"/assets/app.css"} />
-    <script defer phx-track-static type="text/javascript" src={~p"/assets/app.js"}>
+    <link
+      phx-track-static
+      rel="stylesheet"
+      href={
+        DuskmoonBundler.static_path(ManifoldWeb.Endpoint, "/assets/css/app.css",
+          profile: :manifold_web
+        )
+      }
+    />
+    {DuskmoonBundler.Preload.tags(ManifoldWeb.Endpoint, "/assets/js/app.js",
+      profile: :manifold_web
+    )}
+    <script
+      defer
+      phx-track-static
+      type="module"
+      src={
+        DuskmoonBundler.static_path(ManifoldWeb.Endpoint, "/assets/js/app.js",
+          profile: :manifold_web
+        )
+      }
+    >
     </script>
   </head>
   <body>
