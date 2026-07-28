@@ -1,0 +1,20 @@
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand">Manifold</div>
+    <nav>
+      <.nav_link to={~p"/deliveries"}>Deliveries</.nav_link>
+      <.nav_link to={~p"/domains"}>Domains</.nav_link>
+      <.nav_link to={~p"/mailboxes"}>Mailboxes</.nav_link>
+      <.nav_link to={~p"/aliases"}>Aliases</.nav_link>
+    </nav>
+    <form action={~p"/logout"} method="post">
+      <input type="hidden" name="_method" value="delete" />
+      <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
+      <button type="submit">Sign out</button>
+    </form>
+  </aside>
+  <main class="content">
+    <.flash_group flash={@flash} />
+    {@inner_content}
+  </main>
+</div>

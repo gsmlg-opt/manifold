@@ -1,0 +1,83 @@
+{ pkgs, lib, config, ... }:
+
+let
+  root = builtins.toString ./.;
+in
+{
+  env.MIX_BUN_PATH = lib.getExe pkgs.bun;
+  env.MIX_TAILWIND_PATH = lib.getExe pkgs.tailwindcss_4;
+  env.NODE_PATH = "${root}/deps";
+
+  env.DATABASE_URL = "postgres://manifold_dev:manifold_dev@localhost/manifold_dev";
+  env.TEST_DATABASE_URL = "postgres://manifold_dev:manifold_dev@localhost/manifold_test";
+  env.PGHOST = "${config.env.DEVENV_RUNTIME}/postgres";
+  env.POSTGRES_SOCKET_DIR = "${config.env.DEVENV_RUNTIME}/postgres";
+
+  env.MANIFOLD_SMTP_HOSTNAME = "localhost";
+  env.MANIFOLD_SMTP_BIND = "127.0.0.1";
+  env.MANIFOLD_SMTP_PORT = "2525";
+  env.MANIFOLD_SPOOL_DIR = "${root}/priv/spool/dev";
+  env.MANIFOLD_RAW_STORE_BACKEND = "local";
+  env.MANIFOLD_RAW_STORE_DIR = "${root}/priv/raw_store/dev";
+  env.PHX_HOST = "localhost";
+  env.PORT = "4000";
+
+  packages = with pkgs; [
+    git
+    gnumake
+    gcc
+    openssl
+    pkg-config
+    postgresql_16
+    tailwindcss_4
+    beam28Packages.elixir-ls
+  ] ++ lib.optionals stdenv.isLinux [
+    inotify-tools
+  ];
+
+  languages.elixir.enable = true;
+  languages.elixir.package = pkgs.beam28Packages.elixir;
+
+  languages.javascript.enable = true;
+  languages.javascript.bun.enable = true;
+  languages.javascript.bun.package = pkgs.bun;
+
+  services.postgres = {
+    enable = true;
+    package = pkgs.postgresql_16;
+    listen_addresses = "";
+    initialDatabases = [
+      {
+        name = "manifold_dev";
+        user = "manifold_dev";
+        pass = "manifold_dev";
+      }
+      {
+        name = "manifold_test";
+        user = "manifold_dev";
+        pass = "manifold_dev";
+      }
+    ];
+  };
+
+  scripts.manifold-setup.exec = ''
+    mix setup
+  '';
+
+  scripts.manifold-migrate.exec = ''
+    mix ecto.migrate
+  '';
+
+  scripts.manifold-test.exec = ''
+    mix test
+  '';
+
+  scripts.manifold-server.exec = ''
+    mix phx.server
+  '';
+
+  enterShell = ''
+    echo "Manifold devenv ready"
+    echo "PostgreSQL socket: $PGHOST"
+  '';
+}

@@ -1,0 +1,17 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/.elixir_ls/
+/.devenv/
+/.direnv/
+/node_modules/
+/apps/manifold_web/node_modules/
+/apps/manifold_web/assets/node_modules/
+/apps/*/tmp/
+/apps/manifold_web/priv/static/assets/
+/apps/manifold_web/priv/static/cache_manifest.json
+/priv/spool/
+/priv/raw_store/
+erl_crash.dump
+*.ez
