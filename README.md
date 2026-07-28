@@ -53,7 +53,7 @@ mix ecto.migrate
 Start Phoenix and the SMTP listener:
 
 ```sh
-mix phx.server
+mix manifold.run
 ```
 
 Open Phoenix at `http://localhost:4000`. Submit SMTP mail to `127.0.0.1:2525`.

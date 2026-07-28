@@ -64,7 +64,7 @@ in
   '';
 
   scripts.manifold-server.exec = ''
-    mix phx.server
+    mix manifold.run
   '';
 
   enterShell = ''
