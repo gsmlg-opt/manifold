@@ -3,7 +3,15 @@ defmodule Manifold.Ingest.Jobs.ArchiveRawEmail do
   Archives accepted raw messages from ready spool bundles into the raw store.
   """
 
-  use Oban.Worker, queue: :archive, max_attempts: 10
+  use Oban.Worker,
+    queue: :archive,
+    max_attempts: 10,
+    unique: [
+      period: :infinity,
+      fields: [:worker, :args],
+      keys: [:inbound_delivery_id],
+      states: :incomplete
+    ]
 
   alias Manifold.Core.Error
   alias Manifold.Ingest

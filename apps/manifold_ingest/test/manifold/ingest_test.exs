@@ -77,12 +77,42 @@ defmodule Manifold.IngestTest do
     %{route: route} = route_fixture()
 
     assert {:ok, bundle} =
-             Spool.write_bundle(raw_message(), spool_attrs([route]), ingest_id: "tx-failure")
+             Spool.write_bundle(
+               raw_message(),
+               Map.put(spool_attrs([route]), :routes, [route]),
+               ingest_id: "tx-failure"
+             )
 
     assert {:error, %{reason: :after_delivery_insert_before_commit}} =
              Ingest.accept(bundle, [route], fail_at: :after_delivery_insert_before_commit)
 
     refute Repo.get_by(InboundDelivery, ingest_id: "tx-failure")
+    assert Repo.aggregate(Oban.Job, :count) == 0
+  end
+
+  test "acceptance rejects empty frozen routes before writing database state" do
+    assert {:ok, bundle} =
+             Spool.write_bundle(raw_message(), spool_attrs([]), ingest_id: "empty-routes")
+
+    assert {:error, %{class: :permanent, reason: :invalid_routes}} =
+             Ingest.accept(bundle, [])
+
+    refute Repo.get_by(InboundDelivery, ingest_id: "empty-routes")
+    assert Repo.aggregate(Oban.Job, :count) == 0
+  end
+
+  test "acceptance rejects routes that differ from the durable manifest" do
+    %{route: route} = route_fixture()
+
+    assert {:ok, bundle} =
+             Spool.write_bundle(raw_message(), spool_attrs([route]), ingest_id: "route-mismatch")
+
+    changed_route = %{route | original_recipient: "other@example.test"}
+
+    assert {:error, %{class: :permanent, reason: :invalid_routes}} =
+             Ingest.accept(bundle, [changed_route])
+
+    refute Repo.get_by(InboundDelivery, ingest_id: "route-mismatch")
     assert Repo.aggregate(Oban.Job, :count) == 0
   end
 
@@ -95,6 +125,14 @@ defmodule Manifold.IngestTest do
 
     delivery = Repo.get!(InboundDelivery, delivery.id)
     assert delivery.raw_storage_state == "archived"
+
+    assert Repo.aggregate(
+             from(event in MessageEvent,
+               where: event.inbound_delivery_id == ^delivery.id and event.event_type == "archived"
+             ),
+             :count
+           ) == 1
+
     refute File.exists?(delivery.spool_bundle_path)
   end
 
@@ -112,6 +150,27 @@ defmodule Manifold.IngestTest do
     assert :ok = ArchiveRawEmail.perform(%Oban.Job{args: %{"inbound_delivery_id" => delivery.id}})
   end
 
+  test "retry repairs a corrupt raw object before committing archived state" do
+    %{domain: domain, route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+
+    key = RawStore.build_key(domain.id, delivery.received_at, delivery.id)
+
+    assert {:error, %{reason: :after_raw_copy_before_update}} =
+             Ingest.archive_delivery(delivery.id, fail_at: :after_raw_copy_before_update)
+
+    raw_path =
+      Application.fetch_env!(:manifold_storage, :raw_store_dir)
+      |> Path.join(key)
+
+    File.write!(raw_path, "truncated")
+
+    assert :ok = Ingest.archive_delivery(delivery.id)
+    assert {:ok, %{size: size, sha256: sha256}} = RawStore.stat(key)
+    assert size == delivery.raw_size
+    assert sha256 == delivery.raw_sha256
+  end
+
   test "successful archive records object key before cleanup" do
     %{route: route} = route_fixture()
     assert {:ok, delivery} = accept_delivery([route])
@@ -126,6 +185,107 @@ defmodule Manifold.IngestTest do
 
     assert :ok = Ingest.archive_delivery(delivery.id)
     refute File.exists?(delivery.spool_bundle_path)
+  end
+
+  test "archived cleanup retains the spool when the raw object cannot be verified" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+
+    assert {:error, %{reason: :after_archived_state_before_cleanup}} =
+             Ingest.archive_delivery(delivery.id, fail_at: :after_archived_state_before_cleanup)
+
+    delivery = Repo.get!(InboundDelivery, delivery.id)
+    assert :ok = RawStore.delete(delivery.raw_object_key)
+
+    assert {:error, %{reason: :object_store_failed}} =
+             Ingest.archive_delivery(delivery.id)
+
+    assert File.exists?(delivery.spool_bundle_path)
+  end
+
+  test "reconciliation inserts at most one actionable archival job" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+
+    assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
+    assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
+
+    assert Repo.aggregate(
+             from(job in Oban.Job,
+               where:
+                 job.worker == ^inspect(ArchiveRawEmail) and
+                   fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery.id)
+             ),
+             :count
+           ) == 1
+  end
+
+  test "reconciliation removes expired partial bundles" do
+    partial = Path.join([Spool.spool_root(), "tmp", "expired.partial"])
+    File.mkdir_p!(partial)
+
+    assert :ok =
+             Reconciler.reconcile_once(
+               root: Spool.spool_root(),
+               partial_retention_seconds: 0
+             )
+
+    refute File.exists?(partial)
+  end
+
+  test "reconciliation restores a previously missing bundle and resumes archival" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+    assert :ok = Spool.remove_ready_bundle(delivery.spool_bundle_path)
+
+    assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
+    assert Repo.get!(InboundDelivery, delivery.id).raw_storage_state == "missing_spool"
+
+    assert {:ok, _bundle} =
+             Spool.write_bundle(
+               raw_message(),
+               Map.put(spool_attrs([route]), :routes, [route]),
+               ingest_id: delivery.ingest_id
+             )
+
+    assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
+    assert Repo.get!(InboundDelivery, delivery.id).raw_storage_state == "spooled"
+    assert :ok = Ingest.archive_delivery(delivery.id)
+  end
+
+  test "transient spool stat errors do not mark deliveries missing" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+
+    assert :ok =
+             Reconciler.reconcile_once(
+               root: Spool.spool_root(),
+               file_stat_fun: fn _path -> {:error, :eacces} end
+             )
+
+    assert Repo.get!(InboundDelivery, delivery.id).raw_storage_state == "spooled"
+
+    refute Repo.get_by(MessageEvent,
+             inbound_delivery_id: delivery.id,
+             event_type: "missing_spool"
+           )
+  end
+
+  test "stale missing-spool detection cannot downgrade an archived delivery" do
+    %{route: route} = route_fixture()
+    assert {:ok, stale_delivery} = accept_delivery([route])
+    assert :ok = Ingest.archive_delivery(stale_delivery.id)
+
+    assert :ok = Ingest.mark_missing_spool(stale_delivery)
+
+    delivery = Repo.get!(InboundDelivery, stale_delivery.id)
+    assert delivery.raw_storage_state == "archived"
+    assert delivery.processing_state == "archived"
+
+    refute Repo.get_by(MessageEvent,
+             inbound_delivery_id: delivery.id,
+             event_type: "missing_spool"
+           )
   end
 
   test "crash boundary: failure before ready rename leaves only partial bundle" do

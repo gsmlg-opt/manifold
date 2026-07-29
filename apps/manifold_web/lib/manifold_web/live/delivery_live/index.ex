@@ -2,13 +2,20 @@ defmodule ManifoldWeb.DeliveryLive.Index do
   use ManifoldWeb, :live_view
 
   alias Manifold.Ingest
+  alias ManifoldWeb.IngestNotifier
 
   def mount(_params, _session, socket) do
+    if connected?(socket), do: Phoenix.PubSub.subscribe(Manifold.PubSub, IngestNotifier.topic())
+
     {:ok,
      assign(socket,
        page_title: "Inbound Deliveries",
        deliveries: Ingest.list_inbound_deliveries()
      )}
+  end
+
+  def handle_info({:delivery_committed, _delivery_id}, socket) do
+    {:noreply, assign(socket, :deliveries, Ingest.list_inbound_deliveries())}
   end
 
   def render(assigns) do

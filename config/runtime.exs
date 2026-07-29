@@ -25,6 +25,8 @@ config :manifold_smtp,
   max_message_bytes:
     String.to_integer(System.get_env("MANIFOLD_SMTP_MAX_MESSAGE_BYTES", "26214400")),
   max_recipients: String.to_integer(System.get_env("MANIFOLD_SMTP_MAX_RECIPIENTS", "100")),
+  max_connections: String.to_integer(System.get_env("MANIFOLD_SMTP_MAX_CONNECTIONS", "16")),
+  acceptors: String.to_integer(System.get_env("MANIFOLD_SMTP_ACCEPTORS", "4")),
   tls_certfile: System.get_env("MANIFOLD_SMTP_TLS_CERTFILE"),
   tls_keyfile: System.get_env("MANIFOLD_SMTP_TLS_KEYFILE")
 

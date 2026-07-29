@@ -32,6 +32,7 @@ defmodule ManifoldWeb.MixProject do
       {:phoenix_live_view, "~> 1.2"},
       {:lazy_html, "~> 0.1"},
       {:phoenix_pubsub, "~> 2.2"},
+      {:telemetry, "~> 1.3"},
       {:phoenix_duskmoon, "~> 9.9"},
       {:jason, "~> 1.4"},
       {:bandit, "~> 1.8"},

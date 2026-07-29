@@ -20,7 +20,7 @@ defmodule Manifold.Ingest.Reconciler do
 
   @impl true
   def init(opts) do
-    Process.send_after(self(), :reconcile, Keyword.get(opts, :interval_ms, @interval_ms))
+    send(self(), :reconcile)
     {:ok, opts}
   end
 
@@ -42,8 +42,16 @@ defmodule Manifold.Ingest.Reconciler do
         Application.get_env(:manifold_ingest, :orphan_retention_seconds, 3600)
       )
 
+    partial_retention_seconds =
+      Keyword.get(
+        opts,
+        :partial_retention_seconds,
+        Application.get_env(:manifold_ingest, :partial_retention_seconds, 3600)
+      )
+
+    Spool.cleanup_partials(root, partial_retention_seconds)
     reconcile_ready_bundles(root, retention_seconds)
-    mark_missing_unarchived_bundles()
+    mark_missing_unarchived_bundles(opts)
     :ok
   end
 
@@ -55,11 +63,19 @@ defmodule Manifold.Ingest.Reconciler do
 
       case Repo.get_by(InboundDelivery, ingest_id: ingest_id) do
         %InboundDelivery{raw_storage_state: "archived"} = delivery ->
-          if File.exists?(delivery.spool_bundle_path),
-            do: Spool.remove_ready_bundle(delivery.spool_bundle_path)
+          Ingest.archive_delivery(delivery.id)
 
-        %InboundDelivery{} = delivery ->
-          ArchiveRawEmail.new(%{"inbound_delivery_id" => delivery.id}) |> Oban.insert()
+        %InboundDelivery{raw_storage_state: "spooled"} = delivery ->
+          enqueue_archive_job(delivery.id)
+
+        %InboundDelivery{raw_storage_state: state} = delivery
+        when state in ["failed", "missing_spool"] ->
+          with {:ok, _restored} <- Ingest.restore_spooled(delivery.id) do
+            enqueue_archive_job(delivery.id)
+          end
+
+        %InboundDelivery{} ->
+          :ok
 
         nil ->
           case Spool.classify_ready_orphan(path, retention_seconds) do
@@ -70,13 +86,44 @@ defmodule Manifold.Ingest.Reconciler do
     end)
   end
 
-  defp mark_missing_unarchived_bundles do
+  defp enqueue_archive_job(delivery_id) do
+    Repo.transaction(fn ->
+      InboundDelivery
+      |> where([delivery], delivery.id == ^delivery_id)
+      |> lock("FOR UPDATE")
+      |> Repo.one()
+
+      existing_job =
+        Oban.Job
+        |> where([job], job.worker == ^inspect(ArchiveRawEmail))
+        |> where([job], job.state in ~w(available scheduled executing retryable suspended))
+        |> where(
+          [job],
+          fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery_id)
+        )
+        |> Repo.one()
+
+      if existing_job do
+        existing_job
+      else
+        %{"inbound_delivery_id" => delivery_id}
+        |> ArchiveRawEmail.new()
+        |> Repo.insert!()
+      end
+    end)
+  end
+
+  defp mark_missing_unarchived_bundles(opts) do
+    stat_fun = Keyword.get(opts, :file_stat_fun, &File.stat/1)
+
     InboundDelivery
-    |> where([d], d.raw_storage_state != "archived")
+    |> where([d], d.raw_storage_state == "spooled")
     |> Repo.all()
     |> Enum.each(fn delivery ->
-      unless File.exists?(delivery.spool_bundle_path) do
-        Ingest.mark_missing_spool(delivery)
+      case stat_fun.(delivery.spool_bundle_path) do
+        {:ok, _stat} -> :ok
+        {:error, :enoent} -> Ingest.mark_missing_spool(delivery)
+        {:error, _reason} -> :ok
       end
     end)
   end

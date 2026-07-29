@@ -4,6 +4,7 @@ defmodule Manifold.Storage.Spool do
   """
 
   alias Manifold.Core.{Error, ID}
+  alias Manifold.Storage.Filesystem
   alias Manifold.Storage.Spool.{Bundle, Manifest}
 
   @required_dirs ~w(tmp ready failed quarantine)
@@ -26,8 +27,8 @@ defmodule Manifold.Storage.Spool do
     ingest_id = Keyword.get(opts, :ingest_id, Map.get(attrs, :ingest_id, ID.generate()))
 
     with :ok <- validate_ingest_id(ingest_id),
-         :ok <- ensure_layout(root),
-         :ok <- ensure_capacity(root, min_free_bytes, opts),
+         :ok <- ensure_layout(root, opts),
+         :ok <- ensure_capacity(root, min_free_bytes, byte_size(raw), opts),
          :ok <- maybe_fault(opts, :before_partial_create),
          {:ok, bundle} <-
            write_partial_then_ready(
@@ -165,14 +166,14 @@ defmodule Manifold.Storage.Spool do
     raw_path = Path.join(tmp_path, "raw.eml")
     manifest_path = Path.join(tmp_path, "manifest.json")
 
-    with :ok <- File.mkdir_p(tmp_path),
-         :ok <- write_synced(raw_path, raw),
-         :ok <- write_synced(manifest_path, Jason.encode!(manifest)),
-         :ok <- sync_dir(tmp_path),
-         :ok <- sync_dir(Path.join(root, "tmp")),
+    with :ok <- Filesystem.ensure_private_directory(tmp_path, opts),
+         :ok <- write_synced(raw_path, raw, opts),
+         :ok <- write_synced(manifest_path, Jason.encode!(manifest), opts),
+         :ok <- Filesystem.sync_directory(tmp_path, opts),
+         :ok <- Filesystem.sync_directory(Path.join(root, "tmp"), opts),
          :ok <- maybe_fault(opts, :before_ready_rename),
          :ok <- File.rename(tmp_path, ready_path),
-         :ok <- sync_dir(Path.join(root, "ready")),
+         :ok <- Filesystem.sync_directory(Path.join(root, "ready"), opts),
          :ok <- maybe_fault(opts, :after_ready_rename) do
       {:ok,
        %Bundle{
@@ -193,37 +194,31 @@ defmodule Manifold.Storage.Spool do
     end
   end
 
-  defp write_synced(path, data) do
+  defp write_synced(path, data, opts) do
     with {:ok, io} <- File.open(path, [:write, :binary, :exclusive]) do
-      try do
-        IO.binwrite(io, data)
-        :file.sync(io)
-      after
-        File.close(io)
-      end
-    end
-  end
-
-  defp sync_dir(path) do
-    case :file.open(String.to_charlist(path), [:read, :raw]) do
-      {:ok, io} ->
-        try do
-          case :file.sync(io) do
-            :ok -> :ok
-            {:error, _reason} -> :ok
-          end
-        after
-          :file.close(io)
+      result =
+        with :ok <- Filesystem.chmod(path, 0o600, opts),
+             :ok <- Filesystem.write(io, data, opts),
+             :ok <- Filesystem.sync_file(io, opts) do
+          :ok
         end
 
-      {:error, _reason} ->
-        :ok
+      close_with_result(io, result)
     end
   end
 
-  defp ensure_layout(root) do
+  defp close_with_result(io, result) do
+    close_result = File.close(io)
+
+    case result do
+      :ok -> close_result
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp ensure_layout(root, opts) do
     Enum.reduce_while(@required_dirs, :ok, fn dir, :ok ->
-      case File.mkdir_p(Path.join(root, dir)) do
+      case Filesystem.ensure_private_directory(Path.join(root, dir), opts) do
         :ok ->
           {:cont, :ok}
 
@@ -235,13 +230,11 @@ defmodule Manifold.Storage.Spool do
     end)
   end
 
-  defp ensure_capacity(_root, 0, _opts), do: :ok
-
-  defp ensure_capacity(root, min_free_bytes, opts) do
+  defp ensure_capacity(root, min_free_bytes, raw_size, opts) do
     free_bytes_fun = Keyword.get(opts, :free_bytes_fun, &free_bytes/1)
 
     case free_bytes_fun.(root) do
-      {:ok, free_bytes} when free_bytes >= min_free_bytes ->
+      {:ok, free_bytes} when free_bytes >= min_free_bytes + raw_size ->
         :ok
 
       {:ok, _free_bytes} ->

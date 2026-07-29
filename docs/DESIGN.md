@@ -2,26 +2,39 @@
 
 ## Product and Architecture Design
 
-**Status:** Initial architecture for Release 0.1  
-**Product type:** Elixir-native inbound mail platform  
-**Primary deployment model:** Self-hosted, single installation, single OTP release  
-**Outbound model:** Managed delivery provider; Manifold does not deliver directly to recipient MX servers
+- **Status:** Initial architecture for Release 0.1
+- **Product type:** Self-hosted webmail application and Elixir-native mail platform
+- **Primary deployment model:** Self-hosted, single installation, single OTP release
+- **Primary user interface:** Phoenix LiveView in a web browser
+- **Outbound model:** Managed delivery provider; Manifold does not deliver directly to recipient MX servers
 
 ---
 
 ## 1. Product Definition
 
-Manifold is an Elixir-native platform for receiving, storing, routing, reading, and processing email.
+Manifold is a self-hosted web email application for receiving, reading, organizing,
+composing, and sending email. Its browser interface is the primary mail client and
+is intended to replace desktop clients such as Microsoft Outlook and Apple Mail
+for mailboxes hosted by Manifold.
 
-Its primary responsibility is inbound email. Manifold accepts SMTP deliveries for configured domains, validates recipients during the SMTP transaction, durably records each accepted delivery, preserves the original RFC 5322 message, and processes the message asynchronously into mailbox-oriented views.
+The product combines the user-facing webmail experience with an Elixir-native
+mail platform. Manifold accepts SMTP deliveries for configured domains, validates
+recipients during the SMTP transaction, durably records each accepted delivery,
+preserves the original RFC 5322 message, and processes messages asynchronously
+into mailbox-oriented views.
 
 Outbound mail is deliberately delegated to a managed provider such as Amazon SES, Postmark, Mailgun, or another provider exposed through a Manifold adapter. Manifold owns composition, local queueing, provider submission, and delivery-event tracking, but it does not operate a public outbound MTA or perform direct MX delivery.
 
-Manifold is not intended to reproduce Postfix, Dovecot, and Rspamd in its first release. It is an inbound-first mail application with a Phoenix mailbox interface and an API-oriented core.
+Manifold is not intended to reproduce Postfix, Dovecot, and Rspamd in its first
+release. The implementation is inbound-first because durable receipt is the
+foundation of a trustworthy email client, but the product surface is a complete
+Phoenix webmail application rather than an SMTP administration console.
 
 ### Product statement
 
-> Manifold is an Elixir-native inbound mail platform that durably receives, stores, routes, and presents email while delegating outbound delivery to managed providers.
+> Manifold is a self-hosted webmail application that replaces a desktop email
+> client for locally hosted mailboxes, backed by durable Elixir/OTP mail
+> infrastructure and managed outbound delivery.
 
 ---
 
@@ -39,7 +52,7 @@ Release 0.1 must provide the following capabilities:
 8. Support domains, mailboxes, aliases, and plus addressing.
 9. Store authoritative metadata in PostgreSQL.
 10. Store raw messages and attachments through a storage behaviour, with local filesystem and S3-compatible/ESS implementations.
-11. Provide a Phoenix LiveView administration and mailbox interface.
+11. Provide a Phoenix LiveView webmail interface for inbox, message, mailbox, and administration workflows.
 12. Expose stable context APIs so other applications can use Manifold without scraping the UI.
 13. Submit outbound messages through a paid provider adapter.
 14. Receive and persist provider delivery, bounce, and complaint webhooks.
@@ -62,6 +75,8 @@ The first release will not implement:
 - A complete anti-spam engine.
 - A complete antivirus engine.
 - Gmail or Microsoft 365 mailbox synchronization.
+- Native desktop or mobile applications.
+- An IMAP backend intended for Outlook, Apple Mail, or other desktop clients.
 - Multi-region or active-active clustering.
 - A standalone cloud SMTP relay.
 - End-user rules comparable to mature hosted mail providers.
@@ -74,9 +89,16 @@ These are extension points, not architectural dead ends. In particular, a cloud 
 
 ## 4. Architectural Principles
 
-### 4.1 Inbound-first scope
+### 4.1 Webmail product, inbound-first implementation
 
-Manifold optimizes for reliable receipt and local ownership of email. It does not attempt to become a general-purpose Internet MTA in Release 0.1.
+The browser application is Manifold's primary email client. The target user
+experience includes inbox navigation, message reading, search, mailbox state,
+attachments, composition, reply, forward, drafts, and sent-mail history.
+
+Implementation starts with reliable inbound receipt and local ownership of email
+because every later client workflow depends on durable, replayable message data.
+Manifold does not attempt to become a general-purpose Internet MTA in Release
+0.1.
 
 ### 4.2 Durable acceptance before acknowledgement
 
@@ -181,6 +203,9 @@ Remote sender MTA
                                                  +----------------------+
                                                  | Phoenix LiveView/API |
                                                  +----------------------+
+                                                            ^
+                                                            |
+                                                   web browser / user
 
 
                             OUTBOUND
@@ -375,20 +400,22 @@ It must not contain direct MX lookup or SMTP delivery to recipient servers.
 
 ### 6.10 `manifold_web`
 
-Owns the Phoenix interface:
+Owns the Phoenix webmail application:
 
-- Authentication.
 - Domain, mailbox, and alias administration.
-- Inbox and message views.
+- Inbox, thread, message, and search views.
+- Read, unread, starred, archived, and folder interactions.
 - Safe body rendering.
 - Attachment download.
-- Compose and reply workflows.
+- Compose, draft, reply, reply-all, and forward workflows.
+- Sent-mail and outbound-delivery status.
 - Operational status.
 - JSON API.
 - Provider webhook endpoints.
 - LiveView updates through PubSub.
 
-The initial frontend is Phoenix LiveView using `duskmoon_ui`. A separate SPA is not required.
+Phoenix LiveView using `duskmoon_ui` is the product frontend. A separate SPA or
+native desktop client is not required.
 
 ---
 
@@ -528,14 +555,12 @@ Per-mailbox state must not be stored on the shared transport record.
 
 ### 8.4 Account entities
 
-- `User`
 - `Domain`
 - `Mailbox`
-- `MailboxMembership`
 - `Alias`
 - `AliasTarget`
 
-Release 0.1 may expose a single-owner experience while preserving a model that can support additional users later.
+Release 0.1 treats access to the local web endpoint as full-instance access.
 
 ### 8.5 Outbound entities
 
@@ -859,6 +884,24 @@ Primary threading inputs:
 
 Subject-based fallback may be added conservatively but must not merge unrelated conversations aggressively.
 
+### 14.5 Webmail interaction model
+
+The web interface presents mailbox projections rather than raw transport rows.
+Expected email-client workflows include:
+
+- Browse inbox, sent, drafts, archive, trash, and configured folders.
+- Open individual messages and conversation threads.
+- Mark messages read or unread.
+- Star, archive, restore, move, and delete mailbox entries.
+- Search message metadata and indexed body content.
+- Compose, save drafts, reply, reply-all, and forward.
+- Download attachments and control remote-image loading.
+- Inspect delivery or security details without exposing storage paths.
+
+These workflows are delivered incrementally. Milestone 1 exposes accepted
+deliveries for operational verification; later milestones turn those durable
+records into the complete webmail experience.
+
 ---
 
 ## 15. Security Architecture
@@ -968,32 +1011,51 @@ No Release 0.1 code should:
 
 ---
 
-## 17. Phoenix Web and API
+## 17. Phoenix Webmail and API
 
-### 17.1 Initial interface
+### 17.1 Primary client interface
 
-The initial Phoenix LiveView interface includes:
+Phoenix LiveView is the primary way users read and manage mail. The target
+interface includes:
 
-- Sign-in.
+- Mailbox inbox.
+- Folder and mailbox navigation.
+- Conversation and message lists.
+- Message detail.
+- Search.
+- Read, unread, starred, archive, move, and trash actions.
+- Compose, draft, reply, reply-all, and forward.
+- Sent-mail and provider-delivery status.
+- Attachment download.
+- Safe text and HTML body rendering.
+- Responsive layouts suitable for desktop and mobile browsers.
+
+The UI should behave like an email client, not an infrastructure dashboard.
+Operational details remain available but are secondary to reading and managing
+mail.
+
+### 17.2 Milestone 1 interface
+
+The inbound-first milestone includes:
+
 - Domain list and domain status.
 - Mailbox list.
 - Alias management.
 - Inbound delivery list.
-- Mailbox inbox.
-- Message detail.
 - Raw-header and transport metadata view.
-- Attachment download.
 - Processing and failure status.
 - Operational spool and queue health.
 
-Compose, reply, and provider-event views are added with the outbound milestone.
+MIME body rendering and full client interactions are added after the durable
+inbound slice. Compose, reply, sent-mail, and provider-event views are added with
+the managed outbound milestone.
 
-### 17.2 API principles
+### 17.3 API principles
 
 - Versioned JSON API under `/api/v1`.
 - Stable resource IDs.
 - Cursor pagination for message lists.
-- Explicit authorization at context boundaries.
+- Explicit deployment-boundary access policy.
 - No direct exposure of object-store keys.
 - Signed or controller-mediated attachment downloads.
 - Idempotency key support for message creation.
@@ -1010,11 +1072,17 @@ Candidate resources:
 /api/v1/provider-webhooks/:provider
 ```
 
-### 17.3 Authentication model
+### 17.4 Access model
 
-Release 0.1 can optimize for one installation owner while using ordinary user records and mailbox authorization. The data model must not assume that every future mailbox is globally visible to every user.
+Release 0.1 has no application-level web authentication or mailbox authorization.
+Anyone who can reach the local web endpoint has full-instance access. Deployments
+must enforce their desired trust boundary through host networking or a trusted
+reverse proxy.
 
-### 17.4 Real-time updates
+This is a deliberate single-installation client model: opening the web
+application is equivalent to opening a locally trusted desktop email client.
+
+### 17.5 Real-time updates
 
 LiveView updates use Phoenix PubSub after database commits. The UI must reload authoritative data rather than treating PubSub payloads as the source of truth.
 
@@ -1136,11 +1204,14 @@ MANIFOLD_SMTP_BIND
 MANIFOLD_SMTP_PORT
 MANIFOLD_SMTP_MAX_MESSAGE_BYTES
 MANIFOLD_SMTP_MAX_RECIPIENTS
+MANIFOLD_SMTP_MAX_CONNECTIONS
+MANIFOLD_SMTP_ACCEPTORS
 MANIFOLD_SMTP_TLS_CERTFILE
 MANIFOLD_SMTP_TLS_KEYFILE
 MANIFOLD_SPOOL_DIR
 MANIFOLD_SPOOL_MIN_FREE_BYTES
 MANIFOLD_RAW_STORE_BACKEND
+MANIFOLD_RAW_STORE_DIR
 MANIFOLD_RAW_STORE_BUCKET
 MANIFOLD_OUTBOUND_PROVIDER
 SECRET_KEY_BASE
@@ -1314,10 +1385,13 @@ Do not rely on live Internet services in the default test suite.
 - Mailbox entries.
 - Threading.
 - Basic PostgreSQL search.
+- Inbox, folder, and conversation navigation.
+- Read, unread, starred, archive, move, and trash actions.
 
 ### Milestone 3 — Managed outbound
 
-- Compose and reply.
+- Compose, drafts, reply, reply-all, and forward.
+- Sent-mail views.
 - Provider behaviour.
 - First provider adapter.
 - Outbound Oban queue.
@@ -1341,14 +1415,17 @@ Do not rely on live Internet services in the default test suite.
 - Idempotent acknowledgement.
 - Edge operational UI/API.
 
-### Milestone 6 — Client protocols and external connectors
+### Milestone 6 — External connectors and optional client protocols
 
 Candidates include:
 
-- JMAP.
 - Gmail API synchronization.
 - Microsoft Graph synchronization.
+- JMAP for external interoperability.
 - IMAP only if a concrete interoperability requirement justifies its complexity.
+
+The Phoenix web application remains the primary client. External protocols and
+connectors extend interoperability; they do not define the core user experience.
 
 ---
 
@@ -1356,14 +1433,14 @@ Candidates include:
 
 Release 0.1 is acceptable when:
 
-1. An administrator can create a domain and mailbox.
+1. A local user can create a domain and mailbox.
 2. An SMTP client can deliver a message to that mailbox.
 3. Unknown recipients receive `550` during `RCPT TO`.
 4. A successful `250` is never sent before durable spool and database commit.
 5. The exact accepted raw message is recoverable as `.eml`.
 6. A crash after acceptance does not lose the message.
 7. Object-store outages do not lose accepted messages while spool capacity remains.
-8. The mailbox UI displays accepted and processed messages.
+8. The webmail UI displays accepted and processed messages through inbox and message views.
 9. Attachments are stored and downloaded safely.
 10. Outbound mail is submitted through a managed provider, never directly to recipient MX servers.
 11. Replayed provider webhooks are idempotent.

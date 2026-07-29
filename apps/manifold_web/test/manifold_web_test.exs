@@ -22,15 +22,8 @@ defmodule ManifoldWebTest do
     :ok
   end
 
-  test "unauthenticated access is rejected", %{conn: conn} do
-    conn = get(conn, ~p"/deliveries")
-    assert redirected_to(conn) == ~p"/login"
-  end
-
-  test "authenticated owner can view domain, mailbox, and delivery lists", %{conn: conn} do
-    owner = owner_fixture()
+  test "local access can view domain, mailbox, and delivery lists", %{conn: conn} do
     %{domain: domain} = mailbox_fixture()
-    conn = log_in_owner(conn, owner)
 
     assert {:ok, _view, html} = live(conn, ~p"/domains")
     assert html =~ domain.normalized_domain
@@ -44,10 +37,8 @@ defmodule ManifoldWebTest do
   end
 
   test "delivery details are loaded through context projection", %{conn: conn} do
-    owner = owner_fixture()
     %{domain: domain} = mailbox_fixture()
     {:ok, delivery} = delivery_fixture(domain)
-    conn = log_in_owner(conn, owner)
 
     assert {:ok, _view, html} = live(conn, ~p"/deliveries/#{delivery.id}")
     assert html =~ "sender@example.net"
@@ -55,8 +46,22 @@ defmodule ManifoldWebTest do
     assert html =~ delivery.raw_sha256
   end
 
+  test "open delivery views refresh after committed ingest lifecycle events", %{conn: conn} do
+    %{domain: domain} = mailbox_fixture()
+    assert {:ok, index_view, html} = live(conn, ~p"/deliveries")
+    refute html =~ "sender@example.net"
+
+    {:ok, delivery} = delivery_fixture(domain)
+    assert render(index_view) =~ "sender@example.net"
+
+    assert {:ok, detail_view, html} = live(conn, ~p"/deliveries/#{delivery.id}")
+    assert html =~ "spooled"
+
+    assert :ok = Ingest.archive_delivery(delivery.id)
+    assert render(detail_view) =~ "archived"
+  end
+
   test "raw paths and object-store keys are not exposed as direct public URLs", %{conn: conn} do
-    owner = owner_fixture()
     %{domain: domain} = mailbox_fixture()
     {:ok, delivery} = delivery_fixture(domain)
 
@@ -65,17 +70,10 @@ defmodule ManifoldWebTest do
 
     archived = Repo.get!(Manifold.Ingest.Schema.InboundDelivery, delivery.id)
 
-    conn = log_in_owner(conn, owner)
     assert {:ok, _view, html} = live(conn, ~p"/deliveries/#{delivery.id}")
 
     refute html =~ archived.spool_bundle_path
     refute html =~ archived.raw_object_key
-  end
-
-  defp owner_fixture do
-    email = "owner#{System.unique_integer([:positive])}@example.test"
-    {:ok, owner} = Accounts.create_owner(%{email: email, password: "long-enough-password"})
-    owner
   end
 
   defp mailbox_fixture do

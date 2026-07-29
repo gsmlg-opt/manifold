@@ -6,31 +6,11 @@ defmodule Manifold.Accounts do
   import Ecto.Query
 
   alias Manifold.Accounts.Route
-  alias Manifold.Accounts.Schema.{Alias, AliasTarget, Domain, Mailbox, Owner}
+  alias Manifold.Accounts.Schema.{Alias, AliasTarget, Domain, Mailbox}
   alias Manifold.Core.{Address, Error}
   alias Manifold.Repo
 
   @type create_result(schema) :: {:ok, schema} | {:error, Ecto.Changeset.t()}
-
-  @spec create_owner(map()) :: create_result(Owner.t())
-  def create_owner(attrs) do
-    %Owner{}
-    |> Owner.registration_changeset(attrs)
-    |> Repo.insert()
-  end
-
-  @spec get_owner_by_email_and_password(String.t(), String.t()) :: Owner.t() | nil
-  def get_owner_by_email_and_password(email, password)
-      when is_binary(email) and is_binary(password) do
-    owner = Repo.get_by(Owner, email: email)
-
-    if owner && Bcrypt.verify_pass(password, owner.hashed_password) do
-      owner
-    end
-  end
-
-  @spec get_owner!(Ecto.UUID.t()) :: Owner.t()
-  def get_owner!(id), do: Repo.get!(Owner, id)
 
   @spec list_domains() :: [Domain.t()]
   def list_domains do

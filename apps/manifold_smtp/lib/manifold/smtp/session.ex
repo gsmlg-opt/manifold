@@ -36,9 +36,11 @@ defmodule Manifold.SMTP.Session do
 
   @impl true
   def handle_MAIL(from, state) do
+    state = reset_transaction(state)
+
     case Manifold.Core.Address.parse(to_string(from), allow_null_sender: true) do
       {:ok, :null_sender} -> {:ok, %{state | mail_from: ""}}
-      {:ok, address} -> {:ok, %{state | mail_from: address.original, routes: [], recipients: []}}
+      {:ok, address} -> {:ok, %{state | mail_from: address.original}}
       {:error, _error} -> {:error, "501 5.1.3 invalid sender address syntax", state}
     end
   end
@@ -73,6 +75,7 @@ defmodule Manifold.SMTP.Session do
     })
 
     if byte_size(data) > max_message_bytes(state) do
+      emit_stop(data, state, :message_too_large)
       {:error, "552 5.3.4 message too large", reset_transaction(state)}
     else
       accept_data(data, state)
@@ -92,6 +95,11 @@ defmodule Manifold.SMTP.Session do
   def handle_other(_verb, _args, state), do: {"502 command not implemented", state}
 
   @impl true
+  def handle_error(class, _reason, state)
+      when class in [:data_rejected, :data_receive_error] do
+    {:ok, reset_transaction(state)}
+  end
+
   def handle_error(_class, _reason, state), do: {:ok, state}
 
   @impl true
@@ -139,27 +147,36 @@ defmodule Manifold.SMTP.Session do
 
     case ingest.accept_transport(data, attrs, state.routes) do
       {:ok, delivery} ->
-        :telemetry.execute(
-          [:manifold, :smtp, :transaction, :stop],
-          %{raw_size: byte_size(data)},
-          %{
-            peer_ip: state.peer_ip,
-            ingest_id: delivery.ingest_id,
-            result: :accepted
-          }
-        )
+        emit_stop(data, state, :accepted, %{ingest_id: delivery.ingest_id})
 
         {:ok, "2.0.0 accepted as #{delivery.ingest_id}", reset_transaction(state)}
 
       {:error, %Error{reason: :insufficient_spool_capacity}} ->
-        {:error, "452 4.3.1 insufficient spool capacity", state}
+        emit_stop(data, state, :insufficient_spool_capacity)
+        {:error, "452 4.3.1 insufficient spool capacity", reset_transaction(state)}
 
       {:error, %Error{reason: :message_too_large}} ->
-        {:error, "552 5.3.4 message too large", state}
+        emit_stop(data, state, :message_too_large)
+        {:error, "552 5.3.4 message too large", reset_transaction(state)}
 
       {:error, _error} ->
-        {:error, "451 4.3.0 local accept failure", state}
+        emit_stop(data, state, :local_accept_failure)
+        {:error, "451 4.3.0 local accept failure", reset_transaction(state)}
     end
+  end
+
+  defp emit_stop(data, state, result, extra_metadata \\ %{}) do
+    metadata =
+      Map.merge(
+        %{peer_ip: state.peer_ip, result: result},
+        extra_metadata
+      )
+
+    :telemetry.execute(
+      [:manifold, :smtp, :transaction, :stop],
+      %{raw_size: byte_size(data)},
+      metadata
+    )
   end
 
   defp reset_transaction(state), do: %{state | mail_from: nil, routes: [], recipients: []}

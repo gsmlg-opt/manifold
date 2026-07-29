@@ -24,7 +24,6 @@ defmodule Manifold.Accounts.MixProject do
     [
       {:manifold_core, in_umbrella: true},
       {:manifold_data, in_umbrella: true},
-      {:bcrypt_elixir, "~> 3.3"},
       {:jason, "~> 1.4"}
     ]
   end

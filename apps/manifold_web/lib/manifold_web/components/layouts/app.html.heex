@@ -7,11 +7,6 @@
       <.nav_link to={~p"/mailboxes"}>Mailboxes</.nav_link>
       <.nav_link to={~p"/aliases"}>Aliases</.nav_link>
     </nav>
-    <form action={~p"/logout"} method="post">
-      <input type="hidden" name="_method" value="delete" />
-      <input type="hidden" name="_csrf_token" value={get_csrf_token()} />
-      <button type="submit">Sign out</button>
-    </form>
   </aside>
   <main class="content">
     <.flash_group flash={@flash} />

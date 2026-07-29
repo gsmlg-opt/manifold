@@ -5,20 +5,28 @@ defmodule Manifold.Storage.RawStore.Local do
 
   @behaviour Manifold.Storage.RawStore
 
+  alias Manifold.Storage.Filesystem
   alias Manifold.Storage.Spool.Manifest
 
   @impl true
   def put_from_path(%{root: root}, key, source_path, opts) do
     with :ok <- validate_key(key),
          destination = Path.join(root, key),
-         :ok <- File.mkdir_p(Path.dirname(destination)),
-         :ok <- maybe_fault(opts, :before_copy),
-         {:ok, _bytes} <- File.copy(source_path, destination),
-         :ok <- maybe_fault(opts, :after_copy),
-         :ok <- sync_file(destination),
-         :ok <- sync_dir(Path.dirname(destination)),
-         {:ok, stat} <- stat(%{root: root}, key, opts) do
-      {:ok, stat}
+         temporary = temporary_path(destination) do
+      result =
+        with :ok <- Filesystem.ensure_private_directory(Path.dirname(destination), opts),
+             :ok <- maybe_fault(opts, :before_copy),
+             :ok <- copy_to_temporary(source_path, temporary, opts),
+             :ok <- Filesystem.chmod(temporary, 0o600, opts),
+             :ok <- maybe_fault(opts, :after_copy),
+             :ok <- sync_file(temporary, opts),
+             :ok <- File.rename(temporary, destination),
+             :ok <- Filesystem.sync_directory(Path.dirname(destination), opts),
+             {:ok, stat} <- stat(%{root: root}, key, opts) do
+          {:ok, stat}
+        end
+
+      cleanup_temporary(temporary, result)
     end
   end
 
@@ -56,31 +64,44 @@ defmodule Manifold.Storage.RawStore.Local do
 
   defp validate_key(_key), do: {:error, :invalid_key}
 
-  defp sync_file(path) do
-    with {:ok, io} <- File.open(path, [:read, :binary]) do
-      try do
-        :file.sync(io)
-      after
-        File.close(io)
-      end
+  defp copy_to_temporary(source_path, temporary, opts) do
+    copy_fun = Keyword.get(opts, :copy_fun, &File.copy/2)
+
+    case copy_fun.(source_path, temporary) do
+      {:ok, _bytes} -> :ok
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      other -> {:error, {:unexpected_copy_result, other}}
     end
   end
 
-  defp sync_dir(path) do
-    case :file.open(String.to_charlist(path), [:read, :raw]) do
-      {:ok, io} ->
-        try do
-          case :file.sync(io) do
-            :ok -> :ok
-            {:error, _reason} -> :ok
-          end
-        after
-          :file.close(io)
-        end
-
-      {:error, _reason} ->
-        :ok
+  defp sync_file(path, opts) do
+    with {:ok, io} <- File.open(path, [:read, :binary]) do
+      result = Filesystem.sync_file(io, opts)
+      close_with_result(io, result)
     end
+  end
+
+  defp close_with_result(io, result) do
+    close_result = File.close(io)
+
+    case result do
+      :ok -> close_result
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp cleanup_temporary(temporary, result) do
+    case File.rm(temporary) do
+      :ok -> result
+      {:error, :enoent} -> result
+      {:error, reason} -> {:error, {:temporary_cleanup_failed, reason}}
+    end
+  end
+
+  defp temporary_path(destination) do
+    suffix = System.unique_integer([:monotonic, :positive])
+    destination <> ".partial-" <> Integer.to_string(suffix)
   end
 
   defp maybe_fault(opts, point) do

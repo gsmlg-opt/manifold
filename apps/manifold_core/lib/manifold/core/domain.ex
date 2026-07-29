@@ -5,10 +5,22 @@ defmodule Manifold.Core.Domain do
 
   alias Manifold.Core.Error
 
+  @max_domain_bytes 255
+
   @type normalized :: String.t()
 
   @spec normalize(String.t()) :: {:ok, normalized()} | {:error, Error.t()}
   def normalize(domain) when is_binary(domain) do
+    if ascii?(domain) do
+      normalize_ascii(domain)
+    else
+      invalid("domain must be ASCII")
+    end
+  end
+
+  def normalize(_domain), do: invalid("domain must be a string")
+
+  defp normalize_ascii(domain) do
     normalized =
       domain
       |> String.trim()
@@ -19,8 +31,8 @@ defmodule Manifold.Core.Domain do
       normalized == "" ->
         invalid("domain is empty")
 
-      not ascii?(normalized) ->
-        invalid("domain must be ASCII")
+      byte_size(normalized) > @max_domain_bytes ->
+        invalid("domain exceeds SMTP length limit")
 
       String.contains?(normalized, "..") ->
         invalid("domain contains an empty label")
@@ -36,9 +48,9 @@ defmodule Manifold.Core.Domain do
     end
   end
 
-  def normalize(_domain), do: invalid("domain must be a string")
-
   defp invalid(message), do: {:error, Error.new(:permanent, :invalid_domain, message)}
 
-  defp ascii?(value), do: String.to_charlist(value) |> Enum.all?(&(&1 in 1..127))
+  defp ascii?(<<>>), do: true
+  defp ascii?(<<byte, rest::binary>>) when byte in 1..127, do: ascii?(rest)
+  defp ascii?(_value), do: false
 end

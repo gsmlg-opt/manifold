@@ -22,7 +22,7 @@ repo_config =
 config :manifold_data, Manifold.Repo, repo_config
 
 config :manifold_web, ManifoldWeb.Endpoint,
-  http: [ip: {127, 0, 0, 1}, port: String.to_integer(System.get_env("PORT", "4290"))],
+  http: [ip: {0, 0, 0, 0, 0, 0, 0, 0}, port: String.to_integer(System.get_env("PORT", "4290"))],
   check_origin: false,
   code_reloader: true,
   debug_errors: true,

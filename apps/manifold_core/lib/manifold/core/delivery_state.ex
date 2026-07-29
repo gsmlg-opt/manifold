@@ -9,7 +9,7 @@ defmodule Manifold.Core.DeliveryState do
     "spooled" => ~w(archived failed missing_spool),
     "archived" => [],
     "failed" => ~w(spooled),
-    "missing_spool" => []
+    "missing_spool" => ~w(spooled)
   }
 
   @processing_transitions %{

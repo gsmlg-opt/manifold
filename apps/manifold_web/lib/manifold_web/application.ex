@@ -9,6 +9,7 @@ defmodule ManifoldWeb.Application do
   def start(_type, _args) do
     children = [
       {Phoenix.PubSub, name: Manifold.PubSub},
+      ManifoldWeb.IngestNotifier,
       ManifoldWeb.Endpoint
     ]
 

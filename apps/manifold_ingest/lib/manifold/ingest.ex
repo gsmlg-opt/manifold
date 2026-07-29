@@ -39,8 +39,19 @@ defmodule Manifold.Ingest do
 
   @spec accept(Bundle.t(), [map() | struct()], Keyword.t()) :: accept_result()
   def accept(%Bundle{} = bundle, frozen_routes, opts \\ []) when is_list(frozen_routes) do
-    now = DateTime.utc_now()
     routes = Enum.map(frozen_routes, &normalize_route/1)
+
+    with :ok <- validate_frozen_routes(bundle, routes) do
+      persist_acceptance(bundle, routes, opts)
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error,
+       Error.new(:temporary, :database_unavailable, "database is temporarily unavailable")}
+  end
+
+  defp persist_acceptance(bundle, routes, opts) do
+    now = DateTime.utc_now()
     recipient_rows = build_recipient_rows(routes, now)
     mailbox_entry_rows = build_mailbox_entry_rows(routes, now)
 
@@ -99,10 +110,6 @@ defmodule Manifold.Ingest do
            reason: inspect(reason)
          })}
     end
-  rescue
-    DBConnection.ConnectionError ->
-      {:error,
-       Error.new(:temporary, :database_unavailable, "database is temporarily unavailable")}
   end
 
   @spec list_inbound_deliveries() :: [InboundDelivery.t()]
@@ -155,50 +162,121 @@ defmodule Manifold.Ingest do
         {:error, Error.new(:permanent, :not_found, "delivery not found")}
 
       %InboundDelivery{raw_storage_state: "archived"} = delivery ->
-        cleanup_archived_bundle(delivery)
+        cleanup_archived_bundle(delivery, opts)
 
       %InboundDelivery{} = delivery ->
         archive_spooled_delivery(delivery, opts)
     end
   end
 
-  @spec mark_missing_spool(InboundDelivery.t()) :: :ok | {:error, Ecto.Changeset.t()}
-  def mark_missing_spool(%InboundDelivery{} = delivery) do
-    now = DateTime.utc_now()
+  @spec mark_missing_spool(InboundDelivery.t()) :: :ok | {:error, term()}
+  def mark_missing_spool(%InboundDelivery{id: delivery_id}) do
+    result =
+      Repo.transaction(fn ->
+        delivery =
+          InboundDelivery
+          |> where([delivery], delivery.id == ^delivery_id)
+          |> lock("FOR UPDATE")
+          |> Repo.one!()
 
-    multi =
-      Multi.new()
-      |> Multi.update(
-        :delivery,
-        InboundDelivery.state_changeset(delivery, %{
-          raw_storage_state: "missing_spool",
-          processing_state: "failed",
-          last_error: "ready spool bundle is missing before archival"
-        })
-      )
-      |> Multi.insert(
-        :event,
-        MessageEvent.event_changeset(delivery.id, "missing_spool", %{}, now)
-      )
+        if delivery.raw_storage_state == "spooled" do
+          with :ok <-
+                 DeliveryState.validate_raw_transition(
+                   delivery.raw_storage_state,
+                   "missing_spool"
+                 ),
+               :ok <-
+                 DeliveryState.validate_processing_transition(
+                   delivery.processing_state,
+                   "failed"
+                 ),
+               {:ok, missing} <-
+                 delivery
+                 |> InboundDelivery.state_changeset(%{
+                   raw_storage_state: "missing_spool",
+                   processing_state: "failed",
+                   last_error: "ready spool bundle is missing before archival"
+                 })
+                 |> Repo.update(),
+               {:ok, _event} <-
+                 MessageEvent.event_changeset(
+                   delivery.id,
+                   "missing_spool",
+                   %{},
+                   DateTime.utc_now()
+                 )
+                 |> Repo.insert() do
+            missing
+          else
+            {:error, reason} -> Repo.rollback(reason)
+          end
+        else
+          delivery
+        end
+      end)
 
-    case Repo.transaction(multi) do
-      {:ok, _} -> :ok
-      {:error, _step, changeset, _changes} -> {:error, changeset}
+    case result do
+      {:ok, _delivery} -> :ok
+      {:error, reason} -> {:error, reason}
     end
+  end
+
+  @spec restore_spooled(Ecto.UUID.t()) :: {:ok, InboundDelivery.t()} | {:error, term()}
+  def restore_spooled(delivery_id) do
+    Repo.transaction(fn ->
+      delivery =
+        InboundDelivery
+        |> where([delivery], delivery.id == ^delivery_id)
+        |> lock("FOR UPDATE")
+        |> Repo.one!()
+
+      case delivery.raw_storage_state do
+        "spooled" ->
+          delivery
+
+        state ->
+          with :ok <- DeliveryState.validate_raw_transition(state, "spooled"),
+               :ok <-
+                 DeliveryState.validate_processing_transition(
+                   delivery.processing_state,
+                   "accepted"
+                 ),
+               {:ok, restored} <-
+                 delivery
+                 |> InboundDelivery.state_changeset(%{
+                   raw_storage_state: "spooled",
+                   processing_state: "accepted",
+                   last_error: nil
+                 })
+                 |> Repo.update(),
+               {:ok, _event} <-
+                 MessageEvent.event_changeset(
+                   delivery.id,
+                   "spool_restored",
+                   %{},
+                   DateTime.utc_now()
+                 )
+                 |> Repo.insert() do
+            restored
+          else
+            {:error, reason} -> Repo.rollback(reason)
+          end
+      end
+    end)
   end
 
   defp archive_spooled_delivery(delivery, opts) do
     raw_path = Path.join(delivery.spool_bundle_path, "raw.eml")
 
-    with true <- File.exists?(raw_path) || {:error, :missing_spool},
+    with :ok <- verify_spool_file(raw_path, opts),
          {:ok, domain_id} <- first_domain_id(delivery.id),
          key = RawStore.build_key(domain_id, delivery.received_at, delivery.id),
-         {:ok, stat} <- ensure_raw_stored(key, raw_path, opts),
+         {:ok, stat} <- ensure_raw_stored(delivery, key, raw_path, opts),
          :ok <- verify_raw_stat(delivery, stat),
          :ok <- maybe_fault(opts, :after_raw_copy_before_update),
-         {:ok, _changes} <- commit_archived_state(delivery, key),
+         {:ok, archived_delivery} <- commit_archived_state(delivery.id, key),
          :ok <- maybe_fault(opts, :after_archived_state_before_cleanup),
-         :ok <- cleanup_archived_bundle(%{delivery | raw_storage_state: "archived"}) do
+         :ok <- cleanup_archived_bundle(archived_delivery, opts) do
       :telemetry.execute([:manifold, :ingest, :archive, :stop], %{raw_size: delivery.raw_size}, %{
         delivery_id: delivery.id,
         ingest_id: delivery.ingest_id
@@ -220,22 +298,24 @@ defmodule Manifold.Ingest do
          Error.new(:temporary, :object_store_failed, "raw object archival failed", %{
            reason: inspect(reason)
          })}
-
-      false ->
-        :ok = mark_missing_spool(delivery)
-
-        {:error,
-         Error.new(:permanent, :missing_spool, "ready spool bundle is missing before archival")}
     end
   end
 
-  defp ensure_raw_stored(key, raw_path, opts) do
-    case RawStore.stat(key) do
-      {:ok, stat} ->
-        {:ok, stat}
+  defp ensure_raw_stored(delivery, key, raw_path, opts) do
+    raw_store_opts = Keyword.get(opts, :raw_store_opts, [])
 
-      {:error, _reason} ->
-        RawStore.put_from_path(key, raw_path, Keyword.get(opts, :raw_store_opts, []))
+    case RawStore.stat(key, raw_store_opts) do
+      {:ok, stat} ->
+        case verify_raw_stat(delivery, stat) do
+          :ok -> {:ok, stat}
+          {:error, %Error{}} -> RawStore.put_from_path(key, raw_path, raw_store_opts)
+        end
+
+      {:error, reason} when reason in [:enoent, :not_found] ->
+        RawStore.put_from_path(key, raw_path, raw_store_opts)
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -252,41 +332,98 @@ defmodule Manifold.Ingest do
     end
   end
 
-  defp commit_archived_state(delivery, key) do
-    now = DateTime.utc_now()
+  defp commit_archived_state(delivery_id, key) do
+    Repo.transaction(fn ->
+      delivery =
+        InboundDelivery
+        |> where([delivery], delivery.id == ^delivery_id)
+        |> lock("FOR UPDATE")
+        |> Repo.one!()
 
-    with :ok <- DeliveryState.validate_raw_transition(delivery.raw_storage_state, "archived") do
-      Multi.new()
-      |> Multi.update(
-        :delivery,
-        InboundDelivery.state_changeset(delivery, %{
-          raw_storage_state: "archived",
-          processing_state: "archived",
-          raw_object_key: key,
-          last_error: nil
-        })
-      )
-      |> Multi.insert(
-        :event,
-        MessageEvent.event_changeset(delivery.id, "archived", %{raw_object_key: key}, now)
-      )
-      |> Repo.transaction()
+      case delivery.raw_storage_state do
+        "archived" ->
+          if delivery.raw_object_key == key do
+            delivery
+          else
+            Repo.rollback(
+              Error.new(
+                :permanent,
+                :invalid_state_transition,
+                "delivery is archived under a different raw object key"
+              )
+            )
+          end
+
+        state ->
+          with :ok <- DeliveryState.validate_raw_transition(state, "archived"),
+               {:ok, archived} <-
+                 delivery
+                 |> InboundDelivery.state_changeset(%{
+                   raw_storage_state: "archived",
+                   processing_state: "archived",
+                   raw_object_key: key,
+                   last_error: nil
+                 })
+                 |> Repo.update(),
+               {:ok, _event} <-
+                 delivery.id
+                 |> MessageEvent.event_changeset(
+                   "archived",
+                   %{raw_object_key: key},
+                   DateTime.utc_now()
+                 )
+                 |> Repo.insert() do
+            archived
+          else
+            {:error, reason} -> Repo.rollback(reason)
+          end
+      end
+    end)
+  end
+
+  defp cleanup_archived_bundle(%InboundDelivery{} = delivery, opts) do
+    raw_store_opts = Keyword.get(opts, :raw_store_opts, [])
+
+    with key when is_binary(key) <- delivery.raw_object_key,
+         {:ok, stat} <- RawStore.stat(key, raw_store_opts),
+         :ok <- verify_raw_stat(delivery, stat),
+         :ok <- remove_spool_bundle_if_present(delivery.spool_bundle_path, opts) do
+      :ok
+    else
+      nil ->
+        {:error,
+         Error.new(:temporary, :object_store_failed, "archived delivery has no raw object key")}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+
+      {:error, reason} ->
+        {:error,
+         Error.new(:temporary, :object_store_failed, "archived raw object verification failed", %{
+           reason: inspect(reason)
+         })}
     end
   end
 
-  defp cleanup_archived_bundle(%InboundDelivery{spool_bundle_path: path}) do
-    case File.exists?(path) do
-      true -> Spool.remove_ready_bundle(path)
-      false -> :ok
+  defp remove_spool_bundle_if_present(path, opts) do
+    case file_stat(path, opts) do
+      {:ok, _stat} -> Spool.remove_ready_bundle(path)
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  defp cleanup_archived_bundle(%{spool_bundle_path: path}) do
-    case File.exists?(path) do
-      true -> Spool.remove_ready_bundle(path)
-      false -> :ok
+  defp verify_spool_file(path, opts) do
+    case file_stat(path, opts) do
+      {:ok, %{type: :regular}} -> :ok
+      {:ok, _stat} -> {:error, :missing_spool}
+      {:error, :enoent} -> {:error, :missing_spool}
+      {:error, reason} -> {:error, reason}
     end
   end
+
+  defp file_stat(path, opts),
+    do: Keyword.get(opts, :file_stat_fun, &File.stat/1).(path)
 
   defp first_domain_id(delivery_id) do
     DeliveryRecipient
@@ -351,6 +488,51 @@ defmodule Manifold.Ingest do
       mailbox_ids: route_field(map, :mailbox_ids) || []
     }
   end
+
+  defp validate_frozen_routes(%Bundle{manifest: manifest}, routes) do
+    manifest_routes =
+      case manifest do
+        %{routes: manifest_routes} when is_list(manifest_routes) ->
+          Enum.map(manifest_routes, &normalize_route/1)
+
+        _ ->
+          []
+      end
+
+    original_recipients =
+      case manifest do
+        %{original_recipients: recipients} when is_list(recipients) -> recipients
+        _ -> []
+      end
+
+    valid_routes? =
+      routes != [] and
+        Enum.all?(routes, fn route ->
+          non_empty_string?(route.original_recipient) and
+            non_empty_string?(route.canonical_recipient) and
+            non_empty_string?(route.domain_id) and
+            is_list(route.mailbox_ids) and route.mailbox_ids != [] and
+            Enum.all?(route.mailbox_ids, &non_empty_string?/1) and
+            Enum.uniq(route.mailbox_ids) == route.mailbox_ids
+        end)
+
+    manifest_matches? =
+      manifest_routes == routes and
+        original_recipients == Enum.map(routes, & &1.original_recipient)
+
+    if valid_routes? and manifest_matches? do
+      :ok
+    else
+      {:error,
+       Error.new(
+         :permanent,
+         :invalid_routes,
+         "frozen recipient routes are empty, invalid, or differ from the spool manifest"
+       )}
+    end
+  end
+
+  defp non_empty_string?(value), do: is_binary(value) and byte_size(value) > 0
 
   defp route_field(map, field) when is_map(map) do
     Map.get(map, field) || Map.get(map, Atom.to_string(field))
