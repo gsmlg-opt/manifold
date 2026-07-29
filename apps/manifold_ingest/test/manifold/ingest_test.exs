@@ -3,11 +3,12 @@ defmodule Manifold.IngestTest do
 
   alias Manifold.Accounts
   alias Manifold.Ingest
-  alias Manifold.Ingest.Jobs.{ArchiveRawEmail, ProjectInboundMail}
+  alias Manifold.Ingest.Jobs.{ArchiveRawEmail, EvaluateInboundSecurity, ProjectInboundMail}
   alias Manifold.Ingest.Reconciler
   alias Manifold.Ingest.Schema.{DeliveryRecipient, InboundDelivery, MessageEvent}
   alias Manifold.Mail.Schema.{MailboxEntry, Message}
   alias Manifold.Repo
+  alias Manifold.Security.Schema.SecurityAssessment
   alias Manifold.Storage.RawStore
   alias Manifold.Storage.Spool
 
@@ -41,6 +42,7 @@ defmodule Manifold.IngestTest do
     assert Repo.get_by!(InboundDelivery, ingest_id: delivery.ingest_id)
     assert Repo.aggregate(DeliveryRecipient, :count) == 1
     assert Repo.aggregate(MailboxEntry, :count) == 1
+    assert Repo.one!(MailboxEntry).quarantined
     assert Repo.get_by!(MessageEvent, event_type: "accepted")
     assert [%Oban.Job{worker: worker}] = Repo.all(Oban.Job)
     assert worker == inspect(ArchiveRawEmail)
@@ -140,7 +142,7 @@ defmodule Manifold.IngestTest do
     refute File.exists?(delivery.spool_bundle_path)
   end
 
-  test "archival commits the projection job and projection completes the delivery" do
+  test "archival commits projection and security jobs before projection completes" do
     %{route: route} = route_fixture()
     assert {:ok, delivery} = accept_delivery([route])
 
@@ -153,6 +155,15 @@ defmodule Manifold.IngestTest do
                  "inbound_delivery_id" => delivery.id,
                  "parser_version" => 1,
                  "sanitizer_version" => 1
+               }
+             )
+
+    assert %Oban.Job{} =
+             Repo.get_by(Oban.Job,
+               worker: inspect(EvaluateInboundSecurity),
+               args: %{
+                 "inbound_delivery_id" => delivery.id,
+                 "evaluation_version" => 1
                }
              )
 
@@ -170,6 +181,53 @@ defmodule Manifold.IngestTest do
     assert Repo.get_by!(Message, inbound_delivery_id: delivery.id)
     assert Repo.get_by!(MailboxEntry, inbound_delivery_id: delivery.id).message_id
     assert Repo.get_by!(MessageEvent, inbound_delivery_id: delivery.id, event_type: "parsed")
+  end
+
+  test "security worker releases an allowed delivery only after policy commits" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+    entry = Repo.get_by!(MailboxEntry, inbound_delivery_id: delivery.id)
+    assert entry.quarantined
+
+    assert :ok = Ingest.archive_delivery(delivery.id)
+
+    assert :ok =
+             EvaluateInboundSecurity.perform(%Oban.Job{
+               args: %{
+                 "inbound_delivery_id" => delivery.id,
+                 "evaluation_version" => 1
+               }
+             })
+
+    refute Repo.get!(MailboxEntry, entry.id).quarantined
+
+    assessment =
+      Repo.get_by!(SecurityAssessment, inbound_delivery_id: delivery.id)
+
+    assert assessment.policy_action == "allow"
+    assert assessment.policy_applied
+  end
+
+  test "assessment commit before visibility update remains fail closed and retries" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+    assert :ok = Ingest.archive_delivery(delivery.id)
+
+    assert {:error, %{reason: :after_assessment_before_policy}} =
+             Ingest.evaluate_security(delivery.id,
+               fail_at: :after_assessment_before_policy,
+               evaluation_version: 1
+             )
+
+    assessment =
+      Repo.get_by!(SecurityAssessment, inbound_delivery_id: delivery.id)
+
+    refute assessment.policy_applied
+    assert Repo.get_by!(MailboxEntry, inbound_delivery_id: delivery.id).quarantined
+
+    assert :ok = Ingest.evaluate_security(delivery.id, evaluation_version: 1)
+    refute Repo.get_by!(MailboxEntry, inbound_delivery_id: delivery.id).quarantined
+    assert Repo.get!(SecurityAssessment, assessment.id).policy_applied
   end
 
   test "projection worker honors its parser version and rebuilds a completed projection" do
@@ -286,6 +344,46 @@ defmodule Manifold.IngestTest do
              ),
              :count
            ) == 1
+  end
+
+  test "reconciliation restores missing security work until policy is applied" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+    assert :ok = Ingest.archive_delivery(delivery.id)
+
+    EvaluateInboundSecurity
+    |> inspect()
+    |> then(fn worker ->
+      from(job in Oban.Job, where: job.worker == ^worker)
+    end)
+    |> Repo.delete_all()
+
+    assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
+
+    assert Repo.aggregate(
+             from(job in Oban.Job,
+               where:
+                 job.worker == ^inspect(EvaluateInboundSecurity) and
+                   fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery.id)
+             ),
+             :count
+           ) == 1
+
+    assert :ok = Ingest.evaluate_security(delivery.id)
+
+    EvaluateInboundSecurity
+    |> inspect()
+    |> then(fn worker ->
+      from(job in Oban.Job, where: job.worker == ^worker)
+    end)
+    |> Repo.delete_all()
+
+    assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
+
+    assert Repo.aggregate(
+             from(job in Oban.Job, where: job.worker == ^inspect(EvaluateInboundSecurity)),
+             :count
+           ) == 0
   end
 
   test "reconciliation schedules the exact upgraded projection beside stale active work" do

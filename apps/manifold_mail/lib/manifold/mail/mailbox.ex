@@ -437,6 +437,50 @@ defmodule Manifold.Mail.Mailbox do
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
+  @spec set_delivery_quarantine(Ecto.UUID.t(), boolean()) ::
+          {:ok, non_neg_integer()} | {:error, Error.t()}
+  def set_delivery_quarantine(inbound_delivery_id, quarantined?)
+      when is_boolean(quarantined?) do
+    Repo.transaction(fn ->
+      entries =
+        MailboxEntry
+        |> where(
+          [entry],
+          entry.inbound_delivery_id == ^inbound_delivery_id and
+            entry.quarantined != ^quarantined?
+        )
+        |> lock("FOR UPDATE")
+        |> select([entry], %{id: entry.id, mailbox_id: entry.mailbox_id})
+        |> Repo.all()
+
+      entry_ids = Enum.map(entries, & &1.id)
+
+      count =
+        if entry_ids == [] do
+          0
+        else
+          {count, _rows} =
+            MailboxEntry
+            |> where([entry], entry.id in ^entry_ids)
+            |> Repo.update_all(set: [quarantined: quarantined?, updated_at: DateTime.utc_now()])
+
+          count
+        end
+
+      {count, entries |> Enum.map(& &1.mailbox_id) |> Enum.uniq()}
+    end)
+    |> case do
+      {:ok, {count, mailbox_ids}} ->
+        Enum.each(mailbox_ids, &notify_change({:ok, count}, &1))
+        {:ok, count}
+
+      {:error, reason} ->
+        {:error, database_error(reason)}
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
   defp maybe_search_threads(query, ""), do: query
 
   defp maybe_search_threads(query, search) do
@@ -604,7 +648,9 @@ defmodule Manifold.Mail.Mailbox do
 
   defp scoped_entries(mailbox_id, entry_ids) do
     from(entry in MailboxEntry,
-      where: entry.mailbox_id == ^mailbox_id and entry.id in ^entry_ids
+      where:
+        entry.mailbox_id == ^mailbox_id and entry.id in ^entry_ids and
+          not entry.quarantined
     )
   end
 

@@ -376,11 +376,12 @@ Owns mail security and policy evaluation:
 - Malware-scanner adapters.
 - Spam-classifier adapters.
 - Quarantine decisions.
-- Safe HTML presentation policy.
-- External-image policy.
 - Security-result persistence.
 
 Release 0.1 may begin with explicit `not_evaluated` results and adapter contracts. It must not fabricate successful authentication results.
+Safe HTML sanitization and resource enforcement remain owned by
+`manifold_mail` and `manifold_web`; security supplies policy decisions rather
+than presentation code.
 
 ### 6.9 `manifold_outbound`
 
@@ -438,11 +439,13 @@ Tier 2:
   manifold_mail
 
 Tier 3:
-  manifold_ingest
   manifold_security
   manifold_outbound
 
 Tier 4:
+  manifold_ingest
+
+Tier 5:
   manifold_smtp
   manifold_web
 ```
@@ -759,22 +762,24 @@ A sender may retry if the connection fails after database commit but before it r
 
 ## 12. Asynchronous Inbound Pipeline
 
-The implemented Milestone 2 pipeline is:
+The implemented inbound pipeline is:
 
 ```text
 accepted
   -> archive raw object
-  -> parse MIME
-  -> extract/store attachments
-  -> create normalized message
-  -> assign thread
-  -> finalize mailbox entries
-  -> index for search
-  -> publish UI notification
+     |-> security evaluation -> allow or retain quarantine
+     |-> parse MIME
+          -> extract/store attachments
+          -> create normalized message
+          -> assign thread
+          -> finalize mailbox entries
+          -> index for search
 ```
 
-Authentication/security evaluation and local rules are later pipeline stages.
-They must preserve the same archived-raw and idempotent-projection boundaries.
+Acceptance creates mailbox entries with quarantine visibility enforced.
+Security and MIME projection begin after archival and run independently from
+the same verified raw source. The archive transaction inserts both Oban jobs.
+Only a committed allow or manual-release policy clears quarantine.
 
 Each stage:
 
@@ -948,7 +953,8 @@ A Release 0.1 implementation may integrate an external verifier or initially mar
 ### 15.3 Abuse and content controls
 
 - Per-IP rate limiting.
-- Connection concurrency limits.
+- Per-IP and global connection concurrency limits.
+- Per-IP connection and SMTP transaction fixed-window limits.
 - Recipient-count limits.
 - Message-size limits.
 - Spool capacity backpressure.
@@ -1153,7 +1159,10 @@ Recommended event families:
 [:manifold, :spool, :write, :stop]
 [:manifold, :archive, :stop]
 [:manifold, :mail, :parse, :stop]
-[:manifold, :security, :evaluate, :stop]
+[:manifold, :ingest, :security, :stop]
+[:manifold, :security, :policy, :committed]
+[:manifold, :security, :evaluation, :failed]
+[:manifold, :smtp, :admission, :connection | :transaction]
 [:manifold, :outbound, :submit, :stop]
 [:manifold, :provider, :webhook, :processed]
 ```
@@ -1227,6 +1236,11 @@ MANIFOLD_SMTP_PORT
 MANIFOLD_SMTP_MAX_MESSAGE_BYTES
 MANIFOLD_SMTP_MAX_RECIPIENTS
 MANIFOLD_SMTP_MAX_CONNECTIONS
+MANIFOLD_SMTP_MAX_CONNECTIONS_PER_PEER
+MANIFOLD_SMTP_CONNECTION_RATE_LIMIT
+MANIFOLD_SMTP_CONNECTION_RATE_WINDOW_MS
+MANIFOLD_SMTP_TRANSACTION_RATE_LIMIT
+MANIFOLD_SMTP_TRANSACTION_RATE_WINDOW_MS
 MANIFOLD_SMTP_ACCEPTORS
 MANIFOLD_SMTP_TLS_CERTFILE
 MANIFOLD_SMTP_TLS_KEYFILE
@@ -1429,11 +1443,18 @@ Implemented.
 
 ### Milestone 4 — Security and policy
 
+Implemented.
+
 - SPF, DKIM, and DMARC evaluation.
 - Rate-limit hardening.
 - Quarantine.
 - Malware/spam adapter integration.
 - Operational dashboards.
+
+Release 0.1 ships deterministic adapter contracts and explicit
+`not_evaluated` defaults. DNS-backed authentication verification and production
+scanner/classifier engines remain deployment integrations, not bundled network
+services.
 
 ### Milestone 5 — Cloud ingress edge
 

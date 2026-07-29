@@ -42,6 +42,28 @@
 16. A valid webhook received before the provider message ID commits is retained
     as unmatched. The provider-acceptance transaction reconciles and applies it;
     duplicate and out-of-order events do not regress recipient state.
+17. SMTP acceptance creates mailbox entries quarantined. A crash before
+    security evaluation cannot make pending mail visible.
+18. Failure before the archive transaction commits rolls back the security job
+    together with archive state. The existing archive job retries from the
+    ready spool bundle.
+19. Failure after archive commit but before security worker execution leaves a
+    verified raw object and a transactional security job. Oban or reconciliation
+    resumes evaluation after restart.
+20. A transient adapter failure commits no successful assessment and leaves all
+    mailbox entries quarantined. Oban retries the same evaluation version.
+21. Failure after assessment persistence but before policy application leaves
+    `policy_applied = false` and the mailbox projection hidden. Retry applies the
+    stored decision without duplicating the assessment.
+22. Failure after an allow decision updates mailbox visibility but before the
+    assessment finalization leaves the persisted allow decision available for
+    retry. Retry marks the same policy applied; it does not rerun adapters.
+23. Failure during manual release before the release audit commit can clear
+    visibility only after an explicit operator decision. Repeating release
+    commits one effective `released` event.
+24. SMTP session crashes release monitored per-peer connection leases. Admission
+    counters are deliberately ephemeral and reset on SMTP application restart;
+    no durable mail state depends on them.
 
 A database row whose unarchived bundle is missing is marked `missing_spool` with an
 operational event. If that trusted ready bundle later reappears, reconciliation

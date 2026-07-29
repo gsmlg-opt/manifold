@@ -27,6 +27,18 @@ config :manifold_smtp,
   max_recipients: String.to_integer(System.get_env("MANIFOLD_SMTP_MAX_RECIPIENTS", "100")),
   max_connections: String.to_integer(System.get_env("MANIFOLD_SMTP_MAX_CONNECTIONS", "16")),
   acceptors: String.to_integer(System.get_env("MANIFOLD_SMTP_ACCEPTORS", "4")),
+  admission: [
+    max_connections_per_peer:
+      String.to_integer(System.get_env("MANIFOLD_SMTP_MAX_CONNECTIONS_PER_PEER", "8")),
+    connection_rate_limit:
+      String.to_integer(System.get_env("MANIFOLD_SMTP_CONNECTION_RATE_LIMIT", "60")),
+    connection_rate_window_ms:
+      String.to_integer(System.get_env("MANIFOLD_SMTP_CONNECTION_RATE_WINDOW_MS", "60000")),
+    transaction_rate_limit:
+      String.to_integer(System.get_env("MANIFOLD_SMTP_TRANSACTION_RATE_LIMIT", "120")),
+    transaction_rate_window_ms:
+      String.to_integer(System.get_env("MANIFOLD_SMTP_TRANSACTION_RATE_WINDOW_MS", "60000"))
+  ],
   tls_certfile: System.get_env("MANIFOLD_SMTP_TLS_CERTFILE"),
   tls_keyfile: System.get_env("MANIFOLD_SMTP_TLS_KEYFILE")
 

@@ -5,7 +5,7 @@ defmodule Manifold.SMTPTest do
   alias Manifold.Core.Error
   alias Manifold.Ingest.Schema.{DeliveryRecipient, InboundDelivery}
   alias Manifold.Repo
-  alias Manifold.SMTP.{Listener, Session}
+  alias Manifold.SMTP.{Admission, Listener, RateLimit, Session}
 
   @moduletag :tmp_dir
 
@@ -384,6 +384,98 @@ defmodule Manifold.SMTPTest do
     assert ["555" <> _] = recv_response(socket)
   end
 
+  test "fixed-window rate limit refills deterministically" do
+    assert {:ok, first} = RateLimit.check(nil, 2, 1_000, 100)
+    assert {:ok, second} = RateLimit.check(first, 2, 1_000, 200)
+    assert {:error, 800, ^second} = RateLimit.check(second, 2, 1_000, 300)
+    assert {:ok, reset} = RateLimit.check(second, 2, 1_000, 1_100)
+    assert reset.count == 1
+    assert reset.started_at_ms == 1_100
+  end
+
+  test "admission isolates peers and releases crashed session leases" do
+    admission = start_admission!(max_connections_per_peer: 1)
+    first = spawn(fn -> Process.sleep(:infinity) end)
+    second = spawn(fn -> Process.sleep(:infinity) end)
+    third = spawn(fn -> Process.sleep(:infinity) end)
+
+    on_exit(fn -> Enum.each([first, second, third], &Process.exit(&1, :kill)) end)
+
+    assert :ok = Admission.acquire_connection("192.0.2.1", first, admission)
+
+    assert {:error, :connection_limit} =
+             Admission.acquire_connection("192.0.2.1", second, admission)
+
+    assert :ok = Admission.acquire_connection("192.0.2.2", second, admission)
+    Process.exit(first, :kill)
+
+    assert_eventually(fn ->
+      Admission.acquire_connection("192.0.2.1", third, admission) == :ok
+    end)
+  end
+
+  test "admission prunes expired peer rate windows" do
+    {:ok, clock} = Agent.start_link(fn -> 100 end)
+    admission = start_admission!(clock: fn -> Agent.get(clock, & &1) end)
+    owner = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(owner, :kill) end)
+
+    assert :ok = Admission.acquire_connection("192.0.2.10", owner, admission)
+    assert :ok = Admission.allow_transaction("192.0.2.10", admission)
+    assert :ok = Admission.release_connection(owner, admission)
+
+    assert map_size(:sys.get_state(admission).connection_windows) == 1
+    assert map_size(:sys.get_state(admission).transaction_windows) == 1
+
+    Agent.update(clock, fn _now -> 60_100 end)
+    send(admission, :prune)
+
+    assert_eventually(fn ->
+      state = :sys.get_state(admission)
+      state.connection_windows == %{} and state.transaction_windows == %{}
+    end)
+  end
+
+  test "per-peer connection limit rejects a second TCP session with 421" do
+    admission = start_admission!(max_connections_per_peer: 1)
+    port = start_smtp!(admission: admission)
+    first = connect!(port)
+
+    assert {:ok, second} =
+             :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, packet: :line, active: false])
+
+    assert ["421 4.7.0" <> _] = recv_response(second)
+    :ok = :gen_tcp.close(first)
+  end
+
+  test "per-peer connection rate applies after a session releases its lease" do
+    admission = start_admission!(connection_rate_limit: 1)
+    port = start_smtp!(admission: admission)
+    first = connect!(port)
+
+    send_line(first, "QUIT\r\n")
+    assert ["221" <> _] = recv_response(first)
+
+    assert {:ok, second} =
+             :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, packet: :line, active: false])
+
+    assert ["421 4.7.0" <> _] = recv_response(second)
+  end
+
+  test "per-peer transaction rate rejects MAIL FROM temporarily" do
+    admission = start_admission!(transaction_rate_limit: 1)
+    port = start_smtp!(admission: admission)
+    socket = connect!(port)
+
+    ehlo(socket)
+    mail_from(socket)
+    send_line(socket, "RSET\r\n")
+    assert ["250" <> _] = recv_response(socket)
+
+    send_line(socket, "MAIL FROM:<second@example.net>\r\n")
+    assert ["451 4.7.0" <> _] = recv_response(socket)
+  end
+
   test "listener configures conservative Ranch connection limits" do
     with_smtp_config(max_connections: 12, acceptors: 3)
 
@@ -435,6 +527,7 @@ defmodule Manifold.SMTPTest do
       max_message_bytes: Keyword.get(opts, :max_message_bytes, 25 * 1024 * 1024),
       max_recipients: Keyword.get(opts, :max_recipients, 100),
       tls_enabled?: false,
+      admission: Keyword.get(opts, :admission),
       resolver: Keyword.get(opts, :resolver, Manifold.Accounts),
       ingest: Keyword.get(opts, :ingest, Manifold.Ingest)
     ]
@@ -453,6 +546,19 @@ defmodule Manifold.SMTPTest do
     end)
 
     port
+  end
+
+  defp start_admission!(overrides) do
+    defaults = [
+      name: nil,
+      max_connections_per_peer: 8,
+      connection_rate_limit: 60,
+      connection_rate_window_ms: 60_000,
+      transaction_rate_limit: 120,
+      transaction_rate_window_ms: 60_000
+    ]
+
+    start_supervised!({Admission, Keyword.merge(defaults, overrides)})
   end
 
   defp connect!(port) do
@@ -535,6 +641,18 @@ defmodule Manifold.SMTPTest do
       )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp assert_eventually(fun, attempts \\ 20)
+  defp assert_eventually(fun, 0), do: assert(fun.())
+
+  defp assert_eventually(fun, attempts) do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(10)
+      assert_eventually(fun, attempts - 1)
+    end
   end
 
   defp with_smtp_config(overrides) do

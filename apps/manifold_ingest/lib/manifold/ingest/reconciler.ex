@@ -54,6 +54,7 @@ defmodule Manifold.Ingest.Reconciler do
     reconcile_ready_bundles(root, retention_seconds)
     mark_missing_unarchived_bundles(opts)
     reconcile_archived_projections()
+    reconcile_archived_security()
     :ok
   end
 
@@ -157,5 +158,29 @@ defmodule Manifold.Ingest.Reconciler do
       {:ok, _job} -> :ok
       {:error, _reason} -> :ok
     end
+  end
+
+  defp reconcile_archived_security do
+    evaluation_version = Application.get_env(:manifold_security, :evaluation_version, 1)
+
+    delivery_ids =
+      InboundDelivery
+      |> where([delivery], delivery.raw_storage_state == "archived")
+      |> order_by([delivery], asc: delivery.updated_at, asc: delivery.id)
+      |> limit(500)
+      |> select([delivery], delivery.id)
+      |> Repo.all()
+
+    applied_ids =
+      Manifold.Security.policy_applied_delivery_ids(delivery_ids, evaluation_version)
+
+    delivery_ids
+    |> Enum.reject(&MapSet.member?(applied_ids, &1))
+    |> Enum.each(fn delivery_id ->
+      case Ingest.ensure_security_job(delivery_id) do
+        {:ok, _job} -> :ok
+        {:error, _reason} -> :ok
+      end
+    end)
   end
 end

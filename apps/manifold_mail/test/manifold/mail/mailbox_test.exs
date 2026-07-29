@@ -169,6 +169,56 @@ defmodule Manifold.Mail.MailboxTest do
     assert {:error, %{reason: :not_found}} = Mail.open_attachment(mailbox_id, attachment.id)
   end
 
+  test "delivery quarantine updates every mailbox projection and is idempotent" do
+    first_mailbox_id = mailbox_fixture()
+    second_mailbox_id = mailbox_fixture()
+    assert {:ok, first_folders} = Mail.list_folders(first_mailbox_id)
+    inbox = Enum.find(first_folders, &(&1.kind == "inbox"))
+
+    %{entries: [first_entry]} =
+      thread_fixture(first_mailbox_id, inbox.id, "Shared delivery", DateTime.utc_now(), 1)
+
+    second_entry =
+      %MailboxEntry{}
+      |> MailboxEntry.changeset(%{
+        mailbox_id: second_mailbox_id,
+        inbound_delivery_id: first_entry.inbound_delivery_id,
+        original_recipient: "inbox@example.test",
+        quarantined: false
+      })
+      |> Repo.insert!()
+
+    assert {:ok, 2} = Mail.set_delivery_quarantine(first_entry.inbound_delivery_id, true)
+    assert Repo.get!(MailboxEntry, first_entry.id).quarantined
+    assert Repo.get!(MailboxEntry, second_entry.id).quarantined
+
+    assert {:ok, 0} = Mail.set_delivery_quarantine(first_entry.inbound_delivery_id, true)
+    assert {:ok, 2} = Mail.set_delivery_quarantine(first_entry.inbound_delivery_id, false)
+    refute Repo.get!(MailboxEntry, first_entry.id).quarantined
+    refute Repo.get!(MailboxEntry, second_entry.id).quarantined
+  end
+
+  test "normal mailbox mutations cannot bypass quarantine" do
+    mailbox_id = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox_id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    archive = Enum.find(folders, &(&1.kind == "archive"))
+
+    %{entries: [entry]} =
+      thread_fixture(mailbox_id, inbox.id, "No mutation bypass", DateTime.utc_now(), 1)
+
+    assert {:ok, 1} = Mail.set_delivery_quarantine(entry.inbound_delivery_id, true)
+    assert {:ok, 0} = Mail.mark_read(mailbox_id, [entry.id], true)
+    assert {:ok, 0} = Mail.set_starred(mailbox_id, [entry.id], true)
+    assert {:ok, 0} = Mail.move(mailbox_id, [entry.id], archive.id)
+
+    unchanged = Repo.get!(MailboxEntry, entry.id)
+    assert unchanged.quarantined
+    assert unchanged.read_at == nil
+    assert unchanged.starred_at == nil
+    assert unchanged.folder_id == inbox.id
+  end
+
   test "malformed resource identifiers return classified not-found errors" do
     mailbox_id = mailbox_fixture()
 

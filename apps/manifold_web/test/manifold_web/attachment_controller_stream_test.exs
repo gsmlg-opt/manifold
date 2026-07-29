@@ -173,6 +173,7 @@ defmodule ManifoldWeb.AttachmentControllerStreamTest do
              )
 
     assert :ok = Ingest.archive_delivery(delivery.id)
+    assert :ok = Ingest.evaluate_security(delivery.id)
     assert :ok = Ingest.project_delivery(delivery.id)
 
     message = Repo.get_by!(Message, inbound_delivery_id: delivery.id)

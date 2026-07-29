@@ -80,6 +80,10 @@ defmodule Manifold.Mail do
           {:ok, non_neg_integer()} | {:error, Error.t()}
   defdelegate restore(mailbox_id, entry_ids), to: Mailbox
 
+  @spec set_delivery_quarantine(Ecto.UUID.t(), boolean()) ::
+          {:ok, non_neg_integer()} | {:error, Error.t()}
+  defdelegate set_delivery_quarantine(inbound_delivery_id, quarantined?), to: Mailbox
+
   @spec open_attachment(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, Manifold.Mail.View.AttachmentDownload.t()} | {:error, Error.t()}
   defdelegate open_attachment(mailbox_id, attachment_id), to: Mailbox

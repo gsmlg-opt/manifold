@@ -4,14 +4,14 @@ Manifold is a self-hosted Phoenix webmail application backed by an Elixir-native
 mail platform. It is designed to replace a desktop email client for locally
 hosted mailboxes while preserving durable SMTP acceptance and raw message data.
 
-## Milestones 0-3
+## Milestones 0-4
 
 This repository currently implements durable inbound delivery, mailbox
-projection, and managed outbound submission:
+projection, managed outbound submission, and fail-closed inbound policy:
 
 - Phoenix umbrella with `manifold_core`, `manifold_data`, `manifold_accounts`,
   `manifold_storage`, `manifold_ingest`, `manifold_smtp`, `manifold_mail`,
-  `manifold_outbound`, and `manifold_web`.
+  `manifold_security`, `manifold_outbound`, and `manifold_web`.
 - PostgreSQL/Ecto migrations and Oban jobs.
 - Domain, mailbox, alias, alias target, and recipient resolution.
 - `gen_smtp` development listener on port `2525`.
@@ -31,6 +31,13 @@ projection, and managed outbound submission:
   complained, suppressed, delayed, and failed state.
 - Sent-mail and provider lifecycle views that distinguish provider acceptance
   from final recipient delivery.
+- Versioned SPF, DKIM, DMARC, malware, and spam assessment results through
+  replaceable adapters. Disabled adapters persist `not_evaluated`; they never
+  fabricate a successful result.
+- Fail-closed mailbox quarantine from SMTP acceptance until policy commits, with
+  audited manual release and retry-safe security jobs.
+- Per-peer SMTP connection concurrency, connection rate, and transaction rate
+  controls.
 - Isolated sanitized HTML rendering and mailbox-scoped attachment downloads.
 - Operational LiveViews for domains, mailboxes, aliases, inbound deliveries, and
   delivery detail.
@@ -38,8 +45,10 @@ projection, and managed outbound submission:
 ## Out Of Scope
 
 The current milestones intentionally do not implement rich-text composition,
-outbound attachments, spam or malware scanning, IMAP, POP3, JMAP, Gmail sync,
-Microsoft Graph sync, or cloud relay.
+outbound attachments, bundled DNS authentication engines, bundled spam or
+malware engines, IMAP, POP3, JMAP, Gmail sync, Microsoft Graph sync, or cloud
+relay. Production authentication and scanning engines plug into the Milestone 4
+adapter boundaries.
 
 Manifold never performs direct outbound Internet SMTP delivery. Milestone 3
 submits through the configured managed-provider HTTPS adapter.
@@ -101,6 +110,13 @@ Set `RESEND_WEBHOOK_SECRET` to the endpoint signing secret. An optional
 `RESEND_API_BASE_URL` is supported for controlled testing. Without an API key,
 drafts remain usable but queued submissions fail with a classified
 `provider_not_configured` state instead of making a network request.
+
+SMTP abuse limits can be tuned with
+`MANIFOLD_SMTP_MAX_CONNECTIONS_PER_PEER`,
+`MANIFOLD_SMTP_CONNECTION_RATE_LIMIT`,
+`MANIFOLD_SMTP_CONNECTION_RATE_WINDOW_MS`,
+`MANIFOLD_SMTP_TRANSACTION_RATE_LIMIT`, and
+`MANIFOLD_SMTP_TRANSACTION_RATE_WINDOW_MS`.
 
 Run checks:
 

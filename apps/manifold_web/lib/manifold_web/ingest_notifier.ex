@@ -7,7 +7,10 @@ defmodule ManifoldWeb.IngestNotifier do
   @topic "inbound_deliveries"
   @events [
     [:manifold, :ingest, :accept, :stop],
-    [:manifold, :ingest, :archive, :stop]
+    [:manifold, :ingest, :archive, :stop],
+    [:manifold, :ingest, :security, :stop],
+    [:manifold, :security, :policy, :committed],
+    [:manifold, :security, :evaluation, :failed]
   ]
 
   def start_link(opts \\ []) do

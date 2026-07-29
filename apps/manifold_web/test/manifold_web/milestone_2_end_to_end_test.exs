@@ -2,7 +2,7 @@ defmodule ManifoldWeb.Milestone2EndToEndTest do
   use ManifoldWeb.ConnCase, async: false
 
   alias Manifold.Accounts
-  alias Manifold.Ingest.Jobs.{ArchiveRawEmail, ProjectInboundMail}
+  alias Manifold.Ingest.Jobs.{ArchiveRawEmail, EvaluateInboundSecurity, ProjectInboundMail}
   alias Manifold.Ingest.Schema.{InboundDelivery, MessageEvent}
   alias Manifold.Mail
   alias Manifold.Mail.Schema.{MailboxEntry, Message}
@@ -106,6 +106,14 @@ defmodule ManifoldWeb.Milestone2EndToEndTest do
       )
 
     assert :ok = ProjectInboundMail.perform(projection_job)
+
+    security_job =
+      Repo.get_by!(Oban.Job,
+        worker: inspect(EvaluateInboundSecurity),
+        args: %{"inbound_delivery_id" => delivery.id, "evaluation_version" => 1}
+      )
+
+    assert :ok = EvaluateInboundSecurity.perform(security_job)
 
     projected = Repo.get!(InboundDelivery, delivery.id)
     assert projected.processing_state == "processed"

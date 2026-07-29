@@ -6,13 +6,20 @@ defmodule Manifold.SMTP.Session do
   @behaviour :gen_smtp_server_session
 
   alias Manifold.Core.Error
+  alias Manifold.SMTP.Admission
 
-  defstruct [:peer_ip, :helo, :mail_from, routes: [], recipients: [], options: []]
+  defstruct [:peer_ip, :helo, :mail_from, :admission, routes: [], recipients: [], options: []]
 
   @impl true
   def init(_hostname, _session_count, peername, opts) do
-    state = %__MODULE__{peer_ip: peer_to_string(peername), options: opts}
-    {:ok, "Manifold SMTP ready", state}
+    peer_ip = peer_to_string(peername)
+    admission = Keyword.get(opts, :admission)
+    state = %__MODULE__{peer_ip: peer_ip, admission: admission, options: opts}
+
+    case acquire_connection(admission, peer_ip) do
+      :ok -> {:ok, "Manifold SMTP ready", state}
+      {:error, _reason} -> {:stop, :rate_limited, "421 4.7.0 connection limit exceeded"}
+    end
   end
 
   @impl true
@@ -38,10 +45,16 @@ defmodule Manifold.SMTP.Session do
   def handle_MAIL(from, state) do
     state = reset_transaction(state)
 
-    case Manifold.Core.Address.parse(to_string(from), allow_null_sender: true) do
-      {:ok, :null_sender} -> {:ok, %{state | mail_from: ""}}
-      {:ok, address} -> {:ok, %{state | mail_from: address.original}}
-      {:error, _error} -> {:error, "501 5.1.3 invalid sender address syntax", state}
+    case allow_transaction(state.admission, state.peer_ip) do
+      :ok ->
+        case Manifold.Core.Address.parse(to_string(from), allow_null_sender: true) do
+          {:ok, :null_sender} -> {:ok, %{state | mail_from: ""}}
+          {:ok, address} -> {:ok, %{state | mail_from: address.original}}
+          {:error, _error} -> {:error, "501 5.1.3 invalid sender address syntax", state}
+        end
+
+      {:error, _reason} ->
+        {:error, "451 4.7.0 transaction rate limit exceeded", state}
     end
   end
 
@@ -106,7 +119,10 @@ defmodule Manifold.SMTP.Session do
   def code_change(_old_vsn, state, _extra), do: {:ok, state}
 
   @impl true
-  def terminate(reason, state), do: {:ok, reason, state}
+  def terminate(reason, state) do
+    release_connection(state.admission)
+    {:ok, reason, state}
+  end
 
   defp resolve_recipient(to, state) do
     resolver = Keyword.get(state.options, :resolver, Manifold.Accounts)
@@ -205,6 +221,17 @@ defmodule Manifold.SMTP.Session do
       reject_extension(extensions, "STARTTLS")
     end
   end
+
+  defp acquire_connection(nil, _peer_ip), do: :ok
+
+  defp acquire_connection(admission, peer_ip),
+    do: Admission.acquire_connection(peer_ip, self(), admission)
+
+  defp allow_transaction(nil, _peer_ip), do: :ok
+  defp allow_transaction(admission, peer_ip), do: Admission.allow_transaction(peer_ip, admission)
+
+  defp release_connection(nil), do: :ok
+  defp release_connection(admission), do: Admission.release_connection(self(), admission)
 
   defp peer_to_string(peername) do
     peername

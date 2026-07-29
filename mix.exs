@@ -66,6 +66,7 @@ defmodule Manifold.Umbrella.MixProject do
           manifold_accounts: :permanent,
           manifold_storage: :permanent,
           manifold_mail: :permanent,
+          manifold_security: :permanent,
           manifold_outbound: :permanent,
           manifold_ingest: :permanent,
           manifold_smtp: :permanent,

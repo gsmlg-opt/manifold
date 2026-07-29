@@ -8,12 +8,14 @@ defmodule Manifold.Ingest do
   alias Ecto.Multi
   alias Manifold.Accounts
   alias Manifold.Core.{DeliveryState, Error}
-  alias Manifold.Ingest.Jobs.{ArchiveRawEmail, ProjectInboundMail}
+  alias Manifold.Ingest.Jobs.{ArchiveRawEmail, EvaluateInboundSecurity, ProjectInboundMail}
   alias Manifold.Ingest.Schema.{DeliveryRecipient, InboundDelivery, MessageEvent}
   alias Manifold.Mail
   alias Manifold.Mail.InboundSource
   alias Manifold.Ingest.View.DeliveryDetail
   alias Manifold.Repo
+  alias Manifold.Security
+  alias Manifold.Security.Input, as: SecurityInput
   alias Manifold.Storage.{RawStore, Spool}
   alias Manifold.Storage.Spool.Bundle
 
@@ -156,6 +158,7 @@ defmodule Manifold.Ingest do
 
       %InboundDelivery{raw_storage_state: "archived"} = delivery ->
         with {:ok, _job} <- ensure_projection_job(delivery.id),
+             {:ok, _job} <- ensure_security_job(delivery.id),
              :ok <- cleanup_archived_bundle(delivery, opts) do
           :ok
         end
@@ -285,6 +288,38 @@ defmodule Manifold.Ingest do
     end
   end
 
+  @spec evaluate_security(Ecto.UUID.t(), Keyword.t()) :: :ok | {:error, Error.t()}
+  def evaluate_security(delivery_id, opts \\ []) do
+    raw_store_opts = Keyword.get(opts, :raw_store_opts, [])
+
+    with %InboundDelivery{} = delivery <- Repo.get(InboundDelivery, delivery_id),
+         :ok <- validate_security_source(delivery, raw_store_opts),
+         {:ok, _assessment} <- Security.evaluate(security_input(delivery), opts) do
+      :telemetry.execute(
+        [:manifold, :ingest, :security, :stop],
+        %{raw_size: delivery.raw_size},
+        %{delivery_id: delivery.id, ingest_id: delivery.ingest_id}
+      )
+
+      :ok
+    else
+      nil ->
+        {:error, Error.new(:permanent, :not_found, "delivery not found")}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+
+      {:error, reason} ->
+        {:error,
+         Error.new(:temporary, :security_evaluation_failed, "security evaluation failed", %{
+           reason: inspect(reason)
+         })}
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error, Error.new(:temporary, :database_unavailable, "database is unavailable")}
+  end
+
   defp archive_spooled_delivery(delivery, opts) do
     raw_path = Path.join(delivery.spool_bundle_path, "raw.eml")
 
@@ -395,6 +430,9 @@ defmodule Manifold.Ingest do
                  |> Repo.insert(),
                {:ok, _job} <-
                  projection_job_changeset(delivery.id)
+                 |> Repo.insert(),
+               {:ok, _security_job} <-
+                 security_job_changeset(delivery.id)
                  |> Repo.insert() do
             archived
           else
@@ -428,6 +466,33 @@ defmodule Manifold.Ingest do
         end)
 
       existing_job || projection_job_changeset(delivery_id) |> Repo.insert!()
+    end)
+  end
+
+  @spec ensure_security_job(Ecto.UUID.t()) :: {:ok, Oban.Job.t()} | {:error, term()}
+  def ensure_security_job(delivery_id) do
+    Repo.transaction(fn ->
+      InboundDelivery
+      |> where([delivery], delivery.id == ^delivery_id)
+      |> lock("FOR UPDATE")
+      |> Repo.one!()
+
+      target_args = security_job_args(delivery_id)
+
+      existing_job =
+        Oban.Job
+        |> where([job], job.worker == ^inspect(EvaluateInboundSecurity))
+        |> where([job], job.state in ~w(available scheduled executing retryable suspended))
+        |> where(
+          [job],
+          fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery_id)
+        )
+        |> Repo.all()
+        |> Enum.find(fn job ->
+          Map.take(job.args, Map.keys(target_args)) == target_args
+        end)
+
+      existing_job || security_job_changeset(delivery_id) |> Repo.insert!()
     end)
   end
 
@@ -641,6 +706,43 @@ defmodule Manifold.Ingest do
     }
   end
 
+  defp security_input(delivery) do
+    %SecurityInput{
+      inbound_delivery_id: delivery.id,
+      peer_ip: delivery.peer_ip,
+      helo: delivery.helo,
+      envelope_from: delivery.envelope_from,
+      received_at: delivery.received_at,
+      raw_object_key: delivery.raw_object_key,
+      raw_size: delivery.raw_size,
+      raw_sha256: delivery.raw_sha256
+    }
+  end
+
+  defp validate_security_source(
+         %InboundDelivery{raw_storage_state: "archived", raw_object_key: key} = delivery,
+         raw_store_opts
+       )
+       when is_binary(key) do
+    case RawStore.stat(key, raw_store_opts) do
+      {:ok, stat} -> verify_raw_stat(delivery, stat)
+      {:error, reason} -> {:error, raw_verification_error(reason)}
+    end
+  end
+
+  defp validate_security_source(%InboundDelivery{}, _raw_store_opts) do
+    {:error, Error.new(:temporary, :raw_not_archived, "raw message is not archived yet")}
+  end
+
+  defp raw_verification_error(reason) do
+    Error.new(
+      :temporary,
+      :raw_verification_failed,
+      "archived raw message could not be verified for security evaluation",
+      %{reason: inspect(reason)}
+    )
+  end
+
   defp projection_job_changeset(delivery_id) do
     delivery_id
     |> projection_job_args()
@@ -655,6 +757,19 @@ defmodule Manifold.Ingest do
     }
   end
 
+  defp security_job_changeset(delivery_id) do
+    delivery_id
+    |> security_job_args()
+    |> EvaluateInboundSecurity.new()
+  end
+
+  defp security_job_args(delivery_id) do
+    %{
+      "inbound_delivery_id" => delivery_id,
+      "evaluation_version" => security_evaluation_version()
+    }
+  end
+
   defp requested_projection_versions(opts) do
     %{
       parser_version: Keyword.get(opts, :parser_version, parser_version()),
@@ -664,6 +779,9 @@ defmodule Manifold.Ingest do
 
   defp parser_version, do: Application.get_env(:manifold_mail, :parser_version, 1)
   defp sanitizer_version, do: Application.get_env(:manifold_mail, :sanitizer_version, 1)
+
+  defp security_evaluation_version,
+    do: Application.get_env(:manifold_security, :evaluation_version, 1)
 
   defp normalize_transaction_error({:ok, value}), do: {:ok, value}
   defp normalize_transaction_error({:error, %Error{} = error}), do: {:error, error}

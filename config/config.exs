@@ -12,7 +12,7 @@ config :manifold_data, Manifold.Repo,
 
 config :manifold_data, Oban,
   repo: Manifold.Repo,
-  queues: [archive: 10, mail_parse: 2, outbound: 5],
+  queues: [archive: 10, mail_parse: 2, security: 2, outbound: 5],
   plugins: [{Oban.Plugins.Pruner, max_age: 86_400}]
 
 config :manifold_storage,
@@ -45,6 +45,10 @@ config :manifold_outbound,
   provider_adapter: Manifold.Outbound.Provider.Resend,
   provider_config: []
 
+config :manifold_security,
+  evaluation_version: 1,
+  adapter_config: []
+
 config :manifold_smtp,
   enabled: config_env() != :test,
   hostname: "localhost",
@@ -54,6 +58,13 @@ config :manifold_smtp,
   max_recipients: 100,
   max_connections: 16,
   acceptors: 4,
+  admission: [
+    max_connections_per_peer: 8,
+    connection_rate_limit: 60,
+    connection_rate_window_ms: 60_000,
+    transaction_rate_limit: 120,
+    transaction_rate_window_ms: 60_000
+  ],
   tls_certfile: nil,
   tls_keyfile: nil
 

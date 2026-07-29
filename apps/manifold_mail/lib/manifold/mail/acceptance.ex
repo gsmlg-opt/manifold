@@ -36,7 +36,7 @@ defmodule Manifold.Mail.Acceptance do
         id: Ecto.UUID.generate(),
         mailbox_id: mailbox_id,
         original_recipient: original_recipient,
-        quarantined: false,
+        quarantined: true,
         inserted_at: now,
         updated_at: now
       }

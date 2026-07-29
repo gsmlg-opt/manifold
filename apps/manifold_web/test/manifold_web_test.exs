@@ -26,6 +26,24 @@ defmodule ManifoldWebTest do
     def delete(_config, _key, _opts), do: {:error, :unavailable}
   end
 
+  defmodule InfectedAdapter do
+    @behaviour Manifold.Security.MalwareAdapter
+
+    @impl true
+    def scan(_config, _input),
+      do: {:ok, %{verdict: :infected, signature: "web-test-malware", metadata: %{}}}
+  end
+
+  defmodule UnavailableScanner do
+    @behaviour Manifold.Security.MalwareAdapter
+
+    @impl true
+    def scan(_config, _input) do
+      {:error,
+       Manifold.Core.Error.new(:temporary, :scanner_unavailable, "scanner is unavailable")}
+    end
+  end
+
   setup %{tmp_dir: tmp_dir} do
     old_spool = Application.fetch_env!(:manifold_storage, :spool_dir)
     old_raw = Application.fetch_env!(:manifold_storage, :raw_store_dir)
@@ -66,6 +84,50 @@ defmodule ManifoldWebTest do
     assert html =~ "sender@example.net"
     assert html =~ "inbox@#{domain.normalized_domain}"
     assert html =~ delivery.raw_sha256
+    assert html =~ "Pending security evaluation"
+  end
+
+  test "delivery operations show assessment evidence and release quarantine", %{conn: conn} do
+    %{domain: domain} = mailbox_fixture()
+    {:ok, delivery} = delivery_fixture(domain)
+    assert :ok = Ingest.archive_delivery(delivery.id)
+    assert :ok = Ingest.evaluate_security(delivery.id, malware_adapter: InfectedAdapter)
+
+    entry = Repo.get_by!(MailboxEntry, inbound_delivery_id: delivery.id)
+    assert entry.quarantined
+
+    assert {:ok, view, html} = live(conn, ~p"/deliveries/#{delivery.id}")
+    assert html =~ "web-test-malware"
+    assert html =~ "quarantine"
+
+    html =
+      view
+      |> element("#release-quarantine")
+      |> render_click()
+
+    assert html =~ "released"
+    refute Repo.get!(MailboxEntry, entry.id).quarantined
+  end
+
+  test "delivery operations expose classified security failures without exposing mail", %{
+    conn: conn
+  } do
+    %{domain: domain} = mailbox_fixture()
+    {:ok, delivery} = delivery_fixture(domain)
+    assert :ok = Ingest.archive_delivery(delivery.id)
+
+    assert {:error, %{reason: :scanner_unavailable}} =
+             Ingest.evaluate_security(delivery.id, malware_adapter: UnavailableScanner)
+
+    assert Repo.get_by!(MailboxEntry, inbound_delivery_id: delivery.id).quarantined
+
+    assert {:ok, _view, html} = live(conn, ~p"/deliveries")
+    assert html =~ "Failed"
+
+    assert {:ok, _view, html} = live(conn, ~p"/deliveries/#{delivery.id}")
+    assert html =~ "scanner_unavailable"
+    assert html =~ "scanner is unavailable"
+    refute html =~ "Release quarantine"
   end
 
   test "open delivery views refresh after committed ingest lifecycle events", %{conn: conn} do
@@ -361,6 +423,7 @@ defmodule ManifoldWebTest do
 
     assert {:ok, delivery} = delivery_fixture(domain, raw)
     assert :ok = Ingest.archive_delivery(delivery.id)
+    assert :ok = Ingest.evaluate_security(delivery.id)
     assert :ok = Ingest.project_delivery(delivery.id)
 
     message = Repo.get_by!(Message, inbound_delivery_id: delivery.id)
