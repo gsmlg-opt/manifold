@@ -14,12 +14,33 @@ defmodule ManifoldWeb.Router do
     pipe_through(:browser)
 
     live_session :local_instance do
-      live("/", DeliveryLive.Index, :index)
+      live("/", MailLive.Index, :home)
+      live("/mail", MailLive.Index, :home)
+      live("/mail/:mailbox_id/folders/:folder_id", MailLive.Index, :folder)
+
+      live(
+        "/mail/:mailbox_id/folders/:folder_id/threads/:thread_id",
+        MailLive.Index,
+        :conversation
+      )
+
       live("/domains", DomainLive.Index, :index)
       live("/mailboxes", MailboxLive.Index, :index)
       live("/aliases", AliasLive.Index, :index)
       live("/deliveries", DeliveryLive.Index, :index)
       live("/deliveries/:id", DeliveryLive.Show, :show)
     end
+
+    get(
+      "/mailboxes/:mailbox_id/messages/:message_id/body",
+      MessageBodyController,
+      :show
+    )
+
+    get(
+      "/mailboxes/:mailbox_id/attachments/:attachment_id",
+      AttachmentController,
+      :show
+    )
   end
 end

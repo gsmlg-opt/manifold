@@ -21,7 +21,6 @@ defmodule Manifold.Ingest.Schema.InboundDelivery do
     field(:last_error, :string)
 
     has_many(:delivery_recipients, Manifold.Ingest.Schema.DeliveryRecipient)
-    has_many(:mailbox_entries, Manifold.Ingest.Schema.MailboxEntry)
     has_many(:message_events, Manifold.Ingest.Schema.MessageEvent)
 
     timestamps(type: :utc_datetime_usec)

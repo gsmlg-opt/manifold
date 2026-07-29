@@ -9,6 +9,7 @@ defmodule Manifold.Ingest.Reconciler do
   alias Manifold.Ingest
   alias Manifold.Ingest.Jobs.ArchiveRawEmail
   alias Manifold.Ingest.Schema.InboundDelivery
+  alias Manifold.Mail
   alias Manifold.Repo
   alias Manifold.Storage.Spool
 
@@ -52,6 +53,7 @@ defmodule Manifold.Ingest.Reconciler do
     Spool.cleanup_partials(root, partial_retention_seconds)
     reconcile_ready_bundles(root, retention_seconds)
     mark_missing_unarchived_bundles(opts)
+    reconcile_archived_projections()
     :ok
   end
 
@@ -126,5 +128,34 @@ defmodule Manifold.Ingest.Reconciler do
         {:error, _reason} -> :ok
       end
     end)
+  end
+
+  defp reconcile_archived_projections do
+    parser_version = Application.get_env(:manifold_mail, :parser_version, 1)
+    sanitizer_version = Application.get_env(:manifold_mail, :sanitizer_version, 1)
+
+    incomplete_ids =
+      InboundDelivery
+      |> where(
+        [delivery],
+        delivery.raw_storage_state == "archived" and
+          delivery.processing_state in ["archived", "parsing"]
+      )
+      |> select([delivery], delivery.id)
+      |> Repo.all()
+
+    stale_ids = Mail.stale_projection_delivery_ids(parser_version, sanitizer_version)
+
+    incomplete_ids
+    |> Kernel.++(stale_ids)
+    |> Enum.uniq()
+    |> Enum.each(&enqueue_projection_job/1)
+  end
+
+  defp enqueue_projection_job(delivery_id) do
+    case Ingest.ensure_projection_job(delivery_id) do
+      {:ok, _job} -> :ok
+      {:error, _reason} -> :ok
+    end
   end
 end

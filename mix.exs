@@ -31,6 +31,7 @@ defmodule Manifold.Umbrella.MixProject do
       "ecto.setup": ["ecto.create", "ecto.migrate", "run apps/manifold_data/priv/repo/seeds.exs"],
       "ecto.reset": ["ecto.drop", "ecto.setup"],
       "assets.setup": ["npm.install"],
+      "assets.build": ["duskmoon_bundler.build manifold_web --tailwind"],
       "assets.deploy": [
         "duskmoon_bundler.build manifold_web --tailwind",
         &digest_web_assets/1
@@ -64,6 +65,7 @@ defmodule Manifold.Umbrella.MixProject do
           manifold_data: :permanent,
           manifold_accounts: :permanent,
           manifold_storage: :permanent,
+          manifold_mail: :permanent,
           manifold_ingest: :permanent,
           manifold_smtp: :permanent,
           manifold_web: :permanent

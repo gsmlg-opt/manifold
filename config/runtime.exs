@@ -45,6 +45,12 @@ config :manifold_storage,
     System.get_env(
       "MANIFOLD_RAW_STORE_DIR",
       Path.expand("../priv/raw_store/#{config_env()}", __DIR__)
+    ),
+  blob_store_backend: Manifold.Storage.BlobStore.Local,
+  blob_store_dir:
+    System.get_env(
+      "MANIFOLD_BLOB_STORE_DIR",
+      Path.expand("../priv/blob_store/#{config_env()}", __DIR__)
     )
 
 if config_env() == :prod do

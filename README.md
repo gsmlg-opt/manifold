@@ -4,21 +4,32 @@ Manifold is a self-hosted Phoenix webmail application backed by an Elixir-native
 mail platform. It is designed to replace a desktop email client for locally
 hosted mailboxes while preserving durable SMTP acceptance and raw message data.
 
-## Milestone 0-1
+## Milestones 0-2
 
-This repository currently implements the first vertical slice:
+This repository currently implements durable inbound delivery and its first
+mail-client projection:
 
-- Phoenix umbrella with `manifold_core`, `manifold_data`, `manifold_accounts`, `manifold_storage`, `manifold_ingest`, `manifold_smtp`, and `manifold_web`.
+- Phoenix umbrella with `manifold_core`, `manifold_data`, `manifold_accounts`, `manifold_storage`, `manifold_ingest`, `manifold_smtp`, `manifold_mail`, and `manifold_web`.
 - PostgreSQL/Ecto migrations and Oban jobs.
 - Domain, mailbox, alias, alias target, and recipient resolution.
 - `gen_smtp` development listener on port `2525`.
 - Durable spool bundles under `tmp/`, `ready/`, `failed/`, and `quarantine/`.
 - Local filesystem raw-message store.
-- Minimal local-instance LiveViews for domains, mailboxes, aliases, inbound deliveries, and delivery detail.
+- Bounded asynchronous MIME projection with ordered headers, addresses, selected
+  text/HTML bodies, attachments, mailbox folders, reference-based threading, and
+  bounded PostgreSQL full-text search.
+- Content-addressed local attachment storage.
+- Responsive Phoenix LiveView inbox, folder, search, conversation, and mailbox
+  state workflows.
+- Isolated sanitized HTML rendering and mailbox-scoped attachment downloads.
+- Operational LiveViews for domains, mailboxes, aliases, inbound deliveries, and
+  delivery detail.
 
 ## Out Of Scope
 
-This milestone intentionally does not implement MIME parsing, body rendering, spam or malware scanning, IMAP, POP3, JMAP, Gmail sync, Microsoft Graph sync, cloud relay, managed outbound provider submission, or direct outbound MX delivery.
+The current milestones intentionally do not implement composition, drafts,
+reply/forward, spam or malware scanning, IMAP, POP3, JMAP, Gmail sync, Microsoft
+Graph sync, cloud relay, or managed outbound provider submission.
 
 Manifold must not perform direct outbound Internet SMTP delivery. Outbound delivery is reserved for a future managed-provider adapter.
 
@@ -43,7 +54,8 @@ devenv shell -- mix setup
 ```
 
 Frontend assets use Duskmoon Bundler and `duskmoon_npm`; `mix setup` runs
-`mix npm.install`, and production assets are built with `MIX_ENV=prod mix assets.deploy`.
+`mix npm.install`. Use `mix assets.build` during development and
+`MIX_ENV=prod mix assets.deploy` for production assets.
 
 The development seed creates the `example.test` domain and `inbox@example.test` mailbox.
 
@@ -64,6 +76,8 @@ devenv processes start
 ```
 
 Open Phoenix at `http://localhost:4290`. Submit SMTP mail to `127.0.0.1:2525`.
+The root page is the mailbox inbox; transport lifecycle details remain under
+`/deliveries`.
 
 Run checks:
 

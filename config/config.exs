@@ -12,14 +12,29 @@ config :manifold_data, Manifold.Repo,
 
 config :manifold_data, Oban,
   repo: Manifold.Repo,
-  queues: [archive: 10],
+  queues: [archive: 10, mail_parse: 2],
   plugins: [{Oban.Plugins.Pruner, max_age: 86_400}]
 
 config :manifold_storage,
   spool_dir: Path.expand("../priv/spool/#{config_env()}", __DIR__),
   spool_min_free_bytes: 0,
   raw_store_backend: Manifold.Storage.RawStore.Local,
-  raw_store_dir: Path.expand("../priv/raw_store/#{config_env()}", __DIR__)
+  raw_store_dir: Path.expand("../priv/raw_store/#{config_env()}", __DIR__),
+  blob_store_backend: Manifold.Storage.BlobStore.Local,
+  blob_store_dir: Path.expand("../priv/blob_store/#{config_env()}", __DIR__)
+
+config :manifold_mail,
+  parser_version: 1,
+  sanitizer_version: 1,
+  max_raw_bytes: 25 * 1024 * 1024,
+  max_header_bytes: 256 * 1024,
+  max_headers: 1_000,
+  max_mime_depth: 20,
+  max_parts: 500,
+  max_decoded_bytes: 100 * 1024 * 1024,
+  max_attachment_bytes: 50 * 1024 * 1024,
+  parse_timeout_ms: 30_000,
+  parse_max_heap_words: 16_000_000
 
 config :manifold_ingest,
   reconciler_enabled: config_env() != :test,
@@ -53,6 +68,27 @@ config :manifold_web, ManifoldWeb.Endpoint,
   live_view: [signing_salt: "manifold-local-signing-salt"]
 
 config :phoenix, :json_library, Jason
+
+config :codepagex,
+  encodings: [
+    :ascii,
+    :iso_8859_1,
+    :iso_8859_2,
+    :iso_8859_3,
+    :iso_8859_4,
+    :iso_8859_5,
+    :iso_8859_6,
+    :iso_8859_7,
+    :iso_8859_8,
+    :iso_8859_9,
+    :iso_8859_10,
+    :iso_8859_11,
+    :iso_8859_13,
+    :iso_8859_14,
+    :iso_8859_15,
+    :iso_8859_16,
+    "VENDORS/MICSFT/WINDOWS/CP1252"
+  ]
 
 config :duskmoon_bundler,
   root: Path.expand("../apps/manifold_web/assets", __DIR__),

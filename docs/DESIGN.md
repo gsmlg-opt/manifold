@@ -414,8 +414,9 @@ Owns the Phoenix webmail application:
 - Provider webhook endpoints.
 - LiveView updates through PubSub.
 
-Phoenix LiveView using `duskmoon_ui` is the product frontend. A separate SPA or
-native desktop client is not required.
+Phoenix LiveView using Phoenix Duskmoon components is the product frontend.
+Duskmoon Bundler owns JavaScript, CSS, and Tailwind asset builds. A separate SPA
+or native desktop client is not required.
 
 ---
 
@@ -757,21 +758,22 @@ A sender may retry if the connection fails after database commit but before it r
 
 ## 12. Asynchronous Inbound Pipeline
 
-The intended pipeline is:
+The implemented Milestone 2 pipeline is:
 
 ```text
 accepted
   -> archive raw object
-  -> evaluate authentication/security
   -> parse MIME
   -> extract/store attachments
   -> create normalized message
   -> assign thread
   -> finalize mailbox entries
   -> index for search
-  -> apply local rules
   -> publish UI notification
 ```
+
+Authentication/security evaluation and local rules are later pipeline stages.
+They must preserve the same archived-raw and idempotent-projection boundaries.
 
 Each stage:
 
@@ -824,10 +826,13 @@ Do not use sender filenames, subjects, or `Message-ID` values in keys.
 
 ### 13.3 Storage adapters
 
-Release 0.1 should include:
+The current local implementation includes:
 
-1. Local filesystem adapter for development and simple installations.
-2. ESS/S3-compatible adapter for production.
+1. Local filesystem raw-message adapter.
+2. Local filesystem content-addressed attachment adapter.
+
+An ESS/S3-compatible adapter remains planned. Adding it must not change mail or
+ingest context APIs.
 
 The application must remain available for SMTP receipt during a temporary object-store outage as long as the persistent spool has capacity.
 
@@ -861,6 +866,12 @@ Manifold should identify:
 - Attachments.
 
 The original HTML is untrusted.
+
+The normalized text body is stored in full within the configured message-size
+limit. Basic PostgreSQL search indexes the subject, sender address, and first
+32,768 characters of normalized text body. This deliberate projection bound prevents a
+sender-controlled message from exceeding PostgreSQL's `tsvector` size limit;
+the immutable raw message and complete normalized body remain available.
 
 ### 14.3 Safe rendering
 
@@ -899,8 +910,9 @@ Expected email-client workflows include:
 - Inspect delivery or security details without exposing storage paths.
 
 These workflows are delivered incrementally. Milestone 1 exposes accepted
-deliveries for operational verification; later milestones turn those durable
-records into the complete webmail experience.
+deliveries for operational verification. Milestone 2 adds inbox, folder,
+conversation, search, attachment, and mailbox-state workflows. Compose, reply,
+sent mail, and provider state arrive with managed outbound delivery.
 
 ---
 
@@ -1034,7 +1046,7 @@ The UI should behave like an email client, not an infrastructure dashboard.
 Operational details remain available but are secondary to reading and managing
 mail.
 
-### 17.2 Milestone 1 interface
+### 17.2 Incremental interface
 
 The inbound-first milestone includes:
 
@@ -1046,9 +1058,10 @@ The inbound-first milestone includes:
 - Processing and failure status.
 - Operational spool and queue health.
 
-MIME body rendering and full client interactions are added after the durable
-inbound slice. Compose, reply, sent-mail, and provider-event views are added with
-the managed outbound milestone.
+Milestone 2 adds the primary `/` inbox, mailbox/folder navigation, conversation
+reading, search, safe HTML bodies, attachment downloads, and read/star/archive/
+move/trash state. Compose, reply, sent-mail, and provider-event views are added
+with the managed outbound milestone.
 
 ### 17.3 API principles
 
@@ -1329,6 +1342,9 @@ Explicitly test failures:
 5. During object-store upload.
 6. After object-store upload but before database state update.
 7. After archived state update but before spool cleanup.
+8. After attachment blob storage but before projection commit.
+9. After projection commit but before ingest processing-state update.
+10. After archival commit but before the projection worker runs.
 
 The expected recovery state must be documented for each boundary.
 
@@ -1377,6 +1393,8 @@ Do not rely on live Internet services in the default test suite.
 - Recovery and crash-boundary tests.
 
 ### Milestone 2 — Mailbox projection
+
+Implemented.
 
 - MIME parser.
 - Normalized message data.

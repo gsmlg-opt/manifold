@@ -25,6 +25,8 @@ defmodule ManifoldWeb.MixProject do
     [
       {:manifold_accounts, in_umbrella: true},
       {:manifold_ingest, in_umbrella: true},
+      {:manifold_mail, in_umbrella: true},
+      {:manifold_smtp, in_umbrella: true, only: :test, runtime: false},
       {:phoenix, "~> 1.8"},
       {:phoenix_ecto, "~> 4.7"},
       {:phoenix_html, "~> 4.3"},
@@ -44,6 +46,7 @@ defmodule ManifoldWeb.MixProject do
   defp aliases do
     [
       "assets.setup": ["npm.install"],
+      "assets.build": ["duskmoon_bundler.build --tailwind"],
       "assets.deploy": [
         "duskmoon_bundler.build manifold_web --tailwind",
         "phx.digest"

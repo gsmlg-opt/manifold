@@ -15,8 +15,11 @@ defmodule Manifold.Core.DeliveryState do
   @processing_transitions %{
     "accepted" => ~w(archiving archived failed),
     "archiving" => ~w(archived failed),
-    "archived" => [],
-    "failed" => ~w(accepted archiving)
+    "archived" => ~w(parsing failed),
+    "parsing" => ~w(processed parse_failed failed),
+    "parse_failed" => ~w(parsing processed),
+    "processed" => ~w(parsing parse_failed),
+    "failed" => ~w(accepted archiving parsing)
   }
 
   @spec validate_raw_transition(String.t(), String.t()) :: :ok | {:error, Error.t()}

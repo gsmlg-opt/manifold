@@ -3,9 +3,10 @@ defmodule Manifold.IngestTest do
 
   alias Manifold.Accounts
   alias Manifold.Ingest
-  alias Manifold.Ingest.Jobs.ArchiveRawEmail
+  alias Manifold.Ingest.Jobs.{ArchiveRawEmail, ProjectInboundMail}
   alias Manifold.Ingest.Reconciler
-  alias Manifold.Ingest.Schema.{DeliveryRecipient, InboundDelivery, MailboxEntry, MessageEvent}
+  alias Manifold.Ingest.Schema.{DeliveryRecipient, InboundDelivery, MessageEvent}
+  alias Manifold.Mail.Schema.{MailboxEntry, Message}
   alias Manifold.Repo
   alias Manifold.Storage.RawStore
   alias Manifold.Storage.Spool
@@ -15,16 +16,19 @@ defmodule Manifold.IngestTest do
   setup %{tmp_dir: tmp_dir} do
     old_spool = Application.fetch_env!(:manifold_storage, :spool_dir)
     old_raw = Application.fetch_env!(:manifold_storage, :raw_store_dir)
+    old_blob = Application.fetch_env!(:manifold_storage, :blob_store_dir)
 
     spool_dir = Path.join(tmp_dir, "spool")
     raw_dir = Path.join(tmp_dir, "raw_store")
 
     Application.put_env(:manifold_storage, :spool_dir, spool_dir)
     Application.put_env(:manifold_storage, :raw_store_dir, raw_dir)
+    Application.put_env(:manifold_storage, :blob_store_dir, Path.join(tmp_dir, "blob_store"))
 
     on_exit(fn ->
       Application.put_env(:manifold_storage, :spool_dir, old_spool)
       Application.put_env(:manifold_storage, :raw_store_dir, old_raw)
+      Application.put_env(:manifold_storage, :blob_store_dir, old_blob)
     end)
 
     {:ok, spool_dir: spool_dir, raw_dir: raw_dir}
@@ -134,6 +138,198 @@ defmodule Manifold.IngestTest do
            ) == 1
 
     refute File.exists?(delivery.spool_bundle_path)
+  end
+
+  test "archival commits the projection job and projection completes the delivery" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+
+    assert :ok = Ingest.archive_delivery(delivery.id)
+
+    assert %Oban.Job{} =
+             Repo.get_by(Oban.Job,
+               worker: inspect(ProjectInboundMail),
+               args: %{
+                 "inbound_delivery_id" => delivery.id,
+                 "parser_version" => 1,
+                 "sanitizer_version" => 1
+               }
+             )
+
+    assert :ok =
+             ProjectInboundMail.perform(%Oban.Job{
+               args: %{
+                 "inbound_delivery_id" => delivery.id,
+                 "parser_version" => 1,
+                 "sanitizer_version" => 1
+               }
+             })
+
+    projected = Repo.get!(InboundDelivery, delivery.id)
+    assert projected.processing_state == "processed"
+    assert Repo.get_by!(Message, inbound_delivery_id: delivery.id)
+    assert Repo.get_by!(MailboxEntry, inbound_delivery_id: delivery.id).message_id
+    assert Repo.get_by!(MessageEvent, inbound_delivery_id: delivery.id, event_type: "parsed")
+  end
+
+  test "projection worker honors its parser version and rebuilds a completed projection" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+    assert :ok = Ingest.archive_delivery(delivery.id)
+    assert :ok = Ingest.project_delivery(delivery.id, parser_version: 1)
+
+    message = Repo.get_by!(Message, inbound_delivery_id: delivery.id)
+    assert message.parser_version == 1
+
+    assert :ok =
+             ProjectInboundMail.perform(%Oban.Job{
+               args: %{
+                 "inbound_delivery_id" => delivery.id,
+                 "parser_version" => 2,
+                 "sanitizer_version" => 1
+               }
+             })
+
+    rebuilt = Repo.get_by!(Message, inbound_delivery_id: delivery.id)
+    assert rebuilt.id == message.id
+    assert rebuilt.parser_version == 2
+    assert Repo.get!(InboundDelivery, delivery.id).processing_state == "processed"
+  end
+
+  test "projection commit before ingest state update is safe to retry" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+    assert :ok = Ingest.archive_delivery(delivery.id)
+
+    assert {:error, %{reason: :after_projection_before_state_update}} =
+             Ingest.project_delivery(delivery.id, fail_at: :after_projection_before_state_update)
+
+    assert Repo.get!(InboundDelivery, delivery.id).processing_state == "parsing"
+    assert Repo.aggregate(Message, :count) == 1
+
+    assert :ok = Ingest.project_delivery(delivery.id)
+    assert Repo.get!(InboundDelivery, delivery.id).processing_state == "processed"
+    assert Repo.aggregate(Message, :count) == 1
+
+    assert Repo.aggregate(
+             from(event in MessageEvent,
+               where: event.inbound_delivery_id == ^delivery.id and event.event_type == "parsed"
+             ),
+             :count
+           ) == 1
+  end
+
+  test "permanent projection failure is recorded and not recreated by reconciliation", %{
+    raw_dir: raw_dir
+  } do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+    assert :ok = Ingest.archive_delivery(delivery.id)
+
+    archived = Repo.get!(InboundDelivery, delivery.id)
+    File.write!(Path.join(raw_dir, archived.raw_object_key), "corrupt")
+
+    assert {:cancel, :raw_verification_failed} =
+             ProjectInboundMail.perform(%Oban.Job{
+               args: %{
+                 "inbound_delivery_id" => delivery.id,
+                 "parser_version" => 1,
+                 "sanitizer_version" => 1
+               }
+             })
+
+    failed = Repo.get!(InboundDelivery, delivery.id)
+    assert failed.processing_state == "failed"
+    assert failed.last_error == "archived raw message does not match metadata"
+
+    assert Repo.get_by!(MessageEvent,
+             inbound_delivery_id: delivery.id,
+             event_type: "projection_failed"
+           )
+
+    ProjectInboundMail
+    |> inspect()
+    |> then(fn worker -> from(job in Oban.Job, where: job.worker == ^worker) end)
+    |> Repo.delete_all()
+
+    assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
+
+    assert Repo.aggregate(
+             from(job in Oban.Job,
+               where:
+                 job.worker == ^inspect(ProjectInboundMail) and
+                   fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery.id)
+             ),
+             :count
+           ) == 0
+  end
+
+  test "reconciliation restores missing projection work for archived deliveries" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+    assert :ok = Ingest.archive_delivery(delivery.id)
+
+    ProjectInboundMail
+    |> inspect()
+    |> then(fn worker ->
+      from(job in Oban.Job, where: job.worker == ^worker)
+    end)
+    |> Repo.delete_all()
+
+    assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
+
+    assert Repo.aggregate(
+             from(job in Oban.Job,
+               where:
+                 job.worker == ^inspect(ProjectInboundMail) and
+                   fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery.id)
+             ),
+             :count
+           ) == 1
+  end
+
+  test "reconciliation schedules the exact upgraded projection beside stale active work" do
+    old_parser_version = Application.fetch_env!(:manifold_mail, :parser_version)
+    old_sanitizer_version = Application.fetch_env!(:manifold_mail, :sanitizer_version)
+
+    on_exit(fn ->
+      Application.put_env(:manifold_mail, :parser_version, old_parser_version)
+      Application.put_env(:manifold_mail, :sanitizer_version, old_sanitizer_version)
+    end)
+
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+    assert :ok = Ingest.archive_delivery(delivery.id)
+    assert :ok = Ingest.project_delivery(delivery.id, parser_version: 1, sanitizer_version: 1)
+
+    Application.put_env(:manifold_mail, :parser_version, 2)
+    Application.put_env(:manifold_mail, :sanitizer_version, 2)
+
+    assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
+
+    jobs =
+      ProjectInboundMail
+      |> inspect()
+      |> then(fn worker ->
+        from(job in Oban.Job,
+          where:
+            job.worker == ^worker and
+              fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery.id),
+          order_by: [asc: job.id]
+        )
+      end)
+      |> Repo.all()
+
+    assert [
+             %Oban.Job{args: %{"parser_version" => 1, "sanitizer_version" => 1}},
+             %Oban.Job{args: %{"parser_version" => 2, "sanitizer_version" => 2}} = upgraded_job
+           ] = jobs
+
+    assert :ok = ProjectInboundMail.perform(upgraded_job)
+
+    message = Repo.get_by!(Message, inbound_delivery_id: delivery.id)
+    assert message.parser_version == 2
+    assert message.sanitizer_version == 2
   end
 
   test "object-store failure leaves ready bundle and retries" do

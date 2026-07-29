@@ -26,6 +26,7 @@ defmodule Manifold.Ingest.MixProject do
       {:manifold_data, in_umbrella: true},
       {:manifold_accounts, in_umbrella: true},
       {:manifold_storage, in_umbrella: true},
+      {:manifold_mail, in_umbrella: true},
       {:oban, "~> 2.23"},
       {:telemetry, "~> 1.3"}
     ]

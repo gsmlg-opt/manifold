@@ -110,5 +110,8 @@ defmodule Manifold.CoreTest do
 
     assert {:error, %{reason: :invalid_state_transition}} =
              DeliveryState.validate_raw_transition("archived", "spooled")
+
+    assert :ok = DeliveryState.validate_processing_transition("processed", "parse_failed")
+    assert :ok = DeliveryState.validate_processing_transition("parse_failed", "processed")
   end
 end

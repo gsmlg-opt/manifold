@@ -8,8 +8,10 @@ defmodule Manifold.Ingest do
   alias Ecto.Multi
   alias Manifold.Accounts
   alias Manifold.Core.{DeliveryState, Error}
-  alias Manifold.Ingest.Jobs.ArchiveRawEmail
-  alias Manifold.Ingest.Schema.{DeliveryRecipient, InboundDelivery, MailboxEntry, MessageEvent}
+  alias Manifold.Ingest.Jobs.{ArchiveRawEmail, ProjectInboundMail}
+  alias Manifold.Ingest.Schema.{DeliveryRecipient, InboundDelivery, MessageEvent}
+  alias Manifold.Mail
+  alias Manifold.Mail.InboundSource
   alias Manifold.Ingest.View.DeliveryDetail
   alias Manifold.Repo
   alias Manifold.Storage.{RawStore, Spool}
@@ -53,7 +55,6 @@ defmodule Manifold.Ingest do
   defp persist_acceptance(bundle, routes, opts) do
     now = DateTime.utc_now()
     recipient_rows = build_recipient_rows(routes, now)
-    mailbox_entry_rows = build_mailbox_entry_rows(routes, now)
 
     multi =
       Multi.new()
@@ -67,15 +68,7 @@ defmodule Manifold.Ingest do
       |> Multi.insert_all(:delivery_recipients, DeliveryRecipient, fn %{delivery: delivery} ->
         add_delivery_id(recipient_rows, delivery.id)
       end)
-      |> Multi.insert_all(
-        :mailbox_entries,
-        MailboxEntry,
-        fn %{delivery: delivery} ->
-          add_delivery_id(mailbox_entry_rows, delivery.id)
-        end,
-        on_conflict: :nothing,
-        conflict_target: [:mailbox_id, :inbound_delivery_id]
-      )
+      |> Mail.add_acceptance_entries(:mailbox_entries, :delivery, routes, now)
       |> Multi.insert(:accepted_event, fn %{delivery: delivery} ->
         MessageEvent.event_changeset(
           delivery.id,
@@ -127,7 +120,7 @@ defmodule Manifold.Ingest do
   def get_delivery_detail!(id) do
     delivery =
       InboundDelivery
-      |> preload([:delivery_recipients, :mailbox_entries, :message_events])
+      |> preload([:delivery_recipients, :message_events])
       |> Repo.get!(id)
 
     mailbox_ids =
@@ -162,7 +155,10 @@ defmodule Manifold.Ingest do
         {:error, Error.new(:permanent, :not_found, "delivery not found")}
 
       %InboundDelivery{raw_storage_state: "archived"} = delivery ->
-        cleanup_archived_bundle(delivery, opts)
+        with {:ok, _job} <- ensure_projection_job(delivery.id),
+             :ok <- cleanup_archived_bundle(delivery, opts) do
+          :ok
+        end
 
       %InboundDelivery{} = delivery ->
         archive_spooled_delivery(delivery, opts)
@@ -263,6 +259,30 @@ defmodule Manifold.Ingest do
           end
       end
     end)
+  end
+
+  @spec project_delivery(Ecto.UUID.t(), Keyword.t()) :: :ok | {:error, Error.t()}
+  def project_delivery(delivery_id, opts \\ []) do
+    requested_versions = requested_projection_versions(opts)
+
+    with {:ok, delivery} <- begin_projection(delivery_id, requested_versions) do
+      case Mail.project_inbound(inbound_source(delivery), opts) do
+        {:ok, result} ->
+          with :ok <- maybe_fault(opts, :after_projection_before_state_update),
+               {:ok, _delivery} <- finish_projection(delivery.id, result) do
+            :ok
+          end
+
+        {:error, %Error{class: :permanent} = error} ->
+          case fail_projection(delivery.id, error, requested_versions) do
+            {:ok, _delivery} -> {:error, error}
+            {:error, %Error{} = lifecycle_error} -> {:error, lifecycle_error}
+          end
+
+        {:error, %Error{} = error} ->
+          {:error, error}
+      end
+    end
   end
 
   defp archive_spooled_delivery(delivery, opts) do
@@ -372,12 +392,42 @@ defmodule Manifold.Ingest do
                    %{raw_object_key: key},
                    DateTime.utc_now()
                  )
+                 |> Repo.insert(),
+               {:ok, _job} <-
+                 projection_job_changeset(delivery.id)
                  |> Repo.insert() do
             archived
           else
             {:error, reason} -> Repo.rollback(reason)
           end
       end
+    end)
+  end
+
+  @spec ensure_projection_job(Ecto.UUID.t()) :: {:ok, Oban.Job.t()} | {:error, term()}
+  def ensure_projection_job(delivery_id) do
+    Repo.transaction(fn ->
+      InboundDelivery
+      |> where([delivery], delivery.id == ^delivery_id)
+      |> lock("FOR UPDATE")
+      |> Repo.one!()
+
+      target_args = projection_job_args(delivery_id)
+
+      existing_job =
+        Oban.Job
+        |> where([job], job.worker == ^inspect(ProjectInboundMail))
+        |> where([job], job.state in ~w(available scheduled executing retryable suspended))
+        |> where(
+          [job],
+          fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery_id)
+        )
+        |> Repo.all()
+        |> Enum.find(fn job ->
+          Map.take(job.args, Map.keys(target_args)) == target_args
+        end)
+
+      existing_job || projection_job_changeset(delivery_id) |> Repo.insert!()
     end)
   end
 
@@ -438,6 +488,193 @@ defmodule Manifold.Ingest do
     end
   end
 
+  defp begin_projection(delivery_id, versions) do
+    Repo.transaction(fn ->
+      delivery =
+        InboundDelivery
+        |> where([delivery], delivery.id == ^delivery_id)
+        |> lock("FOR UPDATE")
+        |> Repo.one()
+
+      cond do
+        is_nil(delivery) ->
+          Repo.rollback(Error.new(:permanent, :not_found, "delivery not found"))
+
+        delivery.raw_storage_state != "archived" ->
+          Repo.rollback(
+            Error.new(:temporary, :raw_not_archived, "raw message is not archived yet")
+          )
+
+        delivery.processing_state in ["processed", "parse_failed"] ->
+          delivery
+
+        delivery.processing_state == "parsing" ->
+          delivery
+
+        true ->
+          with :ok <-
+                 DeliveryState.validate_processing_transition(
+                   delivery.processing_state,
+                   "parsing"
+                 ),
+               {:ok, parsing} <-
+                 delivery
+                 |> InboundDelivery.state_changeset(%{
+                   processing_state: "parsing",
+                   last_error: nil
+                 })
+                 |> Repo.update(),
+               {:ok, _event} <-
+                 MessageEvent.event_changeset(
+                   delivery.id,
+                   "parse_started",
+                   versions,
+                   DateTime.utc_now()
+                 )
+                 |> Repo.insert() do
+            parsing
+          else
+            {:error, reason} -> Repo.rollback(reason)
+          end
+      end
+    end)
+    |> normalize_transaction_error()
+  end
+
+  defp finish_projection(delivery_id, projection) do
+    Repo.transaction(fn ->
+      delivery =
+        InboundDelivery
+        |> where([delivery], delivery.id == ^delivery_id)
+        |> lock("FOR UPDATE")
+        |> Repo.one!()
+
+      target_state = if projection.state == :fallback, do: "parse_failed", else: "processed"
+      event_type = if projection.state == :fallback, do: "parse_failed", else: "parsed"
+
+      if delivery.processing_state == target_state do
+        delivery
+      else
+        with :ok <-
+               DeliveryState.validate_processing_transition(
+                 delivery.processing_state,
+                 target_state
+               ),
+             {:ok, projected} <-
+               delivery
+               |> InboundDelivery.state_changeset(%{
+                 processing_state: target_state,
+                 last_error:
+                   if(projection.state == :fallback,
+                     do: "message projected with MIME parsing fallback",
+                     else: nil
+                   )
+               })
+               |> Repo.update(),
+             {:ok, _event} <-
+               MessageEvent.event_changeset(
+                 delivery.id,
+                 event_type,
+                 %{
+                   parser_version: projection.parser_version,
+                   sanitizer_version: projection.sanitizer_version
+                 },
+                 DateTime.utc_now()
+               )
+               |> Repo.insert() do
+          projected
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end
+    end)
+    |> normalize_transaction_error()
+  end
+
+  defp fail_projection(delivery_id, %Error{} = error, versions) do
+    Repo.transaction(fn ->
+      delivery =
+        InboundDelivery
+        |> where([delivery], delivery.id == ^delivery_id)
+        |> lock("FOR UPDATE")
+        |> Repo.one!()
+
+      if delivery.processing_state == "failed" do
+        delivery
+      else
+        with :ok <-
+               DeliveryState.validate_processing_transition(
+                 delivery.processing_state,
+                 "failed"
+               ),
+             {:ok, failed} <-
+               delivery
+               |> InboundDelivery.state_changeset(%{
+                 processing_state: "failed",
+                 last_error: error.message
+               })
+               |> Repo.update(),
+             {:ok, _event} <-
+               MessageEvent.event_changeset(
+                 delivery.id,
+                 "projection_failed",
+                 Map.put(versions, :reason, Atom.to_string(error.reason)),
+                 DateTime.utc_now()
+               )
+               |> Repo.insert() do
+          failed
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end
+    end)
+    |> normalize_transaction_error()
+  end
+
+  defp inbound_source(delivery) do
+    %InboundSource{
+      inbound_delivery_id: delivery.id,
+      raw_object_key: delivery.raw_object_key,
+      raw_size: delivery.raw_size,
+      raw_sha256: delivery.raw_sha256,
+      received_at: delivery.received_at
+    }
+  end
+
+  defp projection_job_changeset(delivery_id) do
+    delivery_id
+    |> projection_job_args()
+    |> ProjectInboundMail.new()
+  end
+
+  defp projection_job_args(delivery_id) do
+    %{
+      "inbound_delivery_id" => delivery_id,
+      "parser_version" => parser_version(),
+      "sanitizer_version" => sanitizer_version()
+    }
+  end
+
+  defp requested_projection_versions(opts) do
+    %{
+      parser_version: Keyword.get(opts, :parser_version, parser_version()),
+      sanitizer_version: Keyword.get(opts, :sanitizer_version, sanitizer_version())
+    }
+  end
+
+  defp parser_version, do: Application.get_env(:manifold_mail, :parser_version, 1)
+  defp sanitizer_version, do: Application.get_env(:manifold_mail, :sanitizer_version, 1)
+
+  defp normalize_transaction_error({:ok, value}), do: {:ok, value}
+  defp normalize_transaction_error({:error, %Error{} = error}), do: {:error, error}
+
+  defp normalize_transaction_error({:error, reason}) do
+    {:error,
+     Error.new(:temporary, :database_unavailable, "mail lifecycle transaction failed", %{
+       reason: inspect(reason)
+     })}
+  end
+
   defp build_recipient_rows(routes, now) do
     Enum.flat_map(routes, fn route ->
       Enum.map(route.mailbox_ids, fn mailbox_id ->
@@ -451,26 +688,6 @@ defmodule Manifold.Ingest do
           updated_at: now
         }
       end)
-    end)
-  end
-
-  defp build_mailbox_entry_rows(routes, now) do
-    routes
-    |> Enum.flat_map(fn route ->
-      Enum.map(route.mailbox_ids, &{&1, route.original_recipient})
-    end)
-    |> Enum.reduce(%{}, fn {mailbox_id, original_recipient}, acc ->
-      Map.put_new(acc, mailbox_id, original_recipient)
-    end)
-    |> Enum.map(fn {mailbox_id, original_recipient} ->
-      %{
-        id: Ecto.UUID.generate(),
-        mailbox_id: mailbox_id,
-        original_recipient: original_recipient,
-        status: "unread",
-        inserted_at: now,
-        updated_at: now
-      }
     end)
   end
 

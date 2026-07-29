@@ -10,6 +10,7 @@ defmodule ManifoldWeb.Application do
     children = [
       {Phoenix.PubSub, name: Manifold.PubSub},
       ManifoldWeb.IngestNotifier,
+      ManifoldWeb.MailNotifier,
       ManifoldWeb.Endpoint
     ]
 

@@ -27,7 +27,8 @@ config :manifold_smtp, enabled: false, port: 2526
 
 config :manifold_storage,
   spool_dir: Path.expand("../tmp/test_spool", __DIR__),
-  raw_store_dir: Path.expand("../tmp/test_raw_store", __DIR__)
+  raw_store_dir: Path.expand("../tmp/test_raw_store", __DIR__),
+  blob_store_dir: Path.expand("../tmp/test_blob_store", __DIR__)
 
 config :manifold_web, ManifoldWeb.Endpoint,
   http: [ip: {127, 0, 0, 1}, port: 4002],

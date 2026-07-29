@@ -52,6 +52,7 @@ in
         pass = "manifold_dev";
       }
     ];
+    initialScript = "ALTER ROLE manifold_dev CREATEDB;";
   };
 
   processes.manifold = {

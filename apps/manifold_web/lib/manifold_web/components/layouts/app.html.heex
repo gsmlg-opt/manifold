@@ -1,13 +1,14 @@
 <div class="app-shell">
-  <aside class="sidebar">
-    <div class="brand">Manifold</div>
-    <nav>
-      <.nav_link to={~p"/deliveries"}>Deliveries</.nav_link>
-      <.nav_link to={~p"/domains"}>Domains</.nav_link>
-      <.nav_link to={~p"/mailboxes"}>Mailboxes</.nav_link>
-      <.nav_link to={~p"/aliases"}>Aliases</.nav_link>
+  <header class="app-header">
+    <.link navigate={~p"/"} class="brand">
+      <.dm_mdi name="email-multiple-outline" class="brand-icon" /> Manifold
+    </.link>
+    <nav aria-label="Application">
+      <.nav_link to={~p"/"}>Mail</.nav_link>
+      <.nav_link to={~p"/deliveries"}>Operations</.nav_link>
+      <.nav_link to={~p"/mailboxes"}>Settings</.nav_link>
     </nav>
-  </aside>
+  </header>
   <main class="content">
     <.flash_group flash={@flash} />
     {@inner_content}
