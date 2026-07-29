@@ -56,7 +56,7 @@ Start Phoenix and the SMTP listener:
 mix manifold.run
 ```
 
-Open Phoenix at `http://localhost:4000`. Submit SMTP mail to `127.0.0.1:2525`.
+Open Phoenix at `http://localhost:4290`. Submit SMTP mail to `127.0.0.1:2525`.
 
 Run checks:
 

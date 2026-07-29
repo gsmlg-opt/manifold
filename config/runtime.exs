@@ -51,7 +51,7 @@ if config_env() == :prod do
       raise "SECRET_KEY_BASE is missing. Generate one with mix phx.gen.secret."
 
   host = System.get_env("PHX_HOST") || "localhost"
-  port = String.to_integer(System.get_env("PORT", "4000"))
+  port = String.to_integer(System.get_env("PORT", "4290"))
 
   config :manifold_web, ManifoldWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
