@@ -69,15 +69,19 @@ jobs:
       - name: Fetch dependencies
         run: mix deps.get --only prod
 
+      - name: Configure build-only runtime secrets
+        run: |
+          echo "SECRET_KEY_BASE=$(openssl rand -hex 64)" >> "$GITHUB_ENV"
+          echo "MANIFOLD_CONNECTOR_ENCRYPTION_KEY=$(openssl rand -base64 32 | tr -d '\n')" >> "$GITHUB_ENV"
+
       - name: Install npm packages
-        run: mix npm.ci
+        # WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#106
+        run: mix run --no-start -e 'Application.ensure_all_started(:ssl); Mix.Task.run("npm.ci")'
 
       - name: Build assets
         run: mix assets.deploy
 
       - name: Build release artifact
-        env:
-          SECRET_KEY_BASE: release-build-secret-key-base-release-build-secret-key-base-not-runtime
         run: |
           mix release manifold --overwrite
           mix release manifold_edge --overwrite
