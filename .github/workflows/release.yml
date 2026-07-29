@@ -89,7 +89,7 @@ jobs:
           tar -C _build/prod/rel -czf manifold-edge-${RELEASE_VERSION}.tar.gz manifold_edge
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: manifold-${{ inputs.version }}
           path: |
@@ -100,7 +100,11 @@ jobs:
       - name: Commit version bump
         run: |
           git add mix.exs apps/*/mix.exs mix.lock
-          git commit -m "chore(release): v${RELEASE_VERSION}"
+          if git diff --cached --quiet; then
+            echo "Project versions already match v${RELEASE_VERSION}"
+          else
+            git commit -m "chore(release): v${RELEASE_VERSION}"
+          fi
 
       - name: Tag release
         run: git tag "v${RELEASE_VERSION}"
