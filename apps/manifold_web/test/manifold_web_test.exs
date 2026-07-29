@@ -3,6 +3,7 @@ defmodule ManifoldWebTest do
 
   alias Manifold.Accounts
   alias Manifold.Ingest
+  alias Manifold.Ingest.ExternalSource
   alias Manifold.Ingest.Schema.InboundDelivery
   alias Manifold.Mail
   alias Manifold.Mail.Schema.{Attachment, MailboxEntry, Message, Thread}
@@ -87,6 +88,30 @@ defmodule ManifoldWebTest do
     assert html =~ "Pending security evaluation"
   end
 
+  test "provider delivery details distinguish absent SMTP facts", %{conn: conn} do
+    %{domain: domain, mailbox: mailbox} = mailbox_fixture()
+
+    source = %ExternalSource{
+      provider: "gmail",
+      account_id: Ecto.UUID.generate(),
+      external_message_id: "provider-web-message",
+      mailbox_id: mailbox.id,
+      storage_domain_id: domain.id,
+      recipient_address: "person@gmail.example",
+      received_at: DateTime.utc_now(),
+      ingest_id: "provider-web-#{System.unique_integer([:positive])}"
+    }
+
+    assert {:ok, receipt} =
+             Ingest.import_external("Subject: provider\r\n\r\nBody\r\n", source)
+
+    assert {:ok, _view, html} = live(conn, ~p"/deliveries/#{receipt.inbound_delivery_id}")
+    assert html =~ "External provider import"
+    assert html =~ "Not applicable"
+    assert html =~ "No SMTP envelope recipients were observed"
+    assert html =~ "inbox"
+  end
+
   test "delivery operations show assessment evidence and release quarantine", %{conn: conn} do
     %{domain: domain} = mailbox_fixture()
     {:ok, delivery} = delivery_fixture(domain)
@@ -164,13 +189,15 @@ defmodule ManifoldWebTest do
     %{domain: domain, mailbox: mailbox} = mailbox_fixture()
     projected = projected_delivery_fixture(domain)
 
-    assert {:ok, _view, html} = live(conn, ~p"/")
+    assert {:ok, folders} = Mail.list_folders(mailbox.id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+
+    assert {:ok, _view, html} =
+             live(conn, ~p"/mail/#{mailbox.id}/folders/#{inbox.id}")
+
     assert html =~ "Inbox"
     assert html =~ "A projected message"
     assert html =~ "Sender"
-
-    assert {:ok, folders} = Mail.list_folders(mailbox.id)
-    inbox = Enum.find(folders, &(&1.kind == "inbox"))
 
     assert {:ok, view, html} =
              live(
@@ -220,10 +247,10 @@ defmodule ManifoldWebTest do
   end
 
   test "conversation pagination exposes every page in the LiveView", %{conn: conn} do
-    %{mailbox: mailbox} = mailbox_fixture()
+    %{domain: domain, mailbox: mailbox} = mailbox_fixture()
     assert {:ok, folders} = Mail.list_folders(mailbox.id)
     inbox = Enum.find(folders, &(&1.kind == "inbox"))
-    mailbox_page_fixtures(mailbox.id, inbox.id, 51)
+    mailbox_page_fixtures(domain.id, mailbox.id, inbox.id, 51)
 
     assert {:ok, view, html} = live(conn, ~p"/mail/#{mailbox.id}/folders/#{inbox.id}")
     assert html =~ "Paged message 1"
@@ -436,7 +463,7 @@ defmodule ManifoldWebTest do
     }
   end
 
-  defp mailbox_page_fixtures(mailbox_id, folder_id, count) do
+  defp mailbox_page_fixtures(domain_id, mailbox_id, folder_id, count) do
     now = DateTime.utc_now()
 
     fixtures =
@@ -459,6 +486,7 @@ defmodule ManifoldWebTest do
             spool_bundle_path: "/removed",
             raw_storage_state: "archived",
             processing_state: "processed",
+            storage_domain_id: domain_id,
             inserted_at: timestamp,
             updated_at: timestamp
           },

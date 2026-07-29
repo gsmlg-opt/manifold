@@ -150,6 +150,7 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
         spool_bundle_path: "/removed",
         raw_storage_state: "archived",
         processing_state: "processed",
+        storage_domain_id: mailbox.domain_id,
         inserted_at: now,
         updated_at: now
       }

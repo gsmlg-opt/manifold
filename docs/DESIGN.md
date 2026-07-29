@@ -2,7 +2,7 @@
 
 ## Product and Architecture Design
 
-- **Status:** Implemented Release 0.1 core with Release 0.2 edge/connectors roadmap
+- **Status:** Milestones 0-6 implemented
 - **Product type:** Self-hosted webmail application and Elixir-native mail platform
 - **Primary deployment model:** Self-hosted, single installation, single OTP release
 - **Primary user interface:** Phoenix LiveView in a web browser
@@ -15,7 +15,9 @@
 Manifold is a self-hosted web email application for receiving, reading, organizing,
 composing, and sending email. Its browser interface is the primary mail client and
 is intended to replace desktop clients such as Microsoft Outlook and Apple Mail
-for mailboxes hosted by Manifold.
+for mailboxes hosted by Manifold. Milestone 6 extends that client experience by
+importing mail read-only from Gmail and Microsoft 365 into local Manifold
+mailboxes.
 
 The product combines the user-facing webmail experience with an Elixir-native
 mail platform. Manifold accepts SMTP deliveries for configured domains, validates
@@ -74,7 +76,7 @@ The first release will not implement:
 - Full calendar or contact support.
 - A complete anti-spam engine.
 - A complete antivirus engine.
-- Gmail or Microsoft 365 mailbox synchronization.
+- Gmail or Microsoft 365 mailbox mutation or sending.
 - Native desktop or mobile applications.
 - An IMAP backend intended for Outlook, Apple Mail, or other desktop clients.
 - Multi-region or active-active clustering.
@@ -83,10 +85,11 @@ The first release will not implement:
 - Hard deduplication based only on `Message-ID` or body hashes.
 - Internationalized SMTP envelope addresses through `SMTPUTF8`.
 
-These are extension points, not architectural dead ends. Milestones 0-4 form
-the Release 0.1 local mailbox core. Milestone 5 begins Release 0.2 by adding the
-optional cloud ingress edge; Milestone 6 adds external account connectors and
-only those client protocols justified by concrete interoperability needs.
+These were Release 0.1 boundaries, not architectural dead ends. Milestones 0-4
+form the Release 0.1 local mailbox core. Milestone 5 adds the optional cloud
+ingress edge. Milestone 6 implements read-only Gmail and Microsoft 365
+connectors while leaving IMAP, POP3, JMAP, provider mutation, and provider send
+out of scope.
 
 ---
 
@@ -242,6 +245,7 @@ manifold/
 │   ├── manifold_outbound/
 │   ├── manifold_cloud/
 │   ├── manifold_edge/
+│   ├── manifold_connectors/
 │   └── manifold_web/
 ├── config/
 ├── docs/
@@ -338,7 +342,9 @@ Owns the transport-to-mailbox acceptance workflow:
 - Recovery and retry decisions.
 
 This application defines the acceptance boundary used by local
-`manifold_smtp` and by `manifold_cloud` edge imports.
+`manifold_smtp`, by `manifold_cloud` edge imports, and by
+`manifold_connectors` provider imports. Provider imports use a distinct
+transport-neutral API and do not create SMTP recipient facts.
 
 ### 6.6 `manifold_smtp`
 
@@ -421,6 +427,7 @@ Owns the Phoenix webmail application:
 - Compose, draft, reply, reply-all, and forward workflows.
 - Sent-mail and outbound-delivery status.
 - Operational status.
+- External account OAuth, status, sync-now, and disconnect controls.
 - JSON API.
 - Provider webhook endpoints.
 - LiveView updates through PubSub.
@@ -455,6 +462,26 @@ Owns the standalone cloud ingress release:
 It does not depend on local Accounts, Ingest, Mail, Security, Outbound, or Web
 applications and stores no long-term mailbox state.
 
+### 6.13 `manifold_connectors`
+
+Owns read-only external mailbox synchronization:
+
+- OAuth authorization transactions and PKCE.
+- Encrypted access and refresh credentials.
+- Gmail and Microsoft Graph provider adapters.
+- Provider account, message identity, cursor, and operational event schemas.
+- Bounded Oban synchronization and remote-state jobs.
+- Mapping provider identities to durable local inbound deliveries.
+
+The application depends only on public APIs from Core, Data, Accounts, Ingest,
+and Mail. Provider adapters never write another application's schemas directly.
+They fetch provider-supplied raw RFC message bytes and pass them through
+`Manifold.Ingest.import_external/3`.
+
+This boundary is read-only with respect to Gmail and Microsoft 365. It does not
+send mail, mutate remote messages, register push subscriptions, or implement
+direct outbound MX delivery.
+
 Phoenix LiveView using Phoenix Duskmoon components is the product frontend.
 Duskmoon Bundler owns JavaScript, CSS, and Tailwind asset builds. A separate SPA
 or native desktop client is not required.
@@ -487,6 +514,7 @@ Tier 4:
 
 Tier 5:
   manifold_cloud
+  manifold_connectors
 
 Tier 6:
   manifold_web
@@ -502,6 +530,7 @@ Important rules:
 - `manifold_smtp` calls configured resolver and acceptor behaviours; it has no
   production dependency on Accounts, Ingest, or Edge.
 - `manifold_cloud` calls public APIs from Accounts and Ingest.
+- `manifold_connectors` calls public APIs from Accounts, Ingest, and Mail.
 - `manifold_web` calls public context APIs; it does not implement mail policy.
 - `manifold_accounts` does not depend on SMTP or Phoenix.
 - `manifold_mail` does not depend on the web presentation layer.
@@ -1297,11 +1326,23 @@ MANIFOLD_RAW_STORE_BACKEND
 MANIFOLD_RAW_STORE_DIR
 MANIFOLD_RAW_STORE_BUCKET
 MANIFOLD_OUTBOUND_PROVIDER
+MANIFOLD_CONNECTOR_ENCRYPTION_KEY
+MANIFOLD_GMAIL_CLIENT_ID
+MANIFOLD_GMAIL_CLIENT_SECRET
+MANIFOLD_GMAIL_USERINFO_URL
+MANIFOLD_MICROSOFT_CLIENT_ID
+MANIFOLD_MICROSOFT_CLIENT_SECRET
+MANIFOLD_MICROSOFT_TENANT
 SECRET_KEY_BASE
 PHX_HOST
 ```
 
 Development should default to a non-privileged SMTP port such as 2525.
+The production local release requires
+`MANIFOLD_CONNECTOR_ENCRYPTION_KEY` to decode to exactly 32 bytes. Gmail and
+Microsoft are enabled independently only when both client ID and secret are
+configured. Provider endpoint overrides must be absolute HTTPS URLs without
+credentials or fragments.
 
 ### 20.3 Nix development environment
 
@@ -1364,9 +1405,123 @@ This must reuse the same `manifold_ingest` acceptance contract instead of creati
 
 ---
 
-## 22. Testing Strategy
+## 22. External Mailbox Connectors
 
-### 22.1 Unit tests
+Milestone 6 adds read-only Gmail and Microsoft 365 synchronization. The
+provider is an external source, while PostgreSQL, the raw store, and Manifold's
+mailbox projection remain the local source of truth.
+
+```text
+Gmail API or Microsoft Graph
+          |
+          | pull raw RFC message bytes
+          v
+manifold_connectors
+          |
+          | trusted provider identity and target mailbox
+          v
+durable spool -> manifold_ingest -> raw store -> mailbox projection
+```
+
+### 22.1 OAuth and credential boundary
+
+- Providers are limited to the fixed `gmail` and `microsoft` allowlist.
+- Authorization uses the OAuth 2.0 authorization-code flow and PKCE `S256`.
+- The random state value is persisted only as a SHA-256 digest, expires after a
+  bounded interval, and is consumed once under a database lock.
+- PKCE verifiers and provider tokens use versioned AES-256-GCM envelopes.
+- Encryption associated data binds credentials to their account and purpose.
+- Gmail requests `openid`, `email`, and `gmail.readonly`.
+- Gmail uses the OpenID UserInfo `sub` as the durable account identity; its
+  email address remains mutable display metadata.
+- Microsoft requests `openid`, `profile`, `offline_access`, `User.Read`, and
+  `Mail.Read`.
+- Returned read scopes are validated before account activation.
+- Refresh-token rotation never erases an existing refresh token when the
+  provider omits a replacement.
+- A provider account identity is permanently bound to its first active local
+  mailbox and reauthorization cannot silently move that account.
+
+The intended callback URLs are:
+
+```text
+https://<PHX_HOST>/connectors/gmail/callback
+https://<PHX_HOST>/connectors/microsoft/callback
+```
+
+Local development uses the same paths at `http://localhost:4290`. The exact
+redirect URI is stored with the OAuth transaction and must match on callback.
+The Phoenix controller derives the callback from the configured Endpoint URL.
+
+### 22.2 Provider synchronization
+
+Gmail freezes the profile `historyId`, scans all message IDs including spam and
+trash, fetches each message with `format=RAW`, and then advances through Gmail
+history. An expired history cursor starts a non-destructive full scan.
+
+Microsoft Graph discovers folders through folder delta and creates one message
+delta lane per folder. It requests immutable IDs for message operations, reads
+raw MIME through `/$value`, treats a folder removal as a membership tombstone,
+and validates opaque `nextLink` and `deltaLink` URLs against the configured
+Graph HTTPS authority before following them. An expired delta cursor resets
+only the affected lane.
+
+Each job handles one bounded page. A cursor checkpoint occurs only after every
+message represented by that page has been durably imported or idempotently
+matched. Temporary provider errors snooze Oban work and honor numeric
+`Retry-After`; reconnect errors stop the account until a new authorization is
+completed.
+
+The code inserts the first sync job with OAuth completion and can enqueue an
+individual account manually. The local release starts a `connectors` Oban queue,
+and a five-minute cron job inserts missing work for connected, syncing, or
+failed accounts. Gmail watch and Microsoft Graph subscription/push delivery are
+not implemented.
+
+### 22.3 Durable provider import
+
+Provider import is not an SMTP transaction:
+
+- `InboundDelivery.source_kind` is `provider_import`.
+- The provider account and message IDs form an idempotent external identity.
+- The accepted raw and target-mailbox fingerprints detect conflicting repeats.
+- The spool manifest records provider provenance and trusted destination IDs.
+- SMTP peer IP, HELO, envelope sender, and original recipients remain absent.
+- No `DeliveryRecipient` row is synthesized.
+
+The ready spool bundle is renamed before the PostgreSQL acceptance transaction.
+That transaction creates the inbound delivery, mailbox entry, accepted event,
+archive job, and external-ingress identity together. A retry with the same
+provider identity, bytes, and target mailbox returns the original receipt.
+Different bytes or a different target under the same provider identity are a
+permanent conflict.
+
+After normal archival and projection, a separate idempotent job applies the
+supported remote folder, read, starred, and deleted state through the public
+Mail API. Remote deletion moves the local projection to trash; it never deletes
+the immutable local raw message.
+
+### 22.4 Current integration limits
+
+- No provider push; recurring synchronization polls every five minutes.
+- No Gmail or Microsoft remote mutation.
+- No Gmail or Microsoft send adapter.
+- A provider message disappearing between listing and raw fetch is normalized
+  into an idempotent remote tombstone without deleting local immutable data.
+- Microsoft folder membership removals probe the global message resource; an
+  existing message is treated as a move and `404` as remote deletion.
+- Development and production read provider credentials from the same runtime
+  environment variables. Production additionally requires a stable connector
+  encryption key.
+
+These limits keep provider connectivity isolated from SMTP and outbound
+delivery. Manifold never performs direct outbound MX delivery.
+
+---
+
+## 23. Testing Strategy
+
+### 23.1 Unit tests
 
 Cover pure behavior:
 
@@ -1378,7 +1533,7 @@ Cover pure behavior:
 - Storage key generation.
 - SMTP error classification.
 
-### 22.2 Property tests
+### 23.2 Property tests
 
 Use property testing where it adds value:
 
@@ -1388,7 +1543,7 @@ Use property testing where it adds value:
 - State machine transition validity.
 - Untrusted filename isolation from storage paths.
 
-### 22.3 Integration tests
+### 23.3 Integration tests
 
 Use a real PostgreSQL database and real temporary spool directories:
 
@@ -1401,8 +1556,11 @@ Use a real PostgreSQL database and real temporary spool directories:
 - Process restart resumes committed work.
 - Webhook replay is idempotent.
 - LiveView lists accepted deliveries through public context APIs.
+- OAuth state, provider adapters, encrypted token rotation, bounded sync pages,
+  idempotent provider import, and cursor reset use deterministic local HTTP
+  fakes rather than live provider accounts.
 
-### 22.4 Crash-boundary tests
+### 23.4 Crash-boundary tests
 
 Explicitly test failures:
 
@@ -1419,7 +1577,7 @@ Explicitly test failures:
 
 The expected recovery state must be documented for each boundary.
 
-### 22.5 Fixture corpus
+### 23.5 Fixture corpus
 
 Maintain a safe mail fixture corpus containing:
 
@@ -1439,9 +1597,11 @@ Do not rely on live Internet services in the default test suite.
 
 ---
 
-## 23. Release Milestones
+## 24. Release Milestones
 
 ### Milestone 0 — Repository and architecture
+
+Implemented.
 
 - Umbrella repository.
 - Nix/devenv environment.
@@ -1452,6 +1612,8 @@ Do not rely on live Internet services in the default test suite.
 - Quality and CI commands.
 
 ### Milestone 1 — Durable inbound vertical slice
+
+Implemented.
 
 - Domain, mailbox, and alias configuration.
 - Recipient resolver.
@@ -1506,7 +1668,7 @@ services.
 
 ### Milestone 5 — Cloud ingress edge
 
-Begins Release 0.2.
+Implemented.
 
 - Separate edge release.
 - Recipient route synchronization.
@@ -1517,19 +1679,26 @@ Begins Release 0.2.
 
 ### Milestone 6 — External connectors and optional client protocols
 
-Candidates include:
+Implemented. The connector domain, migration, OAuth/credential primitives,
+Gmail and Microsoft provider adapters, bounded sync engine, durable external
+import, remote-state application, runtime configuration, local-release/Oban
+wiring, polling, and no-auth account settings are implemented and verified.
 
-- Gmail API synchronization.
-- Microsoft Graph synchronization.
-- JMAP for external interoperability.
-- IMAP only if a concrete interoperability requirement justifies its complexity.
+- Read-only Gmail API synchronization.
+- Read-only Microsoft Graph synchronization.
+- Encrypted OAuth credentials and one-time PKCE transactions.
+- Provider-message identity and resumable cursors.
+- Durable raw import without fabricated SMTP metadata.
+- Polling-based synchronization; provider push remains out of scope.
 
 The Phoenix web application remains the primary client. External protocols and
-connectors extend interoperability; they do not define the core user experience.
+connectors extend interoperability; they do not define the core user
+experience. JMAP and IMAP remain future extension points and are not part of
+Milestone 6.
 
 ---
 
-## 24. Release 0.1 Acceptance Criteria
+## 25. Release 0.1 Acceptance Criteria
 
 Release 0.1 is acceptable when:
 
@@ -1550,7 +1719,7 @@ Release 0.1 is acceptable when:
 
 ---
 
-## 25. Initial Architectural Decisions
+## 26. Initial Architectural Decisions
 
 The repository should record at least these ADRs:
 

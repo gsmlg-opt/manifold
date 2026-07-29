@@ -23,6 +23,23 @@ config :manifold_data, Manifold.Repo, repo_config
 
 config :manifold_data, Oban, testing: :manual, queues: false, plugins: false
 
+config :manifold_connectors,
+  encryption_key: "A/6Bm4le6HQiXyh+gE1NQr2+RLEcEpZ/JSPBt4y1Lrk=",
+  providers: [
+    gmail: [
+      authorization_url: "https://accounts.google.invalid/authorize",
+      token_url: "https://accounts.google.invalid/token",
+      userinfo_url: "https://openidconnect.invalid/v1/userinfo",
+      base_url: "https://gmail.invalid"
+    ],
+    microsoft: [
+      authorization_url: "https://login.microsoft.invalid/authorize",
+      token_url: "https://login.microsoft.invalid/token",
+      base_url: "https://graph.microsoft.invalid/v1.0",
+      tenant: "organizations"
+    ]
+  ]
+
 config :manifold_smtp, enabled: false, port: 2526
 
 config :manifold_storage,

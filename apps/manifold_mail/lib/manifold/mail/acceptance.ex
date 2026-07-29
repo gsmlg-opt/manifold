@@ -21,6 +21,40 @@ defmodule Manifold.Mail.Acceptance do
     )
   end
 
+  @spec add_external_entry(
+          Multi.t(),
+          atom(),
+          atom(),
+          Ecto.UUID.t(),
+          String.t(),
+          DateTime.t()
+        ) :: Multi.t()
+  def add_external_entry(
+        %Multi{} = multi,
+        step_name,
+        delivery_step,
+        mailbox_id,
+        recipient_address,
+        %DateTime{} = _now
+      ) do
+    Multi.insert(
+      multi,
+      step_name,
+      fn changes ->
+        delivery = Map.fetch!(changes, delivery_step)
+
+        MailboxEntry.changeset(%MailboxEntry{}, %{
+          mailbox_id: mailbox_id,
+          inbound_delivery_id: delivery.id,
+          original_recipient: recipient_address,
+          quarantined: true
+        })
+      end,
+      on_conflict: :nothing,
+      conflict_target: [:mailbox_id, :inbound_delivery_id]
+    )
+  end
+
   defp build_rows(routes, now) do
     routes
     |> Enum.flat_map(fn route ->

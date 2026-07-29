@@ -4,14 +4,15 @@ Manifold is a self-hosted Phoenix webmail application backed by an Elixir-native
 mail platform. It is designed to replace a desktop email client for locally
 hosted mailboxes while preserving durable SMTP acceptance and raw message data.
 
-## Milestones 0-5
+## Milestones 0-6
 
-This repository currently implements durable inbound delivery, mailbox
-projection, managed outbound submission, and fail-closed inbound policy:
+Milestones 0-6 implement durable inbound delivery, mailbox projection, managed
+outbound submission, fail-closed inbound policy, optional cloud ingress, and
+read-only Gmail and Microsoft 365 synchronization:
 
-- Phoenix umbrella with `manifold_core`, `manifold_data`, `manifold_accounts`,
-  `manifold_storage`, `manifold_ingest`, `manifold_smtp`, `manifold_mail`,
-  `manifold_security`, `manifold_outbound`, and `manifold_web`.
+- Phoenix umbrella with explicit Core, Data, Accounts, Storage, Ingest, SMTP,
+  Mail, Security, Outbound, Cloud, Edge, Connectors, and Web application
+  boundaries.
 - Optional `manifold_edge` release and local `manifold_cloud` pull client.
 - PostgreSQL/Ecto migrations and Oban jobs.
 - Domain, mailbox, alias, alias target, and recipient resolution.
@@ -45,18 +46,149 @@ projection, managed outbound submission, and fail-closed inbound policy:
 - Versioned recipient-route snapshots, edge SMTP recipient rejection, signed
   local-pull synchronization, streamed raw import, idempotent provenance, and
   acknowledge-before-cleanup recovery.
+- Read-only Gmail and Microsoft Graph provider adapters, encrypted OAuth
+  transactions and credentials, durable provider-message identity, bounded
+  cursor pages, and idempotent raw-message import through the normal spool and
+  ingest boundary.
 
 ## Out Of Scope
 
 The current milestones intentionally do not implement rich-text composition,
 outbound attachments, bundled DNS authentication engines, bundled spam or
-malware engines, IMAP, POP3, JMAP, Gmail sync, Microsoft Graph sync, or cloud
-provider hosting. Production authentication and scanning engines plug into the
-Milestone 4 adapter boundaries. The optional edge is ingress-only and never
-performs outbound MX delivery.
+malware engines, IMAP, POP3, JMAP, provider push notifications, Gmail or
+Microsoft mailbox mutation, provider-backed sending, or cloud provider hosting.
+Production authentication and scanning engines plug into the Milestone 4
+adapter boundaries. The optional edge is ingress-only and never performs
+outbound MX delivery.
 
 Manifold never performs direct outbound Internet SMTP delivery. Milestone 3
-submits through the configured managed-provider HTTPS adapter.
+submits locally composed mail through the configured managed-provider HTTPS
+adapter. The Milestone 6 Gmail and Microsoft adapters are read-only and are not
+outbound providers.
+
+## External Mailbox Connectors
+
+Milestone 6 imports provider-hosted mail into an existing local Manifold
+mailbox. It does not make Gmail or Microsoft 365 the metadata source of truth
+for Manifold and does not bypass the durable local acceptance pipeline.
+
+The current implementation includes:
+
+- OAuth authorization-code primitives with one-time, hashed state and PKCE
+  `S256`.
+- AES-256-GCM encryption envelopes for access tokens, refresh tokens, and PKCE
+  verifiers. Encryption binds each secret to its account and purpose.
+- Gmail OpenID identity, message-list, history, and `format=RAW` operations
+  using the stable subject identifier and `gmail.readonly` scope.
+- Microsoft Graph profile, folder-delta, message-delta, immutable message ID,
+  and `/$value` raw-message operations using `Mail.Read`.
+- Transactional account, credential, cursor, event, and first Oban sync-job
+  persistence after OAuth completion.
+- Bounded, retryable sync pages with provider-message identity and cursor
+  checkpointing only after every message in the page has crossed the local
+  acceptance boundary.
+- Idempotent external import through a version-2 spool bundle, raw archive,
+  mailbox projection, and a retryable remote-state application job.
+- A no-auth `/settings/accounts` LiveView with OAuth start/callback routes,
+  sync-now, status, and disconnect controls.
+- A local-release `connectors` Oban queue and five-minute polling job that
+  recreates missing active-account sync work.
+
+Provider imports are transport-neutral. They set `source_kind` to
+`provider_import` and retain provider account/message identity, but they do not
+invent an SMTP peer IP, HELO, envelope sender, or `RCPT TO` recipient. No
+`DeliveryRecipient` row is created when no SMTP transaction occurred.
+
+There are no Gmail watch notifications or Microsoft Graph subscriptions yet.
+Sync is pull-based. OAuth completion inserts the first sync job
+transactionally; the local release polls connected, syncing, and failed
+accounts every five minutes and inserts any missing active sync job. The
+settings view can also enqueue an individual sync.
+
+A provider message that disappears between listing and raw fetch is normalized
+into an idempotent remote tombstone. The local raw object and accepted delivery
+remain immutable when a provider later deletes its copy.
+
+Each provider account identity is permanently bound to the local mailbox chosen
+at first connection. Reauthorization refreshes that account but cannot silently
+move it to a different mailbox.
+
+### Provider Configuration
+
+The local release and development runtime support:
+
+```text
+MANIFOLD_CONNECTOR_ENCRYPTION_KEY
+MANIFOLD_GMAIL_CLIENT_ID
+MANIFOLD_GMAIL_CLIENT_SECRET
+MANIFOLD_GMAIL_AUTHORIZATION_URL
+MANIFOLD_GMAIL_TOKEN_URL
+MANIFOLD_GMAIL_USERINFO_URL
+MANIFOLD_GMAIL_API_BASE_URL
+MANIFOLD_MICROSOFT_CLIENT_ID
+MANIFOLD_MICROSOFT_CLIENT_SECRET
+MANIFOLD_MICROSOFT_TENANT
+MANIFOLD_MICROSOFT_AUTHORIZATION_URL
+MANIFOLD_MICROSOFT_TOKEN_URL
+MANIFOLD_MICROSOFT_API_BASE_URL
+```
+
+`MANIFOLD_CONNECTOR_ENCRYPTION_KEY` must be standard Base64 encoding of exactly
+32 random bytes and is required for the production local release even when no
+provider client is configured. Generate one with:
+
+```sh
+openssl rand -base64 32
+```
+
+The provider application registrations will use these exact callback paths:
+
+```text
+https://<your-manifold-host>/connectors/gmail/callback
+https://<your-manifold-host>/connectors/microsoft/callback
+```
+
+For local development, the intended callbacks are:
+
+```text
+http://localhost:4290/connectors/gmail/callback
+http://localhost:4290/connectors/microsoft/callback
+```
+
+Register only the production HTTPS callbacks with provider consoles. Local HTTP
+callbacks are suitable for provider development registrations where the
+provider permits loopback HTTP. OAuth transactions compare the callback URI
+byte-for-byte with the URI stored at authorization start.
+
+The provider configuration uses:
+
+```text
+Gmail authorization: https://accounts.google.com/o/oauth2/v2/auth
+Gmail token:         https://oauth2.googleapis.com/token
+Gmail API:           https://gmail.googleapis.com
+
+Microsoft authorization:
+  https://login.microsoftonline.com/<tenant>/oauth2/v2.0/authorize
+Microsoft token:
+  https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token
+Microsoft Graph:
+  https://graph.microsoft.com/v1.0
+```
+
+Use `organizations` as the Microsoft tenant default for work/school accounts.
+Authorization, token, and API endpoint overrides must be absolute HTTPS URLs
+without credentials or fragments. A provider is enabled only when its client ID
+and secret are both set; configuring only one makes startup fail.
+Development and test configuration use non-production encryption keys;
+development has no provider client credentials and test uses inert endpoints.
+Set the provider client environment variables before
+`devenv processes start` to exercise a real provider in `MIX_ENV=dev`.
+The requested read-only scopes are:
+
+```text
+Gmail:     openid email https://www.googleapis.com/auth/gmail.readonly
+Microsoft: openid profile offline_access User.Read Mail.Read
+```
 
 ## Development
 
@@ -99,6 +231,9 @@ Start Phoenix and the SMTP listener:
 ```sh
 devenv processes start
 ```
+
+The managed Manifold process runs pending Ecto migrations after PostgreSQL is
+ready and before starting the application.
 
 Open Phoenix at `http://localhost:4290`. Submit SMTP mail to `127.0.0.1:2525`.
 The root page is the mailbox inbox; transport lifecycle details remain under

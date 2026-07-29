@@ -39,9 +39,10 @@ defmodule ManifoldWeb.DeliveryLive.Show do
     <section>
       <h1>Inbound Delivery</h1>
       <dl class="detail-grid">
-        <dt>Envelope Sender</dt><dd>{@detail.delivery.envelope_from}</dd>
-        <dt>Peer IP</dt><dd>{@detail.delivery.peer_ip}</dd>
-        <dt>HELO</dt><dd>{@detail.delivery.helo}</dd>
+        <dt>Source</dt><dd>{source_label(@detail.delivery.source_kind)}</dd>
+        <dt>Envelope Sender</dt><dd>{transport_value(@detail.delivery.envelope_from)}</dd>
+        <dt>Peer IP</dt><dd>{transport_value(@detail.delivery.peer_ip)}</dd>
+        <dt>HELO</dt><dd>{transport_value(@detail.delivery.helo)}</dd>
         <dt>Received</dt><dd>
           {Calendar.strftime(@detail.delivery.received_at, "%Y-%m-%d %H:%M:%S UTC")}
         </dd>
@@ -90,6 +91,9 @@ defmodule ManifoldWeb.DeliveryLive.Show do
       </button>
 
       <h2>Recipients</h2>
+      <p :if={@detail.recipients == []} class="policy-pending">
+        No SMTP envelope recipients were observed for this delivery.
+      </p>
       <div class="table-scroll">
         <table>
           <thead>
@@ -161,6 +165,14 @@ defmodule ManifoldWeb.DeliveryLive.Show do
 
   defp releasable?(%{policy_action: "quarantine", policy_applied: true}), do: true
   defp releasable?(_assessment), do: false
+
+  defp source_label("smtp"), do: "Local SMTP"
+  defp source_label("edge_smtp"), do: "Cloud SMTP edge"
+  defp source_label("provider_import"), do: "External provider import"
+  defp source_label(source), do: source
+
+  defp transport_value(nil), do: "Not applicable"
+  defp transport_value(value), do: value
 
   defp public_metadata(metadata) when is_map(metadata) do
     Map.drop(metadata, [

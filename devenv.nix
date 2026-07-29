@@ -56,7 +56,7 @@ in
   };
 
   processes.manifold = {
-    exec = "mix manifold.run";
+    exec = "mix ecto.migrate && mix manifold.run";
     after = [ "devenv:processes:postgres" ];
     ready.http.get = {
       port = 4290;

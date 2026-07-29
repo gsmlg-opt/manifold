@@ -10,8 +10,14 @@ defmodule Manifold.Storage.Spool do
   @required_dirs ~w(tmp ready failed quarantine)
 
   @type write_attrs :: %{
-          required(:peer_ip) => String.t(),
           required(:received_at) => DateTime.t(),
+          optional(:source_kind) => String.t(),
+          optional(:external_provider) => String.t(),
+          optional(:external_source_id) => String.t(),
+          optional(:external_message_id) => String.t(),
+          optional(:storage_domain_id) => String.t(),
+          optional(:target_mailbox_id) => String.t(),
+          optional(:peer_ip) => String.t() | nil,
           optional(:ingest_id) => String.t(),
           optional(:helo) => String.t() | nil,
           optional(:envelope_from) => String.t() | nil,

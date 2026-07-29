@@ -46,6 +46,16 @@ defmodule Manifold.Accounts do
     |> Repo.all()
   end
 
+  @spec list_active_mailboxes() :: [Mailbox.t()]
+  def list_active_mailboxes do
+    Mailbox
+    |> join(:inner, [m], d in Domain, on: d.id == m.domain_id)
+    |> where([m, d], m.active and d.active)
+    |> order_by([m, d], asc: d.normalized_domain, asc: m.canonical_local_part)
+    |> preload([m, d], domain: d)
+    |> Repo.all()
+  end
+
   @spec list_mailboxes(Domain.t()) :: [Mailbox.t()]
   def list_mailboxes(%Domain{id: domain_id}) do
     Mailbox
@@ -99,6 +109,30 @@ defmodule Manifold.Accounts do
         {:error,
          Error.new(:temporary, :database_unavailable, "mailbox not found during archival")}
     end
+  end
+
+  @spec active_mailbox_domain_id(Ecto.UUID.t()) ::
+          {:ok, Ecto.UUID.t()} | {:error, Error.t()}
+  def active_mailbox_domain_id(mailbox_id) do
+    query =
+      from(mailbox in Mailbox,
+        join: domain in Domain,
+        on: domain.id == mailbox.domain_id,
+        where: mailbox.id == ^mailbox_id and mailbox.active and domain.active,
+        select: domain.id
+      )
+
+    case Repo.one(query) do
+      domain_id when is_binary(domain_id) ->
+        {:ok, domain_id}
+
+      nil ->
+        {:error, Error.new(:permanent, :mailbox_not_active, "mailbox destination is not active")}
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error,
+       Error.new(:temporary, :database_unavailable, "mailbox database is temporarily unavailable")}
   end
 
   @spec create_mailbox(Domain.t(), map()) :: create_result(Mailbox.t())

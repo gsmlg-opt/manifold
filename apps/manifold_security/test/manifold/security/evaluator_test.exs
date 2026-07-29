@@ -66,6 +66,21 @@ defmodule Manifold.Security.EvaluatorTest do
              Evaluator.evaluate(input(), authentication_adapter: invalid)
   end
 
+  test "provider imports never fabricate SMTP authentication evidence" do
+    provider_input = %{input() | source_kind: "provider_import", peer_ip: nil}
+
+    assert {:ok, evaluation} =
+             Evaluator.evaluate(provider_input,
+               authentication_adapter: AuthenticationAdapter,
+               malware_adapter: MalwareAdapter
+             )
+
+    assert evaluation.spf == :not_evaluated
+    assert evaluation.dkim == :not_evaluated
+    assert evaluation.dmarc == :not_evaluated
+    assert evaluation.malware.verdict == :infected
+  end
+
   defp input do
     %Input{
       inbound_delivery_id: Ecto.UUID.generate(),

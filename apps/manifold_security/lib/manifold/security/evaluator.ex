@@ -19,8 +19,7 @@ defmodule Manifold.Security.Evaluator do
 
   @spec evaluate(Input.t(), Keyword.t()) :: {:ok, Evaluation.t()} | {:error, Error.t()}
   def evaluate(%Input{} = input, opts \\ []) do
-    authentication_adapter =
-      Keyword.get(opts, :authentication_adapter, NotEvaluatedAuthentication)
+    authentication_adapter = authentication_adapter(input, opts)
 
     malware_adapter = Keyword.get(opts, :malware_adapter, NotEvaluatedMalware)
     spam_adapter = Keyword.get(opts, :spam_adapter, NotEvaluatedSpam)
@@ -63,6 +62,12 @@ defmodule Manifold.Security.Evaluator do
 
   defp invoke(adapter, callback, config, input) when is_atom(adapter),
     do: apply(adapter, callback, [config, input])
+
+  defp authentication_adapter(%Input{source_kind: "provider_import"}, _opts),
+    do: NotEvaluatedAuthentication
+
+  defp authentication_adapter(%Input{}, opts),
+    do: Keyword.get(opts, :authentication_adapter, NotEvaluatedAuthentication)
 
   defp validate_authentication(authentication) when is_map(authentication) do
     if Enum.all?([:spf, :dkim, :dmarc], &(Map.get(authentication, &1) in @authentication_results)) do

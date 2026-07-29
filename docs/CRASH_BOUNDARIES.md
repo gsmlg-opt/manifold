@@ -99,6 +99,72 @@
 36. Signed edge requests are bound to the received Host authority, never follow
     redirects, and return authenticated metadata and raw content with
     `Cache-Control: no-store, private`.
+37. Failure after an OAuth transaction commits but before redirecting to the
+    provider leaves an unused, hashed-state row. It grants no provider access
+    and becomes unusable after its expiry time.
+38. OAuth state consumption commits before token exchange. If exchange or local
+    authorization persistence fails, the state cannot be replayed; the user
+    must start a new authorization. Any provider-side grant is harmless to
+    Manifold until encrypted credentials commit locally.
+39. Account, encrypted credential, initial cursor, connector event, and first
+    sync job are one PostgreSQL transaction. A failure before commit exposes no
+    partially connected local account.
+40. Refresh-token rotation commits before processing the next provider page.
+    If page processing later fails, retry decrypts and reuses the newest
+    committed token envelope.
+41. Failure during provider raw fetch creates no spool bundle and advances no
+    cursor. The current sync job retries or stops according to the provider
+    error classification.
+42. Failure before a provider-import ready rename leaves only a partial bundle.
+    Existing spool partial cleanup semantics apply; no external ingress
+    identity or local acceptance exists.
+43. Failure after the deterministic ready rename but before provider acceptance
+    commit leaves a ready bundle and no logical acceptance. Retrying the same
+    provider identity verifies and reuses that bundle before reattempting the
+    acceptance transaction.
+44. Provider acceptance commits the inbound delivery, mailbox entry, accepted
+    event, archive job, and external-ingress identity atomically. Failure after
+    that commit but before connector-message mapping leaves a recoverable
+    receipt; retry finds the identity and maps it without importing a second
+    delivery.
+45. Failure after connector-message mapping but before cursor checkpoint leaves
+    the provider cursor unchanged. Retry idempotently updates the same mapping
+    and reuses the accepted delivery.
+46. Remote-state work is inserted with an imported mapping. If it executes
+    before normal mail projection, it snoozes on `projection_pending`; after
+    projection it applies folder, read, starred, and deleted state
+    idempotently.
+47. Failure after cursor checkpoint but before the current Oban job returns
+    leaves the next cursor position durable. Retrying the same job selects the
+    next incomplete lane; it does not repeat a committed cursor position as new
+    mail.
+48. Gmail history expiry resets the mailbox lane to a non-destructive initial
+    scan. Existing provider identities prevent duplicate local deliveries.
+49. Microsoft Graph delta expiry resets only the affected folder or
+    folder-discovery lane. Opaque continuation URLs are followed only when they
+    retain the configured HTTPS authority.
+50. A Microsoft folder membership removal does not delete local mail. The
+    connector waits for a corresponding message state from another folder;
+    local immutable raw data remains retained if observations arrive in either
+    order.
+51. A provider deletion updates remote state and moves an existing local
+    projection to trash. It never deletes the archived raw object or accepted
+    inbound delivery.
+52. Disconnect deletes encrypted credentials and disables synchronization.
+    Already queued sync jobs fail closed when they reload the disconnected
+    account; imported local mail remains available.
+
+53. Failure after a sync job finishes or disappears while its account remains
+    eligible is repaired by the five-minute `PollAccounts` cron job. It inserts
+    at most one incomplete sync job per account.
+
+Migration `20260729000700` is intentionally irreversible after provider imports.
+Provider deliveries have no SMTP peer IP, so downgrading cannot restore the
+previous non-null transport column without fabricating audit data.
+
+A provider message returning `404` between listing and raw fetch is normalized
+into an idempotent remote tombstone. The cursor may advance after that
+observation is durable, while any existing local raw object remains retained.
 
 A database row whose unarchived bundle is missing is marked `missing_spool` with an
 operational event. If that trusted ready bundle later reappears, reconciliation

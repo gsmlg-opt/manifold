@@ -8,6 +8,8 @@ defmodule Manifold.Ingest.Schema.InboundDelivery do
 
   schema "inbound_deliveries" do
     field(:ingest_id, :string)
+    field(:source_kind, :string, default: "smtp")
+    field(:storage_domain_id, :binary_id)
     field(:peer_ip, :string)
     field(:helo, :string)
     field(:envelope_from, :string)
@@ -26,11 +28,13 @@ defmodule Manifold.Ingest.Schema.InboundDelivery do
     timestamps(type: :utc_datetime_usec)
   end
 
-  def acceptance_changeset(delivery, %Bundle{} = bundle) do
+  def acceptance_changeset(delivery, %Bundle{} = bundle, overrides \\ %{}) do
     manifest = bundle.manifest
 
     attrs = %{
       ingest_id: manifest.ingest_id,
+      source_kind: Map.get(overrides, :source_kind, manifest.source_kind || "smtp"),
+      storage_domain_id: Map.get(overrides, :storage_domain_id, manifest.storage_domain_id),
       peer_ip: manifest.peer_ip,
       helo: manifest.helo,
       envelope_from: manifest.envelope_from,
@@ -45,6 +49,8 @@ defmodule Manifold.Ingest.Schema.InboundDelivery do
     delivery
     |> cast(attrs, [
       :ingest_id,
+      :source_kind,
+      :storage_domain_id,
       :peer_ip,
       :helo,
       :envelope_from,
@@ -57,7 +63,8 @@ defmodule Manifold.Ingest.Schema.InboundDelivery do
     ])
     |> validate_required([
       :ingest_id,
-      :peer_ip,
+      :source_kind,
+      :storage_domain_id,
       :received_at,
       :raw_size,
       :raw_sha256,
@@ -65,6 +72,8 @@ defmodule Manifold.Ingest.Schema.InboundDelivery do
       :raw_storage_state,
       :processing_state
     ])
+    |> validate_inclusion(:source_kind, ["smtp", "edge_smtp", "provider_import"])
+    |> validate_peer_ip()
     |> unique_constraint(:ingest_id)
   end
 
@@ -72,5 +81,12 @@ defmodule Manifold.Ingest.Schema.InboundDelivery do
     delivery
     |> cast(attrs, [:raw_object_key, :raw_storage_state, :processing_state, :last_error])
     |> validate_required([:raw_storage_state, :processing_state])
+  end
+
+  defp validate_peer_ip(changeset) do
+    case get_field(changeset, :source_kind) do
+      "provider_import" -> changeset
+      _other -> validate_required(changeset, [:peer_ip])
+    end
   end
 end

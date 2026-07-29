@@ -21,6 +21,9 @@ repo_config =
 
 config :manifold_data, Manifold.Repo, repo_config
 
+config :manifold_connectors,
+  encryption_key: "G6HVBr8ZblWE1sHBF/vCyXH/aWOJgmExT8ECM+yLPbc="
+
 config :manifold_web, ManifoldWeb.Endpoint,
   http: [ip: {0, 0, 0, 0, 0, 0, 0, 0}, port: String.to_integer(System.get_env("PORT", "4290"))],
   check_origin: false,

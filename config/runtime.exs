@@ -100,7 +100,7 @@ if edge_release? do
     ingest: Manifold.Edge.SMTP
 end
 
-if not edge_release? do
+if not edge_release? and config_env() != :test do
   if edge_api_url = System.get_env("MANIFOLD_EDGE_API_URL") do
     edge_uri = URI.parse(edge_api_url)
 
@@ -177,17 +177,149 @@ config :manifold_outbound,
   provider_adapter: Manifold.Outbound.Provider.Resend,
   provider_config: resend_config
 
-if config_env() == :prod and not edge_release? do
-  secret_key_base =
-    System.get_env("SECRET_KEY_BASE") ||
-      raise "SECRET_KEY_BASE is missing. Generate one with mix phx.gen.secret."
+if not edge_release? do
+  connector_encryption_key =
+    case {config_env(), System.get_env("MANIFOLD_CONNECTOR_ENCRYPTION_KEY")} do
+      {:prod, nil} ->
+        raise "MANIFOLD_CONNECTOR_ENCRYPTION_KEY is required for the manifold release"
 
-  host = System.get_env("PHX_HOST") || "localhost"
-  port = String.to_integer(System.get_env("PORT", "4290"))
+      {_environment, key} ->
+        key
+    end
 
-  config :manifold_web, ManifoldWeb.Endpoint,
-    url: [host: host, port: 443, scheme: "https"],
-    http: [ip: {0, 0, 0, 0}, port: port],
-    secret_key_base: secret_key_base,
-    server: true
+  if connector_encryption_key do
+    case Base.decode64(connector_encryption_key) do
+      {:ok, key} when byte_size(key) == 32 ->
+        :ok
+
+      _invalid ->
+        raise "MANIFOLD_CONNECTOR_ENCRYPTION_KEY must be Base64 encoding of exactly 32 bytes"
+    end
+  end
+
+  https_endpoint! = fn env_name, default ->
+    endpoint = System.get_env(env_name, default)
+    uri = URI.parse(endpoint)
+
+    if uri.scheme == "https" and is_binary(uri.host) and uri.host != "" and
+         is_nil(uri.userinfo) and is_nil(uri.fragment) do
+      String.trim_trailing(endpoint, "/")
+    else
+      raise "#{env_name} must be an absolute https URL without credentials or a fragment"
+    end
+  end
+
+  provider_credentials! = fn provider, client_id_env, client_secret_env, build_config ->
+    case {System.get_env(client_id_env), System.get_env(client_secret_env)} do
+      {nil, nil} ->
+        nil
+
+      {client_id, client_secret}
+      when is_binary(client_id) and client_id != "" and is_binary(client_secret) and
+             client_secret != "" ->
+        build_config.(client_id, client_secret)
+
+      _incomplete ->
+        raise "#{client_id_env} and #{client_secret_env} must be configured together for #{provider}"
+    end
+  end
+
+  gmail_config =
+    provider_credentials!.(
+      "Gmail",
+      "MANIFOLD_GMAIL_CLIENT_ID",
+      "MANIFOLD_GMAIL_CLIENT_SECRET",
+      fn client_id, client_secret ->
+        [
+          client_id: client_id,
+          client_secret: client_secret,
+          authorization_url:
+            https_endpoint!.(
+              "MANIFOLD_GMAIL_AUTHORIZATION_URL",
+              "https://accounts.google.com/o/oauth2/v2/auth"
+            ),
+          token_url:
+            https_endpoint!.(
+              "MANIFOLD_GMAIL_TOKEN_URL",
+              "https://oauth2.googleapis.com/token"
+            ),
+          userinfo_url:
+            https_endpoint!.(
+              "MANIFOLD_GMAIL_USERINFO_URL",
+              "https://openidconnect.googleapis.com/v1/userinfo"
+            ),
+          base_url:
+            https_endpoint!.(
+              "MANIFOLD_GMAIL_API_BASE_URL",
+              "https://gmail.googleapis.com"
+            )
+        ]
+      end
+    )
+
+  microsoft_tenant = System.get_env("MANIFOLD_MICROSOFT_TENANT", "organizations")
+
+  unless Regex.match?(~r/\A[A-Za-z0-9.-]+\z/, microsoft_tenant) do
+    raise "MANIFOLD_MICROSOFT_TENANT contains unsupported characters"
+  end
+
+  microsoft_config =
+    provider_credentials!.(
+      "Microsoft",
+      "MANIFOLD_MICROSOFT_CLIENT_ID",
+      "MANIFOLD_MICROSOFT_CLIENT_SECRET",
+      fn client_id, client_secret ->
+        tenant_base = "https://login.microsoftonline.com/#{microsoft_tenant}/oauth2/v2.0"
+
+        [
+          client_id: client_id,
+          client_secret: client_secret,
+          authorization_url:
+            https_endpoint!.(
+              "MANIFOLD_MICROSOFT_AUTHORIZATION_URL",
+              tenant_base <> "/authorize"
+            ),
+          token_url:
+            https_endpoint!.(
+              "MANIFOLD_MICROSOFT_TOKEN_URL",
+              tenant_base <> "/token"
+            ),
+          base_url:
+            https_endpoint!.(
+              "MANIFOLD_MICROSOFT_API_BASE_URL",
+              "https://graph.microsoft.com/v1.0"
+            ),
+          tenant: microsoft_tenant
+        ]
+      end
+    )
+
+  connector_providers =
+    [gmail: gmail_config, microsoft: microsoft_config]
+    |> Enum.reject(fn {_provider, provider_config} -> is_nil(provider_config) end)
+
+  connector_config =
+    [providers: connector_providers]
+    |> then(fn config ->
+      if connector_encryption_key,
+        do: Keyword.put(config, :encryption_key, connector_encryption_key),
+        else: config
+    end)
+
+  config :manifold_connectors, connector_config
+
+  if config_env() == :prod do
+    secret_key_base =
+      System.get_env("SECRET_KEY_BASE") ||
+        raise "SECRET_KEY_BASE is missing. Generate one with mix phx.gen.secret."
+
+    host = System.get_env("PHX_HOST") || "localhost"
+    port = String.to_integer(System.get_env("PORT", "4290"))
+
+    config :manifold_web, ManifoldWeb.Endpoint,
+      url: [host: host, port: 443, scheme: "https"],
+      http: [ip: {0, 0, 0, 0}, port: port],
+      secret_key_base: secret_key_base,
+      server: true
+  end
 end

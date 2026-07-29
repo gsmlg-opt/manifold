@@ -549,8 +549,9 @@ defmodule Manifold.Mail.ProjectorTest do
     now = DateTime.utc_now()
     delivery_id = Ecto.UUID.generate()
     ingest_id = Ecto.UUID.generate()
+    storage_domain_id = mailbox_domain_id(mailbox_id)
     sha256 = :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
-    raw_key = RawStore.build_key(mailbox_id, now, delivery_id)
+    raw_key = RawStore.build_key(storage_domain_id, now, delivery_id)
     source_path = Path.join(tmp_dir, delivery_id <> ".eml")
     File.write!(source_path, raw)
     assert {:ok, _stat} = RawStore.put_from_path(raw_key, source_path)
@@ -559,6 +560,7 @@ defmodule Manifold.Mail.ProjectorTest do
       %{
         id: dump_uuid(delivery_id),
         ingest_id: ingest_id,
+        storage_domain_id: dump_uuid(storage_domain_id),
         peer_ip: "127.0.0.1",
         envelope_from: "sender@example.net",
         received_at: now,
@@ -589,6 +591,16 @@ defmodule Manifold.Mail.ProjectorTest do
       raw_sha256: sha256,
       received_at: now
     }
+  end
+
+  defp mailbox_domain_id(mailbox_id) do
+    %{rows: [[domain_id]]} =
+      Repo.query!(
+        "SELECT domain_id::text FROM mailboxes WHERE id = $1::uuid",
+        [dump_uuid(mailbox_id)]
+      )
+
+    domain_id
   end
 
   defp plain_message(message_id, subject, body, extra_headers \\ "") do

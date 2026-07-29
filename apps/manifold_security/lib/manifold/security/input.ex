@@ -13,16 +13,17 @@ defmodule Manifold.Security.Input do
     :raw_size,
     :raw_sha256
   ]
-  defstruct @enforce_keys
+  defstruct @enforce_keys ++ [source_kind: "smtp"]
 
   @type t :: %__MODULE__{
           inbound_delivery_id: Ecto.UUID.t(),
-          peer_ip: String.t(),
+          peer_ip: String.t() | nil,
           helo: String.t() | nil,
-          envelope_from: String.t(),
+          envelope_from: String.t() | nil,
           received_at: DateTime.t(),
           raw_object_key: String.t(),
           raw_size: non_neg_integer(),
-          raw_sha256: String.t()
+          raw_sha256: String.t(),
+          source_kind: String.t()
         }
 end

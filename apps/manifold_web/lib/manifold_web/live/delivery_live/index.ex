@@ -41,7 +41,9 @@ defmodule ManifoldWeb.DeliveryLive.Index do
         <table>
           <thead>
             <tr>
-              <th>Received</th><th>Sender</th><th>Size</th><th>Raw</th><th>Processing</th><th>
+              <th>Received</th><th>Source</th><th>Sender</th><th>Size</th><th>Raw</th><th>
+                Processing
+              </th><th>
                 Policy
               </th>
             </tr>
@@ -54,7 +56,8 @@ defmodule ManifoldWeb.DeliveryLive.Index do
                   "%Y-%m-%d %H:%M:%S UTC"
                 )}</.link>
               </td>
-              <td>{row.delivery.envelope_from}</td>
+              <td>{source_label(row.delivery.source_kind)}</td>
+              <td>{row.delivery.envelope_from || "Not applicable"}</td>
               <td>{row.delivery.raw_size}</td>
               <td>{row.delivery.raw_storage_state}</td>
               <td>{row.delivery.processing_state}</td>
@@ -96,4 +99,9 @@ defmodule ManifoldWeb.DeliveryLive.Index do
   defp policy_state(%{state: "failed"}), do: "failed"
   defp policy_state(%{policy_applied: false}), do: "pending"
   defp policy_state(%{policy_action: action}), do: action
+
+  defp source_label("smtp"), do: "SMTP"
+  defp source_label("edge_smtp"), do: "Cloud edge"
+  defp source_label("provider_import"), do: "Provider"
+  defp source_label(source), do: source
 end

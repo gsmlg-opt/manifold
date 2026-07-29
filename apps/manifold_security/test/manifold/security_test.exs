@@ -181,6 +181,7 @@ defmodule Manifold.SecurityTest do
   end
 
   defp input_fixture do
+    domain_id = domain_fixture()
     delivery_id = Ecto.UUID.generate()
     now = DateTime.utc_now()
 
@@ -189,8 +190,8 @@ defmodule Manifold.SecurityTest do
       INSERT INTO inbound_deliveries (
         id, ingest_id, peer_ip, helo, envelope_from, received_at, raw_size,
         raw_sha256, spool_bundle_path, raw_object_key, raw_storage_state,
-        processing_state, inserted_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
+        processing_state, storage_domain_id, inserted_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
       """,
       [
         Ecto.UUID.dump!(delivery_id),
@@ -205,6 +206,7 @@ defmodule Manifold.SecurityTest do
         "raw/trusted/message.eml",
         "archived",
         "processed",
+        Ecto.UUID.dump!(domain_id),
         now
       ]
     )
@@ -219,5 +221,25 @@ defmodule Manifold.SecurityTest do
       raw_size: 123,
       raw_sha256: String.duplicate("0", 64)
     }
+  end
+
+  defp domain_fixture do
+    domain_id = Ecto.UUID.generate()
+    now = DateTime.utc_now()
+    name = "security-#{System.unique_integer([:positive])}.test"
+
+    Repo.insert_all("domains", [
+      %{
+        id: Ecto.UUID.dump!(domain_id),
+        name: name,
+        normalized_domain: name,
+        active: true,
+        plus_addressing_enabled: true,
+        inserted_at: now,
+        updated_at: now
+      }
+    ])
+
+    domain_id
   end
 end

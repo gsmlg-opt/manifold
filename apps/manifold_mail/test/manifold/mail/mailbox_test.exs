@@ -432,11 +432,13 @@ defmodule Manifold.Mail.MailboxTest do
   defp projected_message_fixture(mailbox_id, folder_id, thread_id, subject, sent_at) do
     now = DateTime.utc_now()
     delivery_id = Ecto.UUID.generate()
+    storage_domain_id = mailbox_domain_id(mailbox_id)
 
     Repo.insert_all("inbound_deliveries", [
       %{
         id: Ecto.UUID.dump!(delivery_id),
         ingest_id: Ecto.UUID.generate(),
+        storage_domain_id: Ecto.UUID.dump!(storage_domain_id),
         peer_ip: "127.0.0.1",
         envelope_from: "sender@example.test",
         received_at: now,
@@ -481,5 +483,15 @@ defmodule Manifold.Mail.MailboxTest do
       |> Repo.insert!()
 
     %{message: message, entry: entry}
+  end
+
+  defp mailbox_domain_id(mailbox_id) do
+    %{rows: [[domain_id]]} =
+      Repo.query!(
+        "SELECT domain_id::text FROM mailboxes WHERE id = $1::uuid",
+        [Ecto.UUID.dump!(mailbox_id)]
+      )
+
+    domain_id
   end
 end

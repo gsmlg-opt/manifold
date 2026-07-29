@@ -24,6 +24,7 @@ defmodule ManifoldWeb.MixProject do
   defp deps do
     [
       {:manifold_accounts, in_umbrella: true},
+      {:manifold_connectors, in_umbrella: true},
       {:manifold_ingest, in_umbrella: true},
       {:manifold_mail, in_umbrella: true},
       {:manifold_outbound, in_umbrella: true},

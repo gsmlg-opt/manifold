@@ -12,14 +12,42 @@ config :manifold_data, Manifold.Repo,
 
 config :manifold_data, Oban,
   repo: Manifold.Repo,
-  queues: [archive: 10, mail_parse: 2, security: 2, outbound: 5, cloud_ingress: 2],
+  queues: [
+    archive: 10,
+    mail_parse: 2,
+    security: 2,
+    outbound: 5,
+    cloud_ingress: 2,
+    connectors: 2
+  ],
   plugins: [
     {Oban.Plugins.Pruner, max_age: 86_400},
     {Oban.Plugins.Cron,
      crontab: [
        {"*/5 * * * *", Manifold.Cloud.Jobs.PublishRoutes},
-       {"* * * * *", Manifold.Cloud.Jobs.PullDeliveries}
+       {"* * * * *", Manifold.Cloud.Jobs.PullDeliveries},
+       {"*/5 * * * *", Manifold.Connectors.Jobs.PollAccounts}
      ]}
+  ]
+
+config :manifold_connectors,
+  adapters: [
+    gmail: Manifold.Connectors.Provider.Gmail,
+    microsoft: Manifold.Connectors.Provider.MicrosoftGraph
+  ],
+  providers: [
+    gmail: [
+      authorization_url: "https://accounts.google.com/o/oauth2/v2/auth",
+      token_url: "https://oauth2.googleapis.com/token",
+      userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo",
+      base_url: "https://gmail.googleapis.com"
+    ],
+    microsoft: [
+      authorization_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
+      token_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+      base_url: "https://graph.microsoft.com/v1.0",
+      tenant: "organizations"
+    ]
   ]
 
 config :manifold_storage,

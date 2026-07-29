@@ -287,6 +287,116 @@ code {
   gap: 8px;
 }
 
+.settings-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.settings-heading h1 {
+  margin: 0;
+}
+
+.settings-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.settings-nav a {
+  padding: 7px 9px;
+  border-bottom: 2px solid transparent;
+  color: #46505c;
+  font-size: 13px;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.settings-nav a:hover,
+.settings-nav a:focus-visible {
+  border-bottom-color: #087f5b;
+  color: #075f47;
+  outline: none;
+}
+
+.settings-secondary,
+.settings-error {
+  display: block;
+  margin-top: 3px;
+  color: #68717d;
+  font-size: 13px;
+}
+
+.settings-error {
+  max-width: 280px;
+  color: #a6261c;
+  overflow-wrap: anywhere;
+}
+
+.provider-actions,
+.account-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.settings-action,
+.settings-icon-button {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid #b8c0ca;
+  border-radius: 5px;
+  background: #ffffff;
+  color: #34404d;
+  font-size: 13px;
+  font-weight: 700;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.settings-action:hover,
+.settings-action:focus-visible,
+.settings-icon-button:hover,
+.settings-icon-button:focus-visible {
+  border-color: #6cae98;
+  background: #effaf6;
+  color: #075f47;
+  outline: none;
+}
+
+.settings-action el-dm-mdi,
+.settings-icon-button el-dm-mdi {
+  width: 18px;
+  height: 18px;
+}
+
+.settings-icon-button {
+  width: 36px;
+  padding: 0;
+}
+
+.settings-icon-button-danger {
+  color: #8d251e;
+}
+
+.settings-icon-button:disabled {
+  border-color: #d9dee4;
+  background: #f4f6f8;
+  color: #8a929c;
+  cursor: not-allowed;
+}
+
+.settings-empty {
+  padding: 22px 12px;
+  color: #68717d;
+  text-align: center;
+}
+
 .webmail {
   display: grid;
   grid-template-columns: 230px 390px minmax(420px, 1fr);
@@ -1122,6 +1232,63 @@ code {
 
   .content > section:not(.webmail) {
     padding: 18px 14px;
+  }
+
+  .settings-heading {
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  #external-accounts thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  #external-accounts,
+  #external-accounts tbody,
+  #external-accounts tr,
+  #external-accounts td {
+    display: block;
+    width: 100%;
+  }
+
+  #external-accounts {
+    border: 0;
+  }
+
+  #external-accounts tbody {
+    border: 1px solid #d9dee7;
+    background: #ffffff;
+  }
+
+  #external-accounts tr + tr {
+    border-top: 1px solid #d9dee7;
+  }
+
+  #external-accounts td {
+    display: grid;
+    grid-template-columns: minmax(108px, 0.7fr) minmax(0, 1fr);
+    gap: 12px;
+    border: 0;
+  }
+
+  #external-accounts td::before {
+    color: #46505c;
+    content: attr(data-label);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  #external-accounts .settings-empty {
+    display: block;
+  }
+
+  #external-accounts .settings-empty::before {
+    content: none;
   }
 
   .webmail {

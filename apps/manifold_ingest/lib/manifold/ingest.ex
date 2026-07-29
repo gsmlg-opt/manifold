@@ -8,12 +8,13 @@ defmodule Manifold.Ingest do
   alias Ecto.Multi
   alias Manifold.Accounts
   alias Manifold.Core.{DeliveryState, Error}
-  alias Manifold.Ingest.AcceptanceReceipt
+  alias Manifold.Ingest.{AcceptanceReceipt, ExternalAcceptanceReceipt, ExternalSource}
   alias Manifold.Ingest.Jobs.{ArchiveRawEmail, EvaluateInboundSecurity, ProjectInboundMail}
 
   alias Manifold.Ingest.Schema.{
     CloudIngressIdentity,
     DeliveryRecipient,
+    ExternalIngressIdentity,
     InboundDelivery,
     MessageEvent
   }
@@ -25,10 +26,12 @@ defmodule Manifold.Ingest do
   alias Manifold.Security
   alias Manifold.Security.Input, as: SecurityInput
   alias Manifold.Storage.{RawStore, Spool}
-  alias Manifold.Storage.Spool.Bundle
+  alias Manifold.Storage.Spool.{Bundle, Manifest}
 
   @type accept_result :: {:ok, InboundDelivery.t()} | {:error, Error.t()}
   @type edge_accept_result :: {:ok, AcceptanceReceipt.t()} | {:error, Error.t()}
+  @type external_accept_result ::
+          {:ok, ExternalAcceptanceReceipt.t()} | {:error, Error.t()}
 
   @spec accept_transport(binary(), map(), [map() | struct()], Keyword.t()) :: accept_result()
   def accept_transport(raw, attrs, frozen_routes, opts \\ []) when is_binary(raw) do
@@ -37,6 +40,8 @@ defmodule Manifold.Ingest do
     spool_attrs =
       attrs
       |> Map.put(:routes, frozen_routes)
+      |> Map.put_new(:source_kind, "smtp")
+      |> Map.put_new(:storage_domain_id, first_route_domain_id(frozen_routes))
       |> Map.put_new(:received_at, DateTime.utc_now())
       |> Map.put_new(
         :original_recipients,
@@ -48,6 +53,59 @@ defmodule Manifold.Ingest do
          {:ok, delivery} <- accept(bundle, frozen_routes, opts) do
       {:ok, delivery}
     end
+  end
+
+  @doc """
+  Durably imports an immutable raw message from an external mailbox provider.
+
+  Provider imports intentionally create no SMTP delivery-recipient facts.
+  Repeating the same provider identity returns the original receipt when the
+  raw content and target mailbox match.
+  """
+  @spec import_external(binary(), ExternalSource.t(), Keyword.t()) :: external_accept_result()
+  def import_external(raw, %ExternalSource{} = source, opts \\ []) when is_binary(raw) do
+    fingerprint = external_fingerprint(source, raw)
+
+    with :ok <- validate_external_source(source),
+         :ok <- validate_external_mailbox(source) do
+      case fetch_external_identity(source) do
+        nil ->
+          with {:ok, bundle} <- external_bundle(raw, source, opts) do
+            persist_external_acceptance(bundle, source, fingerprint, opts)
+          end
+
+        identity ->
+          verify_existing_external(identity, fingerprint)
+      end
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error,
+       Error.new(:temporary, :database_unavailable, "database is temporarily unavailable")}
+  end
+
+  @doc """
+  Finds an already committed provider acceptance by its trusted source identity.
+  """
+  @spec lookup_external(String.t(), String.t(), String.t()) :: external_accept_result()
+  def lookup_external(provider, source_id, external_message_id)
+      when is_binary(provider) and is_binary(source_id) and is_binary(external_message_id) do
+    case fetch_external_identity(provider, source_id, external_message_id) do
+      %ExternalIngressIdentity{} = identity ->
+        {:ok, external_receipt(identity, true)}
+
+      nil ->
+        {:error,
+         Error.new(
+           :permanent,
+           :external_ingress_not_found,
+           "external ingress identity was not found"
+         )}
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error,
+       Error.new(:temporary, :database_unavailable, "database is temporarily unavailable")}
   end
 
   @spec accept(Bundle.t(), [map() | struct()], Keyword.t()) :: accept_result()
@@ -148,9 +206,11 @@ defmodule Manifold.Ingest do
          fingerprint,
          opts
        ) do
+    edge_opts = Keyword.put(opts, :source_kind, "edge_smtp")
+
     multi =
       bundle
-      |> acceptance_multi(routes, opts)
+      |> acceptance_multi(routes, edge_opts)
       |> Multi.insert(:cloud_ingress_identity, fn %{delivery: delivery} ->
         CloudIngressIdentity.changeset(%CloudIngressIdentity{}, %{
           source_id: source_id,
@@ -178,12 +238,90 @@ defmodule Manifold.Ingest do
     end
   end
 
+  defp persist_external_acceptance(bundle, source, fingerprint, opts) do
+    now = DateTime.utc_now()
+
+    multi =
+      Multi.new()
+      |> Multi.insert(
+        :delivery,
+        InboundDelivery.acceptance_changeset(%InboundDelivery{}, bundle, %{
+          source_kind: "provider_import",
+          storage_domain_id: source.storage_domain_id
+        })
+      )
+      |> Multi.run(:maybe_fail_after_delivery, fn _repo, _changes ->
+        case maybe_fault(opts, :after_delivery_insert_before_commit) do
+          :ok -> {:ok, :ok}
+          {:error, error} -> {:error, error}
+        end
+      end)
+      |> Mail.add_external_acceptance_entry(
+        :mailbox_entry,
+        :delivery,
+        source.mailbox_id,
+        source.recipient_address,
+        now
+      )
+      |> Multi.insert(:accepted_event, fn %{delivery: delivery} ->
+        MessageEvent.event_changeset(
+          delivery.id,
+          "accepted",
+          %{
+            source_kind: "provider_import",
+            provider: source.provider,
+            source_id: source.account_id,
+            external_message_id: source.external_message_id
+          },
+          now
+        )
+      end)
+      |> Multi.insert(:archive_job, fn %{delivery: delivery} ->
+        ArchiveRawEmail.new(%{"inbound_delivery_id" => delivery.id})
+      end)
+      |> Multi.insert(:external_ingress_identity, fn %{delivery: delivery} ->
+        ExternalIngressIdentity.changeset(%ExternalIngressIdentity{}, %{
+          provider: source.provider,
+          source_id: source.account_id,
+          external_message_id: source.external_message_id,
+          inbound_delivery_id: delivery.id,
+          mailbox_id: source.mailbox_id,
+          raw_size: fingerprint.raw_size,
+          raw_sha256: fingerprint.raw_sha256,
+          target_sha256: fingerprint.target_sha256
+        })
+      end)
+
+    case Repo.transaction(multi) do
+      {:ok, %{delivery: delivery, external_ingress_identity: identity}} ->
+        emit_acceptance_telemetry(delivery)
+        {:ok, external_receipt(%{identity | inbound_delivery: delivery}, false)}
+
+      transaction_error ->
+        case fetch_external_identity(source) do
+          %ExternalIngressIdentity{} = identity ->
+            verify_existing_external(identity, fingerprint)
+
+          nil ->
+            normalize_acceptance_error(transaction_error)
+        end
+    end
+  end
+
   defp acceptance_multi(bundle, routes, opts) do
     now = DateTime.utc_now()
     recipient_rows = build_recipient_rows(routes, now)
+    source_kind = Keyword.get(opts, :source_kind, "smtp")
+    storage_domain_id = Keyword.get(opts, :storage_domain_id, first_route_domain_id(routes))
 
     Multi.new()
-    |> Multi.insert(:delivery, InboundDelivery.acceptance_changeset(%InboundDelivery{}, bundle))
+    |> Multi.insert(
+      :delivery,
+      InboundDelivery.acceptance_changeset(%InboundDelivery{}, bundle, %{
+        source_kind: source_kind,
+        storage_domain_id: storage_domain_id
+      })
+    )
     |> Multi.run(:maybe_fail_after_delivery, fn _repo, _changes ->
       case maybe_fault(opts, :after_delivery_insert_before_commit) do
         :ok -> {:ok, :ok}
@@ -226,8 +364,13 @@ defmodule Manifold.Ingest do
       |> Repo.get!(id)
 
     mailbox_ids =
-      delivery.delivery_recipients
-      |> Enum.map(& &1.mailbox_id)
+      Enum.map(delivery.delivery_recipients, & &1.mailbox_id)
+      |> Kernel.++(
+        ExternalIngressIdentity
+        |> where([identity], identity.inbound_delivery_id == ^delivery.id)
+        |> select([identity], identity.mailbox_id)
+        |> Repo.all()
+      )
       |> Enum.uniq()
 
     mailboxes =
@@ -641,15 +784,25 @@ defmodule Manifold.Ingest do
     do: Keyword.get(opts, :file_stat_fun, &File.stat/1).(path)
 
   defp first_domain_id(delivery_id) do
-    DeliveryRecipient
-    |> where([r], r.inbound_delivery_id == ^delivery_id)
-    |> order_by([r], asc: r.id)
-    |> select([r], r.mailbox_id)
-    |> limit(1)
-    |> Repo.one()
-    |> case do
-      nil -> {:error, Error.new(:temporary, :object_store_failed, "delivery has no recipients")}
-      mailbox_id -> Accounts.mailbox_domain_id(mailbox_id)
+    case Repo.get(InboundDelivery, delivery_id) do
+      %InboundDelivery{storage_domain_id: domain_id} when is_binary(domain_id) ->
+        {:ok, domain_id}
+
+      _delivery ->
+        DeliveryRecipient
+        |> where([r], r.inbound_delivery_id == ^delivery_id)
+        |> order_by([r], asc: r.id)
+        |> select([r], r.mailbox_id)
+        |> limit(1)
+        |> Repo.one()
+        |> case do
+          nil ->
+            {:error,
+             Error.new(:temporary, :object_store_failed, "delivery has no storage domain")}
+
+          mailbox_id ->
+            Accounts.mailbox_domain_id(mailbox_id)
+        end
     end
   end
 
@@ -815,7 +968,8 @@ defmodule Manifold.Ingest do
       received_at: delivery.received_at,
       raw_object_key: delivery.raw_object_key,
       raw_size: delivery.raw_size,
-      raw_sha256: delivery.raw_sha256
+      raw_sha256: delivery.raw_sha256,
+      source_kind: delivery.source_kind
     }
   end
 
@@ -1075,6 +1229,203 @@ defmodule Manifold.Ingest do
 
   defp route_field(map, field) when is_map(map) do
     Map.get(map, field) || Map.get(map, Atom.to_string(field))
+  end
+
+  defp first_route_domain_id([route | _rest]), do: route_field(route, :domain_id)
+  defp first_route_domain_id([]), do: nil
+
+  defp validate_external_source(%ExternalSource{} = source) do
+    valid_provider? = source.provider in ["gmail", "microsoft"]
+
+    valid_ids? =
+      Enum.all?(
+        [
+          {source.account_id, 255},
+          {source.external_message_id, 512},
+          {source.mailbox_id, 255},
+          {source.storage_domain_id, 255},
+          {source.recipient_address, 998},
+          {source.ingest_id, 255}
+        ],
+        fn {value, max_bytes} ->
+          is_binary(value) and value != "" and value == String.trim(value) and
+            byte_size(value) <= max_bytes
+        end
+      )
+
+    if valid_provider? and valid_ids? and match?(%DateTime{}, source.received_at) do
+      :ok
+    else
+      {:error,
+       Error.new(
+         :permanent,
+         :invalid_external_source,
+         "external message source is invalid"
+       )}
+    end
+  end
+
+  defp validate_external_mailbox(source) do
+    case Accounts.active_mailbox_domain_id(source.mailbox_id) do
+      {:ok, domain_id} when domain_id == source.storage_domain_id ->
+        :ok
+
+      {:ok, _other_domain_id} ->
+        {:error,
+         Error.new(
+           :permanent,
+           :external_target_mismatch,
+           "external target mailbox does not belong to the storage domain"
+         )}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp external_bundle(raw, source, opts) do
+    spool_opts = Keyword.get(opts, :spool_opts, [])
+    root = Keyword.get(spool_opts, :root, Spool.spool_root())
+    bundle = Spool.bundle_for(root, source.ingest_id)
+
+    case File.stat(bundle.path) do
+      {:ok, %{type: :directory}} ->
+        load_external_bundle(bundle, source, raw)
+
+      {:error, :enoent} ->
+        attrs = %{
+          source_kind: "provider_import",
+          external_provider: source.provider,
+          external_source_id: source.account_id,
+          external_message_id: source.external_message_id,
+          storage_domain_id: source.storage_domain_id,
+          target_mailbox_id: source.mailbox_id,
+          received_at: source.received_at,
+          peer_ip: nil,
+          helo: nil,
+          envelope_from: nil,
+          original_recipients: [],
+          routes: []
+        }
+
+        Spool.write_bundle(
+          raw,
+          attrs,
+          Keyword.put(spool_opts, :ingest_id, source.ingest_id)
+        )
+
+      {:ok, _other} ->
+        external_bundle_error(:invalid_ready_bundle)
+
+      {:error, reason} ->
+        {:error,
+         Error.new(:temporary, :spool_failed, "external spool status failed", %{
+           reason: inspect(reason)
+         })}
+    end
+  end
+
+  defp load_external_bundle(bundle, source, raw) do
+    expected_sha256 = Manifest.sha256(raw)
+
+    with {:ok, manifest} <- Spool.read_manifest(bundle.path),
+         {:ok, stat} <- File.stat(bundle.raw_path),
+         {:ok, actual_sha256} <- Manifest.sha256_file(bundle.raw_path),
+         true <-
+           manifest.version == 2 and
+             manifest.ingest_id == source.ingest_id and
+             manifest.ingest_id == Path.basename(bundle.path) and
+             manifest.source_kind == "provider_import" and
+             manifest.external_provider == source.provider and
+             manifest.external_source_id == source.account_id and
+             manifest.external_message_id == source.external_message_id and
+             manifest.storage_domain_id == source.storage_domain_id and
+             manifest.target_mailbox_id == source.mailbox_id and
+             manifest.raw_size == byte_size(raw) and
+             manifest.raw_size == stat.size and
+             manifest.raw_sha256 == expected_sha256 and
+             manifest.raw_sha256 == actual_sha256 do
+      {:ok, %{bundle | manifest: manifest}}
+    else
+      false -> external_bundle_error(:ready_bundle_conflict)
+      {:error, reason} -> external_bundle_error(reason)
+    end
+  end
+
+  defp external_bundle_error(reason) do
+    {:error,
+     Error.new(
+       :permanent,
+       :external_ready_conflict,
+       "existing external ready bundle does not match the provider message",
+       %{reason: inspect(reason)}
+     )}
+  end
+
+  defp external_fingerprint(source, raw) do
+    %{
+      raw_size: byte_size(raw),
+      raw_sha256: Manifest.sha256(raw),
+      target_sha256: external_target_sha256(source)
+    }
+  end
+
+  defp external_target_sha256(source) do
+    {
+      source.mailbox_id,
+      source.storage_domain_id,
+      source.recipient_address
+    }
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp fetch_external_identity(source) do
+    fetch_external_identity(source.provider, source.account_id, source.external_message_id)
+  end
+
+  defp fetch_external_identity(provider, source_id, external_message_id) do
+    ExternalIngressIdentity
+    |> Repo.get_by(
+      provider: provider,
+      source_id: source_id,
+      external_message_id: external_message_id
+    )
+    |> Repo.preload(:inbound_delivery)
+  end
+
+  defp verify_existing_external(identity, fingerprint) do
+    existing = %{
+      raw_size: identity.raw_size,
+      raw_sha256: identity.raw_sha256,
+      target_sha256: identity.target_sha256
+    }
+
+    if existing == fingerprint do
+      {:ok, external_receipt(identity, true)}
+    else
+      {:error,
+       Error.new(
+         :permanent,
+         :external_ingress_conflict,
+         "provider message identity conflicts with previously accepted content or target"
+       )}
+    end
+  end
+
+  defp external_receipt(identity, existing?) do
+    %ExternalAcceptanceReceipt{
+      provider: identity.provider,
+      source_id: identity.source_id,
+      external_message_id: identity.external_message_id,
+      inbound_delivery_id: identity.inbound_delivery_id,
+      ingest_id: identity.inbound_delivery.ingest_id,
+      raw_sha256: identity.raw_sha256,
+      raw_size: identity.raw_size,
+      target_sha256: identity.target_sha256,
+      existing?: existing?
+    }
   end
 
   defp maybe_fault(opts, point) do

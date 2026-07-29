@@ -17,6 +17,9 @@ defmodule ManifoldWeb.Router do
   scope "/", ManifoldWeb do
     pipe_through(:browser)
 
+    get("/connectors/:provider/start", ConnectorOAuthController, :start)
+    get("/connectors/:provider/callback", ConnectorOAuthController, :callback)
+
     live_session :local_instance do
       live("/", MailLive.Index, :home)
       live("/mail", MailLive.Index, :home)
@@ -38,6 +41,7 @@ defmodule ManifoldWeb.Router do
       live("/deliveries", DeliveryLive.Index, :index)
       live("/deliveries/:id", DeliveryLive.Show, :show)
       live("/cloud", CloudLive.Index, :index)
+      live("/settings/accounts", ExternalAccountLive.Index, :index)
     end
 
     get(

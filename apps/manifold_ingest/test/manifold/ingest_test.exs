@@ -4,12 +4,14 @@ defmodule Manifold.IngestTest do
   alias Manifold.Accounts
   alias Manifold.Ingest
   alias Manifold.Ingest.AcceptanceReceipt
+  alias Manifold.Ingest.{ExternalAcceptanceReceipt, ExternalSource}
   alias Manifold.Ingest.Jobs.{ArchiveRawEmail, EvaluateInboundSecurity, ProjectInboundMail}
   alias Manifold.Ingest.Reconciler
 
   alias Manifold.Ingest.Schema.{
     CloudIngressIdentity,
     DeliveryRecipient,
+    ExternalIngressIdentity,
     InboundDelivery,
     MessageEvent
   }
@@ -219,6 +221,165 @@ defmodule Manifold.IngestTest do
 
     assert Repo.aggregate(InboundDelivery, :count) == 1
     assert Repo.aggregate(CloudIngressIdentity, :count) == 1
+  end
+
+  test "external import atomically creates a provider delivery without SMTP recipient facts" do
+    %{domain: domain, mailbox: mailbox} = route_fixture()
+    source = external_source(domain, mailbox, "gmail-message-1")
+
+    assert {:ok,
+            %ExternalAcceptanceReceipt{
+              provider: "gmail",
+              external_message_id: "gmail-message-1",
+              existing?: false
+            } = receipt} = Ingest.import_external(raw_message(), source)
+
+    delivery = Repo.get!(InboundDelivery, receipt.inbound_delivery_id)
+    assert delivery.source_kind == "provider_import"
+    assert delivery.storage_domain_id == domain.id
+    assert is_nil(delivery.peer_ip)
+    assert is_nil(delivery.helo)
+    assert is_nil(delivery.envelope_from)
+    assert Repo.aggregate(DeliveryRecipient, :count) == 0
+
+    assert %MailboxEntry{
+             mailbox_id: mailbox_id,
+             inbound_delivery_id: inbound_delivery_id,
+             original_recipient: "person@gmail.example"
+           } = Repo.one!(MailboxEntry)
+
+    assert mailbox_id == mailbox.id
+    assert inbound_delivery_id == delivery.id
+    assert Repo.get_by!(MessageEvent, inbound_delivery_id: delivery.id, event_type: "accepted")
+    assert Repo.get_by!(ExternalIngressIdentity, inbound_delivery_id: delivery.id)
+    assert Repo.get_by!(Oban.Job, worker: inspect(ArchiveRawEmail))
+
+    detail = Ingest.get_delivery_detail!(delivery.id)
+    assert Enum.map(detail.mailboxes, & &1.id) == [mailbox.id]
+  end
+
+  test "repeated external import returns the same durable receipt" do
+    %{domain: domain, mailbox: mailbox} = route_fixture()
+    source = external_source(domain, mailbox, "gmail-message-repeat")
+
+    assert {:ok, first} = Ingest.import_external(raw_message(), source)
+
+    assert {:ok, %ExternalAcceptanceReceipt{existing?: true} = repeated} =
+             Ingest.import_external(raw_message(), source)
+
+    assert repeated.inbound_delivery_id == first.inbound_delivery_id
+    assert Repo.aggregate(InboundDelivery, :count) == 1
+    assert Repo.aggregate(ExternalIngressIdentity, :count) == 1
+    assert Repo.aggregate(MailboxEntry, :count) == 1
+    assert Repo.aggregate(Oban.Job, :count) == 1
+  end
+
+  test "external acceptance can be recovered by trusted provider identity" do
+    %{domain: domain, mailbox: mailbox} = route_fixture()
+    source = external_source(domain, mailbox, "gmail-message-lookup")
+
+    assert {:ok, first} = Ingest.import_external(raw_message(), source)
+
+    assert {:ok, %ExternalAcceptanceReceipt{existing?: true} = recovered} =
+             Ingest.lookup_external(
+               source.provider,
+               source.account_id,
+               source.external_message_id
+             )
+
+    assert recovered.inbound_delivery_id == first.inbound_delivery_id
+
+    assert {:error, %{class: :permanent, reason: :external_ingress_not_found}} =
+             Ingest.lookup_external(source.provider, source.account_id, "missing")
+  end
+
+  test "external identity rejects changed content or target mailbox" do
+    %{domain: domain, mailbox: mailbox} = route_fixture()
+    {:ok, other_mailbox} = Accounts.create_mailbox(domain, %{local_part: "external-other"})
+    source = external_source(domain, mailbox, "gmail-message-conflict")
+
+    assert {:ok, _receipt} = Ingest.import_external(raw_message(), source)
+
+    assert {:error, %{class: :permanent, reason: :external_ingress_conflict}} =
+             Ingest.import_external("Subject: changed\r\n\r\nChanged\r\n", source)
+
+    assert {:error, %{class: :permanent, reason: :external_ingress_conflict}} =
+             Ingest.import_external(
+               raw_message(),
+               %{source | mailbox_id: other_mailbox.id}
+             )
+
+    assert Repo.aggregate(InboundDelivery, :count) == 1
+    assert Repo.aggregate(ExternalIngressIdentity, :count) == 1
+  end
+
+  test "external import rejects inactive mailbox destinations" do
+    %{domain: domain, mailbox: mailbox} = route_fixture()
+    source = external_source(domain, mailbox, "gmail-message-disabled")
+
+    mailbox
+    |> Ecto.Changeset.change(active: false)
+    |> Repo.update!()
+
+    assert {:error, %{class: :permanent, reason: :mailbox_not_active}} =
+             Ingest.import_external(raw_message(), source)
+
+    assert Repo.aggregate(InboundDelivery, :count) == 0
+  end
+
+  test "external acceptance failure leaves a ready orphan and no logical acceptance" do
+    %{domain: domain, mailbox: mailbox} = route_fixture()
+    source = external_source(domain, mailbox, "gmail-message-rollback")
+
+    assert {:error, %{reason: :after_delivery_insert_before_commit}} =
+             Ingest.import_external(raw_message(), source,
+               fail_at: :after_delivery_insert_before_commit
+             )
+
+    assert Repo.aggregate(InboundDelivery, :count) == 0
+    assert Repo.aggregate(ExternalIngressIdentity, :count) == 0
+    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert File.dir?(Path.join([Spool.spool_root(), "ready", source.ingest_id]))
+  end
+
+  test "external ready reuse binds manifest version and ingest ID to its directory" do
+    %{domain: domain, mailbox: mailbox} = route_fixture()
+    source = external_source(domain, mailbox, "gmail-message-ready-binding")
+
+    assert {:error, %{reason: :after_delivery_insert_before_commit}} =
+             Ingest.import_external(raw_message(), source,
+               fail_at: :after_delivery_insert_before_commit
+             )
+
+    manifest_path =
+      Path.join([Spool.spool_root(), "ready", source.ingest_id, "manifest.json"])
+
+    manifest =
+      manifest_path
+      |> File.read!()
+      |> Jason.decode!()
+      |> Map.put("version", 1)
+      |> Map.put("ingest_id", "different-ingest-id")
+
+    File.write!(manifest_path, Jason.encode!(manifest))
+
+    assert {:error, %{class: :permanent, reason: :external_ready_conflict}} =
+             Ingest.import_external(raw_message(), source)
+
+    assert Repo.aggregate(InboundDelivery, :count) == 0
+  end
+
+  test "external delivery archives through its trusted storage domain without recipients" do
+    %{domain: domain, mailbox: mailbox} = route_fixture()
+    source = external_source(domain, mailbox, "gmail-message-archive")
+
+    assert {:ok, receipt} = Ingest.import_external(raw_message(), source)
+    assert :ok = Ingest.archive_delivery(receipt.inbound_delivery_id)
+
+    delivery = Repo.get!(InboundDelivery, receipt.inbound_delivery_id)
+    assert delivery.raw_storage_state == "archived"
+    assert String.starts_with?(delivery.raw_object_key, "raw/#{domain.id}/")
+    assert Repo.aggregate(DeliveryRecipient, :count) == 0
   end
 
   test "acceptance rejects empty frozen routes before writing database state" do
@@ -785,6 +946,19 @@ defmodule Manifold.IngestTest do
     {:ok, mailbox} = Accounts.create_mailbox(domain, %{local_part: "inbox"})
     {:ok, route} = Accounts.resolve_recipient("inbox@#{domain.normalized_domain}")
     %{domain: domain, mailbox: mailbox, route: route}
+  end
+
+  defp external_source(domain, mailbox, message_id) do
+    %ExternalSource{
+      provider: "gmail",
+      account_id: Ecto.UUID.generate(),
+      external_message_id: message_id,
+      mailbox_id: mailbox.id,
+      storage_domain_id: domain.id,
+      recipient_address: "person@gmail.example",
+      received_at: DateTime.utc_now(),
+      ingest_id: "gmail-" <> Ecto.UUID.generate()
+    }
   end
 
   defp spool_attrs(routes) do

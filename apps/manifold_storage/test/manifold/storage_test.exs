@@ -53,6 +53,39 @@ defmodule Manifold.StorageTest do
   end
 
   @tag :tmp_dir
+  test "provider manifest preserves trusted provenance without SMTP facts", %{tmp_dir: tmp_dir} do
+    provider_attrs = %{
+      received_at: DateTime.utc_now(),
+      source_kind: "provider_import",
+      external_provider: "gmail",
+      external_source_id: "account-id",
+      external_message_id: "message-id",
+      storage_domain_id: "domain-id",
+      target_mailbox_id: "mailbox-id"
+    }
+
+    assert {:ok, bundle} =
+             Spool.write_bundle("raw", provider_attrs,
+               root: tmp_dir,
+               ingest_id: "provider-manifest"
+             )
+
+    assert {:ok, manifest} = Spool.read_manifest(bundle.path)
+    assert manifest.version == 2
+    assert manifest.source_kind == "provider_import"
+    assert manifest.external_provider == "gmail"
+    assert manifest.external_source_id == "account-id"
+    assert manifest.external_message_id == "message-id"
+    assert manifest.storage_domain_id == "domain-id"
+    assert manifest.target_mailbox_id == "mailbox-id"
+    assert is_nil(manifest.peer_ip)
+    assert is_nil(manifest.helo)
+    assert is_nil(manifest.envelope_from)
+    assert manifest.original_recipients == []
+    assert manifest.routes == []
+  end
+
+  @tag :tmp_dir
   test "ready cleanup uses a resumable tombstone", %{tmp_dir: tmp_dir} do
     assert {:ok, bundle} =
              Spool.write_bundle("raw", attrs(), root: tmp_dir, ingest_id: "cleanup-1")

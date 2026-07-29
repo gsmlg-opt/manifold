@@ -5,7 +5,15 @@ defmodule Manifold.Mail do
 
   alias Ecto.Multi
   alias Manifold.Core.Error
-  alias Manifold.Mail.{Acceptance, InboundSource, Mailbox, ProjectionResult, Projector}
+
+  alias Manifold.Mail.{
+    Acceptance,
+    ExternalState,
+    InboundSource,
+    Mailbox,
+    ProjectionResult,
+    Projector
+  }
 
   @spec add_acceptance_entries(
           Multi.t(),
@@ -18,9 +26,44 @@ defmodule Manifold.Mail do
     Acceptance.add_entries(multi, step_name, delivery_step, routes, now)
   end
 
+  @spec add_external_acceptance_entry(
+          Multi.t(),
+          atom(),
+          atom(),
+          Ecto.UUID.t(),
+          String.t(),
+          DateTime.t()
+        ) :: Multi.t()
+  def add_external_acceptance_entry(
+        multi,
+        step_name,
+        delivery_step,
+        mailbox_id,
+        recipient_address,
+        now
+      ) do
+    Acceptance.add_external_entry(
+      multi,
+      step_name,
+      delivery_step,
+      mailbox_id,
+      recipient_address,
+      now
+    )
+  end
+
   @spec project_inbound(InboundSource.t(), Keyword.t()) ::
           {:ok, ProjectionResult.t()} | {:error, Error.t()}
   def project_inbound(source, opts \\ []), do: Projector.project(source, opts)
+
+  @spec apply_external_state(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          ExternalState.normalized_state()
+        ) :: {:ok, :applied} | {:error, Error.t()}
+  defdelegate apply_external_state(mailbox_id, inbound_delivery_id, state),
+    to: ExternalState,
+    as: :apply
 
   @spec stale_projection_delivery_ids(pos_integer(), pos_integer(), Keyword.t()) ::
           [Ecto.UUID.t()]
