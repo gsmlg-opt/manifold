@@ -12,7 +12,7 @@ config :manifold_data, Manifold.Repo,
 
 config :manifold_data, Oban,
   repo: Manifold.Repo,
-  queues: [archive: 10, mail_parse: 2],
+  queues: [archive: 10, mail_parse: 2, outbound: 5],
   plugins: [{Oban.Plugins.Pruner, max_age: 86_400}]
 
 config :manifold_storage,
@@ -40,6 +40,10 @@ config :manifold_ingest,
   reconciler_enabled: config_env() != :test,
   orphan_retention_seconds: 3600,
   partial_retention_seconds: 3600
+
+config :manifold_outbound,
+  provider_adapter: Manifold.Outbound.Provider.Resend,
+  provider_config: []
 
 config :manifold_smtp,
   enabled: config_env() != :test,

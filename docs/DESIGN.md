@@ -389,7 +389,8 @@ Owns managed-provider submission:
 - Outbound message lifecycle.
 - Provider behaviour.
 - Provider-specific adapters.
-- Swoosh integration where appropriate.
+- Direct managed-provider HTTPS integration where precise retry semantics are
+  required.
 - Oban submission jobs.
 - Provider idempotency keys.
 - Webhook signature verification.
@@ -991,12 +992,20 @@ Provider-specific data should be retained in a namespaced JSON field but must no
 
 ### 16.3 Delivery state
 
-Recommended local states:
+Outbound-message submission states:
 
 - `draft`
 - `queued`
 - `submitting`
 - `accepted_by_provider`
+- `failed`
+- `submission_uncertain`
+
+Each recipient independently tracks:
+
+- `pending`
+- `sent`
+- `delayed`
 - `delivered`
 - `bounced`
 - `complained`
@@ -1408,13 +1417,15 @@ Implemented.
 
 ### Milestone 3 — Managed outbound
 
+Implemented.
+
 - Compose, drafts, reply, reply-all, and forward.
 - Sent-mail views.
-- Provider behaviour.
-- First provider adapter.
+- Provider behaviour and Resend HTTPS adapter.
 - Outbound Oban queue.
-- Provider webhooks.
-- Bounce and complaint state.
+- Authenticated raw-body provider webhooks.
+- Per-recipient delivery, bounce, complaint, suppression, delay, and failure
+  state.
 
 ### Milestone 4 — Security and policy
 

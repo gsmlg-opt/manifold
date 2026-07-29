@@ -11,6 +11,7 @@ defmodule Manifold.Mail.Mailbox do
     Folder,
     MailboxEntry,
     Message,
+    MessageAddress,
     Thread
   }
 
@@ -266,6 +267,33 @@ defmodule Manifold.Mail.Mailbox do
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
+  @spec get_reply_source(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, View.ReplySource.t()} | {:error, Error.t()}
+  def get_reply_source(mailbox_id, message_id) do
+    if valid_uuids?([mailbox_id, message_id]) do
+      message =
+        from(entry in MailboxEntry,
+          join: message in Message,
+          on: message.id == entry.message_id,
+          where:
+            entry.mailbox_id == ^mailbox_id and message.id == ^message_id and
+              not entry.quarantined,
+          limit: 1,
+          select: message
+        )
+        |> Repo.one()
+
+      case message do
+        %Message{} = message -> {:ok, reply_source(message)}
+        nil -> {:error, error(:permanent, :not_found, "reply source not found in mailbox")}
+      end
+    else
+      {:error, error(:permanent, :not_found, "reply source not found in mailbox")}
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
   @spec mark_read(Ecto.UUID.t(), [Ecto.UUID.t()], boolean()) ::
           {:ok, non_neg_integer()} | {:error, Error.t()}
   def mark_read(mailbox_id, entry_ids, read?) when is_boolean(read?) do
@@ -514,6 +542,44 @@ defmodule Manifold.Mail.Mailbox do
       attachments: attachments
     }
   end
+
+  defp reply_source(message) do
+    addresses =
+      MessageAddress
+      |> where([address], address.message_id == ^message.id)
+      |> order_by([address], asc: address.kind, asc: address.position)
+      |> Repo.all()
+
+    sender =
+      addresses
+      |> Enum.find(&(&1.kind == "from"))
+      |> case do
+        %MessageAddress{} = address -> address_view(address)
+        nil -> %{display_name: message.sender_name, address: message.sender_address}
+      end
+
+    %View.ReplySource{
+      message_id: message.id,
+      rfc_message_id: message.rfc_message_id,
+      references: message.references,
+      subject: message.subject || "(No subject)",
+      sender: sender,
+      reply_to: addresses_of_kind(addresses, "reply_to"),
+      to: addresses_of_kind(addresses, "to"),
+      cc: addresses_of_kind(addresses, "cc"),
+      sent_at: message.sent_at || message.inserted_at,
+      text_body: message.text_body
+    }
+  end
+
+  defp addresses_of_kind(addresses, kind) do
+    addresses
+    |> Enum.filter(&(&1.kind == kind))
+    |> Enum.map(&address_view/1)
+  end
+
+  defp address_view(address),
+    do: %{display_name: address.display_name, address: address.address}
 
   defp move_to_system(mailbox_id, entry_ids, kind) do
     with {:ok, _folders} <- Folders.ensure(mailbox_id),

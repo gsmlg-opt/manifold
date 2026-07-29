@@ -35,10 +35,16 @@ defmodule ManifoldWeb.Endpoint do
   plug(Plug.RequestId)
   plug(Plug.Telemetry, event_prefix: [:phoenix, :endpoint])
 
+  plug(ManifoldWeb.Plugs.RawBodyCapture,
+    path: "/webhooks/providers/resend",
+    max_bytes: 1_048_576
+  )
+
   plug(Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
-    json_decoder: Phoenix.json_library()
+    json_decoder: Phoenix.json_library(),
+    body_reader: {ManifoldWeb.Plugs.RawBodyCapture, :read_body, []}
   )
 
   plug(Plug.MethodOverride)

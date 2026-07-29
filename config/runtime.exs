@@ -53,6 +53,31 @@ config :manifold_storage,
       Path.expand("../priv/blob_store/#{config_env()}", __DIR__)
     )
 
+resend_config =
+  []
+  |> then(fn config ->
+    case System.get_env("RESEND_API_KEY") do
+      nil -> config
+      api_key -> Keyword.put(config, :api_key, api_key)
+    end
+  end)
+  |> then(fn config ->
+    case System.get_env("RESEND_WEBHOOK_SECRET") do
+      nil -> config
+      secret -> Keyword.put(config, :webhook_secret, secret)
+    end
+  end)
+  |> then(fn config ->
+    case System.get_env("RESEND_API_BASE_URL") do
+      nil -> config
+      base_url -> Keyword.put(config, :base_url, base_url)
+    end
+  end)
+
+config :manifold_outbound,
+  provider_adapter: Manifold.Outbound.Provider.Resend,
+  provider_config: resend_config
+
 if config_env() == :prod do
   secret_key_base =
     System.get_env("SECRET_KEY_BASE") ||

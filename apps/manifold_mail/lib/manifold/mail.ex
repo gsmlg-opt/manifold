@@ -52,6 +52,10 @@ defmodule Manifold.Mail do
           {:ok, String.t()} | {:error, Error.t()}
   defdelegate get_message_body(mailbox_id, message_id), to: Mailbox
 
+  @spec get_reply_source(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, Manifold.Mail.View.ReplySource.t()} | {:error, Error.t()}
+  defdelegate get_reply_source(mailbox_id, message_id), to: Mailbox
+
   @spec mark_read(Ecto.UUID.t(), [Ecto.UUID.t()], boolean()) ::
           {:ok, non_neg_integer()} | {:error, Error.t()}
   defdelegate mark_read(mailbox_id, entry_ids, read?), to: Mailbox

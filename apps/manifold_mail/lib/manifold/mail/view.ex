@@ -86,3 +86,34 @@ defmodule Manifold.Mail.View.AttachmentDownload do
 
   @type t :: %__MODULE__{}
 end
+
+defmodule Manifold.Mail.View.ReplySource do
+  @moduledoc false
+  @enforce_keys [
+    :message_id,
+    :rfc_message_id,
+    :references,
+    :subject,
+    :sender,
+    :reply_to,
+    :to,
+    :cc,
+    :sent_at,
+    :text_body
+  ]
+  defstruct @enforce_keys
+
+  @type address :: %{display_name: String.t() | nil, address: String.t()}
+  @type t :: %__MODULE__{
+          message_id: Ecto.UUID.t(),
+          rfc_message_id: String.t() | nil,
+          references: [String.t()],
+          subject: String.t(),
+          sender: address(),
+          reply_to: [address()],
+          to: [address()],
+          cc: [address()],
+          sent_at: DateTime.t(),
+          text_body: String.t() | nil
+        }
+end

@@ -26,6 +26,7 @@ defmodule ManifoldWeb.MixProject do
       {:manifold_accounts, in_umbrella: true},
       {:manifold_ingest, in_umbrella: true},
       {:manifold_mail, in_umbrella: true},
+      {:manifold_outbound, in_umbrella: true},
       {:manifold_smtp, in_umbrella: true, only: :test, runtime: false},
       {:phoenix, "~> 1.8"},
       {:phoenix_ecto, "~> 4.7"},

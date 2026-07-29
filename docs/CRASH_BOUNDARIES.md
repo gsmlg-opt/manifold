@@ -25,6 +25,23 @@
     transaction leaves the previous active projection unchanged. Retry reparses
     the immutable raw source, replaces message-derived rows in one transaction,
     and preserves mailbox folder, read, starred, and thread identity.
+11. Failure before the outbound queue transaction commits leaves the message as
+    an editable draft. The provider submission, local event, and Oban job roll
+    back with the state change.
+12. Failure after the outbound queue commits but before worker execution leaves
+    a frozen queued message, one logical provider submission, and a committed
+    Oban job. Oban resumes submission after restart.
+13. A transient provider or transport failure returns the message to `queued`
+    and preserves the ready submission. Retries reuse the same request content
+    and idempotency key; provider `Retry-After` is mapped to an Oban snooze.
+14. Failure after provider acceptance but before the local acceptance
+    transaction commits leaves the message in `submitting`. Retry uses the same
+    provider idempotency key within its 24-hour safety window.
+15. A submission still ambiguous when its provider idempotency window expires
+    becomes `submission_uncertain`. Manifold does not automatically resend it.
+16. A valid webhook received before the provider message ID commits is retained
+    as unmatched. The provider-acceptance transaction reconciles and applies it;
+    duplicate and out-of-order events do not regress recipient state.
 
 A database row whose unarchived bundle is missing is marked `missing_spool` with an
 operational event. If that trusted ready bundle later reappears, reconciliation

@@ -4,12 +4,14 @@ Manifold is a self-hosted Phoenix webmail application backed by an Elixir-native
 mail platform. It is designed to replace a desktop email client for locally
 hosted mailboxes while preserving durable SMTP acceptance and raw message data.
 
-## Milestones 0-2
+## Milestones 0-3
 
-This repository currently implements durable inbound delivery and its first
-mail-client projection:
+This repository currently implements durable inbound delivery, mailbox
+projection, and managed outbound submission:
 
-- Phoenix umbrella with `manifold_core`, `manifold_data`, `manifold_accounts`, `manifold_storage`, `manifold_ingest`, `manifold_smtp`, `manifold_mail`, and `manifold_web`.
+- Phoenix umbrella with `manifold_core`, `manifold_data`, `manifold_accounts`,
+  `manifold_storage`, `manifold_ingest`, `manifold_smtp`, `manifold_mail`,
+  `manifold_outbound`, and `manifold_web`.
 - PostgreSQL/Ecto migrations and Oban jobs.
 - Domain, mailbox, alias, alias target, and recipient resolution.
 - `gen_smtp` development listener on port `2525`.
@@ -21,17 +23,26 @@ mail-client projection:
 - Content-addressed local attachment storage.
 - Responsive Phoenix LiveView inbox, folder, search, conversation, and mailbox
   state workflows.
+- Persistent plain-text drafts with compose, reply, reply-all, and forward
+  workflows.
+- Atomic outbound queueing with Oban, stable provider idempotency, and a Resend
+  HTTPS adapter.
+- Authenticated Resend webhook ingestion with per-recipient delivered, bounced,
+  complained, suppressed, delayed, and failed state.
+- Sent-mail and provider lifecycle views that distinguish provider acceptance
+  from final recipient delivery.
 - Isolated sanitized HTML rendering and mailbox-scoped attachment downloads.
 - Operational LiveViews for domains, mailboxes, aliases, inbound deliveries, and
   delivery detail.
 
 ## Out Of Scope
 
-The current milestones intentionally do not implement composition, drafts,
-reply/forward, spam or malware scanning, IMAP, POP3, JMAP, Gmail sync, Microsoft
-Graph sync, cloud relay, or managed outbound provider submission.
+The current milestones intentionally do not implement rich-text composition,
+outbound attachments, spam or malware scanning, IMAP, POP3, JMAP, Gmail sync,
+Microsoft Graph sync, or cloud relay.
 
-Manifold must not perform direct outbound Internet SMTP delivery. Outbound delivery is reserved for a future managed-provider adapter.
+Manifold never performs direct outbound Internet SMTP delivery. Milestone 3
+submits through the configured managed-provider HTTPS adapter.
 
 ## Development
 
@@ -78,6 +89,18 @@ devenv processes start
 Open Phoenix at `http://localhost:4290`. Submit SMTP mail to `127.0.0.1:2525`.
 The root page is the mailbox inbox; transport lifecycle details remain under
 `/deliveries`.
+
+To enable outbound delivery through Resend, set `RESEND_API_KEY` and configure
+the Resend webhook endpoint as:
+
+```text
+https://<your-manifold-host>/webhooks/providers/resend
+```
+
+Set `RESEND_WEBHOOK_SECRET` to the endpoint signing secret. An optional
+`RESEND_API_BASE_URL` is supported for controlled testing. Without an API key,
+drafts remain usable but queued submissions fail with a classified
+`provider_not_configured` state instead of making a network request.
 
 Run checks:
 

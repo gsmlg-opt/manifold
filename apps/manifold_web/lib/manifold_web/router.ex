@@ -10,12 +10,20 @@ defmodule ManifoldWeb.Router do
     plug(:put_secure_browser_headers)
   end
 
+  scope "/webhooks", ManifoldWeb do
+    post("/providers/resend", ResendWebhookController, :create)
+  end
+
   scope "/", ManifoldWeb do
     pipe_through(:browser)
 
     live_session :local_instance do
       live("/", MailLive.Index, :home)
       live("/mail", MailLive.Index, :home)
+      live("/mail/:mailbox_id/drafts", MailLive.Index, :drafts)
+      live("/mail/:mailbox_id/drafts/:draft_id/edit", MailLive.Index, :draft_edit)
+      live("/mail/:mailbox_id/sent", MailLive.Index, :sent)
+      live("/mail/:mailbox_id/sent/:outbound_message_id", MailLive.Index, :sent_detail)
       live("/mail/:mailbox_id/folders/:folder_id", MailLive.Index, :folder)
 
       live(

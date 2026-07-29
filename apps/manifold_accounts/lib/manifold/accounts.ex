@@ -5,7 +5,7 @@ defmodule Manifold.Accounts do
 
   import Ecto.Query
 
-  alias Manifold.Accounts.Route
+  alias Manifold.Accounts.{Route, SenderIdentity}
   alias Manifold.Accounts.Schema.{Alias, AliasTarget, Domain, Mailbox}
   alias Manifold.Core.{Address, Error}
   alias Manifold.Repo
@@ -54,6 +54,38 @@ defmodule Manifold.Accounts do
 
   @spec get_mailbox!(Ecto.UUID.t()) :: Mailbox.t()
   def get_mailbox!(id), do: Repo.get!(Mailbox, id)
+
+  @spec get_sender_identity(Ecto.UUID.t()) :: {:ok, SenderIdentity.t()} | {:error, Error.t()}
+  def get_sender_identity(mailbox_id) do
+    query =
+      from(mailbox in Mailbox,
+        join: domain in Domain,
+        on: domain.id == mailbox.domain_id,
+        where: mailbox.id == ^mailbox_id and mailbox.active and domain.active,
+        select: {mailbox, domain}
+      )
+
+    case Repo.one(query) do
+      {%Mailbox{} = mailbox, %Domain{} = domain} ->
+        address = mailbox.local_part <> "@" <> domain.normalized_domain
+
+        {:ok,
+         %SenderIdentity{
+           mailbox_id: mailbox.id,
+           domain_id: domain.id,
+           display_name: mailbox.display_name,
+           address: address,
+           canonical_address: String.downcase(address, :ascii)
+         }}
+
+      nil ->
+        {:error, Error.new(:permanent, :sender_not_active, "sender mailbox is not active")}
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error,
+       Error.new(:temporary, :database_unavailable, "sender database is temporarily unavailable")}
+  end
 
   @spec mailbox_domain_id(Ecto.UUID.t()) :: {:ok, Ecto.UUID.t()} | {:error, Error.t()}
   def mailbox_domain_id(mailbox_id) do

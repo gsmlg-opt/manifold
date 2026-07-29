@@ -5,6 +5,7 @@ defmodule ManifoldWeb.MailLive.Index do
 
   alias Manifold.Accounts
   alias Manifold.Mail
+  alias Manifold.Outbound
   alias ManifoldWeb.MailNotifier
 
   @impl true
@@ -18,6 +19,12 @@ defmodule ManifoldWeb.MailLive.Index do
        folder: nil,
        page: %{items: [], next_cursor: nil},
        conversation: nil,
+       mail_view: :folder,
+       drafts: [],
+       sent_items: [],
+       draft: nil,
+       draft_params: nil,
+       sent_detail: nil,
        query: "",
        after_cursor: nil,
        subscribed_mailbox_id: nil
@@ -29,7 +36,7 @@ defmodule ManifoldWeb.MailLive.Index do
     mailbox = select_mailbox(socket.assigns.mailboxes, params["mailbox_id"])
     socket = subscribe_mailbox(socket, mailbox && mailbox.id)
 
-    case mailbox && load_mailbox(mailbox, params) do
+    case mailbox && load_view(mailbox, socket.assigns.live_action, params) do
       nil ->
         {:noreply,
          assign(socket,
@@ -39,6 +46,12 @@ defmodule ManifoldWeb.MailLive.Index do
            folder: nil,
            page: %{items: [], next_cursor: nil},
            conversation: nil,
+           mail_view: :folder,
+           drafts: [],
+           sent_items: [],
+           draft: nil,
+           draft_params: nil,
+           sent_detail: nil,
            query: "",
            after_cursor: nil
          )}
@@ -52,6 +65,12 @@ defmodule ManifoldWeb.MailLive.Index do
            folder: loaded.folder,
            page: loaded.page,
            conversation: loaded.conversation,
+           mail_view: loaded.mail_view,
+           drafts: loaded.drafts,
+           sent_items: loaded.sent_items,
+           draft: loaded.draft,
+           draft_params: draft_form_params(loaded.draft),
+           sent_detail: loaded.sent_detail,
            query: loaded.query,
            after_cursor: loaded.after_cursor
          )}
@@ -83,6 +102,94 @@ defmodule ManifoldWeb.MailLive.Index do
 
       _other ->
         {:noreply, put_flash(socket, :error, "Mailbox is unavailable.")}
+    end
+  end
+
+  def handle_event("compose", _params, %{assigns: %{mailbox: mailbox}} = socket) do
+    case Outbound.create_draft(mailbox.id, %{}) do
+      {:ok, draft} ->
+        {:noreply, push_navigate(socket, to: ~p"/mail/#{mailbox.id}/drafts/#{draft.id}/edit")}
+
+      {:error, _reason} ->
+        {:noreply, put_flash(socket, :error, "Draft could not be created.")}
+    end
+  end
+
+  def handle_event("save-draft", %{"draft" => params}, socket) do
+    socket = assign(socket, :draft_params, params)
+
+    case persist_draft(socket, params) do
+      {:ok, draft} ->
+        {:noreply,
+         socket
+         |> assign(draft: draft, draft_params: draft_form_params(draft))
+         |> put_flash(:info, "Draft saved.")}
+
+      {:error, reason} ->
+        {:noreply, draft_error(socket, reason)}
+    end
+  end
+
+  def handle_event("change-draft", %{"draft" => params}, socket),
+    do: {:noreply, assign(socket, :draft_params, params)}
+
+  def handle_event("save-current-draft", _params, socket) do
+    case persist_draft(socket, socket.assigns.draft_params) do
+      {:ok, draft} ->
+        {:noreply,
+         socket
+         |> assign(draft: draft, draft_params: draft_form_params(draft))
+         |> put_flash(:info, "Draft saved.")}
+
+      {:error, reason} ->
+        {:noreply, draft_error(socket, reason)}
+    end
+  end
+
+  def handle_event("send-draft", %{"draft" => params}, socket) do
+    socket = assign(socket, :draft_params, params)
+
+    with {:ok, draft} <- persist_draft(socket, params),
+         {:ok, queued} <-
+           Outbound.queue_draft(socket.assigns.mailbox.id, draft.id,
+             expected_revision: draft.lock_version
+           ) do
+      {:noreply,
+       socket
+       |> put_flash(:info, "Message queued for delivery.")
+       |> push_navigate(to: ~p"/mail/#{socket.assigns.mailbox.id}/sent/#{queued.id}")}
+    else
+      {:error, reason} -> {:noreply, draft_error(socket, reason)}
+    end
+  end
+
+  def handle_event("delete-draft", _params, socket) do
+    case Outbound.delete_draft(socket.assigns.mailbox.id, socket.assigns.draft.id) do
+      {:ok, _draft} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Draft deleted.")
+         |> push_navigate(to: ~p"/mail/#{socket.assigns.mailbox.id}/drafts")}
+
+      {:error, _reason} ->
+        {:noreply, put_flash(socket, :error, "Draft could not be deleted.")}
+    end
+  end
+
+  def handle_event(event, %{"entry-id" => message_id}, socket)
+      when event in ["reply", "reply-all", "forward"] do
+    kind = %{"reply" => :reply, "reply-all" => :reply_all, "forward" => :forward}[event]
+
+    case Outbound.prepare_draft(socket.assigns.mailbox.id, message_id, kind) do
+      {:ok, draft} ->
+        {:noreply,
+         push_navigate(
+           socket,
+           to: ~p"/mail/#{socket.assigns.mailbox.id}/drafts/#{draft.id}/edit"
+         )}
+
+      {:error, _reason} ->
+        {:noreply, put_flash(socket, :error, "Draft could not be prepared.")}
     end
   end
 
@@ -141,10 +248,15 @@ defmodule ManifoldWeb.MailLive.Index do
            load_conversation(mailbox.id, folder.id, params["thread_id"]) do
       {:ok,
        %{
+         mail_view: :folder,
          folders: folders,
          folder: folder,
          page: page,
          conversation: conversation,
+         drafts: Outbound.list_drafts(mailbox.id),
+         sent_items: [],
+         draft: nil,
+         sent_detail: nil,
          query: query,
          after_cursor: after_cursor,
          page_title: conversation_title(conversation, folder)
@@ -153,6 +265,74 @@ defmodule ManifoldWeb.MailLive.Index do
       nil -> {:error, :not_found}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp load_view(mailbox, action, params)
+       when action in [:home, :folder, :conversation],
+       do: load_mailbox(mailbox, params)
+
+  defp load_view(mailbox, :drafts, _params) do
+    with {:ok, folders} <- Mail.list_folders(mailbox.id) do
+      {:ok,
+       outbound_view(:drafts, folders,
+         drafts: Outbound.list_drafts(mailbox.id),
+         page_title: "Drafts"
+       )}
+    end
+  end
+
+  defp load_view(mailbox, :draft_edit, %{"draft_id" => draft_id}) do
+    with {:ok, folders} <- Mail.list_folders(mailbox.id),
+         {:ok, draft} <- Outbound.get_draft(mailbox.id, draft_id) do
+      {:ok,
+       outbound_view(:draft_edit, folders,
+         drafts: Outbound.list_drafts(mailbox.id),
+         draft: draft,
+         page_title: draft.subject || "New message"
+       )}
+    end
+  end
+
+  defp load_view(mailbox, :sent, _params) do
+    with {:ok, folders} <- Mail.list_folders(mailbox.id) do
+      {:ok,
+       outbound_view(:sent, folders,
+         sent_items: Outbound.list_sent(mailbox.id),
+         page_title: "Sent"
+       )}
+    end
+  end
+
+  defp load_view(mailbox, :sent_detail, %{"outbound_message_id" => message_id}) do
+    with {:ok, folders} <- Mail.list_folders(mailbox.id),
+         {:ok, detail} <- Outbound.get_sent(mailbox.id, message_id) do
+      {:ok,
+       outbound_view(:sent_detail, folders,
+         sent_items: Outbound.list_sent(mailbox.id),
+         sent_detail: detail,
+         page_title: detail.subject
+       )}
+    end
+  end
+
+  defp outbound_view(mail_view, folders, overrides) do
+    Map.merge(
+      %{
+        mail_view: mail_view,
+        folders: folders,
+        folder: nil,
+        page: %{items: [], next_cursor: nil},
+        conversation: nil,
+        drafts: [],
+        sent_items: [],
+        draft: nil,
+        sent_detail: nil,
+        query: "",
+        after_cursor: nil,
+        page_title: "Mail"
+      },
+      Map.new(overrides)
+    )
   end
 
   defp select_mailbox([], _id), do: nil
@@ -206,6 +386,14 @@ defmodule ManifoldWeb.MailLive.Index do
   end
 
   defp reload(socket) do
+    if socket.assigns.mail_view != :folder do
+      reload_outbound(socket)
+    else
+      reload_inbound(socket)
+    end
+  end
+
+  defp reload_inbound(socket) do
     params =
       %{
         "mailbox_id" => socket.assigns.mailbox.id,
@@ -230,6 +418,97 @@ defmodule ManifoldWeb.MailLive.Index do
     end
   end
 
+  defp reload_outbound(socket) do
+    params =
+      case socket.assigns.mail_view do
+        :draft_edit -> %{"draft_id" => socket.assigns.draft.id}
+        :sent_detail -> %{"outbound_message_id" => socket.assigns.sent_detail.id}
+        _other -> %{}
+      end
+
+    case load_view(socket.assigns.mailbox, socket.assigns.live_action, params) do
+      {:ok, loaded} ->
+        assign(socket,
+          folders: loaded.folders,
+          drafts: loaded.drafts,
+          sent_items: loaded.sent_items,
+          draft: loaded.draft,
+          sent_detail: loaded.sent_detail
+        )
+
+      {:error, _reason} ->
+        put_flash(socket, :error, "Mailbox refresh failed.")
+    end
+  end
+
+  defp persist_draft(socket, params) do
+    Outbound.update_draft(
+      socket.assigns.mailbox.id,
+      socket.assigns.draft.id,
+      draft_attrs(params),
+      expected_revision: socket.assigns.draft.lock_version
+    )
+    |> case do
+      {:ok, _updated} ->
+        Outbound.get_draft(socket.assigns.mailbox.id, socket.assigns.draft.id)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp draft_attrs(params) do
+    %{
+      subject: params["subject"],
+      text_body: params["text_body"],
+      recipients:
+        for {kind, value} <- [
+              {"to", params["to"]},
+              {"cc", params["cc"]},
+              {"bcc", params["bcc"]}
+            ],
+            address <- split_addresses(value) do
+          %{kind: kind, address: address}
+        end
+    }
+  end
+
+  defp split_addresses(nil), do: []
+
+  defp split_addresses(value) do
+    value
+    |> String.split([",", "\n"])
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp draft_error(socket, %{reason: :stale_draft}) do
+    socket
+    |> reload_outbound()
+    |> put_flash(:error, "This draft changed in another session. Your view was refreshed.")
+  end
+
+  defp draft_error(socket, _reason),
+    do: put_flash(socket, :error, "Draft could not be saved.")
+
+  defp recipient_field(draft, kind) do
+    draft.recipients
+    |> Enum.filter(&(&1.kind == kind))
+    |> Enum.map_join(", ", & &1.address)
+  end
+
+  defp draft_form_params(nil), do: nil
+
+  defp draft_form_params(draft) do
+    %{
+      "to" => recipient_field(draft, "to"),
+      "cc" => recipient_field(draft, "cc"),
+      "bcc" => recipient_field(draft, "bcc"),
+      "subject" => draft.subject || "",
+      "text_body" => draft.text_body || ""
+    }
+  end
+
   defp maybe_put_thread(params, nil), do: params
 
   defp maybe_put_thread(params, conversation),
@@ -247,10 +526,43 @@ defmodule ManifoldWeb.MailLive.Index do
   defp format_size(bytes) when bytes < 1024 * 1024, do: "#{div(bytes, 1024)} KB"
   defp format_size(bytes), do: "#{Float.round(bytes / (1024 * 1024), 1)} MB"
 
+  defp outbound_state_label("accepted_by_provider"), do: "Provider accepted"
+  defp outbound_state_label("submission_uncertain"), do: "Submission uncertain"
+  defp outbound_state_label("queued"), do: "Queued"
+  defp outbound_state_label("submitting"), do: "Sending"
+  defp outbound_state_label("pending"), do: "Pending"
+  defp outbound_state_label("sent"), do: "Sent"
+  defp outbound_state_label("delayed"), do: "Delayed"
+  defp outbound_state_label("delivered"), do: "Delivered"
+  defp outbound_state_label("bounced"), do: "Bounced"
+  defp outbound_state_label("complained"), do: "Complaint received"
+  defp outbound_state_label("suppressed"), do: "Suppressed"
+  defp outbound_state_label("failed"), do: "Failed"
+  defp outbound_state_label(state), do: String.replace(state, "_", " ")
+
+  defp outbound_event_label(event_type) do
+    event_type
+    |> String.replace("_", " ")
+    |> String.capitalize()
+  end
+
+  defp grouped_recipients(recipients) do
+    for kind <- ~w(to cc bcc),
+        grouped = Enum.filter(recipients, &(&1.kind == kind)),
+        grouped != [] do
+      {kind, grouped}
+    end
+  end
+
   @impl true
   def render(assigns) do
     ~H"""
-    <section class={["webmail", @conversation && "reader-open"]}>
+    <section class={[
+      "webmail",
+      @conversation && "reader-open",
+      @mail_view in [:draft_edit, :sent_detail] && "reader-open",
+      @mail_view == :draft_edit && "compose-open"
+    ]}>
       <aside class="mail-folders" aria-label="Mailbox folders">
         <form
           :if={@mailbox}
@@ -270,7 +582,32 @@ defmodule ManifoldWeb.MailLive.Index do
           </select>
         </form>
 
+        <button
+          :if={@mailbox}
+          id="compose-button"
+          type="button"
+          class="compose-button"
+          phx-click="compose"
+        >
+          <.dm_mdi name="pencil-outline" class="mail-icon" /> Compose
+        </button>
+
         <nav :if={@mailbox} class="folder-list">
+          <.link
+            navigate={~p"/mail/#{@mailbox.id}/drafts"}
+            class={["folder-link", @mail_view in [:drafts, :draft_edit] && "is-current"]}
+          >
+            <.dm_mdi name="file-document-edit-outline" class="folder-icon" />
+            <span>Drafts</span>
+            <span :if={length(@drafts) > 0} class="folder-count">{length(@drafts)}</span>
+          </.link>
+          <.link
+            navigate={~p"/mail/#{@mailbox.id}/sent"}
+            class={["folder-link", @mail_view in [:sent, :sent_detail] && "is-current"]}
+          >
+            <.dm_mdi name="send-outline" class="folder-icon" />
+            <span>Sent</span>
+          </.link>
           <.link
             :for={folder <- @folders}
             navigate={~p"/mail/#{@mailbox.id}/folders/#{folder.id}"}
@@ -301,7 +638,11 @@ defmodule ManifoldWeb.MailLive.Index do
         <.link navigate={~p"/mailboxes"} class="text-command">Open mailbox settings</.link>
       </div>
 
-      <section :if={@mailbox} class="conversation-list" aria-label="Conversations">
+      <section
+        :if={@mailbox && @mail_view == :folder}
+        class="conversation-list"
+        aria-label="Conversations"
+      >
         <header class="conversation-list-header">
           <div>
             <h1>{@folder.name}</h1>
@@ -383,7 +724,208 @@ defmodule ManifoldWeb.MailLive.Index do
         </nav>
       </section>
 
-      <article :if={@mailbox && @conversation} class="mail-reader" aria-label="Conversation">
+      <section
+        :if={@mailbox && @mail_view in [:drafts, :draft_edit]}
+        class="conversation-list outbound-list"
+        aria-label="Drafts"
+      >
+        <header class="conversation-list-header">
+          <div>
+            <h1>Drafts</h1>
+            <span class="mailbox-address">{mailbox_label(@mailbox)}</span>
+          </div>
+        </header>
+        <div :if={@drafts == []} class="empty-folder">
+          <.dm_mdi name="file-document-edit-outline" class="empty-icon" />
+          <p>No saved drafts</p>
+        </div>
+        <nav class="conversation-items">
+          <.link
+            :for={item <- @drafts}
+            navigate={~p"/mail/#{@mailbox.id}/drafts/#{item.id}/edit"}
+            class={["conversation-row", @draft && item.id == @draft.id && "is-selected"]}
+          >
+            <div class="conversation-primary">
+              <div class="conversation-meta">
+                <strong>{item.subject}</strong>
+                <time datetime={DateTime.to_iso8601(item.updated_at)}>
+                  {format_time(item.updated_at)}
+                </time>
+              </div>
+              <p>{item.preview}</p>
+            </div>
+          </.link>
+        </nav>
+      </section>
+
+      <section
+        :if={@mailbox && @mail_view in [:sent, :sent_detail]}
+        class="conversation-list outbound-list"
+        aria-label="Sent messages"
+      >
+        <header class="conversation-list-header">
+          <div>
+            <h1>Sent</h1>
+            <span class="mailbox-address">{mailbox_label(@mailbox)}</span>
+          </div>
+        </header>
+        <div :if={@sent_items == []} class="empty-folder">
+          <.dm_mdi name="send-outline" class="empty-icon" />
+          <p>No sent messages</p>
+        </div>
+        <nav class="conversation-items">
+          <.link
+            :for={item <- @sent_items}
+            navigate={~p"/mail/#{@mailbox.id}/sent/#{item.id}"}
+            class={[
+              "conversation-row",
+              @sent_detail && item.id == @sent_detail.id && "is-selected"
+            ]}
+          >
+            <div class="conversation-primary">
+              <div class="conversation-meta">
+                <strong>{Enum.join(item.recipients, ", ")}</strong>
+                <time :if={item.queued_at} datetime={DateTime.to_iso8601(item.queued_at)}>
+                  {format_time(item.queued_at)}
+                </time>
+              </div>
+              <div class="conversation-subject">
+                <span>{item.subject}</span>
+              </div>
+              <p>{outbound_state_label(item.state)}</p>
+            </div>
+          </.link>
+        </nav>
+      </section>
+
+      <article
+        :if={@mailbox && @mail_view == :draft_edit && @draft}
+        class="mail-reader draft-editor"
+        aria-label="Draft editor"
+      >
+        <header class="reader-header">
+          <.link
+            navigate={~p"/mail/#{@mailbox.id}/drafts"}
+            class="reader-back"
+            aria-label="Back to drafts"
+          >
+            <.dm_mdi name="arrow-left" class="mail-icon" />
+          </.link>
+          <h2>{if @draft.composition_kind == "new", do: "New message", else: "Edit draft"}</h2>
+        </header>
+        <form
+          id="outbound-draft-form"
+          class="draft-form"
+          phx-change="change-draft"
+          phx-submit="send-draft"
+        >
+          <div class="draft-address-row">
+            <label>From</label>
+            <span>{@draft.sender_address}</span>
+          </div>
+          <label>
+            <span>To</span>
+            <input
+              type="text"
+              name="draft[to]"
+              value={@draft_params["to"]}
+              autocomplete="off"
+              placeholder="recipient@example.com"
+            />
+          </label>
+          <label>
+            <span>Cc</span>
+            <input
+              type="text"
+              name="draft[cc]"
+              value={@draft_params["cc"]}
+              autocomplete="off"
+            />
+          </label>
+          <label>
+            <span>Bcc</span>
+            <input
+              type="text"
+              name="draft[bcc]"
+              value={@draft_params["bcc"]}
+              autocomplete="off"
+            />
+          </label>
+          <label class="draft-subject">
+            <span>Subject</span>
+            <input type="text" name="draft[subject]" value={@draft_params["subject"]} />
+          </label>
+          <label class="draft-body">
+            <span class="sr-only">Message body</span>
+            <textarea name="draft[text_body]">{@draft_params["text_body"]}</textarea>
+          </label>
+          <footer class="draft-actions">
+            <button type="submit" class="send-button">
+              <.dm_mdi name="send" class="mail-icon" /> Send
+            </button>
+            <button type="button" class="text-command" phx-click="save-current-draft">
+              Save draft
+            </button>
+            <button type="button" class="danger-command" phx-click="delete-draft">
+              <.dm_mdi name="trash-can-outline" class="mail-icon" />
+              <span class="sr-only">Delete draft</span>
+            </button>
+          </footer>
+        </form>
+      </article>
+
+      <article
+        :if={@mailbox && @mail_view == :sent_detail && @sent_detail}
+        class="mail-reader sent-reader"
+        aria-label="Sent message"
+      >
+        <header class="reader-header">
+          <.link
+            navigate={~p"/mail/#{@mailbox.id}/sent"}
+            class="reader-back"
+            aria-label="Back to sent messages"
+          >
+            <.dm_mdi name="arrow-left" class="mail-icon" />
+          </.link>
+          <h2>{@sent_detail.subject}</h2>
+          <span class={["delivery-status", "state-#{@sent_detail.state}"]}>
+            {outbound_state_label(@sent_detail.state)}
+          </span>
+        </header>
+        <div class="sent-message">
+          <dl class="sent-envelope">
+            <div>
+              <dt>From</dt><dd>{@sent_detail.sender_address}</dd>
+            </div>
+            <div :for={{kind, recipients} <- grouped_recipients(@sent_detail.recipients)}>
+              <dt>{String.upcase(kind)}</dt>
+              <dd>{Enum.map_join(recipients, ", ", & &1.address)}</dd>
+            </div>
+          </dl>
+          <pre class="sent-body">{@sent_detail.text_body || ""}</pre>
+          <section class="delivery-timeline" aria-label="Delivery status">
+            <h3>Delivery status</h3>
+            <div :for={recipient <- @sent_detail.recipients} class="recipient-status">
+              <span>{recipient.address}</span>
+              <strong>{outbound_state_label(recipient.delivery_state)}</strong>
+            </div>
+            <ol>
+              <li :for={event <- @sent_detail.events}>
+                <time datetime={DateTime.to_iso8601(event.occurred_at)}>
+                  {format_time(event.occurred_at)}
+                </time>
+                <span>{outbound_event_label(event.event_type)}</span>
+              </li>
+            </ol>
+          </section>
+        </div>
+      </article>
+
+      <article
+        :if={@mailbox && @mail_view == :folder && @conversation}
+        class="mail-reader"
+        aria-label="Conversation"
+      >
         <header class="reader-header">
           <.link
             patch={
@@ -411,6 +953,24 @@ defmodule ManifoldWeb.MailLive.Index do
                 </time>
               </div>
               <div class="message-actions">
+                <.mail_action
+                  label="Reply"
+                  icon="reply"
+                  event="reply"
+                  entry_id={message.id}
+                />
+                <.mail_action
+                  label="Reply all"
+                  icon="reply-all"
+                  event="reply-all"
+                  entry_id={message.id}
+                />
+                <.mail_action
+                  label="Forward"
+                  icon="forward"
+                  event="forward"
+                  entry_id={message.id}
+                />
                 <.mail_action
                   label={if message.read, do: "Mark unread", else: "Mark read"}
                   icon={if message.read, do: "email-outline", else: "email-open-outline"}
@@ -487,9 +1047,22 @@ defmodule ManifoldWeb.MailLive.Index do
         </div>
       </article>
 
-      <aside :if={@mailbox && is_nil(@conversation)} class="reader-placeholder">
+      <aside
+        :if={
+          @mailbox &&
+            ((@mail_view == :folder && is_nil(@conversation)) ||
+               @mail_view in [:drafts, :sent])
+        }
+        class="reader-placeholder"
+      >
         <.dm_mdi name="email-open-outline" class="empty-icon" />
-        <p>Select a conversation to read it</p>
+        <p>
+          {case @mail_view do
+            :drafts -> "Select a draft to edit it"
+            :sent -> "Select a sent message"
+            _folder -> "Select a conversation to read it"
+          end}
+        </p>
       </aside>
     </section>
     """

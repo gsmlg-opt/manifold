@@ -2,7 +2,16 @@ defmodule Manifold.Mail.MailboxTest do
   use Manifold.DataCase, async: true
 
   alias Manifold.Mail
-  alias Manifold.Mail.Schema.{Attachment, Folder, MailboxEntry, Message, Thread}
+
+  alias Manifold.Mail.Schema.{
+    Attachment,
+    Folder,
+    MailboxEntry,
+    Message,
+    MessageAddress,
+    Thread
+  }
+
   alias Manifold.Repo
 
   test "paginates distinct conversations without a message-row cap" do
@@ -171,6 +180,58 @@ defmodule Manifold.Mail.MailboxTest do
 
     assert {:error, %{reason: :not_found}} =
              Mail.open_attachment(mailbox_id, "not-a-uuid")
+  end
+
+  test "reply source exposes ordered addressing and threading through the public context" do
+    mailbox_id = mailbox_fixture()
+    other_mailbox_id = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox_id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+
+    %{messages: [message]} =
+      thread_fixture(mailbox_id, inbox.id, "Reply source", ~U[2026-07-29 04:30:00Z], 1)
+
+    message
+    |> Message.changeset(%{
+      in_reply_to: "<parent@example.net>",
+      references: ["<root@example.net>", "<parent@example.net>"]
+    })
+    |> Repo.update!()
+
+    [
+      %{kind: "from", position: 0, display_name: "Sender", address: "sender@example.net"},
+      %{kind: "reply_to", position: 0, display_name: "Replies", address: "reply@example.net"},
+      %{kind: "to", position: 0, display_name: "Local", address: "inbox@example.test"},
+      %{kind: "to", position: 1, display_name: "Team", address: "team@example.net"},
+      %{kind: "cc", position: 0, display_name: "Observer", address: "observer@example.net"}
+    ]
+    |> Enum.each(fn attrs ->
+      %MessageAddress{}
+      |> MessageAddress.changeset(
+        attrs
+        |> Map.put(:message_id, message.id)
+        |> Map.put(:canonical_address, String.downcase(attrs.address, :ascii))
+      )
+      |> Repo.insert!()
+    end)
+
+    assert {:ok, source} = Mail.get_reply_source(mailbox_id, message.id)
+    assert source.message_id == message.id
+    assert source.rfc_message_id == message.rfc_message_id
+    assert source.references == ["<root@example.net>", "<parent@example.net>"]
+    assert source.subject == "Reply source 1"
+    assert source.sender == %{display_name: "Sender", address: "sender@example.net"}
+    assert source.reply_to == [%{display_name: "Replies", address: "reply@example.net"}]
+
+    assert Enum.map(source.to, & &1.address) == [
+             "inbox@example.test",
+             "team@example.net"
+           ]
+
+    assert Enum.map(source.cc, & &1.address) == ["observer@example.net"]
+
+    assert {:error, %{reason: :not_found}} =
+             Mail.get_reply_source(other_mailbox_id, message.id)
   end
 
   test "restore returns a trashed entry to its custom folder exactly once" do
