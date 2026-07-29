@@ -4,8 +4,8 @@ let
   root = builtins.toString ./.;
 in
 {
-  env.DATABASE_URL = "postgres://manifold_dev:manifold_dev@localhost/manifold_dev";
-  env.TEST_DATABASE_URL = "postgres://manifold_dev:manifold_dev@localhost/manifold_test";
+  env.DATABASE_URL = "postgres://manifold_dev:manifold_dev@localhost/manifold_dev?socket_dir=${config.env.DEVENV_RUNTIME}/postgres";
+  env.TEST_DATABASE_URL = "postgres://manifold_dev:manifold_dev@localhost/manifold_test?socket_dir=${config.env.DEVENV_RUNTIME}/postgres";
   env.PGHOST = "${config.env.DEVENV_RUNTIME}/postgres";
   env.POSTGRES_SOCKET_DIR = "${config.env.DEVENV_RUNTIME}/postgres";
 
@@ -33,6 +33,9 @@ in
   languages.elixir.enable = true;
   languages.elixir.package = pkgs.beam28Packages.elixir;
 
+  languages.javascript.enable = true;
+  languages.javascript.package = pkgs.nodejs_24;
+
   services.postgres = {
     enable = true;
     package = pkgs.postgresql_16;
@@ -49,6 +52,15 @@ in
         pass = "manifold_dev";
       }
     ];
+  };
+
+  processes.manifold = {
+    exec = "mix manifold.run";
+    after = [ "devenv:processes:postgres" ];
+    ready.http.get = {
+      port = 4290;
+      path = "/";
+    };
   };
 
   scripts.manifold-setup.exec = ''

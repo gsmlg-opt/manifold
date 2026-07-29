@@ -66,6 +66,12 @@ jobs:
       - name: Fetch dependencies
         run: mix deps.get
 
+      - name: Install frontend dependencies
+        run: mix npm.ci
+
+      - name: Build frontend assets
+        run: mix assets.deploy
+
       - name: Create test database
         run: psql "$DATABASE_URL" -c 'CREATE DATABASE manifold_test;' || true
 

@@ -1,6 +1,8 @@
 # Manifold
 
-Manifold is an Elixir-native inbound mail platform. It receives SMTP mail for locally hosted domains, validates recipients during the SMTP transaction, writes accepted raw messages to a durable local spool, commits acceptance metadata to PostgreSQL, archives raw `.eml` files asynchronously with Oban, and exposes an operational Phoenix LiveView interface.
+Manifold is a self-hosted Phoenix webmail application backed by an Elixir-native
+mail platform. It is designed to replace a desktop email client for locally
+hosted mailboxes while preserving durable SMTP acceptance and raw message data.
 
 ## Milestone 0-1
 
@@ -8,11 +10,11 @@ This repository currently implements the first vertical slice:
 
 - Phoenix umbrella with `manifold_core`, `manifold_data`, `manifold_accounts`, `manifold_storage`, `manifold_ingest`, `manifold_smtp`, and `manifold_web`.
 - PostgreSQL/Ecto migrations and Oban jobs.
-- Domain, mailbox, alias, alias target, owner auth, and recipient resolution.
+- Domain, mailbox, alias, alias target, and recipient resolution.
 - `gen_smtp` development listener on port `2525`.
 - Durable spool bundles under `tmp/`, `ready/`, `failed/`, and `quarantine/`.
 - Local filesystem raw-message store.
-- Minimal authenticated LiveViews for domains, mailboxes, aliases, inbound deliveries, and delivery detail.
+- Minimal local-instance LiveViews for domains, mailboxes, aliases, inbound deliveries, and delivery detail.
 
 ## Out Of Scope
 
@@ -28,21 +30,26 @@ Enter the reproducible shell:
 devenv shell
 ```
 
-Set up dependencies, PostgreSQL, migrations, seed owner, and sample mailbox:
+On first setup, start PostgreSQL in one terminal:
 
 ```sh
-mix setup
+devenv processes start postgres
+```
+
+Then set up dependencies, migrations, and a sample mailbox from another terminal:
+
+```sh
+devenv shell -- mix setup
 ```
 
 Frontend assets use Duskmoon Bundler and `duskmoon_npm`; `mix setup` runs
 `mix npm.install`, and production assets are built with `MIX_ENV=prod mix assets.deploy`.
 
-The development seed creates:
+The development seed creates the `example.test` domain and `inbox@example.test` mailbox.
 
-- Owner: `owner@example.test`
-- Password: `manifold-dev-password`
-- Domain: `example.test`
-- Mailbox: `inbox@example.test`
+The web interface has no application-level authentication. Anyone who can reach
+the Phoenix endpoint has full access to the local Manifold instance, so network
+access must be restricted by the host or a trusted reverse proxy.
 
 Run migrations only:
 
@@ -53,7 +60,7 @@ mix ecto.migrate
 Start Phoenix and the SMTP listener:
 
 ```sh
-mix manifold.run
+devenv processes start
 ```
 
 Open Phoenix at `http://localhost:4290`. Submit SMTP mail to `127.0.0.1:2525`.

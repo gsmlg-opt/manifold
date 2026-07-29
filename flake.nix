@@ -1,5 +1,5 @@
 {
-  description = "Manifold inbound mail platform development environment";
+  description = "Manifold webmail development environment";
 
   inputs = {
     nixpkgs.url = "github:cachix/devenv-nixpkgs/rolling";
