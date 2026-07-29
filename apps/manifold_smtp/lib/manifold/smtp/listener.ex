@@ -29,6 +29,8 @@ defmodule Manifold.SMTP.Listener do
          max_message_bytes: config(:max_message_bytes),
          max_recipients: config(:max_recipients),
          admission: Manifold.SMTP.Admission,
+         resolver: config(:resolver),
+         ingest: config(:ingest),
          tls_enabled?: match?({:enabled, _, _}, tls)
        ]}
     ]

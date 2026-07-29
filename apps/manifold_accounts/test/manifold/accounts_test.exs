@@ -2,6 +2,7 @@ defmodule Manifold.AccountsTest do
   use Manifold.DataCase, async: true
 
   alias Manifold.Accounts
+  alias Manifold.Accounts.RecipientSnapshot
   alias Manifold.Core.Domain
 
   test "domain normalization" do
@@ -85,6 +86,57 @@ defmodule Manifold.AccountsTest do
       end
 
     assert [first_result, first_result, first_result] = results
+  end
+
+  test "recipient snapshot is deterministic and exposes only active routes" do
+    %{domain: domain, mailbox: mailbox} = mailbox_fixture()
+    {:ok, disabled} = Accounts.create_mailbox(domain, %{local_part: "disabled", active: false})
+    {:ok, alias} = Accounts.create_alias(domain, %{local_part: "team"})
+    {:ok, _target} = Accounts.add_alias_target(alias, mailbox)
+    {:ok, _disabled_target} = Accounts.add_alias_target(alias, disabled)
+
+    now = ~U[2026-07-29 12:00:00Z]
+
+    assert {:ok, %RecipientSnapshot{} = first} = Accounts.recipient_snapshot(now: now)
+    assert {:ok, %RecipientSnapshot{} = second} = Accounts.recipient_snapshot(now: now)
+
+    assert first == second
+    assert first.schema_version == 1
+    assert first.revision > 0
+    assert first.generated_at == now
+    assert first.expires_at == ~U[2026-07-30 12:00:00Z]
+    assert first.digest =~ ~r/^[0-9a-f]{64}$/
+
+    assert Enum.any?(first.domains, &(&1.name == domain.normalized_domain))
+
+    assert Enum.any?(first.routes, fn route ->
+             route.canonical_address == "inbox@#{domain.normalized_domain}" and
+               route.mailbox_ids == [mailbox.id] and route.plus_addressing_enabled
+           end)
+
+    assert Enum.any?(first.routes, fn route ->
+             route.canonical_address == "team@#{domain.normalized_domain}" and
+               route.mailbox_ids == [mailbox.id] and route.plus_addressing_enabled
+           end)
+
+    refute Enum.any?(
+             first.routes,
+             &(&1.canonical_address == "disabled@#{domain.normalized_domain}")
+           )
+  end
+
+  test "recipient snapshot revision advances only when active routes change" do
+    %{domain: domain} = mailbox_fixture()
+
+    assert {:ok, first} = Accounts.recipient_snapshot()
+    assert {:ok, unchanged} = Accounts.recipient_snapshot()
+    assert first.revision == unchanged.revision
+
+    {:ok, _mailbox} = Accounts.create_mailbox(domain, %{local_part: "new-route"})
+
+    assert {:ok, changed} = Accounts.recipient_snapshot()
+    assert changed.revision == first.revision + 1
+    refute changed.digest == first.digest
   end
 
   defp mailbox_fixture do

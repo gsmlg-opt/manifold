@@ -274,6 +274,19 @@ code {
   outline: none;
 }
 
+.command-button:disabled {
+  border-color: #cfd5dc;
+  background: #f4f6f8;
+  color: #7b8490;
+  cursor: not-allowed;
+}
+
+.command-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .webmail {
   display: grid;
   grid-template-columns: 230px 390px minmax(420px, 1fr);

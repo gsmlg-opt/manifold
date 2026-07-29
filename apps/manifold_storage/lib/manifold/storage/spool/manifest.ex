@@ -35,6 +35,11 @@ defmodule Manifold.Storage.Spool.Manifest do
 
   @spec build(map(), binary()) :: t()
   def build(attrs, raw) do
+    build_from_stat(attrs, byte_size(raw), sha256(raw))
+  end
+
+  @spec build_from_stat(map(), non_neg_integer(), String.t()) :: t()
+  def build_from_stat(attrs, raw_size, raw_sha256) do
     %__MODULE__{
       ingest_id: Map.fetch!(attrs, :ingest_id),
       received_at: Map.fetch!(attrs, :received_at),
@@ -43,8 +48,8 @@ defmodule Manifold.Storage.Spool.Manifest do
       envelope_from: Map.get(attrs, :envelope_from),
       original_recipients: Map.get(attrs, :original_recipients, []),
       routes: attrs |> Map.get(:routes, []) |> Enum.map(&route_to_map/1),
-      raw_size: byte_size(raw),
-      raw_sha256: sha256(raw)
+      raw_size: raw_size,
+      raw_sha256: raw_sha256
     }
   end
 

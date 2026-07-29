@@ -1,5 +1,8 @@
 import Config
 
+release_name = System.get_env("RELEASE_NAME", "manifold")
+edge_release? = release_name == "manifold_edge" or System.get_env("MANIFOLD_ROLE") == "edge"
+
 unless config_env() == :test do
   if database_url = System.get_env("DATABASE_URL") do
     repo_config = [
@@ -21,7 +24,10 @@ end
 config :manifold_smtp,
   hostname: System.get_env("MANIFOLD_SMTP_HOSTNAME", "localhost"),
   bind: System.get_env("MANIFOLD_SMTP_BIND", "127.0.0.1"),
-  port: String.to_integer(System.get_env("MANIFOLD_SMTP_PORT", "2525")),
+  port:
+    String.to_integer(
+      System.get_env("MANIFOLD_SMTP_PORT", if(edge_release?, do: "25", else: "2525"))
+    ),
   max_message_bytes:
     String.to_integer(System.get_env("MANIFOLD_SMTP_MAX_MESSAGE_BYTES", "26214400")),
   max_recipients: String.to_integer(System.get_env("MANIFOLD_SMTP_MAX_RECIPIENTS", "100")),
@@ -41,6 +47,87 @@ config :manifold_smtp,
   ],
   tls_certfile: System.get_env("MANIFOLD_SMTP_TLS_CERTFILE"),
   tls_keyfile: System.get_env("MANIFOLD_SMTP_TLS_KEYFILE")
+
+if edge_release? do
+  edge_database_url =
+    System.get_env("MANIFOLD_EDGE_DATABASE_URL") ||
+      System.get_env("DATABASE_URL") ||
+      raise "MANIFOLD_EDGE_DATABASE_URL or DATABASE_URL is required for manifold_edge"
+
+  edge_api_url =
+    System.get_env("MANIFOLD_EDGE_API_URL") ||
+      raise "MANIFOLD_EDGE_API_URL is required and must use https"
+
+  edge_uri = URI.parse(edge_api_url)
+
+  if edge_uri.scheme != "https" or is_nil(edge_uri.authority) do
+    raise "MANIFOLD_EDGE_API_URL must be an absolute https URL"
+  end
+
+  edge_secret =
+    System.get_env("MANIFOLD_EDGE_SHARED_SECRET") ||
+      raise "MANIFOLD_EDGE_SHARED_SECRET is required for manifold_edge"
+
+  if byte_size(edge_secret) < 32 do
+    raise "MANIFOLD_EDGE_SHARED_SECRET must contain at least 32 bytes"
+  end
+
+  edge_installation_id =
+    System.get_env("MANIFOLD_EDGE_INSTALLATION_ID") ||
+      raise "MANIFOLD_EDGE_INSTALLATION_ID is required for manifold_edge"
+
+  config :manifold_edge, Manifold.Edge.Repo,
+    url: edge_database_url,
+    pool_size: String.to_integer(System.get_env("POOL_SIZE", "10"))
+
+  config :manifold_edge,
+    api_server: true,
+    reconciler_enabled: true,
+    api_bind: System.get_env("MANIFOLD_EDGE_API_BIND", "127.0.0.1"),
+    api_port: String.to_integer(System.get_env("MANIFOLD_EDGE_API_PORT", "4291")),
+    api: [
+      installation_id: edge_installation_id,
+      authority: edge_uri.authority,
+      shared_secret: edge_secret,
+      max_clock_skew_seconds:
+        String.to_integer(System.get_env("MANIFOLD_EDGE_MAX_CLOCK_SKEW_SECONDS", "300")),
+      max_request_bytes:
+        String.to_integer(System.get_env("MANIFOLD_EDGE_MAX_REQUEST_BYTES", "2097152"))
+    ]
+
+  config :manifold_smtp,
+    resolver: Manifold.Edge.SMTP,
+    ingest: Manifold.Edge.SMTP
+end
+
+if not edge_release? do
+  if edge_api_url = System.get_env("MANIFOLD_EDGE_API_URL") do
+    edge_uri = URI.parse(edge_api_url)
+
+    if edge_uri.scheme != "https" or is_nil(edge_uri.authority) do
+      raise "MANIFOLD_EDGE_API_URL must be an absolute https URL"
+    end
+
+    local_edge_secret =
+      System.get_env("MANIFOLD_EDGE_SHARED_SECRET") ||
+        raise("MANIFOLD_EDGE_SHARED_SECRET is required when cloud ingress is configured")
+
+    if byte_size(local_edge_secret) < 32 do
+      raise "MANIFOLD_EDGE_SHARED_SECRET must contain at least 32 bytes"
+    end
+
+    config :manifold_cloud,
+      source: [
+        source_id: System.get_env("MANIFOLD_EDGE_SOURCE_ID", "default-edge"),
+        base_url: String.trim_trailing(edge_api_url, "/"),
+        authority: edge_uri.authority,
+        installation_id:
+          System.get_env("MANIFOLD_EDGE_INSTALLATION_ID") ||
+            raise("MANIFOLD_EDGE_INSTALLATION_ID is required when cloud ingress is configured"),
+        secret: local_edge_secret
+      ]
+  end
+end
 
 raw_store_backend =
   case System.get_env("MANIFOLD_RAW_STORE_BACKEND", "local") do
@@ -90,7 +177,7 @@ config :manifold_outbound,
   provider_adapter: Manifold.Outbound.Provider.Resend,
   provider_config: resend_config
 
-if config_env() == :prod do
+if config_env() == :prod and not edge_release? do
   secret_key_base =
     System.get_env("SECRET_KEY_BASE") ||
       raise "SECRET_KEY_BASE is missing. Generate one with mix phx.gen.secret."

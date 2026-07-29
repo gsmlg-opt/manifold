@@ -69,8 +69,17 @@ defmodule Manifold.Umbrella.MixProject do
           manifold_security: :permanent,
           manifold_outbound: :permanent,
           manifold_ingest: :permanent,
+          manifold_cloud: :permanent,
           manifold_smtp: :permanent,
           manifold_web: :permanent
+        ]
+      ],
+      manifold_edge: [
+        applications: [
+          manifold_core: :permanent,
+          manifold_storage: :permanent,
+          manifold_edge: :permanent,
+          manifold_smtp: :permanent
         ]
       ]
     ]

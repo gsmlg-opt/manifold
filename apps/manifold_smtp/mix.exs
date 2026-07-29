@@ -23,8 +23,8 @@ defmodule Manifold.SMTP.MixProject do
   defp deps do
     [
       {:manifold_core, in_umbrella: true},
-      {:manifold_accounts, in_umbrella: true},
-      {:manifold_ingest, in_umbrella: true},
+      {:manifold_accounts, in_umbrella: true, only: :test, runtime: false},
+      {:manifold_ingest, in_umbrella: true, only: :test, runtime: false},
       {:gen_smtp, "~> 1.3"},
       {:telemetry, "~> 1.3"}
     ]

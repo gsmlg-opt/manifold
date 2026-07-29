@@ -8,7 +8,17 @@ defmodule Manifold.SMTP.Session do
   alias Manifold.Core.Error
   alias Manifold.SMTP.Admission
 
-  defstruct [:peer_ip, :helo, :mail_from, :admission, routes: [], recipients: [], options: []]
+  defstruct [
+    :peer_ip,
+    :helo,
+    :mail_from,
+    :admission,
+    :resolver_context,
+    resolver_started?: false,
+    routes: [],
+    recipients: [],
+    options: []
+  ]
 
   @impl true
   def init(_hostname, _session_count, peername, opts) do
@@ -47,10 +57,11 @@ defmodule Manifold.SMTP.Session do
 
     case allow_transaction(state.admission, state.peer_ip) do
       :ok ->
-        case Manifold.Core.Address.parse(to_string(from), allow_null_sender: true) do
-          {:ok, :null_sender} -> {:ok, %{state | mail_from: ""}}
-          {:ok, address} -> {:ok, %{state | mail_from: address.original}}
-          {:error, _error} -> {:error, "501 5.1.3 invalid sender address syntax", state}
+        with {:ok, mail_from} <- parse_sender(from) do
+          {:ok, %{state | mail_from: mail_from}}
+        else
+          {:error, :invalid_sender} ->
+            {:error, "501 5.1.3 invalid sender address syntax", state}
         end
 
       {:error, _reason} ->
@@ -125,9 +136,18 @@ defmodule Manifold.SMTP.Session do
   end
 
   defp resolve_recipient(to, state) do
-    resolver = Keyword.get(state.options, :resolver, Manifold.Accounts)
+    resolver = Keyword.fetch!(state.options, :resolver)
 
-    case resolver.resolve_recipient(to_string(to)) do
+    with {:ok, state} <- ensure_resolver_transaction(state) do
+      resolve_with_context(resolver, to, state)
+    else
+      {:error, _reason} ->
+        {:error, "451 4.3.0 temporary recipient lookup failure", state}
+    end
+  end
+
+  defp resolve_with_context(resolver, to, state) do
+    case call_resolver(resolver, to_string(to), state.resolver_context) do
       {:ok, route} ->
         {:ok,
          %{
@@ -151,7 +171,7 @@ defmodule Manifold.SMTP.Session do
   end
 
   defp accept_data(data, state) do
-    ingest = Keyword.get(state.options, :ingest, Manifold.Ingest)
+    ingest = Keyword.fetch!(state.options, :ingest)
 
     attrs = %{
       peer_ip: state.peer_ip,
@@ -195,7 +215,51 @@ defmodule Manifold.SMTP.Session do
     )
   end
 
-  defp reset_transaction(state), do: %{state | mail_from: nil, routes: [], recipients: []}
+  defp reset_transaction(state) do
+    %{
+      state
+      | mail_from: nil,
+        resolver_context: nil,
+        resolver_started?: false,
+        routes: [],
+        recipients: []
+    }
+  end
+
+  defp parse_sender(from) do
+    case Manifold.Core.Address.parse(to_string(from), allow_null_sender: true) do
+      {:ok, :null_sender} -> {:ok, ""}
+      {:ok, address} -> {:ok, address.original}
+      {:error, _error} -> {:error, :invalid_sender}
+    end
+  end
+
+  defp ensure_resolver_transaction(%{resolver_started?: true} = state), do: {:ok, state}
+
+  defp ensure_resolver_transaction(state) do
+    resolver = Keyword.fetch!(state.options, :resolver)
+
+    if Code.ensure_loaded?(resolver) and function_exported?(resolver, :begin_transaction, 0) do
+      case resolver.begin_transaction() do
+        {:ok, context} -> {:ok, %{state | resolver_context: context, resolver_started?: true}}
+        {:error, _reason} = failure -> failure
+      end
+    else
+      {:ok, %{state | resolver_started?: true}}
+    end
+  end
+
+  defp call_resolver(resolver, address, context) do
+    contextual_resolver? =
+      Code.ensure_loaded?(resolver) and function_exported?(resolver, :begin_transaction, 0) and
+        function_exported?(resolver, :resolve_recipient, 2)
+
+    if contextual_resolver? do
+      resolver.resolve_recipient(address, context)
+    else
+      resolver.resolve_recipient(address)
+    end
+  end
 
   defp max_message_bytes(state), do: Keyword.fetch!(state.options, :max_message_bytes)
 

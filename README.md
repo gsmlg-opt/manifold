@@ -4,7 +4,7 @@ Manifold is a self-hosted Phoenix webmail application backed by an Elixir-native
 mail platform. It is designed to replace a desktop email client for locally
 hosted mailboxes while preserving durable SMTP acceptance and raw message data.
 
-## Milestones 0-4
+## Milestones 0-5
 
 This repository currently implements durable inbound delivery, mailbox
 projection, managed outbound submission, and fail-closed inbound policy:
@@ -12,6 +12,7 @@ projection, managed outbound submission, and fail-closed inbound policy:
 - Phoenix umbrella with `manifold_core`, `manifold_data`, `manifold_accounts`,
   `manifold_storage`, `manifold_ingest`, `manifold_smtp`, `manifold_mail`,
   `manifold_security`, `manifold_outbound`, and `manifold_web`.
+- Optional `manifold_edge` release and local `manifold_cloud` pull client.
 - PostgreSQL/Ecto migrations and Oban jobs.
 - Domain, mailbox, alias, alias target, and recipient resolution.
 - `gen_smtp` development listener on port `2525`.
@@ -41,14 +42,18 @@ projection, managed outbound submission, and fail-closed inbound policy:
 - Isolated sanitized HTML rendering and mailbox-scoped attachment downloads.
 - Operational LiveViews for domains, mailboxes, aliases, inbound deliveries, and
   delivery detail.
+- Versioned recipient-route snapshots, edge SMTP recipient rejection, signed
+  local-pull synchronization, streamed raw import, idempotent provenance, and
+  acknowledge-before-cleanup recovery.
 
 ## Out Of Scope
 
 The current milestones intentionally do not implement rich-text composition,
 outbound attachments, bundled DNS authentication engines, bundled spam or
 malware engines, IMAP, POP3, JMAP, Gmail sync, Microsoft Graph sync, or cloud
-relay. Production authentication and scanning engines plug into the Milestone 4
-adapter boundaries.
+provider hosting. Production authentication and scanning engines plug into the
+Milestone 4 adapter boundaries. The optional edge is ingress-only and never
+performs outbound MX delivery.
 
 Manifold never performs direct outbound Internet SMTP delivery. Milestone 3
 submits through the configured managed-provider HTTPS adapter.
@@ -117,6 +122,51 @@ SMTP abuse limits can be tuned with
 `MANIFOLD_SMTP_CONNECTION_RATE_WINDOW_MS`,
 `MANIFOLD_SMTP_TRANSACTION_RATE_LIMIT`, and
 `MANIFOLD_SMTP_TRANSACTION_RATE_WINDOW_MS`.
+
+## Optional Cloud Ingress
+
+Build both releases with:
+
+```sh
+MIX_ENV=prod mix assets.deploy
+MIX_ENV=prod mix release manifold
+MIX_ENV=prod mix release manifold_edge
+```
+
+The edge release requires:
+
+```text
+MANIFOLD_ROLE=edge
+MANIFOLD_EDGE_DATABASE_URL
+MANIFOLD_EDGE_API_URL=https://edge.example.com
+MANIFOLD_EDGE_INSTALLATION_ID
+MANIFOLD_EDGE_SHARED_SECRET
+MANIFOLD_SPOOL_DIR
+MANIFOLD_SMTP_HOSTNAME
+```
+
+Generate a shared secret with at least 32 random bytes, for example:
+
+```sh
+openssl rand -hex 32
+```
+
+Run edge-only migrations before startup:
+
+```sh
+bin/manifold_edge eval 'Manifold.Edge.Release.migrate()'
+```
+
+The edge API binds to `127.0.0.1:4291` by default and must be published only
+through a trusted HTTPS reverse proxy matching `MANIFOLD_EDGE_API_URL`. Set
+`MANIFOLD_EDGE_API_BIND` only when the host firewall provides an equivalent
+boundary. SMTP defaults to port `25` in the edge release.
+
+Configure the local release with the same `MANIFOLD_EDGE_API_URL`,
+`MANIFOLD_EDGE_INSTALLATION_ID`, and `MANIFOLD_EDGE_SHARED_SECRET`, plus a stable
+`MANIFOLD_EDGE_SOURCE_ID`. The local Oban queues publish routes every five
+minutes and pull pending deliveries every minute. Operators can queue either
+operation from `/cloud`.
 
 Run checks:
 

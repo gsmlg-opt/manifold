@@ -64,6 +64,41 @@
 24. SMTP session crashes release monitored per-peer connection leases. Admission
     counters are deliberately ephemeral and reset on SMTP application restart;
     no durable mail state depends on them.
+25. Edge ready rename before the edge database commit returns no SMTP `250`.
+    Reconciliation retains the orphan and moves it to `failed/` only after the
+    configured retention interval.
+26. Edge database commit before the SMTP response may cause a legitimate sender
+    retry. Each SMTP transaction remains a distinct accepted edge delivery.
+27. Interrupted local raw transfer creates no local ready bundle, provenance
+    row, or edge acknowledgement. The Oban pull retries the same edge ID.
+28. Local ready rename before local acceptance leaves a deterministic ready
+    bundle. Retry loads and verifies that bundle before reattempting the atomic
+    local acceptance, without downloading another copy. The edge retains its
+    copy, and the ready bundle alone is never treated as logical acceptance.
+29. Local acceptance and edge provenance commit in one transaction. A crash
+    before acknowledgement is repaired by lookup of the existing receipt,
+    followed by an idempotent acknowledgement.
+30. Edge acknowledgement commit before spool cleanup leaves an acknowledged
+    tombstone and bundle. Edge reconciliation verifies size and SHA-256 before
+    removing the remaining bundle.
+31. Snapshot installation failure before activation leaves the previous
+    snapshot active. Missing or expired snapshots cause temporary SMTP
+    rejection; stale or conflicting revisions are never activated.
+32. A permanent local integrity or provenance failure is reported through the
+    signed edge API. The edge marks that delivery failed, retains its raw bundle
+    for operator recovery, and later pending deliveries continue to synchronize.
+33. A transient filesystem status error does not change a ready edge delivery
+    to failed. A truly missing bundle records `missing_spool`; if its complete,
+    verified bundle reappears, reconciliation records `spool_restored` and
+    returns it to ready.
+34. A crash during acknowledged spool deletion occurs only after an atomic
+    rename into a deterministic cleanup tombstone. Reconciliation can remove
+    the remaining tombstone without requiring files already deleted.
+35. A request signed with a future timestamp retains its nonce until after the
+    complete signature validity window, so nonce pruning cannot reopen replay.
+36. Signed edge requests are bound to the received Host authority, never follow
+    redirects, and return authenticated metadata and raw content with
+    `Cache-Control: no-store, private`.
 
 A database row whose unarchived bundle is missing is marked `missing_spool` with an
 operational event. If that trusted ready bundle later reappears, reconciliation

@@ -2,7 +2,7 @@
 
 ## Product and Architecture Design
 
-- **Status:** Initial architecture for Release 0.1
+- **Status:** Implemented Release 0.1 core with Release 0.2 edge/connectors roadmap
 - **Product type:** Self-hosted webmail application and Elixir-native mail platform
 - **Primary deployment model:** Self-hosted, single installation, single OTP release
 - **Primary user interface:** Phoenix LiveView in a web browser
@@ -83,7 +83,10 @@ The first release will not implement:
 - Hard deduplication based only on `Message-ID` or body hashes.
 - Internationalized SMTP envelope addresses through `SMTPUTF8`.
 
-These are extension points, not architectural dead ends. In particular, a cloud ingress relay and external account connectors may be added after the local mailbox core is stable.
+These are extension points, not architectural dead ends. Milestones 0-4 form
+the Release 0.1 local mailbox core. Milestone 5 begins Release 0.2 by adding the
+optional cloud ingress edge; Milestone 6 adds external account connectors and
+only those client protocols justified by concrete interoperability needs.
 
 ---
 
@@ -237,6 +240,8 @@ manifold/
 │   ├── manifold_mail/
 │   ├── manifold_security/
 │   ├── manifold_outbound/
+│   ├── manifold_cloud/
+│   ├── manifold_edge/
 │   └── manifold_web/
 ├── config/
 ├── docs/
@@ -332,7 +337,8 @@ Owns the transport-to-mailbox acceptance workflow:
 - Durable message events.
 - Recovery and retry decisions.
 
-This application defines the acceptance boundary used by `manifold_smtp` and, later, by a cloud relay synchronization endpoint.
+This application defines the acceptance boundary used by local
+`manifold_smtp` and by `manifold_cloud` edge imports.
 
 ### 6.6 `manifold_smtp`
 
@@ -342,7 +348,7 @@ Owns the inbound SMTP edge:
 - Session callbacks.
 - SMTP command semantics.
 - Peer and HELO metadata.
-- Recipient validation through `manifold_accounts`.
+- Recipient validation through a configured resolver boundary.
 - Message-size and recipient-count limits.
 - STARTTLS configuration.
 - SMTP response mapping.
@@ -350,6 +356,9 @@ Owns the inbound SMTP edge:
 - Connection and abuse controls.
 
 The initial implementation may use `gen_smtp`, isolated behind a Manifold adapter so the protocol engine can be replaced later if streaming `DATA` is required.
+The transport application has no production dependency on Accounts or Ingest;
+the local release configures those modules, while the edge release configures
+`Manifold.Edge.SMTP`.
 
 ### 6.7 `manifold_mail`
 
@@ -416,6 +425,36 @@ Owns the Phoenix webmail application:
 - Provider webhook endpoints.
 - LiveView updates through PubSub.
 
+### 6.11 `manifold_cloud`
+
+Owns the local side of optional cloud ingress:
+
+- Complete recipient snapshot publication.
+- Signed HTTPS client operations.
+- Bounded pending-delivery pulls.
+- Streamed raw transfer into the local spool.
+- Idempotent edge provenance acceptance.
+- Permanent poison-delivery isolation without blocking later deliveries.
+- Durable Oban publication and pull jobs.
+- Acknowledgement only after local acceptance commits.
+
+It initiates every synchronization connection. The edge never calls into the
+local installation.
+
+### 6.12 `manifold_edge`
+
+Owns the standalone cloud ingress release:
+
+- Edge-only PostgreSQL Repo and migrations.
+- Installed recipient snapshots and replay nonces.
+- Edge SMTP resolver and durable acceptance rows.
+- Signed machine API for list, raw read, status, acknowledgement, and permanent
+  import-failure isolation.
+- Acknowledgement tombstones and spool reconciliation.
+
+It does not depend on local Accounts, Ingest, Mail, Security, Outbound, or Web
+applications and stores no long-term mailbox state.
+
 Phoenix LiveView using Phoenix Duskmoon components is the product frontend.
 Duskmoon Bundler owns JavaScript, CSS, and Tailwind asset builds. A separate SPA
 or native desktop client is not required.
@@ -433,6 +472,7 @@ Tier 0:
 Tier 1:
   manifold_data
   manifold_storage
+  manifold_smtp
 
 Tier 2:
   manifold_accounts
@@ -446,15 +486,22 @@ Tier 4:
   manifold_ingest
 
 Tier 5:
-  manifold_smtp
+  manifold_cloud
+
+Tier 6:
   manifold_web
+
+Separate release boundary:
+  manifold_edge -> manifold_core + manifold_storage + manifold_smtp
 ```
 
 Concrete dependencies may be narrower than the tier diagram, but cycles are prohibited.
 
 Important rules:
 
-- `manifold_smtp` calls public APIs from `manifold_accounts` and `manifold_ingest`.
+- `manifold_smtp` calls configured resolver and acceptor behaviours; it has no
+  production dependency on Accounts, Ingest, or Edge.
+- `manifold_cloud` calls public APIs from Accounts and Ingest.
 - `manifold_web` calls public context APIs; it does not implement mail policy.
 - `manifold_accounts` does not depend on SMTP or Phoenix.
 - `manifold_mail` does not depend on the web presentation layer.
@@ -1281,9 +1328,10 @@ The system should resume Oban jobs and spool reconciliation after restart.
 
 ---
 
-## 21. Future Cloud Ingress Relay
+## 21. Optional Cloud Ingress Edge
 
-A future `manifold_edge` release can receive SMTP in a cloud environment and synchronize accepted mail to a local Manifold instance.
+The separate `manifold_edge` Release 0.2 deployment can receive SMTP in a cloud
+environment and synchronize accepted mail to a local Manifold instance.
 
 Recommended design:
 
@@ -1457,6 +1505,8 @@ scanner/classifier engines remain deployment integrations, not bundled network
 services.
 
 ### Milestone 5 — Cloud ingress edge
+
+Begins Release 0.2.
 
 - Separate edge release.
 - Recipient route synchronization.

@@ -15,6 +15,22 @@ defmodule Manifold.SMTPTest do
     end
   end
 
+  defmodule SnapshotResolver do
+    def begin_transaction, do: {:ok, %{revision: 17}}
+
+    def resolve_recipient(address, %{revision: revision}) do
+      {:ok,
+       %{
+         original_recipient: address,
+         canonical_recipient: String.downcase(address),
+         plus_tag: nil,
+         domain_id: "domain-1",
+         mailbox_ids: ["mailbox-1"],
+         snapshot_revision: revision
+       }}
+    end
+  end
+
   defmodule AcceptingResolver do
     def resolve_recipient(address) do
       {:ok,
@@ -143,6 +159,27 @@ defmodule Manifold.SMTPTest do
     send_line(socket, "RCPT TO:<inbox@example.test>\r\n")
 
     assert ["451 4.3.0" <> _] = recv_response(socket)
+  end
+
+  test "pins one resolver context for every recipient in an SMTP transaction" do
+    state = %Session{
+      peer_ip: "127.0.0.1",
+      options: [
+        max_message_bytes: 100,
+        max_recipients: 10,
+        resolver: SnapshotResolver,
+        ingest: FailingIngest
+      ]
+    }
+
+    assert {:ok, %Session{resolver_context: nil} = state} =
+             Session.handle_MAIL("sender@example.test", state)
+
+    assert {:ok, state} = Session.handle_RCPT("first@example.test", state)
+    assert state.resolver_context == %{revision: 17}
+    assert {:ok, state} = Session.handle_RCPT("second@example.test", state)
+
+    assert [%{snapshot_revision: 17}, %{snapshot_revision: 17}] = state.routes
   end
 
   test "acceptance failure never returns 250" do
@@ -490,6 +527,26 @@ defmodule Manifold.SMTPTest do
                   _
                 ]}
            } = Listener.child_spec()
+  end
+
+  test "listener passes configured transport backends to each session" do
+    with_smtp_config(resolver: TemporaryResolver, ingest: FailingIngest)
+
+    assert %{
+             start:
+               {:ranch_embedded_sup, :start_link,
+                [
+                  :manifold_smtp_listener,
+                  :ranch_tcp,
+                  _ranch_options,
+                  :gen_smtp_server_session,
+                  {Session, session_options}
+                ]}
+           } = Listener.child_spec()
+
+    callback_options = Keyword.fetch!(session_options, :callbackoptions)
+    assert callback_options[:resolver] == TemporaryResolver
+    assert callback_options[:ingest] == FailingIngest
   end
 
   test "listener fails fast when only one TLS file is configured" do

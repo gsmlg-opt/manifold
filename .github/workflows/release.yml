@@ -80,13 +80,17 @@ jobs:
           SECRET_KEY_BASE: release-build-secret-key-base-release-build-secret-key-base-not-runtime
         run: |
           mix release manifold --overwrite
+          mix release manifold_edge --overwrite
           tar -C _build/prod/rel -czf manifold-${RELEASE_VERSION}.tar.gz manifold
+          tar -C _build/prod/rel -czf manifold-edge-${RELEASE_VERSION}.tar.gz manifold_edge
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
           name: manifold-${{ inputs.version }}
-          path: manifold-${{ inputs.version }}.tar.gz
+          path: |
+            manifold-${{ inputs.version }}.tar.gz
+            manifold-edge-${{ inputs.version }}.tar.gz
           if-no-files-found: error
 
       - name: Commit version bump
@@ -109,4 +113,5 @@ jobs:
           gh release create "v${RELEASE_VERSION}" \
             --generate-notes \
             --title "v${RELEASE_VERSION}" \
-            manifold-${RELEASE_VERSION}.tar.gz
+            manifold-${RELEASE_VERSION}.tar.gz \
+            manifold-edge-${RELEASE_VERSION}.tar.gz

@@ -5,9 +5,11 @@ defmodule Manifold.Accounts do
 
   import Ecto.Query
 
-  alias Manifold.Accounts.{Route, SenderIdentity}
-  alias Manifold.Accounts.Schema.{Alias, AliasTarget, Domain, Mailbox}
-  alias Manifold.Core.{Address, Error}
+  alias Manifold.Accounts.{RecipientSnapshot, Route, SenderIdentity}
+  alias Manifold.Accounts.RecipientSnapshot.Domain, as: SnapshotDomain
+  alias Manifold.Accounts.RecipientSnapshot.Route, as: SnapshotRoute
+  alias Manifold.Accounts.Schema.{Alias, AliasTarget, Domain, Mailbox, RouteRevision}
+  alias Manifold.Core.{Address, Error, RouteSnapshotDigest}
   alias Manifold.Repo
 
   @type create_result(schema) :: {:ok, schema} | {:error, Ecto.Changeset.t()}
@@ -32,7 +34,7 @@ defmodule Manifold.Accounts do
   def create_domain(attrs) do
     %Domain{}
     |> Domain.changeset(attrs)
-    |> Repo.insert()
+    |> insert_routing_resource()
   end
 
   @spec list_mailboxes() :: [Mailbox.t()]
@@ -105,7 +107,7 @@ defmodule Manifold.Accounts do
 
     %Mailbox{}
     |> Mailbox.changeset(attrs)
-    |> Repo.insert()
+    |> insert_routing_resource()
   end
 
   @spec list_aliases() :: [Alias.t()]
@@ -131,7 +133,7 @@ defmodule Manifold.Accounts do
 
     %Alias{}
     |> Alias.changeset(attrs)
-    |> Repo.insert()
+    |> insert_routing_resource()
   end
 
   @spec add_alias_target(Alias.t(), Mailbox.t(), map()) :: create_result(AliasTarget.t())
@@ -143,7 +145,44 @@ defmodule Manifold.Accounts do
 
     %AliasTarget{}
     |> AliasTarget.changeset(attrs)
-    |> Repo.insert()
+    |> insert_routing_resource()
+  end
+
+  @doc """
+  Returns a deterministic, versioned projection of active recipient routes.
+  """
+  @spec recipient_snapshot(keyword()) ::
+          {:ok, RecipientSnapshot.t()} | {:error, Error.t()}
+  def recipient_snapshot(opts \\ []) do
+    now = Keyword.get(opts, :now, DateTime.utc_now())
+    ttl_seconds = Keyword.get(opts, :ttl_seconds, 86_400)
+
+    Repo.transaction(
+      fn ->
+        revision = Repo.one!(from(r in RouteRevision, select: r.revision))
+        domains = snapshot_domains()
+        routes = snapshot_routes()
+
+        %RecipientSnapshot{
+          schema_version: 1,
+          revision: revision,
+          generated_at: now,
+          expires_at: DateTime.add(now, ttl_seconds, :second),
+          digest: snapshot_digest(domains, routes),
+          domains: domains,
+          routes: routes
+        }
+      end,
+      isolation: :repeatable_read
+    )
+  rescue
+    DBConnection.ConnectionError ->
+      {:error,
+       Error.new(
+         :temporary,
+         :database_unavailable,
+         "recipient database is temporarily unavailable"
+       )}
   end
 
   @spec resolve_recipient(String.t(), Keyword.t()) :: {:ok, Route.t()} | {:error, Error.t()}
@@ -268,5 +307,130 @@ defmodule Manifold.Accounts do
      Error.new(:permanent, :unknown_recipient, "recipient is not configured", %{
        recipient: parsed.canonical
      })}
+  end
+
+  defp insert_routing_resource(changeset) do
+    Ecto.Multi.new()
+    |> Ecto.Multi.insert(:resource, changeset)
+    |> Ecto.Multi.update_all(
+      :route_revision,
+      RouteRevision,
+      inc: [revision: 1],
+      set: [updated_at: DateTime.utc_now()]
+    )
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{resource: resource}} -> {:ok, resource}
+      {:error, :resource, changeset, _changes} -> {:error, changeset}
+      {:error, operation, reason, _changes} -> {:error, {operation, reason}}
+    end
+  end
+
+  defp snapshot_domains do
+    Domain
+    |> where([domain], domain.active)
+    |> order_by([domain], asc: domain.normalized_domain, asc: domain.id)
+    |> select(
+      [domain],
+      {domain.id, domain.normalized_domain, domain.plus_addressing_enabled}
+    )
+    |> Repo.all()
+    |> Enum.map(fn {id, name, plus_addressing_enabled} ->
+      %SnapshotDomain{
+        id: id,
+        name: name,
+        plus_addressing_enabled: plus_addressing_enabled
+      }
+    end)
+  end
+
+  defp snapshot_routes do
+    mailbox_routes = snapshot_mailbox_routes()
+    mailbox_addresses = MapSet.new(mailbox_routes, & &1.canonical_address)
+
+    mailbox_routes ++
+      (snapshot_alias_routes()
+       |> Enum.reject(&MapSet.member?(mailbox_addresses, &1.canonical_address)))
+  end
+
+  defp snapshot_mailbox_routes do
+    Mailbox
+    |> join(:inner, [mailbox], domain in Domain, on: domain.id == mailbox.domain_id)
+    |> where([mailbox, domain], mailbox.active and domain.active)
+    |> order_by(
+      [mailbox, domain],
+      asc: domain.normalized_domain,
+      asc: mailbox.canonical_local_part,
+      asc: mailbox.id
+    )
+    |> select(
+      [mailbox, domain],
+      {
+        mailbox.canonical_local_part,
+        domain.normalized_domain,
+        domain.id,
+        mailbox.id,
+        domain.plus_addressing_enabled and mailbox.plus_addressing_enabled
+      }
+    )
+    |> Repo.all()
+    |> Enum.map(fn {local_part, domain, domain_id, mailbox_id, plus_enabled} ->
+      %SnapshotRoute{
+        canonical_address: local_part <> "@" <> domain,
+        domain_id: domain_id,
+        mailbox_ids: [mailbox_id],
+        plus_addressing_enabled: plus_enabled
+      }
+    end)
+  end
+
+  defp snapshot_alias_routes do
+    AliasTarget
+    |> join(:inner, [target], alias_schema in Alias, on: alias_schema.id == target.alias_id)
+    |> join(:inner, [target, alias_schema], mailbox in Mailbox,
+      on: mailbox.id == target.mailbox_id
+    )
+    |> join(:inner, [target, alias_schema, mailbox], domain in Domain,
+      on: domain.id == alias_schema.domain_id
+    )
+    |> where(
+      [target, alias_schema, mailbox, domain],
+      target.active and alias_schema.active and mailbox.active and domain.active
+    )
+    |> order_by(
+      [target, alias_schema, mailbox, domain],
+      asc: domain.normalized_domain,
+      asc: alias_schema.canonical_local_part,
+      asc: mailbox.id
+    )
+    |> select(
+      [target, alias_schema, mailbox, domain],
+      {
+        alias_schema.canonical_local_part,
+        domain.normalized_domain,
+        domain.id,
+        mailbox.id,
+        domain.plus_addressing_enabled and alias_schema.plus_addressing_enabled
+      }
+    )
+    |> Repo.all()
+    |> Enum.chunk_by(fn {local_part, domain, domain_id, _mailbox_id, plus_enabled} ->
+      {local_part, domain, domain_id, plus_enabled}
+    end)
+    |> Enum.map(fn rows ->
+      [{local_part, domain, domain_id, _mailbox_id, plus_enabled} | _rest] = rows
+
+      %SnapshotRoute{
+        canonical_address: local_part <> "@" <> domain,
+        domain_id: domain_id,
+        mailbox_ids: Enum.map(rows, &elem(&1, 3)),
+        plus_addressing_enabled: plus_enabled
+      }
+    end)
+  end
+
+  defp snapshot_digest(domains, routes) do
+    {:ok, digest} = RouteSnapshotDigest.compute(1, domains, routes)
+    digest
   end
 end

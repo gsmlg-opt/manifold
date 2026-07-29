@@ -5,7 +5,7 @@ defmodule Manifold.Storage.Spool do
 
   alias Manifold.Core.{Error, ID}
   alias Manifold.Storage.Filesystem
-  alias Manifold.Storage.Spool.{Bundle, Manifest}
+  alias Manifold.Storage.Spool.{Bundle, Manifest, StreamWriter}
 
   @required_dirs ~w(tmp ready failed quarantine)
 
@@ -18,6 +18,8 @@ defmodule Manifold.Storage.Spool do
           optional(:original_recipients) => [String.t()],
           optional(:routes) => [map()]
         }
+
+  @type stream_chunk :: binary() | {:ok, binary()} | {:error, term()}
 
   @spec write_bundle(binary(), write_attrs(), Keyword.t()) ::
           {:ok, Bundle.t()} | {:error, Error.t()}
@@ -41,6 +43,44 @@ defmodule Manifold.Storage.Spool do
       :telemetry.execute([:manifold, :spool, :write, :stop], %{raw_size: byte_size(raw)}, %{
         ingest_id: ingest_id
       })
+
+      {:ok, bundle}
+    end
+  end
+
+  @doc """
+  Writes a bounded enumerable of binary chunks into a durable spool bundle.
+
+  `:max_bytes` is required. Stream items may be binaries, `{:ok, binary}`, or
+  `{:error, reason}`. The latter stops the write and removes the partial bundle.
+  """
+  @spec write_bundle_from_stream(Enumerable.t(), write_attrs(), Keyword.t()) ::
+          {:ok, Bundle.t()} | {:error, Error.t()}
+  def write_bundle_from_stream(stream, attrs, opts \\ []) when is_map(attrs) do
+    root = Keyword.get(opts, :root, spool_root())
+    min_free_bytes = Keyword.get(opts, :min_free_bytes, configured_min_free_bytes())
+    ingest_id = Keyword.get(opts, :ingest_id, Map.get(attrs, :ingest_id, ID.generate()))
+    max_bytes = Keyword.get(opts, :max_bytes)
+
+    with :ok <- validate_ingest_id(ingest_id),
+         :ok <- validate_max_bytes(max_bytes),
+         :ok <- ensure_layout(root, opts),
+         :ok <- ensure_capacity(root, min_free_bytes, max_bytes, opts),
+         :ok <- maybe_fault(opts, :before_partial_create),
+         {:ok, bundle} <-
+           write_stream_partial_then_ready(
+             root,
+             ingest_id,
+             stream,
+             Map.put(attrs, :ingest_id, ingest_id),
+             max_bytes,
+             opts
+           ) do
+      :telemetry.execute(
+        [:manifold, :spool, :write, :stop],
+        %{raw_size: bundle.manifest.raw_size},
+        %{ingest_id: ingest_id}
+      )
 
       {:ok, bundle}
     end
@@ -140,6 +180,47 @@ defmodule Manifold.Storage.Spool do
     end
   end
 
+  @doc """
+  Atomically moves a ready bundle out of the delivery namespace before removal.
+
+  A cleanup interrupted after the rename leaves a deterministic tombstone in
+  `quarantine/` that a later call can remove without re-verifying deleted files.
+  """
+  @spec cleanup_ready_bundle(Path.t(), keyword()) :: :ok | {:error, term()}
+  def cleanup_ready_bundle(path, opts \\ []) do
+    ingest_id = Path.basename(path)
+    root = path |> Path.dirname() |> Path.dirname()
+    expected_path = Path.join([root, "ready", ingest_id])
+    tombstone_path = Path.join([root, "quarantine", "cleanup-" <> ingest_id])
+
+    with :ok <- validate_ingest_id(ingest_id),
+         true <- Path.expand(path) == Path.expand(expected_path) do
+      case File.stat(path) do
+        {:ok, %{type: :directory}} ->
+          with :ok <- remove_cleanup_tombstone(tombstone_path, opts),
+               :ok <- File.rename(path, tombstone_path),
+               :ok <- Filesystem.sync_directory(Path.join(root, "ready"), opts),
+               :ok <- Filesystem.sync_directory(Path.join(root, "quarantine"), opts),
+               :ok <- maybe_fault(opts, :after_cleanup_rename),
+               :ok <- remove_cleanup_tombstone(tombstone_path, opts) do
+            :ok
+          end
+
+        {:error, :enoent} ->
+          resume_cleanup_tombstone(root, tombstone_path, opts)
+
+        {:error, reason} ->
+          {:error, reason}
+
+        {:ok, _not_directory} ->
+          {:error, :enotdir}
+      end
+    else
+      false -> {:error, :invalid_ready_bundle_path}
+      {:error, _reason} = failure -> failure
+    end
+  end
+
   @spec classify_ready_orphan(Path.t(), non_neg_integer()) ::
           :orphan_retained | :orphan_expired | :invalid
   def classify_ready_orphan(bundle_path, retention_seconds) do
@@ -164,11 +245,45 @@ defmodule Manifold.Storage.Spool do
     ready_path = Path.join([root, "ready", ingest_id])
     manifest = Manifest.build(attrs, raw)
     raw_path = Path.join(tmp_path, "raw.eml")
-    manifest_path = Path.join(tmp_path, "manifest.json")
 
     with :ok <- Filesystem.ensure_private_directory(tmp_path, opts),
-         :ok <- write_synced(raw_path, raw, opts),
-         :ok <- write_synced(manifest_path, Jason.encode!(manifest), opts),
+         :ok <- write_synced(raw_path, raw, opts) do
+      finish_bundle(root, ingest_id, tmp_path, ready_path, manifest, opts)
+    else
+      {:error, %Error{} = error} ->
+        {:error, error}
+
+      {:error, reason} ->
+        {:error,
+         Error.new(:temporary, :spool_failed, "spool write failed", %{reason: inspect(reason)})}
+    end
+  end
+
+  defp write_stream_partial_then_ready(root, ingest_id, stream, attrs, max_bytes, opts) do
+    tmp_path = Path.join([root, "tmp", ingest_id <> ".partial"])
+    ready_path = Path.join([root, "ready", ingest_id])
+    raw_path = Path.join(tmp_path, "raw.eml")
+
+    with :ok <- Filesystem.ensure_private_directory(tmp_path, opts) do
+      case StreamWriter.write(raw_path, stream, max_bytes, opts) do
+        {:ok, %{raw_size: raw_size, raw_sha256: raw_sha256}} ->
+          manifest = Manifest.build_from_stat(attrs, raw_size, raw_sha256)
+          finish_bundle(root, ingest_id, tmp_path, ready_path, manifest, opts)
+
+        {:error, %Error{} = error} ->
+          remove_partial(tmp_path)
+          {:error, error}
+      end
+    else
+      {:error, reason} ->
+        {:error, spool_error(reason)}
+    end
+  end
+
+  defp finish_bundle(root, ingest_id, tmp_path, ready_path, manifest, opts) do
+    manifest_path = Path.join(tmp_path, "manifest.json")
+
+    with :ok <- write_synced(manifest_path, Jason.encode!(manifest), opts),
          :ok <- Filesystem.sync_directory(tmp_path, opts),
          :ok <- Filesystem.sync_directory(Path.join(root, "tmp"), opts),
          :ok <- maybe_fault(opts, :before_ready_rename),
@@ -185,13 +300,14 @@ defmodule Manifold.Storage.Spool do
          manifest: manifest
        }}
     else
-      {:error, %Error{} = error} ->
-        {:error, error}
-
-      {:error, reason} ->
-        {:error,
-         Error.new(:temporary, :spool_failed, "spool write failed", %{reason: inspect(reason)})}
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> {:error, spool_error(reason)}
     end
+  end
+
+  defp remove_partial(path) do
+    File.rm_rf(path)
+    :ok
   end
 
   defp write_synced(path, data, opts) do
@@ -269,12 +385,68 @@ defmodule Manifold.Storage.Spool do
   defp configured_min_free_bytes,
     do: Application.get_env(:manifold_storage, :spool_min_free_bytes, 0)
 
+  defp validate_max_bytes(max_bytes) when is_integer(max_bytes) and max_bytes >= 0, do: :ok
+
+  defp validate_max_bytes(_max_bytes) do
+    {:error, Error.new(:permanent, :spool_failed, "max_bytes must be a non-negative integer")}
+  end
+
   defp validate_ingest_id(ingest_id) do
     if ID.safe_path_id?(ingest_id) do
       :ok
     else
       {:error, Error.new(:permanent, :spool_failed, "invalid internal ingest id")}
     end
+  end
+
+  defp remove_cleanup_tombstone(path, opts) do
+    case File.stat(path) do
+      {:error, :enoent} ->
+        :ok
+
+      {:ok, _stat} ->
+        result =
+          opts
+          |> Keyword.get(:cleanup_remove_fun, &File.rm_rf/1)
+          |> then(& &1.(path))
+
+        case result do
+          {:ok, _removed} ->
+            Filesystem.sync_directory(Path.dirname(path), opts)
+
+          {:error, reason, _failed_path} ->
+            {:error, reason}
+
+          {:error, reason} ->
+            {:error, reason}
+
+          other ->
+            {:error, {:unexpected_cleanup_result, other}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp resume_cleanup_tombstone(root, path, opts) do
+    case File.stat(path) do
+      {:error, :enoent} ->
+        :ok
+
+      {:ok, _stat} ->
+        with :ok <- Filesystem.sync_directory(Path.join(root, "ready"), opts),
+             :ok <- Filesystem.sync_directory(Path.join(root, "quarantine"), opts) do
+          remove_cleanup_tombstone(path, opts)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp spool_error(reason) do
+    Error.new(:temporary, :spool_failed, "spool write failed", %{reason: inspect(reason)})
   end
 
   defp maybe_fault(opts, point) do

@@ -12,8 +12,15 @@ config :manifold_data, Manifold.Repo,
 
 config :manifold_data, Oban,
   repo: Manifold.Repo,
-  queues: [archive: 10, mail_parse: 2, security: 2, outbound: 5],
-  plugins: [{Oban.Plugins.Pruner, max_age: 86_400}]
+  queues: [archive: 10, mail_parse: 2, security: 2, outbound: 5, cloud_ingress: 2],
+  plugins: [
+    {Oban.Plugins.Pruner, max_age: 86_400},
+    {Oban.Plugins.Cron,
+     crontab: [
+       {"*/5 * * * *", Manifold.Cloud.Jobs.PublishRoutes},
+       {"* * * * *", Manifold.Cloud.Jobs.PullDeliveries}
+     ]}
+  ]
 
 config :manifold_storage,
   spool_dir: Path.expand("../priv/spool/#{config_env()}", __DIR__),
@@ -56,6 +63,8 @@ config :manifold_smtp,
   port: 2525,
   max_message_bytes: 25 * 1024 * 1024,
   max_recipients: 100,
+  resolver: Manifold.Accounts,
+  ingest: Manifold.Ingest,
   max_connections: 16,
   acceptors: 4,
   admission: [

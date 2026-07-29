@@ -8,8 +8,16 @@ defmodule Manifold.Ingest do
   alias Ecto.Multi
   alias Manifold.Accounts
   alias Manifold.Core.{DeliveryState, Error}
+  alias Manifold.Ingest.AcceptanceReceipt
   alias Manifold.Ingest.Jobs.{ArchiveRawEmail, EvaluateInboundSecurity, ProjectInboundMail}
-  alias Manifold.Ingest.Schema.{DeliveryRecipient, InboundDelivery, MessageEvent}
+
+  alias Manifold.Ingest.Schema.{
+    CloudIngressIdentity,
+    DeliveryRecipient,
+    InboundDelivery,
+    MessageEvent
+  }
+
   alias Manifold.Mail
   alias Manifold.Mail.InboundSource
   alias Manifold.Ingest.View.DeliveryDetail
@@ -20,6 +28,7 @@ defmodule Manifold.Ingest do
   alias Manifold.Storage.Spool.Bundle
 
   @type accept_result :: {:ok, InboundDelivery.t()} | {:error, Error.t()}
+  @type edge_accept_result :: {:ok, AcceptanceReceipt.t()} | {:error, Error.t()}
 
   @spec accept_transport(binary(), map(), [map() | struct()], Keyword.t()) :: accept_result()
   def accept_transport(raw, attrs, frozen_routes, opts \\ []) when is_binary(raw) do
@@ -54,57 +63,148 @@ defmodule Manifold.Ingest do
        Error.new(:temporary, :database_unavailable, "database is temporarily unavailable")}
   end
 
-  defp persist_acceptance(bundle, routes, opts) do
-    now = DateTime.utc_now()
-    recipient_rows = build_recipient_rows(routes, now)
+  @doc """
+  Atomically accepts an edge delivery and records its external identity.
 
+  Repeating an accepted source and external delivery ID returns the original
+  receipt when the raw content and frozen routes match.
+  """
+  @spec accept_edge(String.t(), String.t(), Bundle.t(), [map() | struct()]) ::
+          edge_accept_result()
+  @spec accept_edge(String.t(), String.t(), Bundle.t(), [map() | struct()], Keyword.t()) ::
+          edge_accept_result()
+  def accept_edge(source_id, external_delivery_id, bundle, frozen_routes, opts \\ [])
+
+  def accept_edge(
+        source_id,
+        external_delivery_id,
+        %Bundle{} = bundle,
+        frozen_routes,
+        opts
+      )
+      when is_list(frozen_routes) do
+    routes = Enum.map(frozen_routes, &normalize_route/1)
+
+    with :ok <- validate_ingress_identity(source_id, external_delivery_id),
+         :ok <- validate_frozen_routes(bundle, routes) do
+      fingerprint = ingress_fingerprint(bundle, routes)
+
+      case fetch_ingress_identity(source_id, external_delivery_id) do
+        nil ->
+          persist_edge_acceptance(
+            source_id,
+            external_delivery_id,
+            bundle,
+            routes,
+            fingerprint,
+            opts
+          )
+
+        identity ->
+          verify_existing_ingress(identity, fingerprint)
+      end
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error,
+       Error.new(:temporary, :database_unavailable, "database is temporarily unavailable")}
+  end
+
+  @doc """
+  Looks up the durable receipt for an edge delivery identity.
+  """
+  @spec lookup_ingress(String.t(), String.t()) :: edge_accept_result()
+  def lookup_ingress(source_id, external_delivery_id) do
+    with :ok <- validate_ingress_identity(source_id, external_delivery_id),
+         %CloudIngressIdentity{} = identity <-
+           fetch_ingress_identity(source_id, external_delivery_id) do
+      {:ok, acceptance_receipt(identity, true)}
+    else
+      nil -> {:error, Error.new(:permanent, :not_found, "edge ingress identity not found")}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error,
+       Error.new(:temporary, :database_unavailable, "database is temporarily unavailable")}
+  end
+
+  defp persist_acceptance(bundle, routes, opts) do
+    case Repo.transaction(acceptance_multi(bundle, routes, opts)) do
+      {:ok, %{delivery: delivery}} ->
+        emit_acceptance_telemetry(delivery)
+        {:ok, delivery}
+
+      transaction_error ->
+        normalize_acceptance_error(transaction_error)
+    end
+  end
+
+  defp persist_edge_acceptance(
+         source_id,
+         external_delivery_id,
+         bundle,
+         routes,
+         fingerprint,
+         opts
+       ) do
     multi =
-      Multi.new()
-      |> Multi.insert(:delivery, InboundDelivery.acceptance_changeset(%InboundDelivery{}, bundle))
-      |> Multi.run(:maybe_fail_after_delivery, fn _repo, _changes ->
-        case maybe_fault(opts, :after_delivery_insert_before_commit) do
-          :ok -> {:ok, :ok}
-          {:error, error} -> {:error, error}
-        end
-      end)
-      |> Multi.insert_all(:delivery_recipients, DeliveryRecipient, fn %{delivery: delivery} ->
-        add_delivery_id(recipient_rows, delivery.id)
-      end)
-      |> Mail.add_acceptance_entries(:mailbox_entries, :delivery, routes, now)
-      |> Multi.insert(:accepted_event, fn %{delivery: delivery} ->
-        MessageEvent.event_changeset(
-          delivery.id,
-          "accepted",
-          %{ingest_id: delivery.ingest_id},
-          now
-        )
-      end)
-      |> Multi.insert(:archive_job, fn %{delivery: delivery} ->
-        ArchiveRawEmail.new(%{"inbound_delivery_id" => delivery.id})
+      bundle
+      |> acceptance_multi(routes, opts)
+      |> Multi.insert(:cloud_ingress_identity, fn %{delivery: delivery} ->
+        CloudIngressIdentity.changeset(%CloudIngressIdentity{}, %{
+          source_id: source_id,
+          external_delivery_id: external_delivery_id,
+          inbound_delivery_id: delivery.id,
+          raw_sha256: fingerprint.raw_sha256,
+          raw_size: fingerprint.raw_size,
+          routes_sha256: fingerprint.routes_sha256
+        })
       end)
 
     case Repo.transaction(multi) do
-      {:ok, %{delivery: delivery}} ->
-        :telemetry.execute(
-          [:manifold, :ingest, :accept, :stop],
-          %{raw_size: delivery.raw_size},
-          %{
-            ingest_id: delivery.ingest_id,
-            delivery_id: delivery.id
-          }
-        )
+      {:ok, %{delivery: delivery, cloud_ingress_identity: identity}} ->
+        emit_acceptance_telemetry(delivery)
+        {:ok, acceptance_receipt(%{identity | inbound_delivery: delivery}, false)}
 
-        {:ok, delivery}
+      transaction_error ->
+        case fetch_ingress_identity(source_id, external_delivery_id) do
+          %CloudIngressIdentity{} = identity ->
+            verify_existing_ingress(identity, fingerprint)
 
-      {:error, _step, %Error{} = error, _changes} ->
-        {:error, error}
-
-      {:error, _step, reason, _changes} ->
-        {:error,
-         Error.new(:temporary, :acceptance_failed, "acceptance transaction failed", %{
-           reason: inspect(reason)
-         })}
+          nil ->
+            normalize_acceptance_error(transaction_error)
+        end
     end
+  end
+
+  defp acceptance_multi(bundle, routes, opts) do
+    now = DateTime.utc_now()
+    recipient_rows = build_recipient_rows(routes, now)
+
+    Multi.new()
+    |> Multi.insert(:delivery, InboundDelivery.acceptance_changeset(%InboundDelivery{}, bundle))
+    |> Multi.run(:maybe_fail_after_delivery, fn _repo, _changes ->
+      case maybe_fault(opts, :after_delivery_insert_before_commit) do
+        :ok -> {:ok, :ok}
+        {:error, error} -> {:error, error}
+      end
+    end)
+    |> Multi.insert_all(:delivery_recipients, DeliveryRecipient, fn %{delivery: delivery} ->
+      add_delivery_id(recipient_rows, delivery.id)
+    end)
+    |> Mail.add_acceptance_entries(:mailbox_entries, :delivery, routes, now)
+    |> Multi.insert(:accepted_event, fn %{delivery: delivery} ->
+      MessageEvent.event_changeset(
+        delivery.id,
+        "accepted",
+        %{ingest_id: delivery.ingest_id},
+        now
+      )
+    end)
+    |> Multi.insert(:archive_job, fn %{delivery: delivery} ->
+      ArchiveRawEmail.new(%{"inbound_delivery_id" => delivery.id})
+    end)
   end
 
   @spec list_inbound_deliveries() :: [InboundDelivery.t()]
@@ -789,6 +889,110 @@ defmodule Manifold.Ingest do
   defp normalize_transaction_error({:error, reason}) do
     {:error,
      Error.new(:temporary, :database_unavailable, "mail lifecycle transaction failed", %{
+       reason: inspect(reason)
+     })}
+  end
+
+  defp fetch_ingress_identity(source_id, external_delivery_id) do
+    CloudIngressIdentity
+    |> Repo.get_by(source_id: source_id, external_delivery_id: external_delivery_id)
+    |> Repo.preload(:inbound_delivery)
+  end
+
+  defp verify_existing_ingress(identity, fingerprint) do
+    if ingress_fingerprint(identity) == fingerprint do
+      {:ok, acceptance_receipt(identity, true)}
+    else
+      {:error,
+       Error.new(
+         :permanent,
+         :ingress_conflict,
+         "edge delivery identity conflicts with the previously accepted content or routes"
+       )}
+    end
+  end
+
+  defp acceptance_receipt(identity, existing?) do
+    %AcceptanceReceipt{
+      source_id: identity.source_id,
+      external_delivery_id: identity.external_delivery_id,
+      inbound_delivery_id: identity.inbound_delivery_id,
+      ingest_id: identity.inbound_delivery.ingest_id,
+      raw_sha256: identity.raw_sha256,
+      raw_size: identity.raw_size,
+      routes_sha256: identity.routes_sha256,
+      existing?: existing?
+    }
+  end
+
+  defp ingress_fingerprint(%Bundle{manifest: manifest}, routes) do
+    %{
+      raw_sha256: manifest.raw_sha256,
+      raw_size: manifest.raw_size,
+      routes_sha256: routes_sha256(routes)
+    }
+  end
+
+  defp ingress_fingerprint(%CloudIngressIdentity{} = identity) do
+    %{
+      raw_sha256: identity.raw_sha256,
+      raw_size: identity.raw_size,
+      routes_sha256: identity.routes_sha256
+    }
+  end
+
+  defp routes_sha256(routes) do
+    canonical_routes =
+      Enum.map(routes, fn route ->
+        {
+          route.original_recipient,
+          route.canonical_recipient,
+          route.plus_tag,
+          route.domain_id,
+          route.mailbox_ids
+        }
+      end)
+
+    canonical_routes
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp validate_ingress_identity(source_id, external_delivery_id) do
+    if valid_ingress_id?(source_id) and valid_ingress_id?(external_delivery_id) do
+      :ok
+    else
+      {:error,
+       Error.new(
+         :permanent,
+         :invalid_ingress_identity,
+         "edge source and external delivery IDs must be non-empty strings up to 255 bytes"
+       )}
+    end
+  end
+
+  defp valid_ingress_id?(value) do
+    is_binary(value) and value == String.trim(value) and value != "" and byte_size(value) <= 255
+  end
+
+  defp emit_acceptance_telemetry(delivery) do
+    :telemetry.execute(
+      [:manifold, :ingest, :accept, :stop],
+      %{raw_size: delivery.raw_size},
+      %{
+        ingest_id: delivery.ingest_id,
+        delivery_id: delivery.id
+      }
+    )
+  end
+
+  defp normalize_acceptance_error({:error, _step, %Error{} = error, _changes}),
+    do: {:error, error}
+
+  defp normalize_acceptance_error({:error, _step, reason, _changes}) do
+    {:error,
+     Error.new(:temporary, :acceptance_failed, "acceptance transaction failed", %{
        reason: inspect(reason)
      })}
   end

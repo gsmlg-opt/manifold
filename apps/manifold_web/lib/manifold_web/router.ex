@@ -37,6 +37,7 @@ defmodule ManifoldWeb.Router do
       live("/aliases", AliasLive.Index, :index)
       live("/deliveries", DeliveryLive.Index, :index)
       live("/deliveries/:id", DeliveryLive.Show, :show)
+      live("/cloud", CloudLive.Index, :index)
     end
 
     get(

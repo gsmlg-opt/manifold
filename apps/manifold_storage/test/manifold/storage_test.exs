@@ -53,6 +53,166 @@ defmodule Manifold.StorageTest do
   end
 
   @tag :tmp_dir
+  test "ready cleanup uses a resumable tombstone", %{tmp_dir: tmp_dir} do
+    assert {:ok, bundle} =
+             Spool.write_bundle("raw", attrs(), root: tmp_dir, ingest_id: "cleanup-1")
+
+    assert {:error, %{reason: :after_cleanup_rename}} =
+             Spool.cleanup_ready_bundle(bundle.path, fail_at: :after_cleanup_rename)
+
+    refute File.exists?(bundle.path)
+    assert File.dir?(Path.join([tmp_dir, "quarantine", "cleanup-cleanup-1"]))
+
+    assert :ok = Spool.cleanup_ready_bundle(bundle.path)
+    refute File.exists?(Path.join([tmp_dir, "quarantine", "cleanup-cleanup-1"]))
+  end
+
+  @tag :tmp_dir
+  test "stream bundle creation writes enumerable chunks without buffering the source", %{
+    tmp_dir: tmp_dir
+  } do
+    chunks = ["Subject: streamed\r\n", "\r\n", "Body", "\r\n"]
+    raw = IO.iodata_to_binary(chunks)
+
+    assert {:ok, bundle} =
+             Spool.write_bundle_from_stream(chunks, attrs(),
+               root: tmp_dir,
+               ingest_id: "stream-enumerable",
+               max_bytes: byte_size(raw)
+             )
+
+    assert File.read!(bundle.raw_path) == raw
+    refute File.exists?(Path.join([tmp_dir, "tmp", "stream-enumerable.partial"]))
+  end
+
+  @tag :tmp_dir
+  test "stream bundle creation accepts an IO binary stream", %{tmp_dir: tmp_dir} do
+    raw = "Subject: io\r\n\r\nstreamed body\r\n"
+    {:ok, io} = StringIO.open(raw)
+
+    try do
+      assert {:ok, bundle} =
+               io
+               |> IO.binstream(5)
+               |> Spool.write_bundle_from_stream(attrs(),
+                 root: tmp_dir,
+                 ingest_id: "stream-io",
+                 max_bytes: byte_size(raw)
+               )
+
+      assert File.read!(bundle.raw_path) == raw
+    after
+      StringIO.close(io)
+    end
+  end
+
+  @tag :tmp_dir
+  test "stream manifest records the exact byte count and SHA-256", %{tmp_dir: tmp_dir} do
+    chunks = ["one", <<0, 1, 2>>, "three"]
+    raw = IO.iodata_to_binary(chunks)
+
+    assert {:ok, bundle} =
+             Spool.write_bundle_from_stream(chunks, attrs(),
+               root: tmp_dir,
+               ingest_id: "stream-manifest",
+               max_bytes: 1024
+             )
+
+    assert {:ok, manifest} = Spool.read_manifest(bundle.path)
+    assert manifest.raw_size == byte_size(raw)
+    assert manifest.raw_sha256 == Manifest.sha256(raw)
+    assert bundle.manifest == manifest
+  end
+
+  @tag :tmp_dir
+  test "stream bundle rejects data beyond the configured maximum and removes the partial", %{
+    tmp_dir: tmp_dir
+  } do
+    assert {:error, %{class: :permanent, reason: :message_too_large}} =
+             Spool.write_bundle_from_stream(["1234", "5"], attrs(),
+               root: tmp_dir,
+               ingest_id: "stream-too-large",
+               max_bytes: 4
+             )
+
+    refute File.exists?(Path.join([tmp_dir, "tmp", "stream-too-large.partial"]))
+    refute File.exists?(Path.join([tmp_dir, "ready", "stream-too-large"]))
+  end
+
+  @tag :tmp_dir
+  test "stream bundle removes its partial when the source returns an error", %{tmp_dir: tmp_dir} do
+    stream = Stream.map([{:ok, "partial"}, {:error, :upstream_closed}], & &1)
+
+    assert {:error, %{class: :temporary, reason: :spool_failed, details: details}} =
+             Spool.write_bundle_from_stream(stream, attrs(),
+               root: tmp_dir,
+               ingest_id: "stream-failed",
+               max_bytes: 1024
+             )
+
+    assert details.reason =~ "upstream_closed"
+    refute File.exists?(Path.join([tmp_dir, "tmp", "stream-failed.partial"]))
+    refute File.exists?(Path.join([tmp_dir, "ready", "stream-failed"]))
+  end
+
+  @tag :tmp_dir
+  test "stream bundle removes its partial when the enumerable raises", %{tmp_dir: tmp_dir} do
+    stream =
+      Stream.concat([
+        ["partial"],
+        Stream.map([:fail], fn :fail -> raise "source failed" end)
+      ])
+
+    assert {:error, %{class: :temporary, reason: :spool_failed}} =
+             Spool.write_bundle_from_stream(stream, attrs(),
+               root: tmp_dir,
+               ingest_id: "stream-raised",
+               max_bytes: 1024
+             )
+
+    refute File.exists?(Path.join([tmp_dir, "tmp", "stream-raised.partial"]))
+    refute File.exists?(Path.join([tmp_dir, "ready", "stream-raised"]))
+  end
+
+  @tag :tmp_dir
+  test "stream bundle syncs both files and atomically renames before ready directory sync", %{
+    tmp_dir: tmp_dir
+  } do
+    test_pid = self()
+    ingest_id = "stream-synced"
+    ready_path = Path.join([tmp_dir, "ready", ingest_id])
+
+    file_sync_fun = fn _io ->
+      send(test_pid, :file_synced)
+      :ok
+    end
+
+    dir_sync_fun = fn path ->
+      send(test_pid, {:directory_synced, path, File.exists?(ready_path)})
+      :ok
+    end
+
+    assert {:ok, bundle} =
+             Spool.write_bundle_from_stream(["raw"], attrs(),
+               root: tmp_dir,
+               ingest_id: ingest_id,
+               max_bytes: 3,
+               file_sync_fun: file_sync_fun,
+               dir_sync_fun: dir_sync_fun
+             )
+
+    assert_receive :file_synced
+    assert_receive :file_synced
+    assert_receive {:directory_synced, partial_path, false}
+    assert partial_path == Path.join([tmp_dir, "tmp", ingest_id <> ".partial"])
+    assert_receive {:directory_synced, tmp_path, false}
+    assert tmp_path == Path.join(tmp_dir, "tmp")
+    assert_receive {:directory_synced, ready_dir, true}
+    assert ready_dir == Path.join(tmp_dir, "ready")
+    assert bundle.path == ready_path
+  end
+
+  @tag :tmp_dir
   test "atomic ready transition leaves no ready bundle before rename", %{tmp_dir: tmp_dir} do
     assert {:error, %{reason: :before_ready_rename}} =
              Spool.write_bundle("raw", attrs(),

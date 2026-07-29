@@ -3,9 +3,17 @@ defmodule Manifold.IngestTest do
 
   alias Manifold.Accounts
   alias Manifold.Ingest
+  alias Manifold.Ingest.AcceptanceReceipt
   alias Manifold.Ingest.Jobs.{ArchiveRawEmail, EvaluateInboundSecurity, ProjectInboundMail}
   alias Manifold.Ingest.Reconciler
-  alias Manifold.Ingest.Schema.{DeliveryRecipient, InboundDelivery, MessageEvent}
+
+  alias Manifold.Ingest.Schema.{
+    CloudIngressIdentity,
+    DeliveryRecipient,
+    InboundDelivery,
+    MessageEvent
+  }
+
   alias Manifold.Mail.Schema.{MailboxEntry, Message}
   alias Manifold.Repo
   alias Manifold.Security.Schema.SecurityAssessment
@@ -94,6 +102,123 @@ defmodule Manifold.IngestTest do
 
     refute Repo.get_by(InboundDelivery, ingest_id: "tx-failure")
     assert Repo.aggregate(Oban.Job, :count) == 0
+  end
+
+  test "edge acceptance records provenance in the acceptance transaction" do
+    %{route: route} = route_fixture()
+    bundle = edge_bundle!("edge-first", [route])
+
+    assert {:ok,
+            %AcceptanceReceipt{
+              source_id: "edge-primary",
+              external_delivery_id: "delivery-1",
+              existing?: false
+            } = receipt} =
+             Ingest.accept_edge("edge-primary", "delivery-1", bundle, [route])
+
+    assert receipt.ingest_id == bundle.manifest.ingest_id
+    assert Repo.aggregate(InboundDelivery, :count) == 1
+    assert Repo.aggregate(CloudIngressIdentity, :count) == 1
+
+    assert {:ok, %AcceptanceReceipt{existing?: true} = existing} =
+             Ingest.lookup_ingress("edge-primary", "delivery-1")
+
+    assert existing.inbound_delivery_id == receipt.inbound_delivery_id
+    assert existing.raw_sha256 == receipt.raw_sha256
+    assert existing.raw_size == receipt.raw_size
+    assert existing.routes_sha256 == receipt.routes_sha256
+  end
+
+  test "repeated edge import with the same content and routes returns the existing acceptance" do
+    %{route: route} = route_fixture()
+    first_bundle = edge_bundle!("edge-repeat-first", [route])
+    retry_bundle = edge_bundle!("edge-repeat-second", [route])
+
+    assert {:ok, first} =
+             Ingest.accept_edge("edge-primary", "delivery-repeat", first_bundle, [route])
+
+    assert {:ok, %AcceptanceReceipt{existing?: true} = retry} =
+             Ingest.accept_edge("edge-primary", "delivery-repeat", retry_bundle, [route])
+
+    assert retry.inbound_delivery_id == first.inbound_delivery_id
+    assert Repo.aggregate(InboundDelivery, :count) == 1
+    assert Repo.aggregate(CloudIngressIdentity, :count) == 1
+    assert Repo.aggregate(DeliveryRecipient, :count) == 1
+    assert Repo.aggregate(MailboxEntry, :count) == 1
+    assert Repo.aggregate(Oban.Job, :count) == 1
+  end
+
+  test "repeated edge import rejects conflicting content permanently" do
+    %{route: route} = route_fixture()
+    first_bundle = edge_bundle!("edge-conflict-first", [route])
+
+    conflicting_bundle =
+      edge_bundle!("edge-conflict-second", [route], "Subject: changed\r\n\r\nChanged\r\n")
+
+    assert {:ok, _receipt} =
+             Ingest.accept_edge("edge-primary", "delivery-conflict", first_bundle, [route])
+
+    assert {:error, %{class: :permanent, reason: :ingress_conflict}} =
+             Ingest.accept_edge(
+               "edge-primary",
+               "delivery-conflict",
+               conflicting_bundle,
+               [route]
+             )
+
+    assert Repo.aggregate(InboundDelivery, :count) == 1
+    assert Repo.aggregate(CloudIngressIdentity, :count) == 1
+  end
+
+  test "repeated edge import rejects conflicting frozen routes permanently" do
+    %{domain: domain, route: route} = route_fixture()
+    {:ok, other_mailbox} = Accounts.create_mailbox(domain, %{local_part: "other"})
+
+    conflicting_route = %{
+      route
+      | canonical_recipient: "other@#{domain.normalized_domain}",
+        mailbox_ids: [other_mailbox.id]
+    }
+
+    first_bundle = edge_bundle!("edge-routes-first", [route])
+    conflicting_bundle = edge_bundle!("edge-routes-second", [conflicting_route])
+
+    assert {:ok, _receipt} =
+             Ingest.accept_edge("edge-primary", "delivery-routes", first_bundle, [route])
+
+    assert {:error, %{class: :permanent, reason: :ingress_conflict}} =
+             Ingest.accept_edge(
+               "edge-primary",
+               "delivery-routes",
+               conflicting_bundle,
+               [conflicting_route]
+             )
+
+    assert Repo.aggregate(InboundDelivery, :count) == 1
+    assert Repo.aggregate(CloudIngressIdentity, :count) == 1
+  end
+
+  test "failed edge acceptance rolls back provenance and can be retried" do
+    %{route: route} = route_fixture()
+    bundle = edge_bundle!("edge-rollback", [route])
+
+    assert {:error, %{reason: :after_delivery_insert_before_commit}} =
+             Ingest.accept_edge(
+               "edge-primary",
+               "delivery-rollback",
+               bundle,
+               [route],
+               fail_at: :after_delivery_insert_before_commit
+             )
+
+    refute Repo.get_by(InboundDelivery, ingest_id: bundle.manifest.ingest_id)
+    assert Repo.aggregate(CloudIngressIdentity, :count) == 0
+
+    assert {:ok, %AcceptanceReceipt{existing?: false}} =
+             Ingest.accept_edge("edge-primary", "delivery-rollback", bundle, [route])
+
+    assert Repo.aggregate(InboundDelivery, :count) == 1
+    assert Repo.aggregate(CloudIngressIdentity, :count) == 1
   end
 
   test "acceptance rejects empty frozen routes before writing database state" do
@@ -641,6 +766,17 @@ defmodule Manifold.IngestTest do
 
   defp accept_delivery(routes) do
     Ingest.accept_transport(raw_message(), spool_attrs(routes), routes)
+  end
+
+  defp edge_bundle!(ingest_id, routes, raw \\ raw_message()) do
+    assert {:ok, bundle} =
+             Spool.write_bundle(
+               raw,
+               Map.put(spool_attrs(routes), :routes, routes),
+               ingest_id: ingest_id
+             )
+
+    bundle
   end
 
   defp route_fixture do
