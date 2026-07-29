@@ -42,6 +42,7 @@ defmodule ManifoldWeb.MixProject do
       {:jason, "~> 1.4"},
       {:bandit, "~> 1.8"},
       {:duskmoon_bundler_runtime, "~> 9.9"},
+      # TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#108
       {:duskmoon_bundler, "~> 9.9", runtime: Mix.env() == :dev}
     ]
   end
