@@ -67,7 +67,8 @@ jobs:
         run: mix deps.get
 
       - name: Install frontend dependencies
-        run: mix npm.ci
+        # WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#106
+        run: mix run --no-start -e 'Application.ensure_all_started(:ssl); Mix.Task.run("npm.ci")'
 
       - name: Build frontend assets
         run: mix assets.deploy
