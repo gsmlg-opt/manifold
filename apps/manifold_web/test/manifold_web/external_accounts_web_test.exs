@@ -349,6 +349,31 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     refute has_element?(view, "#continue-add-account")
   end
 
+  test "back moves one step and cancel resets account setup", %{conn: conn} do
+    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+    open_provider_step(view)
+
+    view
+    |> element("#provider-gmail")
+    |> render_click()
+
+    assert view
+           |> element("#back-add-account")
+           |> render_click() =~ "Choose a provider"
+
+    assert view
+           |> element("#cancel-add-account")
+           |> render_click() =~ "Connected accounts"
+
+    refute has_element?(view, "#add-account-panel")
+
+    html = view |> element("#add-account-button") |> render_click()
+
+    assert html =~ "What kind of account are you adding?"
+    refute html =~ "Choose a provider"
+    refute html =~ "Choose a local mailbox"
+  end
+
   defp open_provider_step(view) do
     view
     |> element("#add-account-button")

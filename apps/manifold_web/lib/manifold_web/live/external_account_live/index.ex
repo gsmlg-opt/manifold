@@ -50,6 +50,32 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
 
   def handle_event("choose-provider", _params, socket), do: {:noreply, socket}
 
+  def handle_event(
+        "back-add-account",
+        _params,
+        %{assigns: %{add_account_step: :provider}} = socket
+      ) do
+    {:noreply,
+     assign(socket,
+       add_account_step: :account_type,
+       selected_provider: nil,
+       selected_mailbox_id: nil
+     )}
+  end
+
+  def handle_event(
+        "back-add-account",
+        _params,
+        %{assigns: %{add_account_step: :mailbox}} = socket
+      ) do
+    {:noreply, assign(socket, add_account_step: :provider, selected_mailbox_id: nil)}
+  end
+
+  def handle_event("back-add-account", _params, socket), do: {:noreply, socket}
+
+  def handle_event("cancel-add-account", _params, socket),
+    do: {:noreply, reset_add_account(socket)}
+
   def handle_event("select-add-account-mailbox", %{"mailbox_id" => mailbox_id}, socket) do
     selected_mailbox_id =
       if Enum.any?(socket.assigns.mailboxes, &(&1.id == mailbox_id)),
@@ -213,6 +239,26 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
             Continue to {provider_name(@selected_provider)}
           </a>
         </div>
+
+        <footer class="add-account-panel-footer">
+          <button
+            :if={@add_account_step != :account_type}
+            id="back-add-account"
+            type="button"
+            class="settings-action"
+            phx-click="back-add-account"
+          >
+            Back
+          </button>
+          <button
+            id="cancel-add-account"
+            type="button"
+            class="settings-action"
+            phx-click="cancel-add-account"
+          >
+            Cancel
+          </button>
+        </footer>
       </section>
 
       <h2>Connected accounts</h2>
@@ -304,6 +350,14 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
 
   defp provider_icon("gmail"), do: "gmail"
   defp provider_icon("microsoft"), do: "microsoft"
+
+  defp reset_add_account(socket) do
+    assign(socket,
+      add_account_step: :closed,
+      selected_provider: nil,
+      selected_mailbox_id: nil
+    )
+  end
 
   defp status_label(status), do: String.capitalize(status)
 
