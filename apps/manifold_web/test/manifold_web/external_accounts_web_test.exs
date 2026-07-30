@@ -356,15 +356,110 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
              Connectors.list_accounts()
 
     assert {:ok, view, _html} = live(conn, "/settings/accounts")
-    open_provider_step(view)
+
+    view
+    |> element("#add-account-button")
+    |> render_click()
+
+    assert has_element?(
+             view,
+             "#add-account-type-heading[tabindex='-1'][phx-mounted*='focus']",
+             "What kind of account are you adding?"
+           )
+
+    refute has_element?(view, "#back-add-account")
+    assert has_element?(view, "#cancel-add-account")
+
+    assert has_element?(
+             view,
+             "#cancel-add-account[phx-click*='cancel-add-account'][phx-click*='focus'][phx-click*='#add-account-button']"
+           )
+
+    view
+    |> element("#external-account-type")
+    |> render_click()
+
+    assert has_element?(
+             view,
+             "#add-account-provider-heading[tabindex='-1'][phx-mounted*='focus']",
+             "Choose a provider"
+           )
+
+    assert has_element?(view, "#back-add-account")
+    assert has_element?(view, "#cancel-add-account")
 
     view
     |> element("#provider-gmail")
     |> render_click()
 
+    assert has_element?(
+             view,
+             "#add-account-mailbox-heading[tabindex='-1'][phx-mounted*='focus']",
+             "Choose a local mailbox"
+           )
+
+    assert has_element?(view, "#back-add-account")
+    assert has_element?(view, "#cancel-add-account")
+
+    view
+    |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
+    |> render_change()
+
+    assert has_element?(view, "#continue-add-account")
+
     assert view
            |> element("#back-add-account")
            |> render_click() =~ "Choose a provider"
+
+    assert has_element?(
+             view,
+             "#add-account-provider-heading[tabindex='-1'][phx-mounted*='focus']"
+           )
+
+    assert has_element?(view, "#back-add-account")
+    assert has_element?(view, "#cancel-add-account")
+
+    view
+    |> element("#provider-gmail")
+    |> render_click()
+
+    refute has_element?(view, "#continue-add-account")
+
+    view
+    |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
+    |> render_change()
+
+    assert has_element?(view, "#continue-add-account")
+
+    view
+    |> element("#back-add-account")
+    |> render_click()
+
+    html = view |> element("#back-add-account") |> render_click()
+
+    assert html =~ "What kind of account are you adding?"
+
+    assert has_element?(
+             view,
+             "#add-account-type-heading[tabindex='-1'][phx-mounted*='focus']"
+           )
+
+    refute has_element?(view, "#back-add-account")
+    assert has_element?(view, "#cancel-add-account")
+
+    view
+    |> element("#external-account-type")
+    |> render_click()
+
+    view
+    |> element("#provider-gmail")
+    |> render_click()
+
+    view
+    |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
+    |> render_change()
+
+    assert has_element?(view, "#continue-add-account")
 
     html = view |> element("#cancel-add-account") |> render_click()
 
@@ -378,8 +473,11 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     html = view |> element("#add-account-button") |> render_click()
 
     assert html =~ "What kind of account are you adding?"
+    refute has_element?(view, "#back-add-account")
+    assert has_element?(view, "#cancel-add-account")
     refute html =~ "Choose a provider"
     refute html =~ "Choose a local mailbox"
+    refute has_element?(view, "#continue-add-account")
   end
 
   defp open_provider_step(view) do

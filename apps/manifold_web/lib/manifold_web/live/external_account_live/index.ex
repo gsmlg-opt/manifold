@@ -157,7 +157,9 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
         </header>
 
         <div :if={@add_account_step == :account_type}>
-          <h3>What kind of account are you adding?</h3>
+          <h3 id="add-account-type-heading" tabindex="-1" phx-mounted={JS.focus()}>
+            What kind of account are you adding?
+          </h3>
           <button
             id="external-account-type"
             type="button"
@@ -174,7 +176,9 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
         </div>
 
         <div :if={@add_account_step == :provider}>
-          <h3>Choose a provider</h3>
+          <h3 id="add-account-provider-heading" tabindex="-1" phx-mounted={JS.focus()}>
+            Choose a provider
+          </h3>
           <div class="add-account-choices">
             <button
               :for={provider <- ["gmail", "microsoft"]}
@@ -200,7 +204,9 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
         </div>
 
         <div :if={@add_account_step == :mailbox}>
-          <h3>Choose a local mailbox</h3>
+          <h3 id="add-account-mailbox-heading" tabindex="-1" phx-mounted={JS.focus()}>
+            Choose a local mailbox
+          </h3>
           <p class="settings-secondary">
             Imported {provider_name(@selected_provider)} mail will be delivered here.
           </p>
@@ -254,7 +260,7 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
             id="cancel-add-account"
             type="button"
             class="settings-action"
-            phx-click="cancel-add-account"
+            phx-click={JS.push("cancel-add-account") |> JS.focus(to: "#add-account-button")}
           >
             Cancel
           </button>
