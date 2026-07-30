@@ -6,6 +6,7 @@
 /.devenv/
 /.direnv/
 /.superpowers/
+/.trees/
 /node_modules/
 /apps/manifold_web/.duskmoon_bundler/
 /apps/manifold_web/node_modules/
