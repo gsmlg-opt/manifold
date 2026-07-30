@@ -349,7 +349,12 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     refute has_element?(view, "#continue-add-account")
   end
 
-  test "back moves one step and cancel resets account setup", %{conn: conn} do
+  test "back moves one step and cancel resets account setup", %{conn: conn, mailbox: mailbox} do
+    connect_account(conn, "microsoft", mailbox.id)
+
+    assert [%{id: account_id, email_address: "person@outlook.example"}] =
+             Connectors.list_accounts()
+
     assert {:ok, view, _html} = live(conn, "/settings/accounts")
     open_provider_step(view)
 
@@ -361,9 +366,12 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
            |> element("#back-add-account")
            |> render_click() =~ "Choose a provider"
 
-    assert view
-           |> element("#cancel-add-account")
-           |> render_click() =~ "Connected accounts"
+    html = view |> element("#cancel-add-account") |> render_click()
+
+    assert html =~ "Connected accounts"
+    assert html =~ "person@outlook.example"
+    assert has_element?(view, "#external-account-#{account_id} button[phx-click=sync]")
+    assert has_element?(view, "#external-account-#{account_id} button[phx-click=disconnect]")
 
     refute has_element?(view, "#add-account-panel")
 
