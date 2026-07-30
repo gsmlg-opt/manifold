@@ -28,13 +28,21 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
      )}
   end
 
-  def handle_event("choose-account-type", %{"type" => "external"}, socket) do
+  def handle_event(
+        "choose-account-type",
+        %{"type" => "external"},
+        %{assigns: %{add_account_step: :account_type}} = socket
+      ) do
     {:noreply, assign(socket, :add_account_step, :provider)}
   end
 
   def handle_event("choose-account-type", _params, socket), do: {:noreply, socket}
 
-  def handle_event("choose-provider", %{"provider" => provider}, socket)
+  def handle_event(
+        "choose-provider",
+        %{"provider" => provider},
+        %{assigns: %{add_account_step: :provider}} = socket
+      )
       when provider in ["gmail", "microsoft"] do
     if provider_configured?(socket.assigns.configured_providers, provider) do
       {:noreply,
@@ -76,7 +84,11 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
   def handle_event("cancel-add-account", _params, socket),
     do: {:noreply, reset_add_account(socket)}
 
-  def handle_event("select-add-account-mailbox", %{"mailbox_id" => mailbox_id}, socket) do
+  def handle_event(
+        "select-add-account-mailbox",
+        %{"mailbox_id" => mailbox_id},
+        %{assigns: %{add_account_step: :mailbox}} = socket
+      ) do
     selected_mailbox_id =
       if Enum.any?(socket.assigns.mailboxes, &(&1.id == mailbox_id)),
         do: mailbox_id,

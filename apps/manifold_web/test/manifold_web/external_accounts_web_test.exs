@@ -167,6 +167,86 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert html =~ "Continue to Gmail"
   end
 
+  test "external account wizard creates a Microsoft OAuth handoff", %{
+    conn: conn,
+    mailbox: mailbox
+  } do
+    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+    open_provider_step(view)
+
+    view
+    |> element("#provider-microsoft")
+    |> render_click()
+
+    view
+    |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
+    |> render_change()
+
+    assert has_element?(
+             view,
+             "#continue-add-account[href='/connectors/microsoft/start?mailbox_id=#{mailbox.id}']",
+             "Continue to Microsoft 365"
+           )
+  end
+
+  test "wizard rejects forward events while closed", %{conn: conn, mailbox: mailbox} do
+    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+
+    render_hook(view, "choose-account-type", %{"type" => "external"})
+    render_hook(view, "choose-provider", %{"provider" => "gmail"})
+    render_hook(view, "select-add-account-mailbox", %{"mailbox_id" => mailbox.id})
+
+    refute has_element?(view, "#add-account-panel")
+    refute has_element?(view, "#continue-add-account")
+
+    assert {:ok, socket} = Phoenix.LiveView.Debug.socket(view.pid)
+
+    assert %{
+             add_account_step: :closed,
+             selected_provider: nil,
+             selected_mailbox_id: nil
+           } = socket.assigns
+  end
+
+  test "wizard rejects a provider before account type selection", %{conn: conn} do
+    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+
+    view
+    |> element("#add-account-button")
+    |> render_click()
+
+    assert render_hook(view, "choose-provider", %{"provider" => "gmail"}) =~
+             "What kind of account are you adding?"
+
+    refute has_element?(view, "#continue-add-account")
+
+    assert {:ok, socket} = Phoenix.LiveView.Debug.socket(view.pid)
+
+    assert %{
+             add_account_step: :account_type,
+             selected_provider: nil,
+             selected_mailbox_id: nil
+           } = socket.assigns
+  end
+
+  test "wizard rejects a mailbox before provider selection", %{conn: conn, mailbox: mailbox} do
+    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+    open_provider_step(view)
+
+    assert render_hook(view, "select-add-account-mailbox", %{"mailbox_id" => mailbox.id}) =~
+             "Choose a provider"
+
+    refute has_element?(view, "#continue-add-account")
+
+    assert {:ok, socket} = Phoenix.LiveView.Debug.socket(view.pid)
+
+    assert %{
+             add_account_step: :provider,
+             selected_provider: nil,
+             selected_mailbox_id: nil
+           } = socket.assigns
+  end
+
   test "add account panel is descriptively labelled without duplicate live announcements", %{
     conn: conn
   } do
@@ -327,9 +407,14 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     html = render(view)
 
-    assert has_element?(view, "#provider-gmail[disabled]")
-    assert has_element?(view, "#provider-microsoft[disabled]")
-    assert html =~ "Provider not configured"
+    assert view
+           |> element("#provider-gmail[disabled]")
+           |> render() =~ "Provider not configured"
+
+    assert view
+           |> element("#provider-microsoft[disabled]")
+           |> render() =~ "Provider not configured"
+
     refute html =~ "/connectors/gmail/start"
     refute html =~ "/connectors/microsoft/start"
 
