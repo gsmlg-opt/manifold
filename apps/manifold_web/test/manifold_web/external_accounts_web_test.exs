@@ -122,17 +122,49 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     {:ok, domain: domain, mailbox: mailbox}
   end
 
-  test "settings accounts is available without authentication", %{
-    conn: conn,
-    domain: domain
-  } do
-    assert {:ok, _view, html} = live(conn, "/settings/accounts")
+  test "settings accounts opens with an add account button", %{conn: conn} do
+    assert {:ok, view, html} = live(conn, "/settings/accounts")
 
-    assert html =~ "External accounts"
-    assert html =~ "person@#{domain.normalized_domain}"
-    assert html =~ "Connect Gmail"
-    assert html =~ "Connect Microsoft 365"
+    assert has_element?(view, "#add-account-button", "Add account")
+    refute has_element?(view, "#add-account-panel")
+    refute html =~ "/connectors/gmail/start"
+    refute html =~ "/connectors/microsoft/start"
     refute html =~ "Log in"
+  end
+
+  test "external account wizard selects a provider and mailbox", %{conn: conn, mailbox: mailbox} do
+    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+
+    assert view
+           |> element("#add-account-button")
+           |> render_click() =~ "External account"
+
+    html =
+      view
+      |> element("#external-account-type")
+      |> render_click()
+
+    assert html =~ "Choose a provider"
+    assert has_element?(view, "#provider-gmail:not([disabled])")
+    assert has_element?(view, "#provider-microsoft:not([disabled])")
+
+    html = view |> element("#provider-gmail") |> render_click()
+
+    assert html =~ "Choose a local mailbox"
+    refute has_element?(view, "#continue-add-account")
+
+    html =
+      view
+      |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
+      |> render_change()
+
+    assert has_element?(
+             view,
+             "#continue-add-account[href='/connectors/gmail/start?mailbox_id=#{mailbox.id}']",
+             "Continue to Gmail"
+           )
+
+    assert html =~ "Continue to Gmail"
   end
 
   test "OAuth start and callback consume matching state and connect the account", %{
@@ -222,11 +254,17 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     refute html =~ "/ready/"
   end
 
-  test "unconfigured providers are not offered as connection targets", %{conn: conn} do
+  test "unconfigured providers are shown as unavailable", %{conn: conn} do
     Application.put_env(:manifold_connectors, :providers, [])
 
-    assert {:ok, _view, html} = live(conn, "/settings/accounts")
-    assert html =~ "No provider is configured"
+    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+    open_provider_step(view)
+
+    html = render(view)
+
+    assert has_element?(view, "#provider-gmail[disabled]")
+    assert has_element?(view, "#provider-microsoft[disabled]")
+    assert html =~ "Provider not configured"
     refute html =~ "/connectors/gmail/start"
     refute html =~ "/connectors/microsoft/start"
   end
@@ -239,8 +277,25 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     |> Ecto.Changeset.change(active: false)
     |> Manifold.Repo.update!()
 
-    assert {:ok, _view, html} = live(conn, "/settings/accounts")
+    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+    open_provider_step(view)
+
+    html = view |> element("#provider-gmail") |> render_click()
+
     refute html =~ mailbox.local_part
+    assert html =~ "Create an active local mailbox before connecting an external account."
+    assert has_element?(view, "#manage-mailboxes-link[href='/mailboxes']")
+    refute has_element?(view, "#continue-add-account")
+  end
+
+  defp open_provider_step(view) do
+    view
+    |> element("#add-account-button")
+    |> render_click()
+
+    view
+    |> element("#external-account-type")
+    |> render_click()
   end
 
   defp connect_account(conn, provider, mailbox_id) do
