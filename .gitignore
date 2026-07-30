@@ -5,6 +5,7 @@
 /.elixir_ls/
 /.devenv/
 /.direnv/
+/.superpowers/
 /node_modules/
 /apps/manifold_web/.duskmoon_bundler/
 /apps/manifold_web/node_modules/
