@@ -146,8 +146,6 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
         id="add-account-panel"
         class="add-account-panel"
         aria-labelledby="add-account-title"
-        aria-live="polite"
-        aria-atomic="true"
       >
         <header class="add-account-panel-header">
           <div>

@@ -167,14 +167,23 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert html =~ "Continue to Gmail"
   end
 
-  test "add account panel announces wizard step changes", %{conn: conn} do
+  test "add account panel is descriptively labelled without duplicate live announcements", %{
+    conn: conn
+  } do
     assert {:ok, view, _html} = live(conn, "/settings/accounts")
 
     view
     |> element("#add-account-button")
     |> render_click()
 
-    assert has_element?(view, "#add-account-panel[aria-live='polite'][aria-atomic='true']")
+    assert has_element?(
+             view,
+             "#add-account-panel[aria-labelledby='add-account-title'] #add-account-title",
+             "Add an email account"
+           )
+
+    refute has_element?(view, "#add-account-panel[aria-live]")
+    refute has_element?(view, "#add-account-panel[aria-atomic]")
   end
 
   test "wizard ignores forged account type and provider values", %{conn: conn} do
@@ -462,6 +471,11 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert has_element?(view, "#continue-add-account")
 
     html = view |> element("#cancel-add-account") |> render_click()
+
+    assert {:ok, socket} = Phoenix.LiveView.Debug.socket(view.pid)
+    assert socket.assigns.add_account_step == :closed
+    assert socket.assigns.selected_provider == nil
+    assert socket.assigns.selected_mailbox_id == nil
 
     assert html =~ "Connected accounts"
     assert html =~ "person@outlook.example"
