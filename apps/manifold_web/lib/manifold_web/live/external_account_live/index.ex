@@ -32,6 +32,8 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
     {:noreply, assign(socket, :add_account_step, :provider)}
   end
 
+  def handle_event("choose-account-type", _params, socket), do: {:noreply, socket}
+
   def handle_event("choose-provider", %{"provider" => provider}, socket)
       when provider in ["gmail", "microsoft"] do
     if provider_configured?(socket.assigns.configured_providers, provider) do
@@ -46,6 +48,8 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
     end
   end
 
+  def handle_event("choose-provider", _params, socket), do: {:noreply, socket}
+
   def handle_event("select-add-account-mailbox", %{"mailbox_id" => mailbox_id}, socket) do
     selected_mailbox_id =
       if Enum.any?(socket.assigns.mailboxes, &(&1.id == mailbox_id)),
@@ -53,6 +57,10 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
         else: nil
 
     {:noreply, assign(socket, :selected_mailbox_id, selected_mailbox_id)}
+  end
+
+  def handle_event("select-add-account-mailbox", _params, socket) do
+    {:noreply, assign(socket, :selected_mailbox_id, nil)}
   end
 
   @impl Phoenix.LiveView
@@ -112,6 +120,8 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
         id="add-account-panel"
         class="add-account-panel"
         aria-labelledby="add-account-title"
+        aria-live="polite"
+        aria-atomic="true"
       >
         <header class="add-account-panel-header">
           <div>

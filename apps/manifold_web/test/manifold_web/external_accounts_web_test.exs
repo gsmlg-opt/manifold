@@ -167,6 +167,62 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert html =~ "Continue to Gmail"
   end
 
+  test "add account panel announces wizard step changes", %{conn: conn} do
+    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+
+    view
+    |> element("#add-account-button")
+    |> render_click()
+
+    assert has_element?(view, "#add-account-panel[aria-live='polite'][aria-atomic='true']")
+  end
+
+  test "wizard ignores forged account type and provider values", %{conn: conn} do
+    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+
+    view
+    |> element("#add-account-button")
+    |> render_click()
+
+    assert render_hook(view, "choose-account-type", %{"type" => "local"}) =~
+             "What kind of account are you adding?"
+
+    assert render_hook(view, "choose-account-type", %{}) =~ "What kind of account are you adding?"
+
+    view
+    |> element("#external-account-type")
+    |> render_click()
+
+    assert render_hook(view, "choose-provider", %{"provider" => "imap"}) =~
+             "Choose a provider"
+
+    assert render_hook(view, "choose-provider", %{}) =~ "Choose a provider"
+    refute has_element?(view, "#continue-add-account")
+  end
+
+  test "wizard clears the mailbox selection for forged values", %{conn: conn, mailbox: mailbox} do
+    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+    open_provider_step(view)
+
+    view
+    |> element("#provider-gmail")
+    |> render_click()
+
+    view
+    |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
+    |> render_change()
+
+    assert has_element?(view, "#continue-add-account")
+
+    assert render_hook(view, "select-add-account-mailbox", %{"mailbox_id" => "unknown"}) =~
+             "Choose a local mailbox"
+
+    refute has_element?(view, "#continue-add-account")
+
+    assert render_hook(view, "select-add-account-mailbox", %{}) =~ "Choose a local mailbox"
+    refute has_element?(view, "#continue-add-account")
+  end
+
   test "OAuth start and callback consume matching state and connect the account", %{
     conn: conn,
     mailbox: mailbox
@@ -267,6 +323,11 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert html =~ "Provider not configured"
     refute html =~ "/connectors/gmail/start"
     refute html =~ "/connectors/microsoft/start"
+
+    assert render_hook(view, "choose-provider", %{"provider" => "gmail"}) =~
+             "Choose a provider"
+
+    refute has_element?(view, "#continue-add-account")
   end
 
   test "inactive mailboxes are not offered as connector destinations", %{
