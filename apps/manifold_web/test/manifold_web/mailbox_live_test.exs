@@ -169,6 +169,32 @@ defmodule ManifoldWeb.MailboxLiveTest do
     assert [%{canonical_local_part: "inbox"}] = Accounts.list_mailboxes()
   end
 
+  test "back after new-domain creation resets to existing domain selection", %{conn: conn} do
+    assert Accounts.list_domains() == []
+    {:ok, view, _html} = live(conn, ~p"/mailboxes")
+
+    view |> element("#create-mailbox-button") |> render_click()
+
+    view
+    |> form("#mailbox-domain-form", %{domain: %{name: "Back.TEST"}})
+    |> render_submit()
+
+    assert has_element?(view, "#mailbox-details-heading")
+    assert [domain] = Accounts.list_domains()
+
+    view |> element("#back-mailbox-setup") |> render_click()
+
+    assert has_element?(view, "#mailbox-domain-selection option[value='#{domain.id}']")
+    refute has_element?(view, "#new-domain-name")
+
+    view
+    |> form("#mailbox-domain-form", %{domain: %{selection: domain.id}})
+    |> render_submit()
+
+    assert has_element?(view, "#mailbox-details-heading")
+    refute render(view) =~ "has already been taken"
+  end
+
   test "preserves the typed new-domain name across form changes", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/mailboxes")
     view |> element("#create-mailbox-button") |> render_click()

@@ -131,7 +131,9 @@ defmodule ManifoldWeb.MailboxLive.Index do
     {:noreply,
      assign(socket,
        setup_step: :domain,
+       domain_mode: :existing,
        selected_domain: nil,
+       domain_form: empty_form(:domain),
        mailbox_form: empty_form(:mailbox)
      )}
   end
