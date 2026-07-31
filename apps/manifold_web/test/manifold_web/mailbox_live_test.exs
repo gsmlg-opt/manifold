@@ -105,6 +105,73 @@ defmodule ManifoldWeb.MailboxLiveTest do
     refute has_element?(view, "#mailbox-details-heading")
   end
 
+  test "creates a domain before creating the first mailbox", %{conn: conn} do
+    assert Accounts.list_domains() == []
+    {:ok, view, _html} = live(conn, ~p"/mailboxes")
+
+    view |> element("#create-mailbox-button") |> render_click()
+
+    assert has_element?(view, "#new-domain-name")
+    refute has_element?(view, "#mailbox-domain-selection")
+
+    html =
+      view
+      |> form("#mailbox-domain-form", %{domain: %{name: "bad domain"}})
+      |> render_submit()
+
+    assert html =~ "domain syntax is invalid"
+    assert has_element?(view, "#domain-name-error.settings-error")
+
+    view
+    |> form("#mailbox-domain-form", %{domain: %{name: "New-Mail.TEST"}})
+    |> render_submit()
+
+    assert has_element?(view, "#mailbox-address-domain", "@new-mail.test")
+
+    view
+    |> form("#create-mailbox-form", %{mailbox: %{local_part: "inbox"}})
+    |> render_submit()
+
+    assert [%{normalized_domain: "new-mail.test"}] = Accounts.list_domains()
+    assert [%{canonical_local_part: "inbox"}] = Accounts.list_mailboxes()
+  end
+
+  test "can switch from an existing domain to new-domain creation", %{conn: conn} do
+    {:ok, existing} = Accounts.create_domain(%{name: unique_domain("switch")})
+    {:ok, view, _html} = live(conn, ~p"/mailboxes")
+    view |> element("#create-mailbox-button") |> render_click()
+
+    view
+    |> form("#mailbox-domain-form", %{domain: %{selection: "new"}})
+    |> render_change()
+
+    assert has_element?(view, "#new-domain-name")
+
+    view
+    |> form("#mailbox-domain-form", %{domain: %{name: existing.normalized_domain}})
+    |> render_submit()
+
+    assert render(view) =~ "has already been taken"
+    assert has_element?(view, "#domain-name-error")
+  end
+
+  test "forged setup events cannot bypass domain selection", %{conn: conn} do
+    {:ok, domain} = Accounts.create_domain(%{name: unique_domain("guard")})
+    {:ok, view, _html} = live(conn, ~p"/mailboxes")
+
+    render_hook(view, "continue-mailbox-domain", %{"domain" => %{"selection" => domain.id}})
+    render_hook(view, "create-mailbox", %{"mailbox" => %{"local_part" => "forged"}})
+
+    refute has_element?(view, "#mailbox-setup-panel")
+    assert Accounts.list_mailboxes(domain) == []
+
+    view |> element("#create-mailbox-button") |> render_click()
+    render_hook(view, "continue-mailbox-domain", %{"domain" => %{"selection" => "unknown"}})
+
+    assert has_element?(view, "#mailbox-domain-heading")
+    refute has_element?(view, "#mailbox-details-heading")
+  end
+
   defp open_existing_domain(view, domain) do
     view |> element("#create-mailbox-button") |> render_click()
 

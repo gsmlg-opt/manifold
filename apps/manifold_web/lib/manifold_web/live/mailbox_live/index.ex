@@ -40,9 +40,48 @@ defmodule ManifoldWeb.MailboxLive.Index do
   def handle_event("open-mailbox-setup", _params, socket), do: {:noreply, socket}
 
   def handle_event(
-        "continue-mailbox-domain",
+        "change-mailbox-domain",
+        %{"domain" => %{"selection" => "new"}},
+        %{assigns: %{setup_step: :domain}} = socket
+      ) do
+    {:noreply, assign(socket, domain_mode: :new, domain_form: empty_form(:domain))}
+  end
+
+  def handle_event(
+        "change-mailbox-domain",
         %{"domain" => %{"selection" => domain_id}},
         %{assigns: %{setup_step: :domain}} = socket
+      ) do
+    mode = if Enum.any?(socket.assigns.domains, &(&1.id == domain_id)), do: :existing, else: nil
+    {:noreply, assign(socket, :domain_mode, mode)}
+  end
+
+  def handle_event("change-mailbox-domain", _params, socket), do: {:noreply, socket}
+
+  def handle_event(
+        "continue-mailbox-domain",
+        %{"domain" => %{} = attrs},
+        %{assigns: %{setup_step: :domain, domain_mode: :new}} = socket
+      ) do
+    case Accounts.create_domain(Map.take(attrs, ["name"])) do
+      {:ok, domain} ->
+        {:noreply,
+         assign(socket,
+           domains: Accounts.list_domains(),
+           setup_step: :mailbox,
+           selected_domain: domain,
+           mailbox_form: empty_form(:mailbox)
+         )}
+
+      {:error, changeset} ->
+        {:noreply, assign(socket, :domain_form, error_form(changeset, :domain))}
+    end
+  end
+
+  def handle_event(
+        "continue-mailbox-domain",
+        %{"domain" => %{"selection" => domain_id}},
+        %{assigns: %{setup_step: :domain, domain_mode: :existing}} = socket
       ) do
     case Enum.find(socket.assigns.domains, &(&1.id == domain_id)) do
       nil ->
@@ -142,19 +181,49 @@ defmodule ManifoldWeb.MailboxLive.Index do
           :if={@setup_step == :domain}
           id="mailbox-domain-form"
           phx-submit="continue-mailbox-domain"
+          phx-change="change-mailbox-domain"
           class="mailbox-setup-form"
         >
           <h3 id="mailbox-domain-heading" tabindex="-1" phx-mounted={JS.focus()}>
             Choose or create a domain
           </h3>
-          <label for="mailbox-domain-selection">Domain</label>
-          <select id="mailbox-domain-selection" name="domain[selection]" required>
+          <label :if={@domains != []} for="mailbox-domain-selection">Domain</label>
+          <select
+            :if={@domains != []}
+            id="mailbox-domain-selection"
+            name="domain[selection]"
+            required
+          >
             <option value="">Select a domain</option>
             <option :for={domain <- @domains} value={domain.id}>
               {domain.normalized_domain}
             </option>
-            <option value="new">Create a new domain</option>
+            <option value="new" selected={@domain_mode == :new}>Create a new domain</option>
           </select>
+          <input
+            :if={@domains == []}
+            type="hidden"
+            name="domain[selection]"
+            value="new"
+          />
+          <div :if={@domain_mode == :new} class="mailbox-domain-name">
+            <label for="new-domain-name">Domain name</label>
+            <input
+              id="new-domain-name"
+              name={@domain_form[:name].name}
+              value={@domain_form[:name].value}
+              placeholder="example.com"
+              autocomplete="off"
+              required
+            />
+            <p
+              :for={error <- @domain_form[:name].errors}
+              id="domain-name-error"
+              class="settings-error"
+            >
+              {error_message(error)}
+            </p>
+          </div>
           <button type="submit" class="settings-action settings-action-primary">Continue</button>
         </form>
 
