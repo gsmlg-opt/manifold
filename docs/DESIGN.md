@@ -246,7 +246,8 @@ manifold/
 │   ├── manifold_cloud/
 │   ├── manifold_edge/
 │   ├── manifold_connectors/
-│   └── manifold_web/
+│   ├── manifold_web/
+│   └── manifold_api/
 ├── config/
 ├── docs/
 ├── flake.nix
@@ -428,7 +429,6 @@ Owns the Phoenix webmail application:
 - Sent-mail and outbound-delivery status.
 - Operational status.
 - External account OAuth, status, sync-now, and disconnect controls.
-- JSON API.
 - Provider webhook endpoints.
 - LiveView updates through PubSub.
 
@@ -482,6 +482,26 @@ This boundary is read-only with respect to Gmail and Microsoft 365. It does not
 send mail, mutate remote messages, register push subscriptions, or implement
 direct outbound MX delivery.
 
+### 6.14 `manifold_api`
+
+Owns the HTTP machine interface for local mail read and search:
+
+- Versioned REST under `/api/v1`.
+- GraphQL under `/api/graphql` (GraphiQL only in non-production).
+- Product discovery at `GET /.well-known/manifold` (absolute REST/GraphQL URLs,
+  version, and `auth: deployment_boundary`).
+- Shared JSON serialization for mailbox, folder, conversation, body, and
+  attachment metadata.
+- Attachment binary download over REST only; GraphQL exposes REST attachment
+  URLs rather than binary payloads.
+- Structured `Manifold.Core.Error` mapping to HTTP status and JSON error bodies.
+
+It runs as a separate Phoenix Endpoint on `API_PORT` (default `4292`) and depends
+only on public Accounts and Mail context APIs. It does not own compose/send,
+domain/alias administration, provider webhooks, or application-level auth.
+Clients should target the API host; if a reverse proxy merges hosts, forward
+`/.well-known/manifold` to this endpoint.
+
 Phoenix LiveView using Phoenix Duskmoon components is the product frontend.
 Duskmoon Bundler owns JavaScript, CSS, and Tailwind asset builds. A separate SPA
 or native desktop client is not required.
@@ -518,6 +538,7 @@ Tier 5:
 
 Tier 6:
   manifold_web
+  manifold_api
 
 Separate release boundary:
   manifold_edge -> manifold_core + manifold_storage + manifold_smtp
@@ -531,7 +552,8 @@ Important rules:
   production dependency on Accounts, Ingest, or Edge.
 - `manifold_cloud` calls public APIs from Accounts and Ingest.
 - `manifold_connectors` calls public APIs from Accounts, Ingest, and Mail.
-- `manifold_web` calls public context APIs; it does not implement mail policy.
+- `manifold_web` and `manifold_api` call public context APIs; they do not
+  implement mail policy.
 - `manifold_accounts` does not depend on SMTP or Phoenix.
 - `manifold_mail` does not depend on the web presentation layer.
 - Durable jobs are authoritative; PubSub is only a notification mechanism.
@@ -1157,6 +1179,8 @@ with the managed outbound milestone.
 ### 17.3 API principles
 
 - Versioned JSON API under `/api/v1`.
+- GraphQL under `/api/graphql`.
+- Discovery document at `GET /.well-known/manifold` on the API endpoint.
 - Stable resource IDs.
 - Cursor pagination for message lists.
 - Explicit deployment-boundary access policy.
@@ -1168,6 +1192,7 @@ with the managed outbound milestone.
 Candidate resources:
 
 ```text
+/.well-known/manifold
 /api/v1/domains
 /api/v1/mailboxes
 /api/v1/mailboxes/:id/messages

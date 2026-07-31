@@ -119,6 +119,19 @@ config :manifold_web, ManifoldWeb.Endpoint,
   pubsub_server: Manifold.PubSub,
   live_view: [signing_salt: "manifold-local-signing-salt"]
 
+config :manifold_api,
+  generators: [timestamp_type: :utc_datetime_usec, binary_id: true],
+  ecto_repos: [Manifold.Repo]
+
+config :manifold_api, ManifoldAPI.Endpoint,
+  url: [host: "localhost"],
+  adapter: Bandit.PhoenixAdapter,
+  render_errors: [
+    formats: [json: ManifoldAPI.ErrorJSON],
+    layout: false
+  ],
+  pubsub_server: ManifoldAPI.PubSub
+
 config :phoenix, :json_library, Jason
 
 config :codepagex,

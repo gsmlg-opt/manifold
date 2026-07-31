@@ -315,10 +315,17 @@ if not edge_release? do
 
     host = System.get_env("PHX_HOST") || "localhost"
     port = String.to_integer(System.get_env("PORT", "4290"))
+    api_port = String.to_integer(System.get_env("API_PORT", "4292"))
 
     config :manifold_web, ManifoldWeb.Endpoint,
       url: [host: host, port: 443, scheme: "https"],
       http: [ip: {0, 0, 0, 0}, port: port],
+      secret_key_base: secret_key_base,
+      server: true
+
+    config :manifold_api, ManifoldAPI.Endpoint,
+      url: [host: host, port: 443, scheme: "https"],
+      http: [ip: {0, 0, 0, 0}, port: api_port],
       secret_key_base: secret_key_base,
       server: true
   end

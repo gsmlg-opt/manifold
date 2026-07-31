@@ -72,7 +72,8 @@ defmodule Manifold.Umbrella.MixProject do
           manifold_cloud: :permanent,
           manifold_connectors: :permanent,
           manifold_smtp: :permanent,
-          manifold_web: :permanent
+          manifold_web: :permanent,
+          manifold_api: :permanent
         ]
       ],
       manifold_edge: [

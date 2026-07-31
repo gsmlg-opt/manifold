@@ -17,6 +17,7 @@ in
   env.MANIFOLD_RAW_STORE_DIR = "${root}/priv/raw_store/dev";
   env.PHX_HOST = "localhost";
   env.PORT = "4290";
+  env.API_PORT = "4292";
 
   packages = with pkgs; [
     git

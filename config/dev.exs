@@ -35,5 +35,16 @@ config :manifold_web, ManifoldWeb.Endpoint,
     duskmoon_bundler: {Mix.Tasks.DuskmoonBundler.Dev, :run, [["manifold_web"]]}
   ]
 
+config :manifold_api, ManifoldAPI.Endpoint,
+  http: [
+    ip: {0, 0, 0, 0, 0, 0, 0, 0},
+    port: String.to_integer(System.get_env("API_PORT", "4292"))
+  ],
+  check_origin: false,
+  code_reloader: true,
+  debug_errors: true,
+  secret_key_base:
+    "dev-api-secret-key-base-dev-api-secret-key-base-dev-api-secret-key-base-dev"
+
 config :phoenix, :stacktrace_depth, 20
 config :phoenix, :plug_init_mode, :runtime
