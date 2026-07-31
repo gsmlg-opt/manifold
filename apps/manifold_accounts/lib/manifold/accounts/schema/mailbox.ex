@@ -22,7 +22,7 @@ defmodule Manifold.Accounts.Schema.Mailbox do
     |> validate_required([:domain_id, :local_part])
     |> validate_format(:local_part, ~r/^[A-Za-z0-9.!#$%&'*+\-\/=?^_`{|}~]+$/)
     |> put_canonical_local_part()
-    |> unique_constraint([:domain_id, :canonical_local_part])
+    |> unique_constraint([:domain_id, :canonical_local_part], error_key: :local_part)
   end
 
   defp put_canonical_local_part(changeset) do
