@@ -719,4 +719,3 @@ git add \
   apps/manifold_web/assets/css/app.css
 git commit -m "feat(web): finish add account interface"
 ```
-

@@ -76,4 +76,3 @@ Scoped LiveView tests will verify:
 - The final OAuth URL contains the chosen provider and mailbox ID.
 - No active mailboxes produces the management link and no OAuth continuation.
 - Back and Cancel reset or preserve transient state as designed.
-
