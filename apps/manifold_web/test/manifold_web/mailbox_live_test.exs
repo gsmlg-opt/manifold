@@ -46,6 +46,8 @@ defmodule ManifoldWeb.MailboxLiveTest do
     {:ok, view, _html} = live(conn, ~p"/mailboxes")
 
     open_existing_domain(view, domain)
+    refute has_element?(view, "#mailbox-local-part[aria-invalid]")
+    refute has_element?(view, "#mailbox-local-part[aria-describedby]")
 
     html =
       view
@@ -54,6 +56,11 @@ defmodule ManifoldWeb.MailboxLiveTest do
 
     assert html =~ "has invalid format"
     assert has_element?(view, "#mailbox-local-part-error.settings-error")
+
+    assert has_element?(
+             view,
+             "#mailbox-local-part[aria-invalid='true'][aria-describedby='mailbox-local-part-error']"
+           )
 
     html =
       view
@@ -64,6 +71,18 @@ defmodule ManifoldWeb.MailboxLiveTest do
     assert Accounts.list_mailboxes(domain) |> length() == 1
   end
 
+  test "malformed mailbox payload is ignored on the details step", %{conn: conn} do
+    {:ok, domain} = Accounts.create_domain(%{name: unique_domain("malformed")})
+    {:ok, view, _html} = live(conn, ~p"/mailboxes")
+
+    open_existing_domain(view, domain)
+
+    render_hook(view, "create-mailbox", %{"mailbox" => "malformed"})
+
+    assert has_element?(view, "#mailbox-details-heading", "Create the mailbox")
+    assert Accounts.list_mailboxes(domain) == []
+  end
+
   test "cancel closes and clears transient mailbox setup", %{conn: conn} do
     {:ok, domain} = Accounts.create_domain(%{name: unique_domain("cancel")})
     {:ok, view, _html} = live(conn, ~p"/mailboxes")
@@ -71,15 +90,15 @@ defmodule ManifoldWeb.MailboxLiveTest do
     open_existing_domain(view, domain)
     assert has_element?(view, "#mailbox-setup-panel")
 
-    view |> element("#cancel-mailbox-setup") |> render_click()
-
-    refute has_element?(view, "#mailbox-setup-panel")
-
     assert has_element?(
              view,
              "#cancel-mailbox-setup[phx-click*='focus'][phx-click*='#create-mailbox-button']",
              "Cancel"
-           ) == false
+           )
+
+    view |> element("#cancel-mailbox-setup") |> render_click()
+
+    refute has_element?(view, "#mailbox-setup-panel")
 
     view |> element("#create-mailbox-button") |> render_click()
     assert has_element?(view, "#mailbox-domain-heading")

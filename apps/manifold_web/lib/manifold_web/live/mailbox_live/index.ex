@@ -63,7 +63,7 @@ defmodule ManifoldWeb.MailboxLive.Index do
 
   def handle_event(
         "create-mailbox",
-        %{"mailbox" => attrs},
+        %{"mailbox" => %{} = attrs},
         %{assigns: %{setup_step: :mailbox, selected_domain: domain}} = socket
       )
       when not is_nil(domain) do
@@ -174,6 +174,12 @@ defmodule ManifoldWeb.MailboxLive.Index do
               name={@mailbox_form[:local_part].name}
               value={@mailbox_form[:local_part].value}
               autocomplete="off"
+              aria-invalid={if @mailbox_form[:local_part].errors == [], do: nil, else: "true"}
+              aria-describedby={
+                if @mailbox_form[:local_part].errors == [],
+                  do: nil,
+                  else: "mailbox-local-part-error"
+              }
               required
             />
             <span id="mailbox-address-domain">@{@selected_domain.normalized_domain}</span>
