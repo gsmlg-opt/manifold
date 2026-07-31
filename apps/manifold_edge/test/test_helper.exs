@@ -12,9 +12,13 @@ repo_config =
   end
 
 repo_config =
-  case System.get_env("POSTGRES_SOCKET_DIR") do
-    nil -> repo_config
-    socket_dir -> Keyword.put(repo_config, :socket_dir, socket_dir)
+  if System.get_env("DEVENV_RUNTIME") not in [nil, ""] do
+    case System.get_env("POSTGRES_SOCKET_DIR") do
+      nil -> repo_config
+      socket_dir -> Keyword.put(repo_config, :socket_dir, socket_dir)
+    end
+  else
+    repo_config
   end
 
 repo_config =

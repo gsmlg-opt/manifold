@@ -3,22 +3,95 @@ import Config
 release_name = System.get_env("RELEASE_NAME", "manifold")
 edge_release? = release_name == "manifold_edge" or System.get_env("MANIFOLD_ROLE") == "edge"
 
-unless config_env() == :test do
-  if database_url = System.get_env("DATABASE_URL") do
+# Only honor devenv's Unix-socket Postgres when `devenv shell` exported
+# DEVENV_RUNTIME. Outside devenv, ignore stale socket DATABASE_URL / socket_dir
+# and keep compile-time TCP defaults (localhost:5432).
+devenv? = System.get_env("DEVENV_RUNTIME") not in [nil, ""]
+
+usable_database_url? = fn
+  nil -> false
+  url -> devenv? or not String.contains?(url, "socket_dir")
+end
+
+maybe_put_socket_dir = fn repo_config ->
+  if devenv? do
+    case System.get_env("POSTGRES_SOCKET_DIR") do
+      nil -> repo_config
+      socket_dir -> Keyword.put(repo_config, :socket_dir, socket_dir)
+    end
+  else
+    repo_config
+  end
+end
+
+case config_env() do
+  :test ->
+    partition = System.get_env("MIX_TEST_PARTITION")
+    default_db = if partition in [nil, ""], do: "manifold_test", else: "manifold_test#{partition}"
+
     repo_config = [
-      url: database_url,
+      username: System.get_env("POSTGRES_USER", "manifold_dev"),
+      password: System.get_env("POSTGRES_PASSWORD", "manifold_dev"),
+      database: System.get_env("POSTGRES_TEST_DB", default_db),
+      hostname: System.get_env("POSTGRES_HOST", "localhost"),
+      port: String.to_integer(System.get_env("POSTGRES_PORT", "5432"))
+    ]
+
+    repo_config =
+      case System.get_env("TEST_DATABASE_URL") do
+        url when is_binary(url) ->
+          if usable_database_url?.(url) do
+            Keyword.put(repo_config, :url, url)
+          else
+            repo_config
+          end
+
+        _ ->
+          repo_config
+      end
+
+    config :manifold_data, Manifold.Repo, maybe_put_socket_dir.(repo_config)
+
+  :dev ->
+    repo_config = [
+      username: System.get_env("POSTGRES_USER", "manifold_dev"),
+      password: System.get_env("POSTGRES_PASSWORD", "manifold_dev"),
+      database: System.get_env("POSTGRES_DB", "manifold_dev"),
+      hostname: System.get_env("POSTGRES_HOST", "localhost"),
+      port: String.to_integer(System.get_env("POSTGRES_PORT", "5432")),
       pool_size: String.to_integer(System.get_env("POOL_SIZE", "10"))
     ]
 
     repo_config =
-      if socket_dir = System.get_env("POSTGRES_SOCKET_DIR") do
-        Keyword.put(repo_config, :socket_dir, socket_dir)
-      else
-        repo_config
+      case System.get_env("DATABASE_URL") do
+        url when is_binary(url) ->
+          if usable_database_url?.(url) do
+            Keyword.put(repo_config, :url, url)
+          else
+            repo_config
+          end
+
+        _ ->
+          repo_config
       end
 
-    config :manifold_data, Manifold.Repo, repo_config
-  end
+    config :manifold_data, Manifold.Repo, maybe_put_socket_dir.(repo_config)
+
+    config :manifold_web, ManifoldWeb.Endpoint,
+      http: [port: String.to_integer(System.get_env("PORT", "4290"))]
+
+    config :manifold_api, ManifoldAPI.Endpoint,
+      http: [port: String.to_integer(System.get_env("API_PORT", "4292"))]
+
+  _other ->
+    if database_url = System.get_env("DATABASE_URL") do
+      repo_config = [
+        url: database_url,
+        pool_size: String.to_integer(System.get_env("POOL_SIZE", "10"))
+      ]
+
+      config :manifold_data, Manifold.Repo, maybe_put_socket_dir.(repo_config)
+    end
 end
 
 config :manifold_smtp,
@@ -129,28 +202,31 @@ if not edge_release? and config_env() != :test do
   end
 end
 
-raw_store_backend =
-  case System.get_env("MANIFOLD_RAW_STORE_BACKEND", "local") do
-    "local" -> Manifold.Storage.RawStore.Local
-    other -> raise "unsupported MANIFOLD_RAW_STORE_BACKEND=#{other}"
-  end
+# Keep compile-time test storage paths (tmp/*); do not inherit devenv/dev dirs.
+unless config_env() == :test do
+  raw_store_backend =
+    case System.get_env("MANIFOLD_RAW_STORE_BACKEND", "local") do
+      "local" -> Manifold.Storage.RawStore.Local
+      other -> raise "unsupported MANIFOLD_RAW_STORE_BACKEND=#{other}"
+    end
 
-config :manifold_storage,
-  spool_dir:
-    System.get_env("MANIFOLD_SPOOL_DIR", Path.expand("../priv/spool/#{config_env()}", __DIR__)),
-  spool_min_free_bytes: String.to_integer(System.get_env("MANIFOLD_SPOOL_MIN_FREE_BYTES", "0")),
-  raw_store_backend: raw_store_backend,
-  raw_store_dir:
-    System.get_env(
-      "MANIFOLD_RAW_STORE_DIR",
-      Path.expand("../priv/raw_store/#{config_env()}", __DIR__)
-    ),
-  blob_store_backend: Manifold.Storage.BlobStore.Local,
-  blob_store_dir:
-    System.get_env(
-      "MANIFOLD_BLOB_STORE_DIR",
-      Path.expand("../priv/blob_store/#{config_env()}", __DIR__)
-    )
+  config :manifold_storage,
+    spool_dir:
+      System.get_env("MANIFOLD_SPOOL_DIR", Path.expand("../priv/spool/#{config_env()}", __DIR__)),
+    spool_min_free_bytes: String.to_integer(System.get_env("MANIFOLD_SPOOL_MIN_FREE_BYTES", "0")),
+    raw_store_backend: raw_store_backend,
+    raw_store_dir:
+      System.get_env(
+        "MANIFOLD_RAW_STORE_DIR",
+        Path.expand("../priv/raw_store/#{config_env()}", __DIR__)
+      ),
+    blob_store_backend: Manifold.Storage.BlobStore.Local,
+    blob_store_dir:
+      System.get_env(
+        "MANIFOLD_BLOB_STORE_DIR",
+        Path.expand("../priv/blob_store/#{config_env()}", __DIR__)
+      )
+end
 
 resend_config =
   []

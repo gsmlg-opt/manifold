@@ -1,25 +1,14 @@
 import Config
 
-repo_config = [
-  url: System.get_env("TEST_DATABASE_URL"),
-  username: System.get_env("POSTGRES_USER", "manifold_dev"),
-  password: System.get_env("POSTGRES_PASSWORD", "manifold_dev"),
-  database:
-    System.get_env("POSTGRES_TEST_DB", "manifold_test#{System.get_env("MIX_TEST_PARTITION")}"),
-  hostname: System.get_env("POSTGRES_HOST", "localhost"),
-  port: String.to_integer(System.get_env("POSTGRES_PORT", "5432")),
+# Compile-time defaults only. Env overrides belong in config/runtime.exs.
+config :manifold_data, Manifold.Repo,
+  username: "manifold_dev",
+  password: "manifold_dev",
+  database: "manifold_test",
+  hostname: "localhost",
+  port: 5432,
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: System.schedulers_online() * 2
-]
-
-repo_config =
-  if socket_dir = System.get_env("POSTGRES_SOCKET_DIR") do
-    Keyword.put(repo_config, :socket_dir, socket_dir)
-  else
-    repo_config
-  end
-
-config :manifold_data, Manifold.Repo, repo_config
 
 config :manifold_data, Oban, testing: :manual, queues: false, plugins: false
 
@@ -55,8 +44,7 @@ config :manifold_web, ManifoldWeb.Endpoint,
 
 config :manifold_api, ManifoldAPI.Endpoint,
   http: [ip: {127, 0, 0, 1}, port: 4003],
-  secret_key_base:
-    "test-api-secret-key-base-test-api-secret-key-base-test-api-secret-key-base",
+  secret_key_base: "test-api-secret-key-base-test-api-secret-key-base-test-api-secret-key-base",
   server: false
 
 config :logger, level: :warning
