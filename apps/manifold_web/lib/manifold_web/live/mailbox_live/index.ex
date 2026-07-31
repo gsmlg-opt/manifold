@@ -41,10 +41,11 @@ defmodule ManifoldWeb.MailboxLive.Index do
 
   def handle_event(
         "change-mailbox-domain",
-        %{"domain" => %{"selection" => "new"}},
+        %{"domain" => %{"selection" => "new"} = attrs},
         %{assigns: %{setup_step: :domain}} = socket
       ) do
-    {:noreply, assign(socket, domain_mode: :new, domain_form: empty_form(:domain))}
+    domain_form = attrs |> Map.take(["name"]) |> to_form(as: :domain)
+    {:noreply, assign(socket, domain_mode: :new, domain_form: domain_form)}
   end
 
   def handle_event(
@@ -214,6 +215,10 @@ defmodule ManifoldWeb.MailboxLive.Index do
               value={@domain_form[:name].value}
               placeholder="example.com"
               autocomplete="off"
+              aria-invalid={if @domain_form[:name].errors == [], do: nil, else: "true"}
+              aria-describedby={
+                if @domain_form[:name].errors == [], do: nil, else: "domain-name-error"
+              }
               required
             />
             <p

@@ -112,6 +112,8 @@ defmodule ManifoldWeb.MailboxLiveTest do
     view |> element("#create-mailbox-button") |> render_click()
 
     assert has_element?(view, "#new-domain-name")
+    refute has_element?(view, "#new-domain-name[aria-invalid]")
+    refute has_element?(view, "#new-domain-name[aria-describedby]")
     refute has_element?(view, "#mailbox-domain-selection")
 
     html =
@@ -121,6 +123,11 @@ defmodule ManifoldWeb.MailboxLiveTest do
 
     assert html =~ "domain syntax is invalid"
     assert has_element?(view, "#domain-name-error.settings-error")
+
+    assert has_element?(
+             view,
+             "#new-domain-name[aria-invalid='true'][aria-describedby='domain-name-error']"
+           )
 
     view
     |> form("#mailbox-domain-form", %{domain: %{name: "New-Mail.TEST"}})
@@ -134,6 +141,19 @@ defmodule ManifoldWeb.MailboxLiveTest do
 
     assert [%{normalized_domain: "new-mail.test"}] = Accounts.list_domains()
     assert [%{canonical_local_part: "inbox"}] = Accounts.list_mailboxes()
+  end
+
+  test "preserves the typed new-domain name across form changes", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/mailboxes")
+    view |> element("#create-mailbox-button") |> render_click()
+
+    view
+    |> form("#mailbox-domain-form", %{
+      domain: %{selection: "new", name: "Draft.TEST"}
+    })
+    |> render_change()
+
+    assert has_element?(view, "#new-domain-name[value='Draft.TEST']")
   end
 
   test "can switch from an existing domain to new-domain creation", %{conn: conn} do
