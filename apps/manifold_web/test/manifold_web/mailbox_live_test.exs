@@ -105,6 +105,32 @@ defmodule ManifoldWeb.MailboxLiveTest do
     refute has_element?(view, "#mailbox-details-heading")
   end
 
+  test "setup panel labels steps and manages focus", %{conn: conn} do
+    {:ok, domain} = Accounts.create_domain(%{name: unique_domain("a11y")})
+    {:ok, view, _html} = live(conn, ~p"/mailboxes")
+
+    view |> element("#create-mailbox-button") |> render_click()
+
+    assert has_element?(
+             view,
+             "#mailbox-setup-panel[aria-labelledby='mailbox-setup-title'] #mailbox-domain-heading[tabindex='-1'][phx-mounted*='focus']"
+           )
+
+    assert has_element?(
+             view,
+             "#cancel-mailbox-setup[phx-click*='cancel-mailbox-setup'][phx-click*='focus'][phx-click*='#create-mailbox-button']"
+           )
+
+    view
+    |> form("#mailbox-domain-form", %{domain: %{selection: domain.id}})
+    |> render_submit()
+
+    assert has_element?(
+             view,
+             "#mailbox-details-heading[tabindex='-1'][phx-mounted*='focus']"
+           )
+  end
+
   test "creates a domain before creating the first mailbox", %{conn: conn} do
     assert Accounts.list_domains() == []
     {:ok, view, _html} = live(conn, ~p"/mailboxes")
