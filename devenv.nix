@@ -56,8 +56,18 @@ in
     initialScript = "ALTER ROLE manifold_dev CREATEDB;";
   };
 
+  # Load optional `.env` at process/shell start (not via dotenv.enable) so
+  # OAuth client secrets stay out of the nix store. See .env.example.
   processes.manifold = {
-    exec = "mix ecto.migrate && mix manifold.run";
+    exec = ''
+      if [ -f .env ]; then
+        set -a
+        # shellcheck disable=SC1091
+        . ./.env
+        set +a
+      fi
+      mix ecto.migrate && mix manifold.run
+    '';
     after = [ "devenv:processes:postgres" ];
     ready.http.get = {
       port = 4290;
@@ -78,11 +88,26 @@ in
   '';
 
   scripts.manifold-server.exec = ''
+    if [ -f .env ]; then
+      set -a
+      # shellcheck disable=SC1091
+      . ./.env
+      set +a
+    fi
     mix manifold.run
   '';
 
   enterShell = ''
     echo "Manifold devenv ready"
     echo "PostgreSQL socket: $PGHOST"
+    if [ -f .env ]; then
+      set -a
+      # shellcheck disable=SC1091
+      . ./.env
+      set +a
+      echo "Loaded .env (connector OAuth vars if set)"
+    else
+      echo "No .env yet — copy .env.example to enable Gmail/Microsoft connectors"
+    fi
   '';
 }

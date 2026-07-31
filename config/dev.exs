@@ -15,6 +15,9 @@ config :manifold_connectors,
   encryption_key: "G6HVBr8ZblWE1sHBF/vCyXH/aWOJgmExT8ECM+yLPbc="
 
 config :manifold_web, ManifoldWeb.Endpoint,
+  # Include the listener port in `:url` so OAuth callback URIs match the
+  # provider-console registrations documented as http://localhost:4290/...
+  url: [host: "localhost", port: 4290],
   http: [ip: {0, 0, 0, 0, 0, 0, 0, 0}, port: 4290],
   check_origin: false,
   code_reloader: true,

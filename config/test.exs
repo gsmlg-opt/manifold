@@ -22,7 +22,7 @@ config :manifold_connectors,
       base_url: "https://gmail.invalid"
     ],
     microsoft: [
-      authorization_url: "https://login.microsoft.invalid/authorize",
+      device_code_url: "https://login.microsoft.invalid/devicecode",
       token_url: "https://login.microsoft.invalid/token",
       base_url: "https://graph.microsoft.invalid/v1.0",
       tenant: "organizations"

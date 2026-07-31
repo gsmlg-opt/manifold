@@ -4,43 +4,51 @@ defmodule ManifoldWeb.ConnectorOAuthController do
   alias Manifold.Connectors
   alias Manifold.Connectors.OAuth
 
-  @providers ~w(gmail microsoft)
+  # Gmail keeps authorization-code + PKCE because Google's device-flow allowlist
+  # excludes Gmail API scopes. Microsoft uses device flow in LiveView instead.
+  @gmail "gmail"
 
-  def start(conn, %{"provider" => provider, "mailbox_id" => mailbox_id})
-      when provider in @providers do
-    case OAuth.start(provider, mailbox_id, callback_url(provider)) do
+  def start(conn, %{"provider" => @gmail, "mailbox_id" => mailbox_id}) do
+    case OAuth.start(@gmail, mailbox_id, callback_url(@gmail)) do
       {:ok, authorization} ->
         redirect(conn, external: authorization.url)
 
       {:error, _reason} ->
-        connector_error(conn, "The #{provider_name(provider)} connection could not be started.")
+        connector_error(conn, "The Gmail connection could not be started.")
     end
+  end
+
+  def start(conn, %{"provider" => "microsoft"}) do
+    connector_error(
+      conn,
+      "Microsoft 365 uses device authorization. Start the connection from Add account."
+    )
   end
 
   def start(conn, _params) do
     connector_error(conn, "The external account connection could not be started.")
   end
 
-  def callback(conn, %{"provider" => provider, "code" => code, "state" => state})
-      when provider in @providers do
-    redirect_uri = callback_url(provider)
+  def callback(conn, %{"provider" => @gmail, "code" => code, "state" => state}) do
+    redirect_uri = callback_url(@gmail)
 
-    case OAuth.consume(provider, state, redirect_uri) do
+    case OAuth.consume(@gmail, state, redirect_uri) do
       {:ok, consumed} ->
-        complete_authorization(conn, provider, code, consumed)
+        complete_authorization(conn, code, consumed)
 
       {:error, _reason} ->
-        connector_error(
-          conn,
-          "The #{provider_name(provider)} authorization request is invalid or expired."
-        )
+        connector_error(conn, "The Gmail authorization request is invalid or expired.")
     end
   end
 
-  def callback(conn, %{"provider" => provider}) when provider in @providers do
+  def callback(conn, %{"provider" => @gmail}) do
+    connector_error(conn, "The Gmail authorization request is invalid or expired.")
+  end
+
+  def callback(conn, %{"provider" => "microsoft"}) do
     connector_error(
       conn,
-      "The #{provider_name(provider)} authorization request is invalid or expired."
+      "Microsoft 365 uses device authorization. Start the connection from Add account."
     )
   end
 
@@ -48,15 +56,15 @@ defmodule ManifoldWeb.ConnectorOAuthController do
     connector_error(conn, "The external account authorization request is invalid or expired.")
   end
 
-  defp complete_authorization(conn, provider, code, consumed) do
-    case Connectors.complete_authorization(provider, code, consumed) do
+  defp complete_authorization(conn, code, consumed) do
+    case Connectors.complete_authorization(@gmail, code, consumed) do
       {:ok, _account} ->
         conn
-        |> put_flash(:info, "#{provider_name(provider)} account connected.")
+        |> put_flash(:info, "Gmail account connected.")
         |> redirect(to: ~p"/settings/accounts")
 
       {:error, _reason} ->
-        connector_error(conn, "The #{provider_name(provider)} account could not be connected.")
+        connector_error(conn, "The Gmail account could not be connected.")
     end
   end
 
@@ -67,7 +75,4 @@ defmodule ManifoldWeb.ConnectorOAuthController do
   end
 
   defp callback_url(provider), do: url(~p"/connectors/#{provider}/callback")
-
-  defp provider_name("gmail"), do: "Gmail"
-  defp provider_name("microsoft"), do: "Microsoft 365"
 end

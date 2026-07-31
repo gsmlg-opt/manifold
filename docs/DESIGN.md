@@ -1365,8 +1365,9 @@ PHX_HOST
 Development should default to a non-privileged SMTP port such as 2525.
 The production local release requires
 `MANIFOLD_CONNECTOR_ENCRYPTION_KEY` to decode to exactly 32 bytes. Gmail and
-Microsoft are enabled independently only when both client ID and secret are
-configured. Provider endpoint overrides must be absolute HTTPS URLs without
+Microsoft are enabled independently when a non-empty `client_id` and the
+required endpoint URLs are present; `client_secret` is optional for public
+clients. Provider endpoint overrides must be absolute HTTPS URLs without
 credentials or fragments.
 
 ### 20.3 Nix development environment
@@ -1451,10 +1452,15 @@ durable spool -> manifold_ingest -> raw store -> mailbox projection
 ### 22.1 OAuth and credential boundary
 
 - Providers are limited to the fixed `gmail` and `microsoft` allowlist.
-- Authorization uses the OAuth 2.0 authorization-code flow and PKCE `S256`.
+- Microsoft uses the OAuth 2.0 Device Authorization Grant (RFC 8628) as a
+  public client (`client_id` required; `client_secret` optional).
+- Gmail keeps authorization code + PKCE `S256` because Google's device-flow
+  allowlist excludes Gmail API scopes. Gmail `client_secret` is also optional
+  for public/Desktop clients.
 - The random state value is persisted only as a SHA-256 digest, expires after a
   bounded interval, and is consumed once under a database lock.
-- PKCE verifiers and provider tokens use versioned AES-256-GCM envelopes.
+- Device codes, PKCE verifiers, and provider tokens use versioned AES-256-GCM
+  envelopes.
 - Encryption associated data binds credentials to their account and purpose.
 - Gmail requests `openid`, `email`, and `gmail.readonly`.
 - Gmail uses the OpenID UserInfo `sub` as the durable account identity; its
@@ -1467,16 +1473,16 @@ durable spool -> manifold_ingest -> raw store -> mailbox projection
 - A provider account identity is permanently bound to its first active local
   mailbox and reauthorization cannot silently move that account.
 
-The intended callback URLs are:
+The Gmail callback URL is:
 
 ```text
 https://<PHX_HOST>/connectors/gmail/callback
-https://<PHX_HOST>/connectors/microsoft/callback
 ```
 
-Local development uses the same paths at `http://localhost:4290`. The exact
-redirect URI is stored with the OAuth transaction and must match on callback.
-The Phoenix controller derives the callback from the configured Endpoint URL.
+Local development uses the same path at `http://localhost:4290`. The exact
+redirect URI is stored with the Gmail OAuth transaction and must match on
+callback. Microsoft device authorization does not use a redirect URI; the Add
+Account LiveView displays the user code and polls the token endpoint.
 
 ### 22.2 Provider synchronization
 

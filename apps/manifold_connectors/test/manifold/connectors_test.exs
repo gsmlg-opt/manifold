@@ -43,6 +43,26 @@ defmodule Manifold.ConnectorsTest do
     end
 
     @impl true
+    def request_device_code(_config, _opts),
+      do:
+        {:error,
+         %Manifold.Connectors.Provider.Error{
+           class: :permanent,
+           code: :device_flow_unsupported,
+           message: "not used"
+         }}
+
+    @impl true
+    def exchange_device_code(_device_code, _config, _opts),
+      do:
+        {:error,
+         %Manifold.Connectors.Provider.Error{
+           class: :permanent,
+           code: :device_flow_unsupported,
+           message: "not used"
+         }}
+
+    @impl true
     def refresh_token(_refresh_token, _config, _opts), do: raise("not used")
 
     @impl true

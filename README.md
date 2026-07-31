@@ -74,10 +74,15 @@ for Manifold and does not bypass the durable local acceptance pipeline.
 
 The current implementation includes:
 
-- OAuth authorization-code primitives with one-time, hashed state and PKCE
-  `S256`.
-- AES-256-GCM encryption envelopes for access tokens, refresh tokens, and PKCE
-  verifiers. Encryption binds each secret to its account and purpose.
+- Microsoft OAuth Device Authorization Grant (RFC 8628) for public clients
+  (`client_id` only; same public-client idea as a desktop mail app).
+- Gmail authorization-code + PKCE `S256` (Google's device-flow allowlist
+  excludes Gmail API scopes). Prefer a Desktop/public Google client so
+  `client_secret` is optional.
+- One-time, hashed OAuth state; encrypted device codes or PKCE verifiers.
+- AES-256-GCM encryption envelopes for access tokens, refresh tokens, and
+  temporary OAuth secrets. Encryption binds each secret to its account and
+  purpose.
 - Gmail OpenID identity, message-list, history, and `format=RAW` operations
   using the stable subject identifier and `gmail.readonly` scope.
 - Microsoft Graph profile, folder-delta, message-delta, immutable message ID,
@@ -89,8 +94,8 @@ The current implementation includes:
   acceptance boundary.
 - Idempotent external import through a version-2 spool bundle, raw archive,
   mailbox projection, and a retryable remote-state application job.
-- A no-auth `/settings/accounts` LiveView with OAuth start/callback routes,
-  sync-now, status, and disconnect controls.
+- A no-auth `/settings/accounts` LiveView with Gmail OAuth start/callback
+  routes, Microsoft device-code UX, sync-now, status, and disconnect controls.
 - A local-release `connectors` Oban queue and five-minute polling job that
   recreates missing active-account sync work.
 
@@ -120,15 +125,15 @@ The local release and development runtime support:
 ```text
 MANIFOLD_CONNECTOR_ENCRYPTION_KEY
 MANIFOLD_GMAIL_CLIENT_ID
-MANIFOLD_GMAIL_CLIENT_SECRET
+MANIFOLD_GMAIL_CLIENT_SECRET          # optional for public/Desktop clients
 MANIFOLD_GMAIL_AUTHORIZATION_URL
 MANIFOLD_GMAIL_TOKEN_URL
 MANIFOLD_GMAIL_USERINFO_URL
 MANIFOLD_GMAIL_API_BASE_URL
 MANIFOLD_MICROSOFT_CLIENT_ID
-MANIFOLD_MICROSOFT_CLIENT_SECRET
+MANIFOLD_MICROSOFT_CLIENT_SECRET      # optional for public clients
 MANIFOLD_MICROSOFT_TENANT
-MANIFOLD_MICROSOFT_AUTHORIZATION_URL
+MANIFOLD_MICROSOFT_DEVICE_CODE_URL
 MANIFOLD_MICROSOFT_TOKEN_URL
 MANIFOLD_MICROSOFT_API_BASE_URL
 ```
@@ -141,24 +146,25 @@ provider client is configured. Generate one with:
 openssl rand -base64 32
 ```
 
-The provider application registrations will use these exact callback paths:
+A commented variable checklist lives in `.env.example`. With devenv, `.env` is
+sourced automatically; outside devenv export the variables before starting the
+app (`set -a && source .env && set +a`).
+
+Gmail still needs a redirect callback (authorization code + PKCE):
 
 ```text
 https://<your-manifold-host>/connectors/gmail/callback
-https://<your-manifold-host>/connectors/microsoft/callback
 ```
 
-For local development, the intended callbacks are:
+Local development:
 
 ```text
 http://localhost:4290/connectors/gmail/callback
-http://localhost:4290/connectors/microsoft/callback
 ```
 
-Register only the production HTTPS callbacks with provider consoles. Local HTTP
-callbacks are suitable for provider development registrations where the
-provider permits loopback HTTP. OAuth transactions compare the callback URI
-byte-for-byte with the URI stored at authorization start.
+Microsoft uses device authorization and does not require a redirect URI.
+Development Endpoint `:url` includes port `4290` so Gmail redirect URIs match
+local callback registrations.
 
 The provider configuration uses:
 
@@ -167,8 +173,8 @@ Gmail authorization: https://accounts.google.com/o/oauth2/v2/auth
 Gmail token:         https://oauth2.googleapis.com/token
 Gmail API:           https://gmail.googleapis.com
 
-Microsoft authorization:
-  https://login.microsoftonline.com/<tenant>/oauth2/v2.0/authorize
+Microsoft device code:
+  https://login.microsoftonline.com/<tenant>/oauth2/v2.0/devicecode
 Microsoft token:
   https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token
 Microsoft Graph:
@@ -176,9 +182,9 @@ Microsoft Graph:
 ```
 
 Use `organizations` as the Microsoft tenant default for work/school accounts.
-Authorization, token, and API endpoint overrides must be absolute HTTPS URLs
-without credentials or fragments. A provider is enabled only when its client ID
-and secret are both set; configuring only one makes startup fail.
+Endpoint overrides must be absolute HTTPS URLs without credentials or fragments.
+A provider is enabled when its `client_id` and required endpoint URLs are set;
+`client_secret` is optional. Setting a secret without a client ID fails startup.
 Development and test configuration use non-production encryption keys;
 development has no provider client credentials and test uses inert endpoints.
 Set the provider client environment variables before
@@ -188,6 +194,94 @@ The requested read-only scopes are:
 ```text
 Gmail:     openid email https://www.googleapis.com/auth/gmail.readonly
 Microsoft: openid profile offline_access User.Read Mail.Read
+```
+
+### Compared with Apple Mail
+
+Apple Mail (and similar desktop clients) also uses **OAuth user consent** with a
+**public/native client**: you pick Google or Outlook, sign in in a system or
+browser sheet, and the app never stores your provider password. Under the hood
+Apple then talks **IMAP/SMTP + XOAUTH2** (or Exchange protocols)—not the Gmail
+API or Microsoft Graph.
+
+Manifold mirrors that **user-facing OAuth model** (register your own public
+client, typically `client_id` only, then sign in / approve):
+
+| | Apple Mail | Manifold Milestone 6 |
+| --- | --- | --- |
+| User consent | OAuth (system/browser) | OAuth (browser for Gmail; device code for Microsoft) |
+| Client type | Apple’s native/public app | **Your** public/Desktop or public Entra app |
+| Sync channel | IMAP / Exchange | Gmail API + Microsoft Graph (read-only) |
+| `client_secret` | Not an operator concern | Optional; leave unset for public clients |
+
+Do **not** reuse Apple Mail’s (or any other vendor’s) OAuth `client_id` or
+secret. That violates provider terms, and redirect or device registration will
+not match Manifold. IMAP as the first connector remains rejected (see
+[ADR 0007](docs/adr/0007-read-only-provider-connectors.md)).
+
+### Google Cloud OAuth client (Gmail)
+
+Google’s documented OAuth device-flow allowlist does **not** include Gmail API
+scopes, so Manifold cannot use device authorization for Gmail. Use authorization
+code + PKCE instead.
+
+1. In Google Cloud Console, create or select a project.
+2. Enable the Gmail API for that project.
+3. Configure the OAuth consent screen (External or Internal). Add the test
+   users who will connect during development if the app is in Testing.
+4. Create an OAuth client ID. Prefer **Desktop app** / installed for a public
+   client (`client_id` only). A **Web application** client also works and may
+   include a secret.
+5. For Web clients, add the authorized redirect URI
+   `http://localhost:4290/connectors/gmail/callback` for local use, and the
+   production HTTPS callback for a deployed host. Desktop clients use the
+   loopback redirect generated by Manifold’s Endpoint URL.
+6. Copy the client ID into `MANIFOLD_GMAIL_CLIENT_ID`. Set
+   `MANIFOLD_GMAIL_CLIENT_SECRET` only when the Google client has a secret.
+7. Scopes requested by Manifold:
+   `openid`, `email`, and
+   `https://www.googleapis.com/auth/gmail.readonly`. Offline access is
+   requested via `access_type=offline` and `prompt=consent`.
+
+### Azure AD app registration (Microsoft 365)
+
+1. In Microsoft Entra ID (Azure AD), register a new application.
+2. Under **Authentication** → **Advanced settings**, set **Allow public client
+   flows** to **Yes**. No redirect URI is required for device code flow.
+3. Under **API permissions**, add Microsoft Graph **delegated** permissions:
+   `openid`, `profile`, `offline_access`, `User.Read`, and `Mail.Read`.
+   Do not add `Mail.ReadWrite` or `Mail.Send`.
+4. Grant admin consent if your tenant requires it for `Mail.Read`.
+5. Copy the Application (client) ID into `MANIFOLD_MICROSOFT_CLIENT_ID`.
+   A client secret is optional for this public-client device flow.
+6. Set `MANIFOLD_MICROSOFT_TENANT` to `organizations` (default, work/school),
+   a specific tenant ID/domain, or `common` only when personal accounts must
+   be allowed.
+
+### Connect and smoke-test from the UI
+
+1. Ensure at least one local mailbox exists (`mix setup` seeds
+   `inbox@example.test`, or create one under `/mailboxes`).
+2. Open `http://localhost:4290/settings/accounts` → **Add account**.
+3. Choose **External account**, then **Gmail** or **Microsoft 365** (disabled
+   providers mean the matching env vars are not loaded — only `client_id` is
+   required).
+4. Select the destination local mailbox and continue:
+   - **Gmail** → **Sign in with Google** (browser consent, then callback).
+   - **Microsoft 365** → **Sign in with Microsoft** (device user code +
+     verification URI; approve on any device while Manifold polls).
+5. After authorization, the account should appear as connected and the first
+   sync job is inserted. Use **Synchronize now** if needed; wait for mail to
+   show in the chosen mailbox inbox.
+6. Use **Disconnect** to revoke the local connection (provider-side consent
+   may remain until removed in the provider account settings).
+
+Minimal env for a mail-client-style setup (placeholders only):
+
+```text
+MANIFOLD_GMAIL_CLIENT_ID=your-desktop-client-id.apps.googleusercontent.com
+MANIFOLD_MICROSOFT_CLIENT_ID=00000000-0000-0000-0000-000000000000
+# secrets intentionally omitted
 ```
 
 ## Development

@@ -55,6 +55,111 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
              )
   end
 
+  test "requests a device code without requiring a client secret" do
+    config =
+      Keyword.merge(@config,
+        client_secret: nil,
+        device_code_url: "https://login.microsoftonline.test/organizations/oauth2/v2.0/devicecode"
+      )
+
+    Req.Test.expect(MicrosoftGraph, fn conn ->
+      assert conn.method == "POST"
+      assert conn.request_path == "/organizations/oauth2/v2.0/devicecode"
+
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      assert Plug.Conn.Query.decode(body) == %{
+               "client_id" => "graph-client",
+               "scope" => "openid profile offline_access User.Read Mail.Read"
+             }
+
+      Req.Test.json(conn, %{
+        "device_code" => "device-code",
+        "user_code" => "ABCD-EFGH",
+        "verification_uri" => "https://microsoft.com/devicelogin",
+        "expires_in" => 900,
+        "interval" => 5
+      })
+    end)
+
+    assert {:ok,
+            %Provider.DeviceCode{
+              device_code: "device-code",
+              user_code: "ABCD-EFGH",
+              verification_uri: "https://microsoft.com/devicelogin",
+              interval_seconds: 5,
+              expires_at: ~U[2026-07-29 08:15:00Z]
+            }} = MicrosoftGraph.request_device_code(config, now: @now)
+  end
+
+  test "polls the device token endpoint until authorization completes" do
+    config =
+      Keyword.merge(@config,
+        client_secret: nil,
+        device_code_url: "https://login.microsoftonline.test/organizations/oauth2/v2.0/devicecode"
+      )
+
+    Req.Test.expect(MicrosoftGraph, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      assert Plug.Conn.Query.decode(body) == %{
+               "client_id" => "graph-client",
+               "device_code" => "device-code",
+               "grant_type" => "urn:ietf:params:oauth:grant-type:device_code",
+               "scope" => "openid profile offline_access User.Read Mail.Read"
+             }
+
+      conn
+      |> Plug.Conn.put_status(400)
+      |> Req.Test.json(%{"error" => "authorization_pending"})
+    end)
+
+    assert {:pending, :authorization_pending} =
+             MicrosoftGraph.exchange_device_code("device-code", config, now: @now)
+
+    Req.Test.expect(MicrosoftGraph, fn conn ->
+      conn
+      |> Plug.Conn.put_status(400)
+      |> Req.Test.json(%{"error" => "slow_down", "interval" => 7})
+    end)
+
+    assert {:pending, :slow_down, 7} =
+             MicrosoftGraph.exchange_device_code("device-code", config, now: @now)
+
+    Req.Test.expect(MicrosoftGraph, fn conn ->
+      Req.Test.json(conn, %{
+        "access_token" => "device-access",
+        "refresh_token" => "device-refresh",
+        "expires_in" => 3600,
+        "scope" => "Mail.Read offline_access"
+      })
+    end)
+
+    assert {:ok,
+            %Provider.Token{
+              access_token: "device-access",
+              refresh_token: "device-refresh",
+              expires_at: ~U[2026-07-29 09:00:00Z],
+              scopes: ["Mail.Read", "offline_access"]
+            }} = MicrosoftGraph.exchange_device_code("device-code", config, now: @now)
+  end
+
+  test "classifies device access_denied as authorization declined" do
+    config = Keyword.put(@config, :client_secret, nil)
+
+    Req.Test.expect(MicrosoftGraph, fn conn ->
+      conn
+      |> Plug.Conn.put_status(400)
+      |> Req.Test.json(%{"error" => "access_denied"})
+    end)
+
+    assert {:error,
+            %Provider.Error{
+              class: :permanent,
+              code: :authorization_declined
+            }} = MicrosoftGraph.exchange_device_code("device-code", config, now: @now)
+  end
+
   test "refresh preserves requested scopes and leaves an omitted rotated token unset" do
     Req.Test.expect(MicrosoftGraph, fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)

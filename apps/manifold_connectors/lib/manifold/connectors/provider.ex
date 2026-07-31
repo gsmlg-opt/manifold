@@ -4,6 +4,7 @@ defmodule Manifold.Connectors.Provider do
   """
 
   alias Manifold.Connectors.Provider.{
+    DeviceCode,
     Error,
     Identity,
     Page,
@@ -14,6 +15,13 @@ defmodule Manifold.Connectors.Provider do
 
   @callback exchange_code(String.t(), String.t(), String.t(), Keyword.t(), Keyword.t()) ::
               {:ok, Token.t()} | {:error, Error.t()}
+  @callback request_device_code(Keyword.t(), Keyword.t()) ::
+              {:ok, DeviceCode.t()} | {:error, Error.t()}
+  @callback exchange_device_code(String.t(), Keyword.t(), Keyword.t()) ::
+              {:ok, Token.t()}
+              | {:pending, :authorization_pending}
+              | {:pending, :slow_down, pos_integer()}
+              | {:error, Error.t()}
   @callback refresh_token(String.t(), Keyword.t(), Keyword.t()) ::
               {:ok, Token.t()} | {:error, Error.t()}
   @callback identity(String.t(), Keyword.t(), Keyword.t()) ::
@@ -24,6 +32,22 @@ defmodule Manifold.Connectors.Provider do
               {:ok, Page.t()} | {:error, Error.t()}
   @callback fetch_raw(String.t(), String.t(), Keyword.t(), Keyword.t()) ::
               {:ok, RawMessage.t()} | {:error, Error.t()}
+end
+
+defmodule Manifold.Connectors.Provider.DeviceCode do
+  @moduledoc false
+
+  @enforce_keys [:device_code, :user_code, :verification_uri, :interval_seconds, :expires_at]
+  defstruct [:verification_uri_complete | @enforce_keys]
+
+  @type t :: %__MODULE__{
+          device_code: String.t(),
+          user_code: String.t(),
+          verification_uri: String.t(),
+          verification_uri_complete: String.t() | nil,
+          interval_seconds: pos_integer(),
+          expires_at: DateTime.t()
+        }
 end
 
 defmodule Manifold.Connectors.Provider.Token do

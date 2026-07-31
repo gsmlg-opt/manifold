@@ -62,6 +62,46 @@ defmodule Manifold.Connectors.Provider.GmailTest do
              )
   end
 
+  test "exchanges an authorization code as a public client without a secret" do
+    config = Keyword.delete(@config, :client_secret)
+
+    Req.Test.expect(Gmail, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      assert URI.decode_query(body) == %{
+               "client_id" => "gmail-client",
+               "code" => "authorization-code",
+               "code_verifier" => "pkce-verifier",
+               "grant_type" => "authorization_code",
+               "redirect_uri" => "https://mail.example.test/oauth/gmail/callback"
+             }
+
+      Req.Test.json(conn, %{
+        "access_token" => "access-token",
+        "refresh_token" => "refresh-token",
+        "expires_in" => 3_600,
+        "scope" => "https://www.googleapis.com/auth/gmail.readonly"
+      })
+    end)
+
+    assert {:ok, %Provider.Token{access_token: "access-token"}} =
+             Gmail.exchange_code(
+               "authorization-code",
+               "pkce-verifier",
+               "https://mail.example.test/oauth/gmail/callback",
+               config,
+               now: ~U[2026-07-29 01:00:00Z]
+             )
+  end
+
+  test "rejects Gmail device authorization because Google excludes Gmail scopes" do
+    assert {:error,
+            %Provider.Error{
+              class: :permanent,
+              code: :device_flow_unsupported
+            }} = Gmail.request_device_code(@config, [])
+  end
+
   test "refreshes access without inventing a replacement refresh token" do
     Req.Test.expect(Gmail, fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)

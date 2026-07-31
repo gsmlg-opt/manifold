@@ -5,6 +5,9 @@
 /.elixir_ls/
 /.devenv/
 /.direnv/
+/.env
+/.env.*
+!/.env.example
 /.superpowers/
 /.trees/
 /node_modules/

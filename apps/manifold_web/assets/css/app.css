@@ -346,6 +346,22 @@ code {
   overflow-wrap: anywhere;
 }
 
+.device-user-code {
+  margin: 1rem 0;
+}
+
+.device-user-code code {
+  display: inline-block;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #cfd6de;
+  border-radius: 4px;
+  background: #f7f8fa;
+  color: #1b2430;
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+
 .account-actions {
   display: flex;
   flex-wrap: wrap;

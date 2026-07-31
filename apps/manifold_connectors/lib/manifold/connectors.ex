@@ -8,7 +8,7 @@ defmodule Manifold.Connectors do
   alias Ecto.Multi
   alias Manifold.Connectors.Crypto
   alias Manifold.Connectors.Jobs.SyncAccount
-  alias Manifold.Connectors.OAuth.Consumed
+  alias Manifold.Connectors.OAuth.{Consumed, DeviceConsumed}
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.{Identity, Token}
   alias Manifold.Connectors.Sync
@@ -52,7 +52,40 @@ defmodule Manifold.Connectors do
          {:ok, cursors} <-
            adapter.initial_cursors(token.access_token, config, provider_opts(opts)),
          :ok <- validate_cursors(cursors) do
-      persist_authorization(provider, consumed, token, identity, cursors, now, opts)
+      persist_authorization(provider, consumed.mailbox_id, token, identity, cursors, now, opts)
+    else
+      {:error, %ProviderError{} = error} -> {:error, provider_error(error)}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error, database_error(:unavailable)}
+  end
+
+  @spec complete_device_authorization(
+          String.t(),
+          Token.t(),
+          DeviceConsumed.t(),
+          Keyword.t()
+        ) ::
+          {:ok, ExternalAccount.t()} | {:error, Error.t() | Ecto.Changeset.t()}
+  def complete_device_authorization(
+        provider,
+        %Token{} = token,
+        %DeviceConsumed{} = consumed,
+        opts \\ []
+      ) do
+    now = Keyword.get(opts, :now, DateTime.utc_now())
+
+    with :ok <- validate_device_consumed(provider, consumed),
+         :ok <- validate_granted_scopes(provider, token.scopes),
+         {:ok, adapter, config} <- adapter_config(provider),
+         {:ok, %Identity{} = identity} <-
+           adapter.identity(token.access_token, config, provider_opts(opts)),
+         {:ok, cursors} <-
+           adapter.initial_cursors(token.access_token, config, provider_opts(opts)),
+         :ok <- validate_cursors(cursors) do
+      persist_authorization(provider, consumed.mailbox_id, token, identity, cursors, now, opts)
     else
       {:error, %ProviderError{} = error} -> {:error, provider_error(error)}
       {:error, %Error{} = error} -> {:error, error}
@@ -77,13 +110,24 @@ defmodule Manifold.Connectors do
     ["gmail", "microsoft"]
     |> Enum.filter(fn provider ->
       config = Keyword.get(providers, String.to_existing_atom(provider), [])
-
-      Enum.all?([:client_id, :client_secret, :authorization_url], fn key ->
-        value = Keyword.get(config, key)
-        is_binary(value) and value != ""
-      end)
+      provider_configured?(provider, config)
     end)
   end
+
+  defp provider_configured?("gmail", config) do
+    present?(Keyword.get(config, :client_id)) and
+      present?(Keyword.get(config, :authorization_url))
+  end
+
+  defp provider_configured?("microsoft", config) do
+    present?(Keyword.get(config, :client_id)) and
+      present?(Keyword.get(config, :device_code_url)) and
+      present?(Keyword.get(config, :token_url))
+  end
+
+  defp provider_configured?(_provider, _config), do: false
+
+  defp present?(value), do: is_binary(value) and value != ""
 
   @spec get_account(Ecto.UUID.t()) :: {:ok, View.Account.t()} | {:error, Error.t()}
   def get_account(account_id) do
@@ -241,10 +285,10 @@ defmodule Manifold.Connectors do
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
-  defp persist_authorization(provider, consumed, token, identity, cursors, now, opts) do
+  defp persist_authorization(provider, mailbox_id, token, identity, cursors, now, opts) do
     Multi.new()
     |> Multi.run(:account, fn repo, _changes ->
-      upsert_account(repo, provider, consumed.mailbox_id, identity, token.scopes)
+      upsert_account(repo, provider, mailbox_id, identity, token.scopes)
     end)
     |> Multi.run(:credential, fn repo, %{account: account} ->
       upsert_credential(repo, account.id, token)
@@ -400,6 +444,12 @@ defmodule Manifold.Connectors do
   defp validate_consumed(provider, %Consumed{provider: provider}), do: :ok
 
   defp validate_consumed(_provider, _consumed) do
+    {:error, Error.new(:permanent, :oauth_provider_mismatch, "OAuth provider does not match")}
+  end
+
+  defp validate_device_consumed(provider, %DeviceConsumed{provider: provider}), do: :ok
+
+  defp validate_device_consumed(_provider, _consumed) do
     {:error, Error.new(:permanent, :oauth_provider_mismatch, "OAuth provider does not match")}
   end
 

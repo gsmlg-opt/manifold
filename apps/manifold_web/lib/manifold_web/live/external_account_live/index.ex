@@ -46,7 +46,8 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
         <div>
           <h1>External accounts</h1>
           <p class="settings-intro">
-            Import mail from provider accounts into local Manifold mailboxes.
+            Connect Gmail or Microsoft 365 with public-client OAuth (like a
+            desktop mail app), then import read-only through the provider API.
           </p>
         </div>
         <div class="settings-heading-actions">

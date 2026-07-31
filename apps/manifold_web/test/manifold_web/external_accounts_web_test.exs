@@ -5,6 +5,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
+  alias Manifold.Connectors.OAuth
   alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
   alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
 
@@ -21,6 +22,26 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
          scopes: ["openid", "email", "https://www.googleapis.com/auth/gmail.readonly"]
        }}
     end
+
+    @impl true
+    def request_device_code(_config, _opts),
+      do:
+        {:error,
+         %Manifold.Connectors.Provider.Error{
+           class: :permanent,
+           code: :device_flow_unsupported,
+           message: "not used"
+         }}
+
+    @impl true
+    def exchange_device_code(_device_code, _config, _opts),
+      do:
+        {:error,
+         %Manifold.Connectors.Provider.Error{
+           class: :permanent,
+           code: :device_flow_unsupported,
+           message: "not used"
+         }}
 
     @impl true
     def refresh_token(_refresh_token, _config, _opts), do: raise("not used")
@@ -48,13 +69,61 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     @behaviour Manifold.Connectors.Provider
 
     @impl true
-    def exchange_code("valid-code", _verifier, _redirect_uri, _config, _opts) do
+    def exchange_code(_code, _verifier, _redirect_uri, _config, _opts) do
+      {:error,
+       %Manifold.Connectors.Provider.Error{
+         class: :permanent,
+         code: :authorization_code_unsupported,
+         message: "use device flow"
+       }}
+    end
+
+    @impl true
+    def request_device_code(_config, opts) do
+      now = Keyword.get(opts, :now, DateTime.utc_now())
+
       {:ok,
-       %Token{
-         access_token: "microsoft-access-token",
-         refresh_token: "microsoft-refresh-token",
-         expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
-         scopes: ["openid", "profile", "offline_access", "User.Read", "Mail.Read"]
+       %Manifold.Connectors.Provider.DeviceCode{
+         device_code: "device-code-secret",
+         user_code: "ABCD-EFGH",
+         verification_uri: "https://microsoft.com/devicelogin",
+         verification_uri_complete: "https://microsoft.com/devicelogin?otc=ABCD-EFGH",
+         interval_seconds: 1,
+         expires_at: DateTime.add(now, 600, :second)
+       }}
+    end
+
+    @impl true
+    def exchange_device_code("device-code-secret", _config, _opts) do
+      case Application.get_env(:manifold_connectors, :test_device_poll_result, :token) do
+        :pending ->
+          {:pending, :authorization_pending}
+
+        :declined ->
+          {:error,
+           %Manifold.Connectors.Provider.Error{
+             class: :permanent,
+             code: :authorization_declined,
+             message: "declined"
+           }}
+
+        :token ->
+          {:ok,
+           %Token{
+             access_token: "microsoft-access-token",
+             refresh_token: "microsoft-refresh-token",
+             expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
+             scopes: ["openid", "profile", "offline_access", "User.Read", "Mail.Read"]
+           }}
+      end
+    end
+
+    def exchange_device_code(_device_code, _config, _opts) do
+      {:error,
+       %Manifold.Connectors.Provider.Error{
+         class: :permanent,
+         code: :invalid_grant,
+         message: "invalid device code"
        }}
     end
 
@@ -98,14 +167,14 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     Application.put_env(:manifold_connectors, :providers,
       gmail: [
-        client_id: "gmail-client-secret-id",
-        client_secret: "gmail-client-secret",
-        authorization_url: "https://accounts.google.test/o/oauth2/v2/auth"
+        client_id: "gmail-client-id",
+        authorization_url: "https://accounts.google.test/o/oauth2/v2/auth",
+        token_url: "https://oauth.google.test/token"
       ],
       microsoft: [
-        client_id: "microsoft-client-secret-id",
-        client_secret: "microsoft-client-secret",
-        authorization_url: "https://login.microsoft.test/oauth2/v2.0/authorize"
+        client_id: "microsoft-client-id",
+        device_code_url: "https://login.microsoft.test/oauth2/v2.0/devicecode",
+        token_url: "https://login.microsoft.test/oauth2/v2.0/token"
       ]
     )
 
@@ -113,6 +182,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
       restore_env(:encryption_key, old_key)
       restore_env(:adapters, old_adapters)
       restore_env(:providers, old_providers)
+      Application.delete_env(:manifold_connectors, :test_device_poll_result)
     end)
 
     suffix = System.unique_integer([:positive])
@@ -174,16 +244,18 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert has_element?(
              view,
              "#continue-add-account[href='/connectors/gmail/start?mailbox_id=#{mailbox.id}']",
-             "Continue to Gmail"
+             "Sign in with Google"
            )
 
-    assert html =~ "Continue to Gmail"
+    assert html =~ "Sign in with Google"
   end
 
-  test "external account wizard creates a Microsoft OAuth handoff", %{
+  test "external account wizard creates a Microsoft device authorization handoff", %{
     conn: conn,
     mailbox: mailbox
   } do
+    Application.put_env(:manifold_connectors, :test_device_poll_result, :pending)
+
     assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
     open_provider_step(view)
 
@@ -195,11 +267,45 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
     |> render_change()
 
-    assert has_element?(
-             view,
-             "#continue-add-account[href='/connectors/microsoft/start?mailbox_id=#{mailbox.id}']",
-             "Continue to Microsoft 365"
-           )
+    assert has_element?(view, "#continue-add-account", "Sign in with Microsoft")
+
+    html = view |> element("#continue-add-account") |> render_click()
+
+    assert html =~ "Approve Microsoft 365 access"
+    assert has_element?(view, "#device-user-code", "ABCD-EFGH")
+    assert has_element?(view, "#device-verification-link", "https://microsoft.com/devicelogin")
+    assert has_element?(view, "#device-waiting", "Waiting for authorization")
+  end
+
+  test "Microsoft device authorization connects the account after polling", %{
+    conn: conn,
+    mailbox: mailbox
+  } do
+    Application.put_env(:manifold_connectors, :test_device_poll_result, :token)
+
+    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
+    open_provider_step(view)
+
+    view
+    |> element("#provider-microsoft")
+    |> render_click()
+
+    view
+    |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
+    |> render_change()
+
+    view
+    |> element("#continue-add-account")
+    |> render_click()
+
+    send(view.pid, :poll_device_authorization)
+
+    assert_redirect(view, "/settings/accounts")
+
+    assert [account] = Connectors.list_accounts()
+    assert account.mailbox_id == mailbox.id
+    assert account.provider == "microsoft"
+    assert account.email_address == "person@outlook.example"
   end
 
   test "wizard rejects forward events before account type selection", %{
@@ -345,6 +451,15 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert [account] = Connectors.list_accounts()
     assert account.mailbox_id == mailbox.id
     assert account.provider == "gmail"
+  end
+
+  test "Microsoft connector start route directs operators to device authorization", %{conn: conn} do
+    start_conn = get(conn, "/connectors/microsoft/start", %{"mailbox_id" => Ecto.UUID.generate()})
+
+    assert redirected_to(start_conn, 302) == "/settings/accounts"
+
+    assert Phoenix.Flash.get(start_conn.assigns.flash, :error) =~
+             "Microsoft 365 uses device authorization"
   end
 
   test "OAuth callback rejects tampered state without connecting an account", %{conn: conn} do
@@ -574,8 +689,8 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     |> render_click()
   end
 
-  defp connect_account(conn, provider, mailbox_id) do
-    start_conn = get(conn, "/connectors/#{provider}/start", %{"mailbox_id" => mailbox_id})
+  defp connect_account(conn, "gmail", mailbox_id) do
+    start_conn = get(conn, "/connectors/gmail/start", %{"mailbox_id" => mailbox_id})
 
     state =
       start_conn
@@ -587,7 +702,15 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     conn
     |> recycle()
-    |> get("/connectors/#{provider}/callback", %{"code" => "valid-code", "state" => state})
+    |> get("/connectors/gmail/callback", %{"code" => "valid-code", "state" => state})
+  end
+
+  defp connect_account(_conn, "microsoft", mailbox_id) do
+    Application.put_env(:manifold_connectors, :test_device_poll_result, :token)
+
+    assert {:ok, authorization} = OAuth.start_device("microsoft", mailbox_id)
+    assert {:ok, token, consumed} = OAuth.poll_device("microsoft", authorization.state)
+    assert {:ok, _account} = Connectors.complete_device_authorization("microsoft", token, consumed)
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)

@@ -121,12 +121,20 @@ return the original receipt; conflicting content is rejected.
 
 ## OAuth Contract
 
+Microsoft uses the Device Authorization Grant. The Add Account LiveView shows
+`user_code` / `verification_uri` and polls the token endpoint until the user
+approves, declines, or the device code expires.
+
+Gmail keeps authorization code + PKCE `S256` because Google's device-flow
+allowed scope list excludes Gmail API scopes.
+
 - Providers are selected from the fixed `gmail` and `microsoft` allowlist.
 - State contains at least 256 random bits, is stored only as a SHA-256 digest,
   expires quickly, and is consumed once under a database row lock.
-- PKCE always uses `S256`.
-- Redirect URIs are generated from the configured Phoenix Endpoint URL and must
-  match the stored transaction exactly.
+- Gmail PKCE always uses `S256`. Redirect URIs are generated from the configured
+  Phoenix Endpoint URL and must match the stored transaction exactly.
+- Device-flow transactions encrypt the provider `device_code` and store the
+  displayed `user_code`, verification URI, and poll interval.
 - Gmail requests `openid email` and `gmail.readonly` with offline access.
 - Gmail account identity uses the OpenID UserInfo `sub`; the email address is
   display metadata and is not used as the durable account identity.
@@ -137,6 +145,10 @@ return the original receipt; conflicting content is rejected.
 - Refresh-token rotation is committed under an optimistic account lock.
 - `invalid_grant`, revoked consent, and insufficient scope move the account to
   `reconnect_required`; transient HTTP failures remain retryable.
+- `client_secret` is optional; a provider is enabled with `client_id` plus the
+  required endpoint URLs. Prefer Google Desktop and Microsoft public-client
+  registrations so operators only set a client ID (mail-client-style setup).
+  Do not reuse third-party vendor client IDs (for example Apple Mail).
 - Production requires a base64-encoded 32-byte connector encryption key.
 
 ## Runtime Configuration
@@ -155,28 +167,31 @@ MANIFOLD_GMAIL_API_BASE_URL
 MANIFOLD_MICROSOFT_CLIENT_ID
 MANIFOLD_MICROSOFT_CLIENT_SECRET
 MANIFOLD_MICROSOFT_TENANT
-MANIFOLD_MICROSOFT_AUTHORIZATION_URL
+MANIFOLD_MICROSOFT_DEVICE_CODE_URL
 MANIFOLD_MICROSOFT_TOKEN_URL
 MANIFOLD_MICROSOFT_API_BASE_URL
 ```
 
-The provider-console callback contracts are:
+The Gmail provider-console callback contract is:
 
 ```text
 https://<PHX_HOST>/connectors/gmail/callback
-https://<PHX_HOST>/connectors/microsoft/callback
 ```
+
+Microsoft uses device authorization and does not require a redirect URI.
 
 Development uses the same paths at `http://localhost:4290`. The routes are not
 registered with provider consoles automatically. Microsoft defaults to the
 `organizations` tenant and Graph API `https://graph.microsoft.com/v1.0`.
 Endpoint overrides must be absolute HTTPS URLs without credentials or
-fragments.
+fragments. Development Endpoint `:url` includes port `4290` so generated OAuth
+redirect URIs match the documented local callbacks.
 
 Development has a non-production encryption key but no default OAuth client
 credentials. The development and production runtimes use the same provider
 client environment variables; production additionally requires a stable
-connector encryption key.
+connector encryption key. See `.env.example` and the README External Mailbox
+Connectors section for console registration and local export steps.
 
 ## Synchronization Flow
 

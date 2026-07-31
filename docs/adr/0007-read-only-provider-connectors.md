@@ -1,7 +1,8 @@
 # ADR 0007: Read-Only Provider Mailbox Connectors
 
-- **Status:** Accepted and implemented
+- **Status:** Accepted and implemented (OAuth revised 2026-07-31)
 - **Date:** 2026-07-29
+- **Revised:** 2026-07-31 — prefer OAuth Device Authorization Grant
 
 ## Context
 
@@ -20,6 +21,15 @@ Provider mailboxes differ from SMTP ingress:
 Reusing SMTP-shaped metadata for provider imports would create false audit data.
 Writing provider results directly into parsed Mail schemas would bypass the
 spool, immutable raw store, acceptance transaction, and recovery model.
+
+Operators want connector registration to work as a **public client** when the
+provider allows it: typically only a `client_id`, without shipping a
+`client_secret` in self-hosted config—the same operator burden as connecting
+Gmail or Outlook in a desktop mail client. Authorization-code redirects with
+PKCE also force registering loopback/production redirect URIs and matching
+Endpoint URL configuration. Manifold does **not** use IMAP/XOAUTH2 as the sync
+channel (see Rejected Alternatives); the public-client OAuth model is what
+aligns with Apple Mail-style setup.
 
 ## Decision
 
@@ -43,7 +53,7 @@ The Web application uses only the public Connectors context.
 
 Implement a normalized provider behaviour for:
 
-- OAuth code exchange and token refresh.
+- OAuth token acquisition (device code and/or authorization code) and refresh.
 - Provider account identity.
 - Initial synchronization cursors.
 - One bounded synchronization page.
@@ -62,26 +72,45 @@ through either provider.
 
 ### OAuth and secrets
 
-OAuth uses authorization code plus PKCE `S256`. State is random, stored only as
-a SHA-256 digest, expires, and is consumed once under a PostgreSQL row lock.
-The exact redirect URI is persisted and compared on callback.
+**Preferred grant:** OAuth 2.0 Device Authorization Grant (RFC 8628). The UI
+shows `user_code` and `verification_uri`, then polls the token endpoint until
+the user finishes consent on another device. `client_secret` is optional: a
+provider is enabled when a non-empty `client_id` and the required endpoint URLs
+are present.
 
-PKCE verifiers, access tokens, and refresh tokens use versioned AES-256-GCM
-envelopes. Associated data binds each envelope to its provider transaction or
-account and credential purpose. Production requires a stable Base64-encoded
-32-byte encryption key.
+**Microsoft 365:** Uses device flow with a public-client app registration
+(“Allow public client flows”). Device and token endpoints are:
 
-The intended callback paths are:
+```text
+https://login.microsoftonline.com/<tenant>/oauth2/v2.0/devicecode
+https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token
+```
+
+**Gmail / Google:** Google’s documented device-flow **allowed scope list does
+not include Gmail API scopes** (only OpenID Sign-In, limited Drive, and
+YouTube). Requesting `gmail.readonly` via device flow is not a supported
+platform path. Therefore Gmail keeps the **authorization code + PKCE `S256`**
+path with a redirect callback. Prefer a Google OAuth client type that can
+operate as a public client (Desktop / installed) so `client_secret` may be
+omitted; a Web client secret remains optional in Manifold config when present.
+
+One-time OAuth transactions store a hashed public state token. Device-flow
+transactions encrypt the provider `device_code`; authorization-code transactions
+encrypt the PKCE verifier and persist the exact redirect URI for callback
+comparison. Access and refresh tokens use versioned AES-256-GCM envelopes.
+Production requires a stable Base64-encoded 32-byte encryption key.
+
+Gmail callback paths remain:
 
 ```text
 https://<PHX_HOST>/connectors/gmail/callback
-https://<PHX_HOST>/connectors/microsoft/callback
 ```
 
-Phoenix controllers derive these active callback routes from the configured
-Endpoint URL. Production runtime configuration requires a valid connector
-encryption key and enables each provider only when its client ID and secret are
-both present.
+(local development: `http://localhost:4290/connectors/gmail/callback`).
+
+Microsoft no longer requires a redirect URI for connection. Phoenix controllers
+retain Gmail start/callback only. Device authorization is driven from the
+Add Account LiveView.
 
 Gmail uses the OpenID UserInfo `sub` as its durable provider account ID. The
 provider email is mutable display metadata. Once connected, a provider account
@@ -144,6 +173,8 @@ Provider push notifications are deliberately not part of this milestone.
 - Cursor replay cannot create duplicate local deliveries for the same provider
   identity.
 - Read-only scopes limit the effect of a compromised connector credential.
+- Device flow removes Microsoft redirect-URI registration for self-hosted
+  public clients.
 
 ### Negative
 
@@ -153,6 +184,8 @@ Provider push notifications are deliberately not part of this milestone.
 - Provider deletion does not reclaim local raw storage automatically.
 - Polling introduces up to five minutes of scheduling delay before new account
   work is recreated.
+- Gmail still needs a redirect URI and cannot use Google’s device grant for
+  mailbox scopes until Google expands the allowed device-flow scope list.
 
 ## Rejected Alternatives
 
@@ -184,3 +217,19 @@ Rejected for Milestone 6. Push requires public callback lifecycle, renewal,
 replay protection, and provider-specific operational state. Initial
 synchronization is pull-based; push may later be an optimization, never the
 only durable trigger.
+
+### Force Google device flow for Gmail scopes
+
+Rejected. Google documents that the limited-input / device OAuth flow supports
+only a fixed allowlist that excludes Gmail API scopes. Pretending otherwise
+would fail at Google’s authorization server.
+
+### Reuse Apple Mail (or other vendor) OAuth client credentials
+
+Rejected. Apple Mail’s OAuth client is Apple’s registered public/native app;
+embedding or configuring that `client_id` in Manifold violates provider terms
+of service, and redirect URIs / device registration will not match. Operators
+must register their own public Desktop (Google) or public Entra (Microsoft)
+application. Manifold aligns with Apple Mail only on the **user experience
+model** (public-client OAuth consent without requiring a shipped secret), not
+on IMAP/XOAUTH2 transport or third-party client IDs.

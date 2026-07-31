@@ -18,7 +18,7 @@ defmodule Manifold.ConfigTest do
     MANIFOLD_MICROSOFT_CLIENT_ID
     MANIFOLD_MICROSOFT_CLIENT_SECRET
     MANIFOLD_MICROSOFT_TENANT
-    MANIFOLD_MICROSOFT_AUTHORIZATION_URL
+    MANIFOLD_MICROSOFT_DEVICE_CODE_URL
     MANIFOLD_MICROSOFT_TOKEN_URL
     MANIFOLD_MICROSOFT_API_BASE_URL
     SECRET_KEY_BASE
@@ -89,7 +89,7 @@ defmodule Manifold.ConfigTest do
       "MANIFOLD_MICROSOFT_CLIENT_ID" => "microsoft-id",
       "MANIFOLD_MICROSOFT_CLIENT_SECRET" => "microsoft-secret",
       "MANIFOLD_MICROSOFT_TENANT" => "tenant-id",
-      "MANIFOLD_MICROSOFT_AUTHORIZATION_URL" => "https://login.example/authorize",
+      "MANIFOLD_MICROSOFT_DEVICE_CODE_URL" => "https://login.example/devicecode",
       "MANIFOLD_MICROSOFT_TOKEN_URL" => "https://login.example/token",
       "MANIFOLD_MICROSOFT_API_BASE_URL" => "https://graph.example/v1.0",
       "SECRET_KEY_BASE" => String.duplicate("s", 64)
@@ -111,7 +111,7 @@ defmodule Manifold.ConfigTest do
     assert connectors[:providers][:microsoft] == [
              client_id: "microsoft-id",
              client_secret: "microsoft-secret",
-             authorization_url: "https://login.example/authorize",
+             device_code_url: "https://login.example/devicecode",
              token_url: "https://login.example/token",
              base_url: "https://graph.example/v1.0",
              tenant: "tenant-id"
@@ -121,13 +121,16 @@ defmodule Manifold.ConfigTest do
   test "development runtime accepts optional OAuth credentials from the environment" do
     put_runtime_env(%{
       "MANIFOLD_GMAIL_CLIENT_ID" => "gmail-dev-id",
-      "MANIFOLD_GMAIL_CLIENT_SECRET" => "gmail-dev-secret"
+      "MANIFOLD_MICROSOFT_CLIENT_ID" => "microsoft-dev-id"
     })
 
     connectors = read_runtime(:dev)[:manifold_connectors]
 
     assert connectors[:providers][:gmail][:client_id] == "gmail-dev-id"
-    assert connectors[:providers][:gmail][:client_secret] == "gmail-dev-secret"
+    refute Keyword.has_key?(connectors[:providers][:gmail], :client_secret)
+    assert connectors[:providers][:microsoft][:client_id] == "microsoft-dev-id"
+    assert connectors[:providers][:microsoft][:device_code_url] =~ "/devicecode"
+    refute Keyword.has_key?(connectors[:providers][:microsoft], :client_secret)
     refute Keyword.has_key?(connectors, :encryption_key)
   end
 

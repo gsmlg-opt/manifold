@@ -6,6 +6,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   @behaviour Manifold.Connectors.Provider
 
   alias Manifold.Connectors.Provider.{
+    DeviceCode,
     Error,
     Identity,
     Page,
@@ -17,6 +18,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
 
   @default_scopes "openid profile offline_access User.Read Mail.Read"
   @immutable_id_preference ~s(IdType="ImmutableId")
+  @device_grant_type "urn:ietf:params:oauth:grant-type:device_code"
 
   @impl true
   @spec exchange_code(String.t(), String.t(), String.t(), Keyword.t(), Keyword.t()) ::
@@ -31,6 +33,42 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
       ],
       config,
       opts
+    )
+  end
+
+  @impl true
+  @spec request_device_code(Keyword.t(), Keyword.t()) ::
+          {:ok, DeviceCode.t()} | {:error, Error.t()}
+  def request_device_code(config, opts) do
+    with {:ok, device_code_url} <- fetch_config(config, :device_code_url),
+         {:ok, client_id} <- fetch_config(config, :client_id) do
+      form =
+        [
+          client_id: client_id,
+          scope: Keyword.get(config, :scopes, @default_scopes)
+        ]
+        |> maybe_put_secret(config)
+
+      request(:post, device_code_url, config, form: form)
+      |> normalize_device_code_response(Keyword.get(opts, :now, DateTime.utc_now()))
+    end
+  end
+
+  @impl true
+  @spec exchange_device_code(String.t(), Keyword.t(), Keyword.t()) ::
+          {:ok, Token.t()}
+          | {:pending, :authorization_pending}
+          | {:pending, :slow_down, pos_integer()}
+          | {:error, Error.t()}
+  def exchange_device_code(device_code, config, opts) when is_binary(device_code) do
+    token_request(
+      [
+        device_code: device_code,
+        grant_type: @device_grant_type
+      ],
+      config,
+      opts,
+      device?: true
     )
   end
 
@@ -116,25 +154,73 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
     end
   end
 
-  defp token_request(grant, config, opts) do
+  defp token_request(grant, config, opts, request_opts \\ []) do
     with {:ok, token_url} <- fetch_config(config, :token_url),
-         {:ok, client_id} <- fetch_config(config, :client_id),
-         {:ok, client_secret} <- fetch_config(config, :client_secret) do
+         {:ok, client_id} <- fetch_config(config, :client_id) do
       form =
         [
           client_id: client_id,
-          client_secret: client_secret,
           scope: Keyword.get(config, :scopes, @default_scopes)
         ]
+        |> maybe_put_secret(config)
         |> Keyword.merge(grant)
 
       request(:post, token_url, config, form: form)
       |> normalize_token_response(
         Keyword.get(opts, :now, DateTime.utc_now()),
-        Keyword.get(config, :scopes, @default_scopes)
+        Keyword.get(config, :scopes, @default_scopes),
+        Keyword.get(request_opts, :device?, false)
       )
     end
   end
+
+  defp maybe_put_secret(form, config) do
+    case Keyword.get(config, :client_secret) do
+      secret when is_binary(secret) and secret != "" ->
+        Keyword.put(form, :client_secret, secret)
+
+      _missing ->
+        form
+    end
+  end
+
+  defp normalize_device_code_response(
+         {:ok,
+          %Req.Response{
+            status: status,
+            body:
+              %{
+                "device_code" => device_code,
+                "user_code" => user_code,
+                "verification_uri" => verification_uri,
+                "expires_in" => expires_in,
+                "interval" => interval
+              } = body
+          }},
+         now
+       )
+       when status in 200..299 and is_binary(device_code) and is_binary(user_code) and
+              is_binary(verification_uri) and is_integer(expires_in) and expires_in > 0 and
+              is_integer(interval) and interval > 0 do
+    {:ok,
+     %DeviceCode{
+       device_code: device_code,
+       user_code: user_code,
+       verification_uri: verification_uri,
+       verification_uri_complete: optional_string(body["verification_uri_complete"]),
+       interval_seconds: interval,
+       expires_at: DateTime.add(now, expires_in, :second)
+     }}
+  end
+
+  defp normalize_device_code_response({:ok, %Req.Response{} = response}, _now),
+    do: {:error, classify_response(response)}
+
+  defp normalize_device_code_response({:error, reason}, _now),
+    do: {:error, transport_error(reason)}
+
+  defp optional_string(value) when is_binary(value) and value != "", do: value
+  defp optional_string(_value), do: nil
 
   defp normalize_token_response(
          {:ok,
@@ -147,7 +233,8 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
               } = body
           }},
          now,
-         requested_scopes
+         requested_scopes,
+         _device?
        )
        when status in 200..299 and is_binary(access_token) and is_integer(expires_in) and
               is_binary(requested_scopes) do
@@ -160,11 +247,55 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
      }}
   end
 
-  defp normalize_token_response({:ok, %Req.Response{} = response}, _now, _requested_scopes),
+  defp normalize_token_response(
+         {:ok, %Req.Response{status: status, body: %{"error" => error}} = response},
+         _now,
+         _requested_scopes,
+         true
+       )
+       when status in 400..499 do
+    classify_device_token_error(error, response)
+  end
+
+  defp normalize_token_response({:ok, %Req.Response{} = response}, _now, _requested_scopes, _device?),
     do: {:error, classify_response(response)}
 
-  defp normalize_token_response({:error, reason}, _now, _requested_scopes),
+  defp normalize_token_response({:error, reason}, _now, _requested_scopes, _device?),
     do: {:error, transport_error(reason)}
+
+  defp classify_device_token_error("authorization_pending", _response),
+    do: {:pending, :authorization_pending}
+
+  defp classify_device_token_error("slow_down", %Req.Response{body: body}) do
+    interval =
+      case body do
+        %{"interval" => value} when is_integer(value) and value > 0 -> value
+        _other -> 5
+      end
+
+    {:pending, :slow_down, interval}
+  end
+
+  defp classify_device_token_error("expired_token", _response) do
+    {:error,
+     %Error{
+       class: :permanent,
+       code: :device_code_expired,
+       message: "Microsoft device code expired before authorization completed"
+     }}
+  end
+
+  defp classify_device_token_error(error, _response)
+       when error in ["access_denied", "authorization_declined"] do
+    {:error,
+     %Error{
+       class: :permanent,
+       code: :authorization_declined,
+       message: "Microsoft authorization was declined"
+     }}
+  end
+
+  defp classify_device_token_error(_error, response), do: {:error, classify_response(response)}
 
   defp token_scopes(scopes, _requested_scopes) when is_binary(scopes),
     do: String.split(scopes)

@@ -77,8 +77,12 @@ case config_env() do
 
     config :manifold_data, Manifold.Repo, maybe_put_socket_dir.(repo_config)
 
+    phx_host = System.get_env("PHX_HOST", "localhost")
+    phx_port = String.to_integer(System.get_env("PORT", "4290"))
+
     config :manifold_web, ManifoldWeb.Endpoint,
-      http: [port: String.to_integer(System.get_env("PORT", "4290"))]
+      url: [host: phx_host, port: phx_port],
+      http: [port: phx_port]
 
     config :manifold_api, ManifoldAPI.Endpoint,
       http: [port: String.to_integer(System.get_env("API_PORT", "4292"))]
@@ -291,12 +295,29 @@ if not edge_release? do
         nil
 
       {client_id, client_secret}
+      when is_binary(client_id) and client_id != "" and
+             (is_nil(client_secret) or client_secret == "") ->
+        build_config.(client_id, nil)
+
+      {client_id, client_secret}
       when is_binary(client_id) and client_id != "" and is_binary(client_secret) and
              client_secret != "" ->
         build_config.(client_id, client_secret)
 
+      {_missing_id, client_secret}
+      when is_binary(client_secret) and client_secret != "" ->
+        raise "#{client_id_env} is required when #{client_secret_env} is set for #{provider}"
+
       _incomplete ->
-        raise "#{client_id_env} and #{client_secret_env} must be configured together for #{provider}"
+        nil
+    end
+  end
+
+  maybe_client_secret = fn config, client_secret ->
+    if is_binary(client_secret) and client_secret != "" do
+      config ++ [client_secret: client_secret]
+    else
+      config
     end
   end
 
@@ -306,30 +327,29 @@ if not edge_release? do
       "MANIFOLD_GMAIL_CLIENT_ID",
       "MANIFOLD_GMAIL_CLIENT_SECRET",
       fn client_id, client_secret ->
-        [
-          client_id: client_id,
-          client_secret: client_secret,
-          authorization_url:
-            https_endpoint!.(
-              "MANIFOLD_GMAIL_AUTHORIZATION_URL",
-              "https://accounts.google.com/o/oauth2/v2/auth"
-            ),
-          token_url:
-            https_endpoint!.(
-              "MANIFOLD_GMAIL_TOKEN_URL",
-              "https://oauth2.googleapis.com/token"
-            ),
-          userinfo_url:
-            https_endpoint!.(
-              "MANIFOLD_GMAIL_USERINFO_URL",
-              "https://openidconnect.googleapis.com/v1/userinfo"
-            ),
-          base_url:
-            https_endpoint!.(
-              "MANIFOLD_GMAIL_API_BASE_URL",
-              "https://gmail.googleapis.com"
-            )
-        ]
+        maybe_client_secret.([client_id: client_id], client_secret) ++
+          [
+            authorization_url:
+              https_endpoint!.(
+                "MANIFOLD_GMAIL_AUTHORIZATION_URL",
+                "https://accounts.google.com/o/oauth2/v2/auth"
+              ),
+            token_url:
+              https_endpoint!.(
+                "MANIFOLD_GMAIL_TOKEN_URL",
+                "https://oauth2.googleapis.com/token"
+              ),
+            userinfo_url:
+              https_endpoint!.(
+                "MANIFOLD_GMAIL_USERINFO_URL",
+                "https://openidconnect.googleapis.com/v1/userinfo"
+              ),
+            base_url:
+              https_endpoint!.(
+                "MANIFOLD_GMAIL_API_BASE_URL",
+                "https://gmail.googleapis.com"
+              )
+          ]
       end
     )
 
@@ -347,26 +367,25 @@ if not edge_release? do
       fn client_id, client_secret ->
         tenant_base = "https://login.microsoftonline.com/#{microsoft_tenant}/oauth2/v2.0"
 
-        [
-          client_id: client_id,
-          client_secret: client_secret,
-          authorization_url:
-            https_endpoint!.(
-              "MANIFOLD_MICROSOFT_AUTHORIZATION_URL",
-              tenant_base <> "/authorize"
-            ),
-          token_url:
-            https_endpoint!.(
-              "MANIFOLD_MICROSOFT_TOKEN_URL",
-              tenant_base <> "/token"
-            ),
-          base_url:
-            https_endpoint!.(
-              "MANIFOLD_MICROSOFT_API_BASE_URL",
-              "https://graph.microsoft.com/v1.0"
-            ),
-          tenant: microsoft_tenant
-        ]
+        maybe_client_secret.([client_id: client_id], client_secret) ++
+          [
+            device_code_url:
+              https_endpoint!.(
+                "MANIFOLD_MICROSOFT_DEVICE_CODE_URL",
+                tenant_base <> "/devicecode"
+              ),
+            token_url:
+              https_endpoint!.(
+                "MANIFOLD_MICROSOFT_TOKEN_URL",
+                tenant_base <> "/token"
+              ),
+            base_url:
+              https_endpoint!.(
+                "MANIFOLD_MICROSOFT_API_BASE_URL",
+                "https://graph.microsoft.com/v1.0"
+              ),
+            tenant: microsoft_tenant
+          ]
       end
     )
 

@@ -49,6 +49,18 @@ defmodule Manifold.Connectors.SyncTest do
     end
 
     @impl true
+    def request_device_code(_config, _opts),
+      do:
+        {:error,
+         %Error{class: :permanent, code: :device_flow_unsupported, message: "not used"}}
+
+    @impl true
+    def exchange_device_code(_device_code, _config, _opts),
+      do:
+        {:error,
+         %Error{class: :permanent, code: :device_flow_unsupported, message: "not used"}}
+
+    @impl true
     def refresh_token("initial-refresh", _config, opts) do
       now = Keyword.get(opts, :now, DateTime.utc_now())
 

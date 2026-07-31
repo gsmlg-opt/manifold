@@ -35,26 +35,48 @@ defmodule Manifold.Connectors.Provider.Gmail do
 
   @impl true
   def exchange_code(code, pkce_verifier, redirect_uri, config, opts) do
-    form = [
-      client_id: Keyword.get(config, :client_id),
-      client_secret: Keyword.get(config, :client_secret),
-      code: code,
-      code_verifier: pkce_verifier,
-      grant_type: "authorization_code",
-      redirect_uri: redirect_uri
-    ]
+    form =
+      [
+        client_id: Keyword.get(config, :client_id),
+        code: code,
+        code_verifier: pkce_verifier,
+        grant_type: "authorization_code",
+        redirect_uri: redirect_uri
+      ]
+      |> maybe_put_secret(config)
 
     token_request(form, config, opts)
   end
 
   @impl true
+  def request_device_code(_config, _opts) do
+    {:error,
+     error(
+       :permanent,
+       :device_flow_unsupported,
+       "Google device authorization does not allow Gmail API scopes"
+     )}
+  end
+
+  @impl true
+  def exchange_device_code(_device_code, _config, _opts) do
+    {:error,
+     error(
+       :permanent,
+       :device_flow_unsupported,
+       "Google device authorization does not allow Gmail API scopes"
+     )}
+  end
+
+  @impl true
   def refresh_token(refresh_token, config, opts) do
-    form = [
-      client_id: Keyword.get(config, :client_id),
-      client_secret: Keyword.get(config, :client_secret),
-      grant_type: "refresh_token",
-      refresh_token: refresh_token
-    ]
+    form =
+      [
+        client_id: Keyword.get(config, :client_id),
+        grant_type: "refresh_token",
+        refresh_token: refresh_token
+      ]
+      |> maybe_put_secret(config)
 
     token_request(form, config, opts)
   end
@@ -528,10 +550,20 @@ defmodule Manifold.Connectors.Provider.Gmail do
   end
 
   defp validate_oauth_config(config) do
-    if present?(config[:client_id]) and present?(config[:client_secret]) do
+    if present?(config[:client_id]) do
       :ok
     else
       {:error, error(:permanent, :provider_not_configured, "Gmail OAuth is not configured")}
+    end
+  end
+
+  defp maybe_put_secret(form, config) do
+    case Keyword.get(config, :client_secret) do
+      secret when is_binary(secret) and secret != "" ->
+        Keyword.put(form, :client_secret, secret)
+
+      _missing ->
+        form
     end
   end
 
