@@ -447,7 +447,7 @@ code {
 .mailbox-setup-form input:focus,
 .mailbox-setup-form select:focus {
   border-color: #087f5b;
-  outline: 2px solid #b8dfd1;
+  outline: 2px solid #064f3b;
   outline-offset: 1px;
 }
 
@@ -552,7 +552,8 @@ code {
 
 .settings-action-primary:focus-visible,
 .add-account-choice:focus-visible,
-.add-account-panel .settings-action:focus-visible {
+.add-account-panel .settings-action:focus-visible,
+.mailbox-setup-panel .settings-action:focus-visible {
   outline: 2px solid #064f3b;
   outline-offset: 2px;
 }
