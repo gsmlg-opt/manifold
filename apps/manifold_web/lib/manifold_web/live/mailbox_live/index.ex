@@ -4,7 +4,7 @@ defmodule ManifoldWeb.MailboxLive.Index do
   alias Manifold.Accounts
 
   @impl Phoenix.LiveView
-  def mount(_params, _session, socket) do
+  def mount(params, _session, socket) do
     {:ok,
      assign(socket,
        page_title: "Mailboxes",
@@ -15,7 +15,7 @@ defmodule ManifoldWeb.MailboxLive.Index do
        selected_domain: nil,
        domain_form: empty_form(:domain),
        mailbox_form: empty_form(:mailbox),
-       return_provider: nil
+       return_provider: return_provider(params)
      )}
   end
 
@@ -327,6 +327,13 @@ defmodule ManifoldWeb.MailboxLive.Index do
     |> to_form(as: name)
   end
 
+  defp finish_mailbox_creation(%{assigns: %{return_provider: provider}} = socket, mailbox)
+       when provider in ["gmail", "microsoft"] do
+    push_navigate(socket,
+      to: ~p"/settings/accounts?#{[provider: provider, mailbox_id: mailbox.id]}"
+    )
+  end
+
   defp finish_mailbox_creation(socket, _mailbox) do
     socket
     |> assign(:domains, Accounts.list_domains())
@@ -344,6 +351,12 @@ defmodule ManifoldWeb.MailboxLive.Index do
       mailbox_form: empty_form(:mailbox)
     )
   end
+
+  defp return_provider(%{"source" => "external_account", "provider" => provider})
+       when provider in ["gmail", "microsoft"],
+       do: provider
+
+  defp return_provider(_params), do: nil
 
   defp error_message({message, options}) do
     Enum.reduce(options, message, fn {key, value}, rendered ->

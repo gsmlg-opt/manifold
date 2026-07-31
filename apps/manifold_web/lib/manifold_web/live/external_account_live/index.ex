@@ -19,6 +19,11 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
   end
 
   @impl Phoenix.LiveView
+  def handle_params(params, _uri, socket) do
+    {:noreply, restore_mailbox_handoff(socket, params)}
+  end
+
+  @impl Phoenix.LiveView
   def handle_event("open-add-account", _params, socket) do
     {:noreply,
      assign(socket,
@@ -241,8 +246,11 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
 
           <div :if={@mailboxes == []} id="add-account-no-mailboxes" class="settings-empty">
             <p>Create an active local mailbox before connecting an external account.</p>
-            <.link id="manage-mailboxes-link" navigate={~p"/mailboxes"}>
-              Manage mailboxes
+            <.link
+              id="create-local-mailbox-link"
+              navigate={~p"/mailboxes?#{[source: "external_account", provider: @selected_provider]}"}
+            >
+              Create local mailbox
             </.link>
           </div>
 
@@ -366,6 +374,30 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
 
   defp provider_icon("gmail"), do: "gmail"
   defp provider_icon("microsoft"), do: "microsoft"
+
+  defp restore_mailbox_handoff(
+         socket,
+         %{"provider" => provider, "mailbox_id" => mailbox_id}
+       )
+       when provider in ["gmail", "microsoft"] do
+    valid_provider =
+      provider_configured?(socket.assigns.configured_providers, provider)
+
+    valid_mailbox =
+      Enum.any?(socket.assigns.mailboxes, &(&1.id == mailbox_id))
+
+    if valid_provider and valid_mailbox do
+      assign(socket,
+        add_account_step: :mailbox,
+        selected_provider: provider,
+        selected_mailbox_id: mailbox_id
+      )
+    else
+      reset_add_account(socket)
+    end
+  end
+
+  defp restore_mailbox_handoff(socket, _params), do: reset_add_account(socket)
 
   defp reset_add_account(socket) do
     assign(socket,

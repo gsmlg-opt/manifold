@@ -192,6 +192,26 @@ defmodule ManifoldWeb.MailboxLiveTest do
     refute has_element?(view, "#mailbox-details-heading")
   end
 
+  test "external-account entry returns with the created mailbox", %{conn: conn} do
+    {:ok, domain} = Accounts.create_domain(%{name: unique_domain("return")})
+
+    assert {:ok, view, _html} =
+             live(conn, ~p"/mailboxes?#{[source: "external_account", provider: "gmail"]}")
+
+    open_existing_domain(view, domain)
+
+    view
+    |> form("#create-mailbox-form", %{mailbox: %{local_part: "imports"}})
+    |> render_submit()
+
+    [mailbox] = Accounts.list_mailboxes(domain)
+
+    assert_redirect(
+      view,
+      ~p"/settings/accounts?#{[provider: "gmail", mailbox_id: mailbox.id]}"
+    )
+  end
+
   defp open_existing_domain(view, domain) do
     view |> element("#create-mailbox-button") |> render_click()
 

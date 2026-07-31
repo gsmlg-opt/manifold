@@ -439,8 +439,60 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     refute html =~ mailbox.local_part
     assert html =~ "Create an active local mailbox before connecting an external account."
-    assert has_element?(view, "#manage-mailboxes-link[href='/mailboxes']")
+
+    assert has_element?(
+             view,
+             "#create-local-mailbox-link[href*='provider=gmail'][href*='source=external_account']",
+             "Create local mailbox"
+           )
+
     refute has_element?(view, "#continue-add-account")
+  end
+
+  test "validated handoff restores provider and mailbox selection", %{
+    conn: conn,
+    mailbox: mailbox
+  } do
+    assert {:ok, view, _html} =
+             live(conn, ~p"/settings/accounts?#{[provider: "gmail", mailbox_id: mailbox.id]}")
+
+    assert has_element?(view, "#add-account-mailbox-heading", "Choose a local mailbox")
+
+    assert has_element?(
+             view,
+             "#add-account-mailbox-id option[value='#{mailbox.id}'][selected]"
+           )
+
+    assert has_element?(
+             view,
+             "#continue-add-account[href='/connectors/gmail/start?mailbox_id=#{mailbox.id}']",
+             "Continue to Gmail"
+           )
+  end
+
+  test "invalid handoff parameters fail closed", %{conn: conn, mailbox: mailbox} do
+    assert {:ok, forged_provider, _html} =
+             live(conn, ~p"/settings/accounts?#{[provider: "imap", mailbox_id: mailbox.id]}")
+
+    refute has_element?(forged_provider, "#add-account-panel")
+
+    assert {:ok, unknown_mailbox, _html} =
+             live(
+               conn,
+               ~p"/settings/accounts?#{[provider: "gmail", mailbox_id: Ecto.UUID.generate()]}"
+             )
+
+    refute has_element?(unknown_mailbox, "#add-account-panel")
+
+    mailbox
+    |> Ecto.Changeset.change(active: false)
+    |> Manifold.Repo.update!()
+
+    assert {:ok, inactive_mailbox, _html} =
+             live(conn, ~p"/settings/accounts?#{[provider: "gmail", mailbox_id: mailbox.id]}")
+
+    refute has_element?(inactive_mailbox, "#add-account-panel")
+    refute has_element?(inactive_mailbox, "#continue-add-account")
   end
 
   test "back moves one step and cancel resets account setup", %{conn: conn, mailbox: mailbox} do
