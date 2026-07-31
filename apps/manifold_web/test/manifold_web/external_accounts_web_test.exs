@@ -122,22 +122,35 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     {:ok, domain: domain, mailbox: mailbox}
   end
 
-  test "settings accounts opens with an add account button", %{conn: conn} do
+  test "settings accounts opens with an add account button that navigates to new", %{conn: conn} do
     assert {:ok, view, html} = live(conn, "/settings/accounts")
 
     assert has_element?(view, "#add-account-button", "Add account")
+    assert has_element?(view, "#add-account-button[href='/settings/accounts/new']")
     refute has_element?(view, "#add-account-panel")
     refute html =~ "/connectors/gmail/start"
     refute html =~ "/connectors/microsoft/start"
     refute html =~ "Log in"
   end
 
-  test "external account wizard selects a provider and mailbox", %{conn: conn, mailbox: mailbox} do
+  test "add account button navigates to the new account page", %{conn: conn} do
     assert {:ok, view, _html} = live(conn, "/settings/accounts")
 
-    assert view
-           |> element("#add-account-button")
-           |> render_click() =~ "External account"
+    assert {:ok, new_view, html} =
+             view
+             |> element("#add-account-button")
+             |> render_click()
+             |> follow_redirect(conn, "/settings/accounts/new")
+
+    assert html =~ "What kind of account are you adding?"
+    assert has_element?(new_view, "#add-account-panel")
+    assert has_element?(new_view, "#external-account-type")
+  end
+
+  test "external account wizard selects a provider and mailbox", %{conn: conn, mailbox: mailbox} do
+    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
+
+    assert render(view) =~ "External account"
 
     html =
       view
@@ -171,7 +184,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     conn: conn,
     mailbox: mailbox
   } do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
     open_provider_step(view)
 
     view
@@ -189,31 +202,29 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
            )
   end
 
-  test "wizard rejects forward events while closed", %{conn: conn, mailbox: mailbox} do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+  test "wizard rejects forward events before account type selection", %{
+    conn: conn,
+    mailbox: mailbox
+  } do
+    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
 
-    render_hook(view, "choose-account-type", %{"type" => "external"})
     render_hook(view, "choose-provider", %{"provider" => "gmail"})
     render_hook(view, "select-add-account-mailbox", %{"mailbox_id" => mailbox.id})
 
-    refute has_element?(view, "#add-account-panel")
     refute has_element?(view, "#continue-add-account")
+    assert has_element?(view, "#add-account-type-heading")
 
     assert {:ok, socket} = Phoenix.LiveView.Debug.socket(view.pid)
 
     assert %{
-             add_account_step: :closed,
+             add_account_step: :account_type,
              selected_provider: nil,
              selected_mailbox_id: nil
            } = socket.assigns
   end
 
   test "wizard rejects a provider before account type selection", %{conn: conn} do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts")
-
-    view
-    |> element("#add-account-button")
-    |> render_click()
+    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
 
     assert render_hook(view, "choose-provider", %{"provider" => "gmail"}) =~
              "What kind of account are you adding?"
@@ -230,7 +241,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
   end
 
   test "wizard rejects a mailbox before provider selection", %{conn: conn, mailbox: mailbox} do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
     open_provider_step(view)
 
     assert render_hook(view, "select-add-account-mailbox", %{"mailbox_id" => mailbox.id}) =~
@@ -250,11 +261,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
   test "add account panel is descriptively labelled without duplicate live announcements", %{
     conn: conn
   } do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts")
-
-    view
-    |> element("#add-account-button")
-    |> render_click()
+    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
 
     assert has_element?(
              view,
@@ -267,11 +274,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
   end
 
   test "wizard ignores forged account type and provider values", %{conn: conn} do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts")
-
-    view
-    |> element("#add-account-button")
-    |> render_click()
+    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
 
     assert render_hook(view, "choose-account-type", %{"type" => "local"}) =~
              "What kind of account are you adding?"
@@ -290,7 +293,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
   end
 
   test "wizard clears the mailbox selection for forged values", %{conn: conn, mailbox: mailbox} do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
     open_provider_step(view)
 
     view
@@ -402,7 +405,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
   test "unconfigured providers are shown as unavailable", %{conn: conn} do
     Application.put_env(:manifold_connectors, :providers, [])
 
-    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
     open_provider_step(view)
 
     html = render(view)
@@ -432,7 +435,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     |> Ecto.Changeset.change(active: false)
     |> Manifold.Repo.update!()
 
-    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
     open_provider_step(view)
 
     html = view |> element("#provider-gmail") |> render_click()
@@ -443,17 +446,13 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     refute has_element?(view, "#continue-add-account")
   end
 
-  test "back moves one step and cancel resets account setup", %{conn: conn, mailbox: mailbox} do
+  test "back moves one step and cancel returns to accounts list", %{conn: conn, mailbox: mailbox} do
     connect_account(conn, "microsoft", mailbox.id)
 
     assert [%{id: account_id, email_address: "person@outlook.example"}] =
              Connectors.list_accounts()
 
-    assert {:ok, view, _html} = live(conn, "/settings/accounts")
-
-    view
-    |> element("#add-account-button")
-    |> render_click()
+    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
 
     assert has_element?(
              view,
@@ -463,11 +462,6 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     refute has_element?(view, "#back-add-account")
     assert has_element?(view, "#cancel-add-account")
-
-    assert has_element?(
-             view,
-             "#cancel-add-account[phx-click*='cancel-add-account'][phx-click*='focus'][phx-click*='#add-account-button']"
-           )
 
     view
     |> element("#external-account-type")
@@ -555,35 +549,26 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     assert has_element?(view, "#continue-add-account")
 
-    html = view |> element("#cancel-add-account") |> render_click()
-
-    assert {:ok, socket} = Phoenix.LiveView.Debug.socket(view.pid)
-    assert socket.assigns.add_account_step == :closed
-    assert socket.assigns.selected_provider == nil
-    assert socket.assigns.selected_mailbox_id == nil
+    assert {:ok, index_view, html} =
+             view
+             |> element("#cancel-add-account")
+             |> render_click()
+             |> follow_redirect(conn, "/settings/accounts")
 
     assert html =~ "Connected accounts"
     assert html =~ "person@outlook.example"
-    assert has_element?(view, "#external-account-#{account_id} button[phx-click=sync]")
-    assert has_element?(view, "#external-account-#{account_id} button[phx-click=disconnect]")
+    assert has_element?(index_view, "#external-account-#{account_id} button[phx-click=sync]")
 
-    refute has_element?(view, "#add-account-panel")
+    assert has_element?(
+             index_view,
+             "#external-account-#{account_id} button[phx-click=disconnect]"
+           )
 
-    html = view |> element("#add-account-button") |> render_click()
-
-    assert html =~ "What kind of account are you adding?"
-    refute has_element?(view, "#back-add-account")
-    assert has_element?(view, "#cancel-add-account")
-    refute html =~ "Choose a provider"
-    refute html =~ "Choose a local mailbox"
-    refute has_element?(view, "#continue-add-account")
+    refute has_element?(index_view, "#add-account-panel")
+    assert has_element?(index_view, "#add-account-button[href='/settings/accounts/new']")
   end
 
   defp open_provider_step(view) do
-    view
-    |> element("#add-account-button")
-    |> render_click()
-
     view
     |> element("#external-account-type")
     |> render_click()
