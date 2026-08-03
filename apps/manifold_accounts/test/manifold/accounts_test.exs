@@ -9,6 +9,21 @@ defmodule Manifold.AccountsTest do
     assert {:ok, "example.test"} = Domain.normalize("Example.TEST")
   end
 
+  test "duplicate domains report the error on name" do
+    assert {:ok, _domain} = Accounts.create_domain(%{name: "Duplicate.test"})
+    assert {:error, changeset} = Accounts.create_domain(%{name: "duplicate.TEST"})
+    assert {"has already been taken", _metadata} = changeset.errors[:name]
+    refute Keyword.has_key?(changeset.errors, :normalized_domain)
+  end
+
+  test "duplicate mailboxes report the error on local part" do
+    domain = domain_fixture()
+    assert {:ok, _mailbox} = Accounts.create_mailbox(domain, %{local_part: "Person"})
+    assert {:error, changeset} = Accounts.create_mailbox(domain, %{local_part: "person"})
+    assert {"has already been taken", _metadata} = changeset.errors[:local_part]
+    refute Keyword.has_key?(changeset.errors, :domain_id)
+  end
+
   test "exact active mailbox lookup" do
     %{domain: domain, mailbox: mailbox} = mailbox_fixture()
 

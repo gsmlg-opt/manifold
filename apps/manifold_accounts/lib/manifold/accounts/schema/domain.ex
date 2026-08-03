@@ -23,7 +23,7 @@ defmodule Manifold.Accounts.Schema.Domain do
     |> cast(attrs, [:name, :active, :plus_addressing_enabled])
     |> validate_required([:name])
     |> normalize_domain()
-    |> unique_constraint(:normalized_domain)
+    |> unique_constraint(:normalized_domain, error_key: :name)
   end
 
   defp normalize_domain(%Ecto.Changeset{} = changeset) do
