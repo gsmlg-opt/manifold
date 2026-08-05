@@ -1235,7 +1235,7 @@ defmodule Manifold.Ingest do
   defp first_route_domain_id([]), do: nil
 
   defp validate_external_source(%ExternalSource{} = source) do
-    valid_provider? = source.provider in ["gmail", "microsoft"]
+    valid_provider? = source.provider in ["gmail", "microsoft", "imap"]
 
     valid_ids? =
       Enum.all?(

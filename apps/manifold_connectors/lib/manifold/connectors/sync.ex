@@ -16,6 +16,7 @@ defmodule Manifold.Connectors.Sync do
     ConnectorEvent,
     Credential,
     ExternalAccount,
+    ImapSettings,
     RemoteMessage,
     SyncCursor
   }
@@ -35,17 +36,18 @@ defmodule Manifold.Connectors.Sync do
 
     with {:ok, account, cursor} <- begin_sync(account_id, now),
          {:ok, adapter, config} <- runtime(account.provider),
-         {:ok, access_token} <-
-           access_token(account, adapter, config, now, provider_opts(opts)),
+         {:ok, config} <- enrich_runtime_config(account, config),
+         {:ok, auth} <-
+           auth_material(account, adapter, config, now, provider_opts(opts)),
          {:ok, %Page{} = page} <-
-           sync_page(adapter, access_token, cursor, config, provider_opts(opts)),
+           sync_page(adapter, auth, cursor, config, provider_opts(opts)),
          :ok <-
            process_messages(
              collapse_messages(page.messages),
              account,
              adapter,
              config,
-             access_token,
+             auth,
              now,
              opts
            ),
@@ -151,6 +153,31 @@ defmodule Manifold.Connectors.Sync do
     |> limit(1)
     |> Repo.one()
   end
+
+  defp auth_material(%ExternalAccount{provider: "imap"} = account, _adapter, _config, _now, _opts) do
+    with %Credential{secret_kind: "password", password_ciphertext: cipher} <-
+           Repo.get_by(Credential, external_account_id: account.id),
+         {:ok, password} <- Crypto.decrypt(cipher, credential_context(account.id, :imap_password)) do
+      {:ok, password}
+    else
+      nil ->
+        {:error, Error.new(:permanent, :credential_missing, "connector credential is missing")}
+
+      %Credential{} ->
+        {:error,
+         Error.new(
+           :permanent,
+           :credential_kind_mismatch,
+           "IMAP account requires a password credential"
+         )}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp auth_material(account, adapter, config, now, opts),
+    do: access_token(account, adapter, config, now, opts)
 
   defp access_token(account, adapter, config, now, provider_opts) do
     case Repo.get_by(Credential, external_account_id: account.id) do
@@ -619,6 +646,12 @@ defmodule Manifold.Connectors.Sync do
     }
   end
 
+  defp runtime("imap") do
+    adapters = Application.get_env(:manifold_connectors, :adapters, [])
+    adapter = Keyword.get(adapters, :imap) || Manifold.Connectors.Provider.IMAP
+    {:ok, adapter, []}
+  end
+
   defp runtime(provider) when provider in ["gmail", "microsoft"] do
     key = String.to_existing_atom(provider)
     adapters = Application.get_env(:manifold_connectors, :adapters, [])
@@ -639,6 +672,41 @@ defmodule Manifold.Connectors.Sync do
         {:error, Error.new(:permanent, :provider_not_configured, "provider is not configured")}
     end
   end
+
+  defp runtime(_provider) do
+    {:error, Error.new(:permanent, :unsupported_provider, "provider is not supported")}
+  end
+
+  defp enrich_runtime_config(%ExternalAccount{provider: "imap"} = account, config) do
+    case Repo.get_by(ImapSettings, external_account_id: account.id) do
+      %ImapSettings{} = settings ->
+        transport =
+          Application.get_env(
+            :manifold_connectors,
+            :imap_transport,
+            Manifold.Connectors.IMAP.Client
+          )
+
+        fake = Application.get_env(:manifold_connectors, :imap_fake, %{})
+
+        {:ok,
+         Keyword.merge(config,
+           host: settings.host,
+           port: settings.port,
+           tls_mode: settings.tls_mode,
+           username: settings.username,
+           mailbox_path: settings.mailbox_path,
+           transport: transport,
+           fake: if(is_map(fake), do: fake, else: %{})
+         )}
+
+      nil ->
+        {:error,
+         Error.new(:permanent, :imap_settings_missing, "IMAP settings are missing for account")}
+    end
+  end
+
+  defp enrich_runtime_config(_account, config), do: {:ok, config}
 
   defp handle_provider_error(account_id, %ProviderError{} = error, now) do
     status = if error.class == :reconnect, do: "reconnect_required", else: "failed"
