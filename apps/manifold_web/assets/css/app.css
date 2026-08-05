@@ -414,14 +414,16 @@ code {
   margin: 2px 0 0;
 }
 
-.mailbox-setup-form {
+.mailbox-setup-form,
+#imap-account-form {
   display: grid;
   max-width: 560px;
   gap: 7px;
   margin-top: 18px;
 }
 
-.mailbox-setup-form label {
+.mailbox-setup-form label,
+#imap-account-form label {
   color: #46505c;
   font-size: 13px;
   font-weight: 700;
@@ -433,7 +435,9 @@ code {
 }
 
 .mailbox-setup-form input,
-.mailbox-setup-form select {
+.mailbox-setup-form select,
+#imap-account-form input,
+#imap-account-form select {
   width: 100%;
   min-width: 0;
   min-height: 42px;
@@ -445,13 +449,16 @@ code {
 }
 
 .mailbox-setup-form input:focus,
-.mailbox-setup-form select:focus {
+.mailbox-setup-form select:focus,
+#imap-account-form input:focus,
+#imap-account-form select:focus {
   border-color: #087f5b;
   outline: 2px solid #064f3b;
   outline-offset: 1px;
 }
 
-.mailbox-setup-form .settings-action {
+.mailbox-setup-form .settings-action,
+#imap-account-form .settings-action {
   width: fit-content;
   margin-top: 9px;
 }

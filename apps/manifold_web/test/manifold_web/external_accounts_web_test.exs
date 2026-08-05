@@ -169,6 +169,20 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     html = render(view)
     assert html =~ "Host"
     refute html =~ "Choose a mailbox"
+
+    assert has_element?(view, "#imap-account-form")
+    assert has_element?(view, "label[for=imap-email-address]", "Email address")
+    assert has_element?(view, "#imap-email-address")
+    assert has_element?(view, "label[for=imap-username]", "Username")
+    assert has_element?(view, "#imap-username")
+    assert has_element?(view, "label[for=imap-password]", "Password")
+    assert has_element?(view, "#imap-password[type=password]")
+    assert has_element?(view, "label[for=imap-host]", "Host")
+    assert has_element?(view, "#imap-host")
+    assert has_element?(view, "label[for=imap-port]", "Port")
+    assert has_element?(view, "#imap-port[type=number]")
+    assert has_element?(view, "label[for=imap-tls-mode]", "TLS mode")
+    assert has_element?(view, "#imap-tls-mode")
   end
 
   test "successful imap submit redirects to mailbox inbox", %{conn: conn} do
