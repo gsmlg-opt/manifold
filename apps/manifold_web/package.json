@@ -3,7 +3,7 @@
   "private": true,
   "dependencies": {
     "@duskmoon-dev/core": "1.17.2",
-    "phoenix_duskmoon": "9.9.4"
+    "phoenix_duskmoon": "9.9.7"
   },
   "devDependencies": {}
 }
