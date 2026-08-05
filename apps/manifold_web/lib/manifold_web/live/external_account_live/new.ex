@@ -157,11 +157,34 @@ defmodule ManifoldWeb.ExternalAccountLive.New do
       tls_mode: form.tls_mode
     }
 
-    case Connectors.create_imap_account(attrs) do
-      {:ok, account} ->
-        {:ok, folders} = Mail.list_folders(account.mailbox_id)
-        inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    result =
+      try do
+        case Connectors.create_imap_account(attrs) do
+          {:ok, account} ->
+            case Mail.list_folders(account.mailbox_id) do
+              {:ok, folders} ->
+                inbox = Enum.find(folders, &(&1.kind == "inbox"))
 
+                if inbox do
+                  {:ok, account, inbox}
+                else
+                  {:error, :inbox_not_found}
+                end
+
+              {:error, reason} ->
+                {:error, reason}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+      rescue
+        e in [Postgrex.Error, DBConnection.ConnectionError, Ecto.ConstraintError] ->
+          {:error, e}
+      end
+
+    case result do
+      {:ok, account, inbox} ->
         {:noreply,
          socket
          |> assign(imap_saving: false)
@@ -461,6 +484,10 @@ defmodule ManifoldWeb.ExternalAccountLive.New do
   defp imap_error_message(%ProviderError{message: message}) when is_binary(message), do: message
   defp imap_error_message(%Error{message: message}) when is_binary(message), do: message
   defp imap_error_message(%Ecto.Changeset{}), do: "Could not save IMAP account settings."
+  defp imap_error_message(%Postgrex.Error{}), do: "Could not save IMAP account settings."
+  defp imap_error_message(%DBConnection.ConnectionError{}), do: "Could not save IMAP account settings."
+  defp imap_error_message(%Ecto.ConstraintError{}), do: "Could not save IMAP account settings."
+  defp imap_error_message(:inbox_not_found), do: "Could not open the mailbox inbox."
   defp imap_error_message(_), do: "Could not connect to the IMAP server."
 
   defp mailbox_address(mailbox),

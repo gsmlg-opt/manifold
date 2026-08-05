@@ -143,10 +143,11 @@ defmodule Manifold.Connectors do
       {:error, %ProviderError{} = error} -> {:error, error}
       {:error, %Error{} = error} -> {:error, error}
       {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
+      {:error, reason} -> {:error, reason}
     end
   rescue
-    DBConnection.ConnectionError ->
-      {:error, database_error(:unavailable)}
+    e in [DBConnection.ConnectionError, Postgrex.Error] ->
+      {:error, database_error(e)}
 
     e in [ArgumentError, ErlangError, FunctionClauseError] ->
       {:error,
