@@ -55,11 +55,12 @@ read-only Gmail and Microsoft 365 synchronization:
 
 The current milestones intentionally do not implement rich-text composition,
 outbound attachments, bundled DNS authentication engines, bundled spam or
-malware engines, IMAP, POP3, JMAP, provider push notifications, Gmail or
+malware engines, POP3, JMAP, provider push notifications, Gmail or
 Microsoft mailbox mutation, provider-backed sending, or cloud provider hosting.
-Production authentication and scanning engines plug into the Milestone 4
-adapter boundaries. The optional edge is ingress-only and never performs
-outbound MX delivery.
+Read-only IMAP INBOX import is supported via the connectors application; POP3
+and JMAP remain out of scope. Production authentication and scanning engines
+plug into the Milestone 4 adapter boundaries. The optional edge is ingress-only
+and never performs outbound MX delivery.
 
 Manifold never performs direct outbound Internet SMTP delivery. Milestone 3
 submits locally composed mail through the configured managed-provider HTTPS
