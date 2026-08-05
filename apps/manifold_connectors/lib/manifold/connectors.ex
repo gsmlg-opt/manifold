@@ -6,10 +6,13 @@ defmodule Manifold.Connectors do
   import Ecto.Query
 
   alias Ecto.Multi
+  alias Manifold.Accounts
   alias Manifold.Connectors.Crypto
+  alias Manifold.Connectors.IMAP.Client
   alias Manifold.Connectors.Jobs.SyncAccount
   alias Manifold.Connectors.OAuth.Consumed
   alias Manifold.Connectors.Provider.Error, as: ProviderError
+  alias Manifold.Connectors.Provider.IMAP, as: ProviderIMAP
   alias Manifold.Connectors.Provider.{Identity, Token}
   alias Manifold.Connectors.Sync
 
@@ -17,12 +20,13 @@ defmodule Manifold.Connectors do
     ConnectorEvent,
     Credential,
     ExternalAccount,
+    ImapSettings,
     RemoteMessage,
     SyncCursor
   }
 
   alias Manifold.Connectors.View
-  alias Manifold.Core.Error
+  alias Manifold.Core.{Address, Error}
   alias Manifold.Mail
   alias Manifold.Repo
 
@@ -83,6 +87,55 @@ defmodule Manifold.Connectors do
         is_binary(value) and value != ""
       end)
     end)
+  end
+
+  @spec test_imap_connection(map()) :: :ok | {:error, Error.t() | ProviderError.t()}
+  def test_imap_connection(attrs) when is_map(attrs) do
+    with {:ok, settings} <- imap_settings_from_attrs(attrs) do
+      transport = imap_transport()
+
+      case transport.connect(settings) do
+        {:ok, conn} ->
+          mailbox_path = Map.get(settings, :mailbox_path, "INBOX")
+
+          result =
+            case transport.select(conn, mailbox_path) do
+              {:ok, _meta} -> :ok
+              {:error, %ProviderError{} = error} -> {:error, error}
+            end
+
+          transport.logout(conn)
+          result
+
+        {:error, %ProviderError{} = error} ->
+          {:error, error}
+      end
+    end
+  end
+
+  @spec create_imap_account(map()) ::
+          {:ok, ExternalAccount.t()}
+          | {:error, Error.t() | Ecto.Changeset.t() | ProviderError.t()}
+  def create_imap_account(attrs) when is_map(attrs) do
+    now = DateTime.utc_now()
+    skip_test? = truthy?(attr(attrs, :skip_test))
+
+    with {:ok, parsed} <- Address.parse(attr(attrs, :email_address) || ""),
+         provider_account_id <- "imap:" <> parsed.canonical,
+         :ok <- reject_duplicate_imap(parsed.canonical, provider_account_id),
+         :ok <- maybe_test_imap(attrs, skip_test?),
+         {:ok, mailbox} <- Accounts.ensure_mailbox_for_address(parsed.canonical),
+         {:ok, cursors} <-
+           ProviderIMAP.initial_cursors(attr(attrs, :password), imap_provider_config(attrs), []) do
+      persist_imap_account(attrs, parsed, provider_account_id, mailbox, cursors, now)
+    else
+      {:error, %ProviderError{} = error} -> {:error, error}
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error, database_error(:unavailable)}
   end
 
   @spec get_account(Ecto.UUID.t()) :: {:ok, View.Account.t()} | {:error, Error.t()}
@@ -210,11 +263,12 @@ defmodule Manifold.Connectors do
   @spec apply_remote_state(Ecto.UUID.t()) :: :ok | {:error, Error.t()}
   def apply_remote_state(remote_message_id) do
     query =
-      from remote in RemoteMessage,
+      from(remote in RemoteMessage,
         join: account in ExternalAccount,
         on: account.id == remote.external_account_id,
         where: remote.id == ^remote_message_id,
         select: {remote, account}
+      )
 
     case Repo.one(query) do
       {%RemoteMessage{inbound_delivery_id: nil}, %ExternalAccount{}} ->
@@ -490,6 +544,188 @@ defmodule Manifold.Connectors do
   defp normalize_folder_kind(_folder_kind), do: "archive"
 
   defp credential_context(account_id, kind), do: "credential:#{account_id}:#{kind}"
+
+  defp imap_transport do
+    Application.get_env(:manifold_connectors, :imap_transport, Client)
+  end
+
+  defp attr(attrs, key) when is_atom(key) do
+    Map.get(attrs, key) || Map.get(attrs, Atom.to_string(key))
+  end
+
+  defp truthy?(value), do: value in [true, "true", 1, "1"]
+
+  defp maybe_test_imap(_attrs, true), do: :ok
+
+  defp maybe_test_imap(attrs, false) do
+    case test_imap_connection(attrs) do
+      :ok -> :ok
+      {:error, %ProviderError{} = error} -> {:error, error}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  defp reject_duplicate_imap(email_canonical, provider_account_id) do
+    conflict =
+      ExternalAccount
+      |> where([account], account.status != "disconnected")
+      |> where(
+        [account],
+        account.provider_account_id == ^provider_account_id or
+          fragment("lower(?) = ?", account.email_address, ^email_canonical)
+      )
+      |> limit(1)
+      |> Repo.one()
+
+    case conflict do
+      nil ->
+        :ok
+
+      %ExternalAccount{} ->
+        {:error,
+         Error.new(
+           :permanent,
+           :account_already_connected,
+           "an IMAP account for this address is already connected"
+         )}
+    end
+  end
+
+  defp imap_settings_from_attrs(attrs) do
+    host = attr(attrs, :host)
+    username = attr(attrs, :username) || attr(attrs, :email_address)
+    password = attr(attrs, :password)
+    tls_mode = attr(attrs, :tls_mode) || "ssl"
+    mailbox_path = attr(attrs, :mailbox_path) || "INBOX"
+    port = parse_port(attr(attrs, :port) || 993)
+
+    cond do
+      not is_binary(host) or host == "" ->
+        {:error, Error.new(:permanent, :invalid_imap_settings, "IMAP host is required")}
+
+      not is_binary(username) or username == "" ->
+        {:error, Error.new(:permanent, :invalid_imap_settings, "IMAP username is required")}
+
+      not is_binary(password) or password == "" ->
+        {:error, Error.new(:permanent, :invalid_imap_settings, "IMAP password is required")}
+
+      tls_mode not in ["ssl", "starttls"] ->
+        {:error, Error.new(:permanent, :invalid_imap_settings, "IMAP tls_mode is invalid")}
+
+      not is_integer(port) ->
+        {:error, Error.new(:permanent, :invalid_imap_settings, "IMAP port is invalid")}
+
+      true ->
+        settings = %{
+          host: host,
+          port: port,
+          tls_mode: tls_mode,
+          username: username,
+          password: password,
+          mailbox_path: mailbox_path
+        }
+
+        fake = Application.get_env(:manifold_connectors, :imap_fake, %{})
+
+        {:ok,
+         settings
+         |> Map.merge(if(is_map(fake), do: fake, else: %{}))
+         |> maybe_merge_attr_fake(attrs)}
+    end
+  end
+
+  defp maybe_merge_attr_fake(settings, attrs) do
+    case attr(attrs, :fake) do
+      %{} = fake -> Map.merge(settings, fake)
+      _ -> settings
+    end
+  end
+
+  defp parse_port(port) when is_integer(port), do: port
+
+  defp parse_port(port) when is_binary(port) do
+    case Integer.parse(port) do
+      {value, ""} -> value
+      _ -> nil
+    end
+  end
+
+  defp parse_port(_), do: nil
+
+  defp imap_provider_config(attrs) do
+    [
+      host: attr(attrs, :host),
+      port: parse_port(attr(attrs, :port) || 993),
+      tls_mode: attr(attrs, :tls_mode) || "ssl",
+      username: attr(attrs, :username) || attr(attrs, :email_address),
+      mailbox_path: attr(attrs, :mailbox_path) || "INBOX",
+      transport: imap_transport()
+    ]
+  end
+
+  defp persist_imap_account(attrs, parsed, provider_account_id, mailbox, cursors, now) do
+    password = attr(attrs, :password)
+    username = attr(attrs, :username) || parsed.canonical
+    host = attr(attrs, :host)
+    port = parse_port(attr(attrs, :port) || 993)
+    tls_mode = attr(attrs, :tls_mode) || "ssl"
+    mailbox_path = attr(attrs, :mailbox_path) || "INBOX"
+
+    Multi.new()
+    |> Multi.insert(:account, fn _changes ->
+      ExternalAccount.changeset(%ExternalAccount{}, %{
+        mailbox_id: mailbox.id,
+        provider: "imap",
+        provider_account_id: provider_account_id,
+        email_address: parsed.canonical,
+        status: "connected",
+        sync_enabled: true,
+        granted_scopes: []
+      })
+    end)
+    |> Multi.run(:credential, fn repo, %{account: account} ->
+      with {:ok, ciphertext} <-
+             Crypto.encrypt(password, credential_context(account.id, :imap_password)) do
+        Credential.changeset(%Credential{}, %{
+          external_account_id: account.id,
+          key_version: 1,
+          secret_kind: "password",
+          password_ciphertext: ciphertext,
+          refresh_token_ciphertext: nil
+        })
+        |> repo.insert()
+      end
+    end)
+    |> Multi.insert(:imap_settings, fn %{account: account} ->
+      ImapSettings.changeset(%ImapSettings{}, %{
+        external_account_id: account.id,
+        host: host,
+        port: port,
+        tls_mode: tls_mode,
+        username: username,
+        mailbox_path: mailbox_path
+      })
+    end)
+    |> Multi.run(:cursors, fn repo, %{account: account} ->
+      replace_cursors(repo, account.id, cursors, now)
+    end)
+    |> Multi.insert(:event, fn %{account: account} ->
+      ConnectorEvent.changeset(%ConnectorEvent{}, %{
+        external_account_id: account.id,
+        event_type: "connected",
+        metadata: %{provider: "imap"},
+        occurred_at: now
+      })
+    end)
+    |> Multi.run(:job, fn repo, %{account: account} ->
+      {:ok, ensure_sync_job(repo, account.id)}
+    end)
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{account: account}} -> {:ok, account}
+      {:error, _step, reason, _changes} -> {:error, reason}
+    end
+  end
 
   defp maybe_fault(opts, point) do
     if Keyword.get(opts, :fail_at) == point do
