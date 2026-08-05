@@ -3,6 +3,9 @@ defmodule ManifoldWeb.ExternalAccountLive.New do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
+  alias Manifold.Connectors.Provider.Error, as: ProviderError
+  alias Manifold.Core.Error
+  alias Manifold.Mail
 
   @impl Phoenix.LiveView
   def mount(_params, _session, socket) do
@@ -13,7 +16,10 @@ defmodule ManifoldWeb.ExternalAccountLive.New do
        configured_providers: Connectors.configured_providers(),
        add_account_step: :account_type,
        selected_provider: nil,
-       selected_mailbox_id: nil
+       selected_mailbox_id: nil,
+       imap_form: empty_imap_form(),
+       imap_error: nil,
+       imap_saving: false
      )}
   end
 
@@ -29,6 +35,19 @@ defmodule ManifoldWeb.ExternalAccountLive.New do
         %{assigns: %{add_account_step: :account_type}} = socket
       ) do
     {:noreply, assign(socket, :add_account_step, :provider)}
+  end
+
+  def handle_event(
+        "choose-account-type",
+        %{"type" => "imap"},
+        %{assigns: %{add_account_step: :account_type}} = socket
+      ) do
+    {:noreply,
+     assign(socket,
+       add_account_step: :imap_form,
+       imap_form: empty_imap_form(),
+       imap_error: nil
+     )}
   end
 
   def handle_event("choose-account-type", _params, socket), do: {:noreply, socket}
@@ -74,6 +93,19 @@ defmodule ManifoldWeb.ExternalAccountLive.New do
     {:noreply, assign(socket, add_account_step: :provider, selected_mailbox_id: nil)}
   end
 
+  def handle_event(
+        "back-add-account",
+        _params,
+        %{assigns: %{add_account_step: :imap_form}} = socket
+      ) do
+    {:noreply,
+     assign(socket,
+       add_account_step: :account_type,
+       imap_form: empty_imap_form(),
+       imap_error: nil
+     )}
+  end
+
   def handle_event("back-add-account", _params, socket), do: {:noreply, socket}
 
   def handle_event("cancel-add-account", _params, socket) do
@@ -96,6 +128,55 @@ defmodule ManifoldWeb.ExternalAccountLive.New do
   def handle_event("select-add-account-mailbox", _params, socket) do
     {:noreply, assign(socket, :selected_mailbox_id, nil)}
   end
+
+  def handle_event(
+        "imap-form-change",
+        %{"imap" => params},
+        %{assigns: %{add_account_step: :imap_form}} = socket
+      ) do
+    form = merge_imap_form(socket.assigns.imap_form, params)
+    {:noreply, assign(socket, imap_form: form, imap_error: nil)}
+  end
+
+  def handle_event("imap-form-change", _params, socket), do: {:noreply, socket}
+
+  def handle_event(
+        "save-imap-account",
+        %{"imap" => params},
+        %{assigns: %{add_account_step: :imap_form, imap_saving: false}} = socket
+      ) do
+    form = merge_imap_form(socket.assigns.imap_form, params)
+    socket = assign(socket, imap_form: form, imap_saving: true, imap_error: nil)
+
+    attrs = %{
+      email_address: form.email_address,
+      username: form.username,
+      password: form.password,
+      host: form.host,
+      port: form.port,
+      tls_mode: form.tls_mode
+    }
+
+    case Connectors.create_imap_account(attrs) do
+      {:ok, account} ->
+        {:ok, folders} = Mail.list_folders(account.mailbox_id)
+        inbox = Enum.find(folders, &(&1.kind == "inbox"))
+
+        {:noreply,
+         socket
+         |> assign(imap_saving: false)
+         |> push_navigate(to: ~p"/mail/#{account.mailbox_id}/folders/#{inbox.id}")}
+
+      {:error, reason} ->
+        {:noreply,
+         assign(socket,
+           imap_saving: false,
+           imap_error: imap_error_message(reason)
+         )}
+    end
+  end
+
+  def handle_event("save-imap-account", _params, socket), do: {:noreply, socket}
 
   @impl Phoenix.LiveView
   def render(assigns) do
@@ -133,19 +214,34 @@ defmodule ManifoldWeb.ExternalAccountLive.New do
           <h3 id="add-account-type-heading" tabindex="-1" phx-mounted={JS.focus()}>
             What kind of account are you adding?
           </h3>
-          <button
-            id="external-account-type"
-            type="button"
-            class="add-account-choice"
-            phx-click="choose-account-type"
-            phx-value-type="external"
-          >
-            <.dm_mdi name="cloud-outline" />
-            <span>
-              <strong>External account</strong>
-              <small>Connect an existing provider-hosted mailbox.</small>
-            </span>
-          </button>
+          <div class="add-account-choices">
+            <button
+              id="external-account-type"
+              type="button"
+              class="add-account-choice"
+              phx-click="choose-account-type"
+              phx-value-type="external"
+            >
+              <.dm_mdi name="cloud-outline" />
+              <span>
+                <strong>Cloud account</strong>
+                <small>Connect Gmail or Microsoft 365 with OAuth.</small>
+              </span>
+            </button>
+            <button
+              id="imap-account-type"
+              type="button"
+              class="add-account-choice"
+              phx-click="choose-account-type"
+              phx-value-type="imap"
+            >
+              <.dm_mdi name="email-outline" />
+              <span>
+                <strong>IMAP account</strong>
+                <small>Connect any IMAP inbox with a password.</small>
+              </span>
+            </button>
+          </div>
         </div>
 
         <div :if={@add_account_step == :provider}>
@@ -222,6 +318,91 @@ defmodule ManifoldWeb.ExternalAccountLive.New do
           </a>
         </div>
 
+        <div :if={@add_account_step == :imap_form}>
+          <h3 id="add-account-imap-heading" tabindex="-1" phx-mounted={JS.focus()}>
+            IMAP connection
+          </h3>
+          <p class="settings-secondary">
+            Manifold will create a local mailbox from the email address and sync INBOX read-only.
+          </p>
+
+          <form
+            id="imap-account-form"
+            phx-change="imap-form-change"
+            phx-submit="save-imap-account"
+          >
+            <label for="imap-email-address">Email address</label>
+            <input
+              id="imap-email-address"
+              type="email"
+              name="imap[email_address]"
+              value={@imap_form.email_address}
+              required
+              autocomplete="username"
+            />
+
+            <label for="imap-username">Username</label>
+            <input
+              id="imap-username"
+              type="text"
+              name="imap[username]"
+              value={@imap_form.username}
+              required
+              autocomplete="username"
+            />
+
+            <label for="imap-password">Password</label>
+            <input
+              id="imap-password"
+              type="password"
+              name="imap[password]"
+              value={@imap_form.password}
+              required
+              autocomplete="current-password"
+            />
+
+            <label for="imap-host">Host</label>
+            <input
+              id="imap-host"
+              type="text"
+              name="imap[host]"
+              value={@imap_form.host}
+              required
+              autocomplete="off"
+            />
+
+            <label for="imap-port">Port</label>
+            <input
+              id="imap-port"
+              type="number"
+              name="imap[port]"
+              value={@imap_form.port}
+              required
+              min="1"
+              max="65535"
+            />
+
+            <label for="imap-tls-mode">TLS mode</label>
+            <select id="imap-tls-mode" name="imap[tls_mode]">
+              <option value="ssl" selected={@imap_form.tls_mode == "ssl"}>SSL</option>
+              <option value="starttls" selected={@imap_form.tls_mode == "starttls"}>STARTTLS</option>
+            </select>
+
+            <p :if={@imap_error} id="imap-account-error" class="settings-error" role="alert">
+              {@imap_error}
+            </p>
+
+            <button
+              id="save-imap-account"
+              type="submit"
+              class="settings-action settings-action-primary"
+              disabled={@imap_saving}
+            >
+              {if @imap_saving, do: "Connecting…", else: "Connect IMAP account"}
+            </button>
+          </form>
+        </div>
+
         <footer class="add-account-panel-footer">
           <button
             :if={@add_account_step != :account_type}
@@ -246,6 +427,42 @@ defmodule ManifoldWeb.ExternalAccountLive.New do
     """
   end
 
+  defp empty_imap_form do
+    %{
+      email_address: "",
+      username: "",
+      password: "",
+      host: "",
+      port: "993",
+      tls_mode: "ssl"
+    }
+  end
+
+  defp merge_imap_form(form, params) when is_map(params) do
+    email = Map.get(params, "email_address", form.email_address)
+    username = Map.get(params, "username", form.username)
+
+    username =
+      cond do
+        username in [nil, ""] and is_binary(email) and email != "" -> email
+        true -> username || ""
+      end
+
+    %{
+      email_address: email || "",
+      username: username,
+      password: Map.get(params, "password", form.password) || "",
+      host: Map.get(params, "host", form.host) || "",
+      port: Map.get(params, "port", form.port) || "993",
+      tls_mode: Map.get(params, "tls_mode", form.tls_mode) || "ssl"
+    }
+  end
+
+  defp imap_error_message(%ProviderError{message: message}) when is_binary(message), do: message
+  defp imap_error_message(%Error{message: message}) when is_binary(message), do: message
+  defp imap_error_message(%Ecto.Changeset{}), do: "Could not save IMAP account settings."
+  defp imap_error_message(_), do: "Could not connect to the IMAP server."
+
   defp mailbox_address(mailbox),
     do: mailbox.local_part <> "@" <> mailbox.domain.normalized_domain
 
@@ -253,9 +470,10 @@ defmodule ManifoldWeb.ExternalAccountLive.New do
   defp provider_name("microsoft"), do: "Microsoft 365"
   defp provider_name(provider), do: provider
 
-  defp add_account_step_label(:account_type), do: "Step 1 of 3"
+  defp add_account_step_label(:account_type), do: "Step 1"
   defp add_account_step_label(:provider), do: "Step 2 of 3"
   defp add_account_step_label(:mailbox), do: "Step 3 of 3"
+  defp add_account_step_label(:imap_form), do: "Step 2 of 2"
 
   defp provider_configured?(configured_providers, provider),
     do: provider in configured_providers
@@ -291,7 +509,10 @@ defmodule ManifoldWeb.ExternalAccountLive.New do
     assign(socket,
       add_account_step: :account_type,
       selected_provider: nil,
-      selected_mailbox_id: nil
+      selected_mailbox_id: nil,
+      imap_form: empty_imap_form(),
+      imap_error: nil,
+      imap_saving: false
     )
   end
 end

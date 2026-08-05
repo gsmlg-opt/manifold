@@ -84,6 +84,8 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     old_key = Application.get_env(:manifold_connectors, :encryption_key)
     old_adapters = Application.get_env(:manifold_connectors, :adapters)
     old_providers = Application.get_env(:manifold_connectors, :providers)
+    old_transport = Application.get_env(:manifold_connectors, :imap_transport)
+    old_fake = Application.get_env(:manifold_connectors, :imap_fake)
 
     Application.put_env(
       :manifold_connectors,
@@ -109,10 +111,20 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
       ]
     )
 
+    Application.put_env(:manifold_connectors, :imap_transport, Manifold.Connectors.IMAP.Fake)
+
+    Application.put_env(:manifold_connectors, :imap_fake, %{
+      password_expected: "secret",
+      messages: [],
+      uidvalidity: 1
+    })
+
     on_exit(fn ->
       restore_env(:encryption_key, old_key)
       restore_env(:adapters, old_adapters)
       restore_env(:providers, old_providers)
+      restore_env(:imap_transport, old_transport)
+      restore_env(:imap_fake, old_fake)
     end)
 
     suffix = System.unique_integer([:positive])
@@ -147,10 +159,69 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert has_element?(new_view, "#external-account-type")
   end
 
+  test "imap account type shows connection form without mailbox picker", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts/new")
+
+    view
+    |> element("button[phx-value-type='imap']", "IMAP account")
+    |> render_click()
+
+    html = render(view)
+    assert html =~ "Host"
+    refute html =~ "Choose a mailbox"
+  end
+
+  test "successful imap submit redirects to mailbox inbox", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts/new")
+
+    view |> element("button[phx-value-type='imap']", "IMAP account") |> render_click()
+
+    view
+    |> form("#imap-account-form", %{
+      imap: %{
+        email_address: "reader@imap.example",
+        username: "reader@imap.example",
+        password: "secret",
+        host: "imap.example",
+        port: "993",
+        tls_mode: "ssl"
+      }
+    })
+    |> render_submit()
+
+    {path, _flash} = assert_redirect(view)
+    assert path =~ ~r|/mail/.+/folders/.+|
+  end
+
+  test "failed imap test connection does not create account", %{conn: conn} do
+    before = Manifold.Repo.aggregate(Manifold.Connectors.Schema.ExternalAccount, :count)
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts/new")
+    view |> element("button[phx-value-type='imap']", "IMAP account") |> render_click()
+
+    html =
+      view
+      |> form("#imap-account-form", %{
+        imap: %{
+          email_address: "reader@imap-fail.example",
+          username: "reader@imap-fail.example",
+          password: "wrong",
+          host: "imap.example",
+          port: "993",
+          tls_mode: "ssl"
+        }
+      })
+      |> render_submit()
+
+    assert html =~ "IMAP authentication failed" or html =~ "Could not connect"
+    assert has_element?(view, "#imap-account-error")
+    assert Manifold.Repo.aggregate(Manifold.Connectors.Schema.ExternalAccount, :count) == before
+  end
+
   test "external account wizard selects a provider and mailbox", %{conn: conn, mailbox: mailbox} do
     assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
 
-    assert render(view) =~ "External account"
+    assert render(view) =~ "Cloud account"
 
     html =
       view
