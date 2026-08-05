@@ -52,7 +52,7 @@ defmodule Manifold.Connectors.Schema.ExternalAccount do
       :sync_enabled,
       :granted_scopes
     ])
-    |> validate_inclusion(:provider, ["gmail", "microsoft"])
+    |> validate_inclusion(:provider, ["gmail", "microsoft", "imap"])
     |> validate_inclusion(:status, @statuses)
     |> validate_length(:provider_account_id, min: 1, max: 255)
     |> validate_length(:email_address, min: 3, max: 998)
