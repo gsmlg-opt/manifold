@@ -204,7 +204,7 @@ On first setup, start PostgreSQL in one terminal:
 devenv processes start postgres
 ```
 
-Then set up dependencies, migrations, and a sample mailbox from another terminal:
+Then set up dependencies and migrations from another terminal:
 
 ```sh
 devenv shell -- mix setup
@@ -214,7 +214,8 @@ Frontend assets use Duskmoon Bundler and `duskmoon_npm`; `mix setup` runs
 `mix npm.install`. Use `mix assets.build` during development and
 `MIX_ENV=prod mix assets.deploy` for production assets.
 
-The development seed creates the `example.test` domain and `inbox@example.test` mailbox.
+No sample mailbox is seeded. Create a domain and mailbox from `/mailboxes`
+after the app is running.
 
 The web interface has no application-level authentication. Anyone who can reach
 the Phoenix endpoint has full access to the local Manifold instance, so network
