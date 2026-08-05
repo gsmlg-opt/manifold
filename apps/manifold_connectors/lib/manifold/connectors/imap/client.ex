@@ -325,7 +325,7 @@ defmodule Manifold.Connectors.IMAP.Client do
 
   defp recv_bytes(%__MODULE__{buffer: buffer} = conn, size) when is_integer(size) do
     if byte_size(buffer) >= size do
-      <<bytes::binary-size(size), rest::binary>> = buffer
+      <<bytes::binary-size(^size), rest::binary>> = buffer
       {:ok, %{conn | buffer: rest}, bytes}
     else
       case recv_data(conn.socket) do
