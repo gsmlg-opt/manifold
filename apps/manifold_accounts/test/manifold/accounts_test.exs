@@ -154,6 +154,23 @@ defmodule Manifold.AccountsTest do
     refute changed.digest == first.digest
   end
 
+  test "ensure_mailbox_for_address creates domain and mailbox" do
+    assert {:ok, mailbox} = Accounts.ensure_mailbox_for_address("Person@Example.COM")
+    assert mailbox.local_part == "Person"
+    assert mailbox.domain.normalized_domain == "example.com"
+    assert mailbox.active
+  end
+
+  test "ensure_mailbox_for_address reuses existing mailbox" do
+    assert {:ok, first} = Accounts.ensure_mailbox_for_address("inbox@reuse.example")
+    assert {:ok, second} = Accounts.ensure_mailbox_for_address("inbox@reuse.example")
+    assert first.id == second.id
+  end
+
+  test "ensure_mailbox_for_address rejects invalid address" do
+    assert {:error, %Manifold.Core.Error{}} = Accounts.ensure_mailbox_for_address("not-an-email")
+  end
+
   defp mailbox_fixture do
     domain = domain_fixture()
 

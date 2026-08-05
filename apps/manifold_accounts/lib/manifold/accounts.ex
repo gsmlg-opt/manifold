@@ -144,6 +144,50 @@ defmodule Manifold.Accounts do
     |> insert_routing_resource()
   end
 
+  @spec ensure_mailbox_for_address(String.t()) ::
+          {:ok, Mailbox.t()} | {:error, Error.t() | Ecto.Changeset.t()}
+  def ensure_mailbox_for_address(address) when is_binary(address) do
+    with {:ok, parsed} <- Address.parse(address) do
+      Repo.transaction(fn ->
+        domain =
+          case Repo.get_by(Domain, normalized_domain: parsed.domain) do
+            %Domain{} = domain ->
+              domain
+
+            nil ->
+              case create_domain(%{name: parsed.domain, active: true}) do
+                {:ok, domain} -> domain
+                {:error, changeset} -> Repo.rollback(changeset)
+              end
+          end
+
+        mailbox =
+          Mailbox
+          |> where(
+            [m],
+            m.domain_id == ^domain.id and m.canonical_local_part == ^parsed.canonical_local_part
+          )
+          |> preload(:domain)
+          |> Repo.one()
+
+        case mailbox do
+          %Mailbox{} = mailbox ->
+            mailbox
+
+          nil ->
+            case create_mailbox(domain, %{local_part: parsed.local_part, active: true}) do
+              {:ok, mailbox} -> Repo.preload(mailbox, :domain)
+              {:error, changeset} -> Repo.rollback(changeset)
+            end
+        end
+      end)
+      |> case do
+        {:ok, mailbox} -> {:ok, mailbox}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
   @spec list_aliases() :: [Alias.t()]
   def list_aliases do
     Alias
