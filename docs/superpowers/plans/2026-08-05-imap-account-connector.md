@@ -505,7 +505,6 @@ end
 
 Client requirements (YAGNI):
 
-- `ssl` mode: `:ssl.connect(host, port, [verify: :verify_peer, cacerts: :public_key.cacerts_get(), …])`
 - `ssl` mode: `:ssl.connect/3` with `verify: :verify_peer` and `cacerts: :public_key.cacerts_get()`
 - `starttls` mode: `:gen_tcp.connect/3` → send `STARTTLS` → `:ssl.connect/2` upgrade with the same verify options
 - Send tagged commands; read until tagged OK/NO/BAD
