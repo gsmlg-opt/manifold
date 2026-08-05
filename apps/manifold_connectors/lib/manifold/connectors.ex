@@ -91,6 +91,8 @@ defmodule Manifold.Connectors do
 
   @spec test_imap_connection(map()) :: :ok | {:error, Error.t() | ProviderError.t()}
   def test_imap_connection(attrs) when is_map(attrs) do
+    attrs = normalize_imap_attrs(attrs)
+
     with {:ok, settings} <- imap_settings_from_attrs(attrs) do
       transport = imap_transport()
 
@@ -111,12 +113,21 @@ defmodule Manifold.Connectors do
           {:error, error}
       end
     end
+  rescue
+    e in [ArgumentError, ErlangError, FunctionClauseError] ->
+      {:error,
+       %ProviderError{
+         class: :temporary,
+         code: :connect_failed,
+         message: "IMAP connect failed: #{Exception.message(e)}"
+       }}
   end
 
   @spec create_imap_account(map()) ::
           {:ok, ExternalAccount.t()}
           | {:error, Error.t() | Ecto.Changeset.t() | ProviderError.t()}
   def create_imap_account(attrs) when is_map(attrs) do
+    attrs = normalize_imap_attrs(attrs)
     now = DateTime.utc_now()
     skip_test? = truthy?(attr(attrs, :skip_test))
 
@@ -136,6 +147,14 @@ defmodule Manifold.Connectors do
   rescue
     DBConnection.ConnectionError ->
       {:error, database_error(:unavailable)}
+
+    e in [ArgumentError, ErlangError, FunctionClauseError] ->
+      {:error,
+       %ProviderError{
+         class: :temporary,
+         code: :connect_failed,
+         message: "IMAP connect failed: #{Exception.message(e)}"
+       }}
   end
 
   @spec get_account(Ecto.UUID.t()) :: {:ok, View.Account.t()} | {:error, Error.t()}
@@ -634,6 +653,40 @@ defmodule Manifold.Connectors do
     end
   end
 
+  defp normalize_imap_attrs(attrs) when is_map(attrs) do
+    attrs
+    |> maybe_put_trimmed(:host)
+    |> maybe_put_trimmed(:username)
+    |> maybe_put_trimmed(:email_address)
+    |> maybe_put_trimmed(:mailbox_path)
+    |> maybe_put_normalized_port()
+  end
+
+  defp maybe_put_trimmed(attrs, key) do
+    case attr(attrs, key) do
+      value when is_binary(value) -> put_attr(attrs, key, String.trim(value))
+      _ -> attrs
+    end
+  end
+
+  defp maybe_put_normalized_port(attrs) do
+    case attr(attrs, :port) do
+      nil -> attrs
+      port -> put_attr(attrs, :port, parse_port(port))
+    end
+  end
+
+  defp put_attr(attrs, key, value) when is_map_key(attrs, key), do: Map.put(attrs, key, value)
+
+  defp put_attr(attrs, key, value) do
+    string_key = Atom.to_string(key)
+
+    cond do
+      is_map_key(attrs, string_key) -> Map.put(attrs, string_key, value)
+      true -> Map.put(attrs, key, value)
+    end
+  end
+
   defp maybe_merge_attr_fake(settings, attrs) do
     case attr(attrs, :fake) do
       %{} = fake -> Map.merge(settings, fake)
@@ -641,11 +694,11 @@ defmodule Manifold.Connectors do
     end
   end
 
-  defp parse_port(port) when is_integer(port), do: port
+  defp parse_port(port) when is_integer(port) and port > 0 and port <= 65_535, do: port
 
   defp parse_port(port) when is_binary(port) do
-    case Integer.parse(port) do
-      {value, ""} -> value
+    case Integer.parse(String.trim(port)) do
+      {value, ""} when value > 0 and value <= 65_535 -> value
       _ -> nil
     end
   end

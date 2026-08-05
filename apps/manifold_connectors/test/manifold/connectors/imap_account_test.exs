@@ -53,6 +53,24 @@ defmodule Manifold.Connectors.ImapAccountTest do
     assert Repo.get_by!(ImapSettings, external_account_id: account.id).host == "imap.example"
   end
 
+  test "create_imap_account trims host and username whitespace before connect and persist" do
+    assert {:ok, account} =
+             Connectors.create_imap_account(%{
+               email_address: "  padded@imap.example ",
+               username: "  padded@imap.example ",
+               password: "secret",
+               host: " imap.example ",
+               port: "993",
+               tls_mode: "ssl"
+             })
+
+    settings = Repo.get_by!(ImapSettings, external_account_id: account.id)
+    assert settings.host == "imap.example"
+    assert settings.username == "padded@imap.example"
+    assert settings.port == 993
+    assert account.email_address == "padded@imap.example"
+  end
+
   test "create_imap_account rejects auth failure without persisting" do
     before = Repo.aggregate(ExternalAccount, :count)
 
@@ -67,6 +85,18 @@ defmodule Manifold.Connectors.ImapAccountTest do
              })
 
     assert Repo.aggregate(ExternalAccount, :count) == before
+  end
+
+  test "test_imap_connection returns error for invalid settings without raising" do
+    assert {:error, %Manifold.Core.Error{reason: :invalid_imap_settings}} =
+             Connectors.test_imap_connection(%{
+               email_address: "reader@imap.example",
+               username: "reader@imap.example",
+               password: "secret",
+               host: "",
+               port: 993,
+               tls_mode: "ssl"
+             })
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)

@@ -12,13 +12,15 @@ defmodule Manifold.Connectors.IMAP.Client do
 
   @impl true
   def connect(settings) when is_map(settings) do
-    host = Map.fetch!(settings, :host)
-    port = Map.fetch!(settings, :port)
+    host = settings |> Map.fetch!(:host) |> normalize_host()
+    port = normalize_port(Map.fetch!(settings, :port))
     tls_mode = Map.fetch!(settings, :tls_mode)
-    username = Map.fetch!(settings, :username)
+    username = settings |> Map.fetch!(:username) |> normalize_text()
     password = Map.fetch!(settings, :password)
 
-    with {:ok, conn} <- open_and_greet(host, port, tls_mode),
+    with {:ok, host} <- require_host(host),
+         {:ok, port} <- require_port(port),
+         {:ok, conn} <- open_and_greet_safe(host, port, tls_mode),
          {:ok, conn} <-
            command(conn, "LOGIN #{quote_string(username)} #{quote_string(password)}", auth: true) do
       put_conn(conn)
@@ -31,12 +33,7 @@ defmodule Manifold.Connectors.IMAP.Client do
         {:error, %Error{class: :temporary, code: :timeout, message: "IMAP connection timed out"}}
 
       {:error, reason} ->
-        {:error,
-         %Error{
-           class: :temporary,
-           code: :connect_failed,
-           message: "IMAP connect failed: #{inspect(reason)}"
-         }}
+        {:error, connect_failed_error(reason)}
     end
   end
 
@@ -165,7 +162,30 @@ defmodule Manifold.Connectors.IMAP.Client do
 
   # --- Socket / protocol ---
 
-  defp open_and_greet(host, port, "ssl") do
+  defp open_and_greet_safe(host, port, tls_mode) do
+    open_and_greet(host, port, tls_mode)
+  rescue
+    e in [ArgumentError, ErlangError, FunctionClauseError] ->
+      {:error, connect_failed_error(e)}
+  catch
+    :error, :badarg ->
+      {:error, connect_failed_error(:badarg)}
+
+    :exit, :badarg ->
+      {:error, connect_failed_error(:badarg)}
+
+    :exit, {:badarg, _} = reason ->
+      {:error, connect_failed_error(reason)}
+
+    :exit, {:function_clause, _} = reason ->
+      {:error, connect_failed_error(reason)}
+  end
+
+  # Exposed for unit tests covering ArgumentError → {:error, _} conversion.
+  @doc false
+  def open_and_greet_for_test(host, port, tls_mode), do: open_and_greet_safe(host, port, tls_mode)
+
+  defp open_and_greet(host, port, "ssl") when is_binary(host) and is_integer(port) do
     host_charlist = String.to_charlist(host)
 
     with {:ok, socket} <-
@@ -174,7 +194,7 @@ defmodule Manifold.Connectors.IMAP.Client do
     end
   end
 
-  defp open_and_greet(host, port, "starttls") do
+  defp open_and_greet(host, port, "starttls") when is_binary(host) and is_integer(port) do
     host_charlist = String.to_charlist(host)
 
     with {:ok, tcp} <- :gen_tcp.connect(host_charlist, port, tcp_opts(), @connect_timeout),
@@ -190,6 +210,46 @@ defmodule Manifold.Connectors.IMAP.Client do
   defp open_and_greet(_host, _port, tls_mode) do
     {:error, {:unsupported_tls_mode, tls_mode}}
   end
+
+  defp normalize_host(host) when is_binary(host), do: String.trim(host)
+  defp normalize_host(host), do: host
+
+  defp normalize_text(value) when is_binary(value), do: String.trim(value)
+  defp normalize_text(value), do: value
+
+  defp normalize_port(port) when is_integer(port), do: port
+
+  defp normalize_port(port) when is_binary(port) do
+    case Integer.parse(String.trim(port)) do
+      {value, ""} -> value
+      _ -> nil
+    end
+  end
+
+  defp normalize_port(_), do: nil
+
+  defp require_host(host) when is_binary(host) and host != "", do: {:ok, host}
+
+  defp require_host(_host) do
+    {:error, %Error{class: :temporary, code: :invalid_host, message: "IMAP host is invalid"}}
+  end
+
+  defp require_port(port) when is_integer(port) and port > 0 and port <= 65_535, do: {:ok, port}
+
+  defp require_port(_port) do
+    {:error, %Error{class: :temporary, code: :invalid_port, message: "IMAP port is invalid"}}
+  end
+
+  defp connect_failed_error(reason) do
+    %Error{
+      class: :temporary,
+      code: :connect_failed,
+      message: "IMAP connect failed: #{inspect_connect_reason(reason)}"
+    }
+  end
+
+  defp inspect_connect_reason(%_{} = exception), do: Exception.message(exception)
+  defp inspect_connect_reason(reason), do: inspect(reason)
 
   defp tcp_opts, do: [:binary, active: false, packet: :raw]
 
