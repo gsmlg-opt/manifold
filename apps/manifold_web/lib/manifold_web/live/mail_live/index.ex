@@ -634,8 +634,9 @@ defmodule ManifoldWeb.MailLive.Index do
 
       <div :if={is_nil(@mailbox)} class="mail-empty-instance">
         <.dm_mdi name="email-plus-outline" class="empty-icon" />
-        <h1>Create a mailbox to begin</h1>
-        <.link navigate={~p"/mailboxes"} class="text-command">Open mailbox settings</.link>
+        <h1>Connect an email account</h1>
+        <.link navigate={~p"/settings/accounts/new"} class="text-command">Add account</.link>
+        <.link navigate={~p"/mailboxes"}>Manage local mailboxes</.link>
       </div>
 
       <section
