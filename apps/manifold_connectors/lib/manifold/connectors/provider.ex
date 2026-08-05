@@ -1,6 +1,9 @@
 defmodule Manifold.Connectors.Provider do
   @moduledoc """
-  Normalized OAuth and mailbox synchronization boundary.
+  Normalized mailbox synchronization boundary.
+
+  OAuth providers implement `exchange_code/5` and `refresh_token/3`.
+  Password-based providers (IMAP) may omit those optional callbacks.
   """
 
   alias Manifold.Connectors.Provider.{
@@ -24,6 +27,8 @@ defmodule Manifold.Connectors.Provider do
               {:ok, Page.t()} | {:error, Error.t()}
   @callback fetch_raw(String.t(), String.t(), Keyword.t(), Keyword.t()) ::
               {:ok, RawMessage.t()} | {:error, Error.t()}
+
+  @optional_callbacks exchange_code: 5, refresh_token: 3
 end
 
 defmodule Manifold.Connectors.Provider.Token do

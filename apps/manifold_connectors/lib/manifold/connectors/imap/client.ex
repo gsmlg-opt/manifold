@@ -150,7 +150,7 @@ defmodule Manifold.Connectors.IMAP.Client do
         size = String.to_integer(size_str)
 
         if byte_size(rest) >= size do
-          <<rfc822::binary-size(size), _::binary>> = rest
+          <<rfc822::binary-size(^size), _::binary>> = rest
           {:ok, rfc822}
         else
           {:error,
