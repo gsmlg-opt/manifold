@@ -519,7 +519,7 @@ defmodule ManifoldWeb.MailLive.Index do
   end
 
   defp format_time(%DateTime{} = datetime) do
-    Calendar.strftime(datetime, "%b %-d, %H:%M")
+    ManifoldWeb.Formatting.datetime(datetime)
   end
 
   defp format_size(bytes) when bytes < 1024, do: "#{bytes} B"
@@ -950,7 +950,7 @@ defmodule ManifoldWeb.MailLive.Index do
                 <strong>{message.sender_name || message.sender_address || "Unknown sender"}</strong>
                 <span :if={message.sender_name}>{message.sender_address}</span>
                 <time datetime={DateTime.to_iso8601(message.sent_at)}>
-                  {Calendar.strftime(message.sent_at, "%Y-%m-%d %H:%M UTC")}
+                  {ManifoldWeb.Formatting.datetime_utc(message.sent_at)}
                 </time>
               </div>
               <div class="message-actions">

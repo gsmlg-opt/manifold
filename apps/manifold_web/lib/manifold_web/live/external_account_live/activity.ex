@@ -101,10 +101,13 @@ defmodule ManifoldWeb.ExternalAccountLive.Activity do
 
       <ol :if={@entries != []} id="activity-entries" class="activity-entries">
         <li :for={entry <- @entries} class="activity-entry">
-          <time>{entry["timestamp"]}</time>
+          <time datetime={entry["timestamp"]}>{format_entry_time(entry["timestamp"])}</time>
           <strong>{event_label(entry["event"])}</strong>
           <span class={"activity-result result-#{entry_result(entry)}"}>
             {entry_result(entry)}
+          </span>
+          <span :if={entry_message_id(entry)} class="activity-message-id">
+            {entry_message_id(entry)}
           </span>
           <span :if={entry_error_code(entry)} class="activity-error-code">{entry_error_code(entry)}</span>
           <span :if={entry_error(entry)} class="settings-error">{entry_error(entry)}</span>
@@ -137,8 +140,15 @@ defmodule ManifoldWeb.ExternalAccountLive.Activity do
   defp event_label(event) when is_list(event), do: Enum.join(event, ".")
   defp event_label(_), do: "unknown"
 
+  defp format_entry_time(timestamp), do: ManifoldWeb.Formatting.datetime_iso(timestamp)
+
   defp entry_result(%{"metadata" => %{"result" => result}}) when is_binary(result), do: result
   defp entry_result(_), do: "unknown"
+
+  defp entry_message_id(%{"metadata" => %{"provider_message_id" => id}}) when is_binary(id),
+    do: id
+
+  defp entry_message_id(_), do: nil
 
   defp entry_error(%{"metadata" => %{"error_message" => message}}) when is_binary(message),
     do: message

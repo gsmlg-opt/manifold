@@ -158,5 +158,5 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
   defp status_label(status), do: String.capitalize(status)
 
   defp format_datetime(nil), do: "Not yet"
-  defp format_datetime(datetime), do: Calendar.strftime(datetime, "%Y-%m-%d %H:%M UTC")
+  defp format_datetime(datetime), do: ManifoldWeb.Formatting.datetime_utc(datetime)
 end
