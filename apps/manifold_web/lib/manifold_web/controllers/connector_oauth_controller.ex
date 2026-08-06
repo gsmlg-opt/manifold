@@ -6,19 +6,24 @@ defmodule ManifoldWeb.ConnectorOAuthController do
 
   @providers ~w(gmail microsoft)
 
-  def start(conn, %{"provider" => provider, "mailbox_id" => mailbox_id})
-      when provider in @providers do
-    case OAuth.start(provider, mailbox_id, callback_url(provider)) do
-      {:ok, authorization} ->
-        redirect(conn, external: authorization.url)
+  def start(conn, %{"provider" => provider} = params) when provider in @providers do
+    account_id = Map.get(params, "account_id") || Map.get(params, "mailbox_id")
 
-      {:error, _reason} ->
-        connector_error(conn, "The #{provider_name(provider)} connection could not be started.")
+    if is_binary(account_id) and account_id != "" do
+      case OAuth.start(provider, account_id, callback_url(provider)) do
+        {:ok, authorization} ->
+          redirect(conn, external: authorization.url)
+
+        {:error, _reason} ->
+          connector_error(conn, "The #{provider_name(provider)} connection could not be started.")
+      end
+    else
+      connector_error(conn, "The account connection could not be started.")
     end
   end
 
   def start(conn, _params) do
-    connector_error(conn, "The external account connection could not be started.")
+    connector_error(conn, "The account connection could not be started.")
   end
 
   def callback(conn, %{"provider" => provider, "code" => code, "state" => state})
@@ -45,15 +50,15 @@ defmodule ManifoldWeb.ConnectorOAuthController do
   end
 
   def callback(conn, _params) do
-    connector_error(conn, "The external account authorization request is invalid or expired.")
+    connector_error(conn, "The account authorization request is invalid or expired.")
   end
 
   defp complete_authorization(conn, provider, code, consumed) do
     case Connectors.complete_authorization(provider, code, consumed) do
-      {:ok, _account} ->
+      {:ok, method} ->
         conn
-        |> put_flash(:info, "#{provider_name(provider)} account connected.")
-        |> redirect(to: ~p"/settings/accounts")
+        |> put_flash(:info, "#{provider_name(provider)} receive method connected.")
+        |> redirect(to: ~p"/settings/accounts/#{method.account_id}")
 
       {:error, _reason} ->
         connector_error(conn, "The #{provider_name(provider)} account could not be connected.")

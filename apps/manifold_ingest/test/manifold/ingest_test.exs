@@ -60,7 +60,7 @@ defmodule Manifold.IngestTest do
 
   test "multiple routes preserve all transport recipient records" do
     %{domain: domain, route: first_route} = route_fixture()
-    {:ok, second} = Accounts.create_mailbox(domain, %{local_part: "second"})
+    {:ok, second} = Accounts.create_account(domain, %{local_part: "second"})
 
     second_route = %{
       first_route
@@ -174,7 +174,7 @@ defmodule Manifold.IngestTest do
 
   test "repeated edge import rejects conflicting frozen routes permanently" do
     %{domain: domain, route: route} = route_fixture()
-    {:ok, other_mailbox} = Accounts.create_mailbox(domain, %{local_part: "other"})
+    {:ok, other_mailbox} = Accounts.create_account(domain, %{local_part: "other"})
 
     conflicting_route = %{
       route
@@ -295,7 +295,7 @@ defmodule Manifold.IngestTest do
 
   test "external identity rejects changed content or target mailbox" do
     %{domain: domain, mailbox: mailbox} = route_fixture()
-    {:ok, other_mailbox} = Accounts.create_mailbox(domain, %{local_part: "external-other"})
+    {:ok, other_mailbox} = Accounts.create_account(domain, %{local_part: "external-other"})
     source = external_source(domain, mailbox, "gmail-message-conflict")
 
     assert {:ok, _receipt} = Ingest.import_external(raw_message(), source)
@@ -943,7 +943,7 @@ defmodule Manifold.IngestTest do
   defp route_fixture do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "ingest#{suffix}.test"})
-    {:ok, mailbox} = Accounts.create_mailbox(domain, %{local_part: "inbox"})
+    {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "inbox"})
     {:ok, route} = Accounts.resolve_recipient("inbox@#{domain.normalized_domain}")
     %{domain: domain, mailbox: mailbox, route: route}
   end

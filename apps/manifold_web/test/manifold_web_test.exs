@@ -63,13 +63,10 @@ defmodule ManifoldWebTest do
     :ok
   end
 
-  test "local access can view domain, mailbox, and delivery lists", %{conn: conn} do
+  test "local access can view accounts and delivery lists", %{conn: conn} do
     %{domain: domain} = mailbox_fixture()
 
-    assert {:ok, _view, html} = live(conn, ~p"/domains")
-    assert html =~ domain.normalized_domain
-
-    assert {:ok, _view, html} = live(conn, ~p"/mailboxes")
+    assert {:ok, _view, html} = live(conn, ~p"/settings/accounts")
     assert html =~ "inbox@#{domain.normalized_domain}"
 
     assert {:ok, _delivery} = delivery_fixture(domain)
@@ -401,7 +398,7 @@ defmodule ManifoldWebTest do
   defp mailbox_fixture do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "web#{suffix}.test"})
-    {:ok, mailbox} = Accounts.create_mailbox(domain, %{local_part: "inbox"})
+    {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "inbox"})
     %{domain: domain, mailbox: mailbox}
   end
 

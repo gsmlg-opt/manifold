@@ -15,7 +15,7 @@ defmodule Manifold.Connectors.Sync do
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
     Credential,
-    ExternalAccount,
+    ReceiveMethod,
     ImapSettings,
     RemoteMessage,
     SyncCursor
@@ -63,7 +63,7 @@ defmodule Manifold.Connectors.Sync do
 
   defp do_run(account_id, now, opts) do
     with {:ok, account, cursor} <- begin_sync(account_id, now),
-         {:ok, adapter, config} <- runtime(account.provider),
+         {:ok, adapter, config} <- runtime(account.kind),
          {:ok, config} <- enrich_runtime_config(account, config),
          {:ok, auth} <-
            auth_material(account, adapter, config, now, provider_opts(opts)) do
@@ -86,16 +86,16 @@ defmodule Manifold.Connectors.Sync do
              :ok <- maybe_fault(opts, :after_page_before_cursor),
              {:ok, more?} <- checkpoint(account, cursor, page, now) do
           outcome = if more?, do: {:snooze, 1}, else: :ok
-          {:ok, account.provider, length(messages), outcome}
+          {:ok, account.kind, length(messages), outcome}
         else
           {:error, {:cursor_provider_error, cursor, %ProviderError{} = error}} ->
             {:error, "imap", error, handle_cursor_provider_error(account_id, cursor, error, now)}
 
           {:error, %ProviderError{} = error} ->
-            {:error, account.provider, error, handle_provider_error(account_id, error, now)}
+            {:error, account.kind, error, handle_provider_error(account_id, error, now)}
 
           {:error, %Error{} = error} ->
-            {:error, account.provider, error, handle_core_error(account_id, error, now)}
+            {:error, account.kind, error, handle_core_error(account_id, error, now)}
 
           {:error, reason} ->
             error =
@@ -104,7 +104,7 @@ defmodule Manifold.Connectors.Sync do
               })
 
             record_failure(account_id, error.class, error.reason, error.message, now)
-            {:error, account.provider, error, {:error, error}}
+            {:error, account.kind, error, {:error, error}}
         end
       after
         release_provider_session(adapter)
@@ -130,7 +130,7 @@ defmodule Manifold.Connectors.Sync do
     end
   end
 
-  defp prepare_provider_session(%ExternalAccount{provider: "imap"}, adapter, opts) do
+  defp prepare_provider_session(%ReceiveMethod{kind: "imap"}, adapter, opts) do
     if function_exported?(adapter, :release_session, 0) do
       Keyword.update(
         opts,
@@ -218,7 +218,7 @@ defmodule Manifold.Connectors.Sync do
   defp begin_sync(account_id, now) do
     Repo.transaction(fn ->
       account =
-        ExternalAccount
+        ReceiveMethod
         |> where([account], account.id == ^account_id)
         |> lock("FOR UPDATE")
         |> Repo.one()
@@ -227,21 +227,24 @@ defmodule Manifold.Connectors.Sync do
         nil ->
           Repo.rollback(Error.new(:permanent, :account_not_found, "connector account not found"))
 
-        %ExternalAccount{status: "disconnected"} ->
+        %ReceiveMethod{status: "disconnected"} ->
           Repo.rollback(
             Error.new(:permanent, :account_disconnected, "connector account is disconnected")
           )
 
-        %ExternalAccount{sync_enabled: false} ->
+        %ReceiveMethod{enabled: false} ->
+          Repo.rollback(Error.new(:permanent, :sync_disabled, "receive method is not enabled"))
+
+        %ReceiveMethod{sync_enabled: false} ->
           Repo.rollback(Error.new(:permanent, :sync_disabled, "connector sync is disabled"))
 
-        %ExternalAccount{} = account ->
+        %ReceiveMethod{} = account ->
           cursor = next_cursor(account.id)
 
           if cursor do
             {:ok, syncing} =
               account
-              |> ExternalAccount.changeset(%{
+              |> ReceiveMethod.changeset(%{
                 status: "syncing",
                 last_attempted_at: now,
                 last_error_class: nil,
@@ -283,7 +286,7 @@ defmodule Manifold.Connectors.Sync do
     |> Repo.one()
   end
 
-  defp auth_material(%ExternalAccount{provider: "imap"} = account, _adapter, _config, _now, _opts) do
+  defp auth_material(%ReceiveMethod{kind: "imap"} = account, _adapter, _config, _now, _opts) do
     with %Credential{secret_kind: "password", password_ciphertext: cipher} <-
            Repo.get_by(Credential, external_account_id: account.id),
          {:ok, password} <- Crypto.decrypt(cipher, credential_context(account.id, :imap_password)) do
@@ -449,7 +452,7 @@ defmodule Manifold.Connectors.Sync do
         {:ok, delivery_id}
 
       _missing_or_pending ->
-        case Ingest.lookup_external(account.provider, account.id, message.id) do
+        case Ingest.lookup_external(account.kind, account.id, message.id) do
           {:ok, receipt} ->
             {:ok, receipt.inbound_delivery_id}
 
@@ -500,7 +503,7 @@ defmodule Manifold.Connectors.Sync do
       %{duration_ms: duration_ms(start)},
       %{
         account_id: account.id,
-        provider: account.provider,
+        provider: account.kind,
         provider_message_id: provider_message_id,
         result: :ok
       }
@@ -513,7 +516,7 @@ defmodule Manifold.Connectors.Sync do
       %{duration_ms: duration_ms(start)},
       %{
         account_id: account.id,
-        provider: account.provider,
+        provider: account.kind,
         provider_message_id: provider_message_id,
         result: :error,
         error_code: error.code,
@@ -528,7 +531,7 @@ defmodule Manifold.Connectors.Sync do
       %{duration_ms: duration_ms(start)},
       %{
         account_id: account.id,
-        provider: account.provider,
+        provider: account.kind,
         provider_message_id: provider_message_id,
         result: :error,
         error_code: error.reason,
@@ -543,7 +546,7 @@ defmodule Manifold.Connectors.Sync do
       %{duration_ms: duration_ms(start)},
       %{
         account_id: account.id,
-        provider: account.provider,
+        provider: account.kind,
         provider_message_id: provider_message_id,
         result: :error,
         error_code: :sync_message_failed,
@@ -554,7 +557,7 @@ defmodule Manifold.Connectors.Sync do
 
   defp import_raw_message(message, raw, account, now, opts) do
     with :ok <- validate_raw_size(raw.bytes),
-         {:ok, storage_domain_id} <- Accounts.mailbox_domain_id(account.mailbox_id),
+         {:ok, storage_domain_id} <- Accounts.account_domain_id(account.account_id),
          merged = merge_remote_state(message, raw),
          source = external_source(account, storage_domain_id, merged, raw, now),
          {:ok, receipt} <-
@@ -618,10 +621,10 @@ defmodule Manifold.Connectors.Sync do
 
   defp external_source(account, storage_domain_id, message, raw, now) do
     %ExternalSource{
-      provider: account.provider,
+      provider: account.kind,
       account_id: account.id,
       external_message_id: message.id,
-      mailbox_id: account.mailbox_id,
+      mailbox_id: account.account_id,
       storage_domain_id: storage_domain_id,
       recipient_address: account.email_address,
       received_at: message.received_at || raw.received_at || now,
@@ -633,7 +636,7 @@ defmodule Manifold.Connectors.Sync do
     digest =
       :crypto.hash(
         :sha256,
-        account.provider <> <<0>> <> account.id <> <<0>> <> message_id
+        account.kind <> <<0>> <> account.id <> <<0>> <> message_id
       )
       |> Base.encode16(case: :lower)
 
@@ -741,7 +744,7 @@ defmodule Manifold.Connectors.Sync do
         |> Repo.exists?()
 
       account
-      |> ExternalAccount.changeset(%{
+      |> ReceiveMethod.changeset(%{
         status: if(more?, do: "syncing", else: "connected"),
         last_synced_at: if(more?, do: account.last_synced_at, else: now),
         last_error_class: nil,
@@ -883,7 +886,7 @@ defmodule Manifold.Connectors.Sync do
     {:error, Error.new(:permanent, :unsupported_provider, "provider is not supported")}
   end
 
-  defp enrich_runtime_config(%ExternalAccount{provider: "imap"} = account, config) do
+  defp enrich_runtime_config(%ReceiveMethod{kind: "imap"} = account, config) do
     case Repo.get_by(ImapSettings, external_account_id: account.id) do
       %ImapSettings{} = settings ->
         transport =
@@ -940,10 +943,10 @@ defmodule Manifold.Connectors.Sync do
         |> where([stored], stored.external_account_id == ^account_id)
         |> Repo.exists?()
 
-      case Repo.get(ExternalAccount, account_id) do
-        %ExternalAccount{} = account ->
+      case Repo.get(ReceiveMethod, account_id) do
+        %ReceiveMethod{} = account ->
           account
-          |> ExternalAccount.changeset(%{
+          |> ReceiveMethod.changeset(%{
             status: if(more?, do: "syncing", else: "connected"),
             last_synced_at: if(more?, do: account.last_synced_at, else: now),
             last_error_class: nil,
@@ -997,13 +1000,13 @@ defmodule Manifold.Connectors.Sync do
 
   defp record_provider_failure(account_id, status, error, now) do
     Repo.transaction(fn ->
-      case Repo.get(ExternalAccount, account_id) do
+      case Repo.get(ReceiveMethod, account_id) do
         nil ->
           :ok
 
         account ->
           account
-          |> ExternalAccount.changeset(%{
+          |> ReceiveMethod.changeset(%{
             status: status,
             last_error_class: Atom.to_string(error.class),
             last_error_code: Atom.to_string(error.code),

@@ -20,7 +20,7 @@ defmodule Manifold.Connectors do
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
     Credential,
-    ExternalAccount,
+    ReceiveMethod,
     ImapSettings,
     RemoteMessage,
     SyncCursor
@@ -37,7 +37,7 @@ defmodule Manifold.Connectors do
   }
 
   @spec complete_authorization(String.t(), String.t(), Consumed.t(), Keyword.t()) ::
-          {:ok, ExternalAccount.t()} | {:error, Error.t() | Ecto.Changeset.t()}
+          {:ok, ReceiveMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def complete_authorization(provider, code, %Consumed{} = consumed, opts \\ []) do
     now = Keyword.get(opts, :now, DateTime.utc_now())
 
@@ -67,12 +67,90 @@ defmodule Manifold.Connectors do
       {:error, database_error(:unavailable)}
   end
 
-  @spec list_accounts() :: [View.Account.t()]
-  def list_accounts do
-    ExternalAccount
-    |> order_by([account], asc: account.provider, asc: account.email_address, asc: account.id)
+  @spec list_receive_methods() :: [View.ReceiveMethod.t()]
+  def list_receive_methods do
+    ReceiveMethod
+    |> order_by([account], asc: account.kind, asc: account.email_address, asc: account.id)
     |> Repo.all()
     |> Enum.map(&account_view/1)
+  end
+
+  @spec list_receive_methods_for_account(Ecto.UUID.t()) :: [View.ReceiveMethod.t()]
+  def list_receive_methods_for_account(account_id) do
+    ReceiveMethod
+    |> where([m], m.account_id == ^account_id)
+    |> order_by([m], desc: m.enabled, asc: m.kind, asc: m.id)
+    |> Repo.all()
+    |> Enum.map(&account_view/1)
+  end
+
+  @doc false
+  def list_accounts, do: list_receive_methods()
+
+  @spec enable_receive_method(Ecto.UUID.t()) ::
+          {:ok, ReceiveMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
+  def enable_receive_method(receive_method_id) do
+    Repo.transaction(fn ->
+      method =
+        ReceiveMethod
+        |> where([m], m.id == ^receive_method_id)
+        |> lock("FOR UPDATE")
+        |> Repo.one()
+
+      case method do
+        nil ->
+          Repo.rollback(Error.new(:permanent, :account_not_found, "receive method not found"))
+
+        %ReceiveMethod{status: "disconnected"} ->
+          Repo.rollback(
+            Error.new(:permanent, :account_disconnected, "receive method is disconnected")
+          )
+
+        %ReceiveMethod{status: "not_implemented"} ->
+          Repo.rollback(
+            Error.new(:permanent, :not_implemented, "receive method is not implemented yet")
+          )
+
+        %ReceiveMethod{} = method ->
+          disable_other_methods(Repo, method.account_id, except_id: method.id)
+
+          case ReceiveMethod.changeset(method, %{enabled: true, sync_enabled: true})
+               |> Repo.update() do
+            {:ok, updated} -> updated
+            {:error, changeset} -> Repo.rollback(changeset)
+          end
+      end
+    end)
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  @spec create_placeholder_receive_method(Ecto.UUID.t(), String.t(), map()) ::
+          {:ok, ReceiveMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
+  def create_placeholder_receive_method(account_id, kind, attrs \\ %{})
+      when kind in ["pop3", "eas", "ews"] do
+    email =
+      Map.get(attrs, :email_address) || Map.get(attrs, "email_address") ||
+        case Accounts.get_account(account_id) do
+          nil -> nil
+          account -> Accounts.account_address(account)
+        end
+
+    if is_nil(email) do
+      {:error, Error.new(:permanent, :account_not_found, "account not found")}
+    else
+      ReceiveMethod.changeset(%ReceiveMethod{}, %{
+        account_id: account_id,
+        kind: kind,
+        provider_account_id: "#{kind}:#{email}:#{Ecto.UUID.generate()}",
+        email_address: email,
+        status: "not_implemented",
+        enabled: false,
+        sync_enabled: false,
+        granted_scopes: []
+      })
+      |> Repo.insert()
+    end
   end
 
   @spec configured_providers() :: [String.t()]
@@ -125,18 +203,19 @@ defmodule Manifold.Connectors do
   end
 
   @spec create_imap_account(map()) ::
-          {:ok, ExternalAccount.t()}
+          {:ok, ReceiveMethod.t()}
           | {:error, Error.t() | Ecto.Changeset.t() | ProviderError.t()}
   def create_imap_account(attrs) when is_map(attrs) do
     attrs = normalize_imap_attrs(attrs)
     now = DateTime.utc_now()
     skip_test? = truthy?(attr(attrs, :skip_test))
+    account_id = attr(attrs, :account_id)
 
     with {:ok, parsed} <- Address.parse(attr(attrs, :email_address) || ""),
          provider_account_id <- "imap:" <> parsed.canonical,
          :ok <- reject_duplicate_imap(parsed.canonical, provider_account_id),
          :ok <- maybe_test_imap(attrs, skip_test?),
-         {:ok, mailbox} <- Accounts.ensure_mailbox_for_address(parsed.canonical),
+         {:ok, mailbox} <- resolve_imap_account(account_id, parsed.canonical),
          {:ok, cursors} <-
            ProviderIMAP.initial_cursors(attr(attrs, :password), imap_provider_config(attrs), []) do
       persist_imap_account(attrs, parsed, provider_account_id, mailbox, cursors, now)
@@ -159,10 +238,19 @@ defmodule Manifold.Connectors do
        }}
   end
 
-  @spec get_account(Ecto.UUID.t()) :: {:ok, View.Account.t()} | {:error, Error.t()}
+  defp resolve_imap_account(nil, address), do: Accounts.ensure_account_for_address(address)
+
+  defp resolve_imap_account(account_id, _address) when is_binary(account_id) do
+    case Accounts.get_account(account_id) do
+      nil -> {:error, Error.new(:permanent, :account_not_found, "account not found")}
+      account -> {:ok, account}
+    end
+  end
+
+  @spec get_account(Ecto.UUID.t()) :: {:ok, View.ReceiveMethod.t()} | {:error, Error.t()}
   def get_account(account_id) do
-    case Repo.get(ExternalAccount, account_id) do
-      %ExternalAccount{} = account -> {:ok, account_view(account)}
+    case Repo.get(ReceiveMethod, account_id) do
+      %ReceiveMethod{} = account -> {:ok, account_view(account)}
       nil -> {:error, Error.new(:permanent, :account_not_found, "connector account not found")}
     end
   rescue
@@ -181,21 +269,24 @@ defmodule Manifold.Connectors do
   def enqueue_sync(account_id) do
     Repo.transaction(fn ->
       account =
-        ExternalAccount
+        ReceiveMethod
         |> where([account], account.id == ^account_id)
         |> lock("FOR UPDATE")
         |> Repo.one()
 
       case account do
-        %ExternalAccount{status: "disconnected"} ->
+        %ReceiveMethod{status: "disconnected"} ->
           Repo.rollback(
-            Error.new(:permanent, :account_disconnected, "connector account is disconnected")
+            Error.new(:permanent, :account_disconnected, "receive method is disconnected")
           )
 
-        %ExternalAccount{sync_enabled: true} ->
+        %ReceiveMethod{enabled: false} ->
+          Repo.rollback(Error.new(:permanent, :sync_disabled, "receive method is not enabled"))
+
+        %ReceiveMethod{sync_enabled: true} ->
           ensure_sync_job(Repo, account_id)
 
-        %ExternalAccount{} ->
+        %ReceiveMethod{} ->
           Repo.rollback(
             Error.new(:permanent, :sync_disabled, "connector synchronization is disabled")
           )
@@ -213,10 +304,12 @@ defmodule Manifold.Connectors do
   def enqueue_due_syncs do
     Repo.transaction(fn ->
       account_ids =
-        ExternalAccount
+        ReceiveMethod
         |> where(
           [account],
-          account.sync_enabled and account.status in ["connected", "syncing", "failed"]
+          account.enabled and account.sync_enabled and
+            account.status in ["connected", "syncing", "failed"] and
+            account.kind in ^ReceiveMethod.implemented_kinds()
         )
         |> order_by([account], asc: account.id)
         |> select([account], account.id)
@@ -230,14 +323,14 @@ defmodule Manifold.Connectors do
   end
 
   @spec disconnect(Ecto.UUID.t()) ::
-          {:ok, ExternalAccount.t()} | {:error, Error.t() | Ecto.Changeset.t()}
+          {:ok, ReceiveMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def disconnect(account_id) do
     now = DateTime.utc_now()
 
     Multi.new()
     |> Multi.run(:account, fn repo, _changes ->
       account =
-        ExternalAccount
+        ReceiveMethod
         |> where([account], account.id == ^account_id)
         |> lock("FOR UPDATE")
         |> repo.one()
@@ -246,13 +339,14 @@ defmodule Manifold.Connectors do
         nil ->
           {:error, Error.new(:permanent, :account_not_found, "connector account not found")}
 
-        %ExternalAccount{status: "disconnected"} = disconnected ->
+        %ReceiveMethod{status: "disconnected"} = disconnected ->
           {:ok, disconnected}
 
-        %ExternalAccount{} = account ->
+        %ReceiveMethod{} = account ->
           account
-          |> ExternalAccount.changeset(%{
+          |> ReceiveMethod.changeset(%{
             status: "disconnected",
+            enabled: false,
             sync_enabled: false,
             disconnected_at: now,
             last_error_class: nil,
@@ -293,18 +387,18 @@ defmodule Manifold.Connectors do
   def apply_remote_state(remote_message_id) do
     query =
       from(remote in RemoteMessage,
-        join: account in ExternalAccount,
+        join: account in ReceiveMethod,
         on: account.id == remote.external_account_id,
         where: remote.id == ^remote_message_id,
         select: {remote, account}
       )
 
     case Repo.one(query) do
-      {%RemoteMessage{inbound_delivery_id: nil}, %ExternalAccount{}} ->
+      {%RemoteMessage{inbound_delivery_id: nil}, %ReceiveMethod{}} ->
         :ok
 
-      {%RemoteMessage{} = remote, %ExternalAccount{} = account} ->
-        account.mailbox_id
+      {%RemoteMessage{} = remote, %ReceiveMethod{} = account} ->
+        account.account_id
         |> Mail.apply_external_state(remote.inbound_delivery_id, %{
           folder_kind: normalize_folder_kind(remote.remote_folder_kind),
           read?: remote.remote_read,
@@ -358,20 +452,21 @@ defmodule Manifold.Connectors do
 
   defp upsert_account(repo, provider, mailbox_id, identity, scopes) do
     existing =
-      ExternalAccount
+      ReceiveMethod
       |> where(
         [account],
-        account.provider == ^provider and account.provider_account_id == ^identity.id
+        account.kind == ^provider and account.provider_account_id == ^identity.id
       )
       |> lock("FOR UPDATE")
       |> repo.one()
 
     attrs = %{
-      mailbox_id: mailbox_id,
-      provider: provider,
+      account_id: mailbox_id,
+      kind: provider,
       provider_account_id: identity.id,
       email_address: identity.email_address,
       status: "connected",
+      enabled: true,
       sync_enabled: true,
       granted_scopes: Enum.sort(scopes),
       disconnected_at: nil,
@@ -382,19 +477,39 @@ defmodule Manifold.Connectors do
 
     case existing do
       nil ->
-        ExternalAccount.changeset(%ExternalAccount{}, attrs) |> repo.insert()
+        disable_other_methods(repo, mailbox_id)
 
-      %ExternalAccount{mailbox_id: ^mailbox_id} = account ->
-        ExternalAccount.changeset(account, attrs) |> repo.update()
+        ReceiveMethod.changeset(%ReceiveMethod{}, attrs) |> repo.insert()
 
-      %ExternalAccount{} ->
+      %ReceiveMethod{account_id: ^mailbox_id} = account ->
+        disable_other_methods(repo, mailbox_id, except_id: account.id)
+        ReceiveMethod.changeset(account, Map.put(attrs, :enabled, true)) |> repo.update()
+
+      %ReceiveMethod{} ->
         {:error,
          Error.new(
            :permanent,
            :mailbox_reassignment_not_allowed,
-           "provider account is already bound to a different mailbox"
+           "provider account is already bound to a different account"
          )}
     end
+  end
+
+  defp disable_other_methods(repo, account_id, opts \\ []) do
+    except_id = Keyword.get(opts, :except_id)
+
+    query =
+      ReceiveMethod
+      |> where([m], m.account_id == ^account_id and m.enabled == true)
+
+    query =
+      if except_id do
+        where(query, [m], m.id != ^except_id)
+      else
+        query
+      end
+
+    repo.update_all(query, set: [enabled: false, updated_at: DateTime.utc_now()])
   end
 
   defp upsert_credential(repo, account_id, token) do
@@ -554,12 +669,13 @@ defmodule Manifold.Connectors do
   end
 
   defp account_view(account) do
-    %View.Account{
+    %View.ReceiveMethod{
       id: account.id,
-      mailbox_id: account.mailbox_id,
-      provider: account.provider,
+      account_id: account.account_id,
+      kind: account.kind,
       email_address: account.email_address,
       status: account.status,
+      enabled: account.enabled,
       sync_enabled: account.sync_enabled,
       last_attempted_at: account.last_attempted_at,
       last_synced_at: account.last_synced_at,
@@ -596,7 +712,7 @@ defmodule Manifold.Connectors do
 
   defp reject_duplicate_imap(email_canonical, provider_account_id) do
     conflict =
-      ExternalAccount
+      ReceiveMethod
       |> where([account], account.status != "disconnected")
       |> where(
         [account],
@@ -610,7 +726,7 @@ defmodule Manifold.Connectors do
       nil ->
         :ok
 
-      %ExternalAccount{} ->
+      %ReceiveMethod{} ->
         {:error,
          Error.new(
            :permanent,
@@ -735,13 +851,18 @@ defmodule Manifold.Connectors do
     mailbox_path = attr(attrs, :mailbox_path) || "INBOX"
 
     Multi.new()
+    |> Multi.run(:disable_others, fn repo, _changes ->
+      disable_other_methods(repo, mailbox.id)
+      {:ok, :ok}
+    end)
     |> Multi.insert(:account, fn _changes ->
-      ExternalAccount.changeset(%ExternalAccount{}, %{
-        mailbox_id: mailbox.id,
-        provider: "imap",
+      ReceiveMethod.changeset(%ReceiveMethod{}, %{
+        account_id: mailbox.id,
+        kind: "imap",
         provider_account_id: provider_account_id,
         email_address: parsed.canonical,
         status: "connected",
+        enabled: true,
         sync_enabled: true,
         granted_scopes: []
       })

@@ -35,8 +35,8 @@ defmodule ManifoldWeb.Milestone2EndToEndTest do
     subject = "Milestone 2 end-to-end #{suffix}"
 
     {:ok, domain} = Accounts.create_domain(%{name: "m2-e2e-#{suffix}.test"})
-    {:ok, mailbox} = Accounts.create_mailbox(domain, %{local_part: "inbox"})
-    {:ok, other_mailbox} = Accounts.create_mailbox(domain, %{local_part: "other"})
+    {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "inbox"})
+    {:ok, other_mailbox} = Accounts.create_account(domain, %{local_part: "other"})
 
     port = start_smtp!()
     socket = connect_smtp!(port)

@@ -12,7 +12,7 @@ defmodule Manifold.Accounts.Schema.Domain do
     field(:active, :boolean, default: true)
     field(:plus_addressing_enabled, :boolean, default: true)
 
-    has_many(:mailboxes, Manifold.Accounts.Schema.Mailbox)
+    has_many(:accounts, Manifold.Accounts.Schema.Account)
     has_many(:aliases, Manifold.Accounts.Schema.Alias)
 
     timestamps(type: :utc_datetime_usec)

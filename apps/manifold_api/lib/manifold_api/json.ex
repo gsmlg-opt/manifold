@@ -3,20 +3,21 @@ defmodule ManifoldAPI.JSON do
   Shared serialization from Accounts/Mail view structs to JSON-safe maps.
   """
 
-  alias Manifold.Accounts.Schema.Mailbox
+  alias Manifold.Accounts.Schema.Account
   alias Manifold.Mail.View
 
-  @spec mailbox(Mailbox.t()) :: map()
-  def mailbox(%Mailbox{} = mailbox) do
-    domain = mailbox.domain
+  @spec mailbox(Account.t()) :: map()
+  def mailbox(%Account{} = account) do
+    domain = account.domain
 
     %{
-      id: mailbox.id,
-      local_part: mailbox.local_part,
-      display_name: mailbox.display_name,
-      active: mailbox.active,
-      plus_addressing_enabled: mailbox.plus_addressing_enabled,
-      domain_id: mailbox.domain_id,
+      id: account.id,
+      local_part: account.local_part,
+      display_name: account.name,
+      name: account.name,
+      active: account.active,
+      plus_addressing_enabled: account.plus_addressing_enabled,
+      domain_id: account.domain_id,
       domain:
         if(domain,
           do: %{
@@ -29,7 +30,7 @@ defmodule ManifoldAPI.JSON do
         ),
       address:
         if(domain,
-          do: mailbox.local_part <> "@" <> domain.normalized_domain,
+          do: account.local_part <> "@" <> domain.normalized_domain,
           else: nil
         )
     }

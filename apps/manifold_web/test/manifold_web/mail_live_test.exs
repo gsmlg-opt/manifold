@@ -8,6 +8,6 @@ defmodule ManifoldWeb.MailLiveTest do
     assert html =~ ~p"/settings/accounts/new"
     assert html =~ "Add account"
     assert html =~ "Connect an email account"
-    assert html =~ ~p"/mailboxes"
+    assert html =~ ~p"/settings/accounts"
   end
 end

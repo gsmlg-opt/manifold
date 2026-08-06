@@ -22,7 +22,7 @@ defmodule Manifold.OutboundTest do
                subject: "Draft subject",
                text_body: "Draft body",
                recipients: [
-                 %{kind: "to", address: "First@Example.net", display_name: "First"},
+                 %{kind: "to", address: "First@Example.net", name: "First"},
                  %{kind: "cc", address: "copy@example.net"}
                ]
              })
@@ -261,7 +261,7 @@ defmodule Manifold.OutboundTest do
     {:ok, domain} = Accounts.create_domain(%{name: "outbound#{suffix}.test"})
 
     {:ok, mailbox} =
-      Accounts.create_mailbox(domain, %{local_part: "inbox", display_name: "Local Inbox"})
+      Accounts.create_account(domain, %{local_part: "inbox", name: "Local Inbox"})
 
     %{mailbox: mailbox, address: "inbox@#{domain.normalized_domain}"}
   end

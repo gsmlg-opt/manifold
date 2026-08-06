@@ -4,7 +4,7 @@ defmodule Manifold.Connectors.ImapAccountTest do
   alias Manifold.Accounts
   alias Manifold.Connectors
   alias Manifold.Connectors.IMAP.Fake
-  alias Manifold.Connectors.Schema.{Credential, ExternalAccount, ImapSettings}
+  alias Manifold.Connectors.Schema.{Credential, ReceiveMethod, ImapSettings}
   alias Manifold.Repo
 
   setup do
@@ -38,11 +38,11 @@ defmodule Manifold.Connectors.ImapAccountTest do
                tls_mode: "ssl"
              })
 
-    assert account.provider == "imap"
+    assert account.kind == "imap"
     assert account.email_address == "reader@imap.example"
     assert account.provider_account_id == "imap:reader@imap.example"
 
-    mailbox = Accounts.get_mailbox!(account.mailbox_id) |> Repo.preload(:domain)
+    mailbox = Accounts.get_account!(account.account_id) |> Repo.preload(:domain)
     assert mailbox.domain.normalized_domain == "imap.example"
 
     credential = Repo.get_by!(Credential, external_account_id: account.id)
@@ -72,7 +72,7 @@ defmodule Manifold.Connectors.ImapAccountTest do
   end
 
   test "create_imap_account rejects auth failure without persisting" do
-    before = Repo.aggregate(ExternalAccount, :count)
+    before = Repo.aggregate(ReceiveMethod, :count)
 
     assert {:error, _} =
              Connectors.create_imap_account(%{
@@ -84,7 +84,7 @@ defmodule Manifold.Connectors.ImapAccountTest do
                tls_mode: "ssl"
              })
 
-    assert Repo.aggregate(ExternalAccount, :count) == before
+    assert Repo.aggregate(ReceiveMethod, :count) == before
   end
 
   test "test_imap_connection returns error for invalid settings without raising" do

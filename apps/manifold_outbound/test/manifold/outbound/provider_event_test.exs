@@ -147,7 +147,7 @@ defmodule Manifold.Outbound.ProviderEventTest do
   defp queued_message_fixture do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "event#{suffix}.test"})
-    {:ok, mailbox} = Accounts.create_mailbox(domain, %{local_part: "inbox"})
+    {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "inbox"})
 
     {:ok, draft} =
       Outbound.create_draft(mailbox.id, %{

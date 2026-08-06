@@ -14,7 +14,7 @@ defmodule ManifoldAPI.Mail do
   @spec list_mailboxes() :: {:ok, [map()]}
   def list_mailboxes do
     mailboxes =
-      Accounts.list_mailboxes()
+      Accounts.list_accounts()
       |> Enum.map(&JSON.mailbox/1)
 
     {:ok, mailboxes}

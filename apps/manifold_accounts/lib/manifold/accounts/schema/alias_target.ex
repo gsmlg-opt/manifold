@@ -1,6 +1,7 @@
 defmodule Manifold.Accounts.Schema.AliasTarget do
   @moduledoc false
 
+  # Alias product surface is retired; schema retained for existing rows / cleanup migrations.
   use Manifold.Accounts.Schema
   import Ecto.Changeset
 
@@ -8,7 +9,7 @@ defmodule Manifold.Accounts.Schema.AliasTarget do
     field(:active, :boolean, default: true)
 
     belongs_to(:alias, Manifold.Accounts.Schema.Alias)
-    belongs_to(:mailbox, Manifold.Accounts.Schema.Mailbox)
+    belongs_to(:account, Manifold.Accounts.Schema.Account, foreign_key: :mailbox_id)
 
     timestamps(type: :utc_datetime_usec)
   end

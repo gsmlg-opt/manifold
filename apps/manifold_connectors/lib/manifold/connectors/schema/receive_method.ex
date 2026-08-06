@@ -1,17 +1,19 @@
-defmodule Manifold.Connectors.Schema.ExternalAccount do
+defmodule Manifold.Connectors.Schema.ReceiveMethod do
   @moduledoc false
 
   use Manifold.Connectors.Schema
   import Ecto.Changeset
 
-  @statuses ~w(connected syncing reconnect_required failed disconnected)
+  @statuses ~w(connected syncing reconnect_required failed disconnected not_implemented)
+  @kinds ~w(gmail microsoft imap pop3 eas ews)
 
   schema "connector_accounts" do
-    field(:mailbox_id, :binary_id)
-    field(:provider, :string)
+    field(:account_id, :binary_id, source: :mailbox_id)
+    field(:kind, :string, source: :provider)
     field(:provider_account_id, :string)
     field(:email_address, :string)
     field(:status, :string, default: "connected")
+    field(:enabled, :boolean, default: false)
     field(:sync_enabled, :boolean, default: true)
     field(:granted_scopes, {:array, :string}, default: [])
     field(:last_attempted_at, :utc_datetime_usec)
@@ -25,15 +27,25 @@ defmodule Manifold.Connectors.Schema.ExternalAccount do
     timestamps(type: :utc_datetime_usec)
   end
 
+  @spec kinds() :: [String.t()]
+  def kinds, do: @kinds
+
+  @spec implemented_kinds() :: [String.t()]
+  def implemented_kinds, do: ~w(gmail microsoft imap)
+
+  @spec placeholder_kinds() :: [String.t()]
+  def placeholder_kinds, do: ~w(pop3 eas ews)
+
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
-  def changeset(account, attrs) do
-    account
+  def changeset(receive_method, attrs) do
+    receive_method
     |> cast(attrs, [
-      :mailbox_id,
-      :provider,
+      :account_id,
+      :kind,
       :provider_account_id,
       :email_address,
       :status,
+      :enabled,
       :sync_enabled,
       :granted_scopes,
       :last_attempted_at,
@@ -44,20 +56,21 @@ defmodule Manifold.Connectors.Schema.ExternalAccount do
       :disconnected_at
     ])
     |> validate_required([
-      :mailbox_id,
-      :provider,
+      :account_id,
+      :kind,
       :provider_account_id,
       :email_address,
       :status,
+      :enabled,
       :sync_enabled,
       :granted_scopes
     ])
-    |> validate_inclusion(:provider, ["gmail", "microsoft", "imap"])
+    |> validate_inclusion(:kind, @kinds)
     |> validate_inclusion(:status, @statuses)
     |> validate_length(:provider_account_id, min: 1, max: 255)
     |> validate_length(:email_address, min: 3, max: 998)
     |> validate_length(:last_error_message, max: 1_000)
-    |> unique_constraint([:provider, :provider_account_id],
+    |> unique_constraint([:kind, :provider_account_id],
       name: :connector_accounts_provider_account_index
     )
     |> optimistic_lock(:lock_version)

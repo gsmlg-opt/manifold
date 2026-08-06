@@ -241,7 +241,7 @@ defmodule Manifold.Outbound.SubmissionTest do
     {:ok, domain} = Accounts.create_domain(%{name: "submit#{suffix}.test"})
 
     {:ok, mailbox} =
-      Accounts.create_mailbox(domain, %{local_part: "inbox", display_name: "Local Inbox"})
+      Accounts.create_account(domain, %{local_part: "inbox", name: "Local Inbox"})
 
     {:ok, draft} =
       Outbound.create_draft(mailbox.id, %{

@@ -155,7 +155,7 @@ defmodule ManifoldAPI.GraphQLTest do
   defp mailbox_fixture do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "gql#{suffix}.test"})
-    {:ok, mailbox} = Accounts.create_mailbox(domain, %{local_part: "inbox"})
+    {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "inbox"})
     %{domain: domain, mailbox: mailbox}
   end
 

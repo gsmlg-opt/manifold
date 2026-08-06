@@ -12,7 +12,7 @@ defmodule Manifold.ConnectorsTest do
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
     Credential,
-    ExternalAccount,
+    ReceiveMethod,
     SyncCursor,
     RemoteMessage
   }
@@ -93,7 +93,7 @@ defmodule Manifold.ConnectorsTest do
 
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "connector#{suffix}.test"})
-    {:ok, mailbox} = Accounts.create_mailbox(domain, %{local_part: "person"})
+    {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "person"})
     {:ok, domain: domain, mailbox: mailbox}
   end
 
@@ -107,10 +107,10 @@ defmodule Manifold.ConnectorsTest do
                now: ~U[2026-07-29 01:00:00.000000Z]
              )
 
-    assert account.provider == "gmail"
+    assert account.kind == "gmail"
     assert account.provider_account_id == "google-subject-1"
     assert account.email_address == "person@gmail.example"
-    assert account.mailbox_id == mailbox.id
+    assert account.account_id == mailbox.id
     assert account.status == "connected"
 
     credential = Repo.get_by!(Credential, external_account_id: account.id)
@@ -149,7 +149,7 @@ defmodule Manifold.ConnectorsTest do
                fail_at: :after_credentials_before_job
              )
 
-    assert Repo.aggregate(ExternalAccount, :count) == 0
+    assert Repo.aggregate(ReceiveMethod, :count) == 0
     assert Repo.aggregate(Credential, :count) == 0
     assert Repo.aggregate(SyncCursor, :count) == 0
     assert Repo.aggregate(ConnectorEvent, :count) == 0
@@ -162,9 +162,9 @@ defmodule Manifold.ConnectorsTest do
 
     assert [view] = Connectors.list_accounts()
     assert view.id == account.id
-    assert view.provider == "gmail"
+    assert view.kind == "gmail"
     assert view.email_address == "person@gmail.example"
-    assert view.mailbox_id == mailbox.id
+    assert view.account_id == mailbox.id
     refute Map.has_key?(Map.from_struct(view), :access_token_ciphertext)
     refute Map.has_key?(Map.from_struct(view), :refresh_token_ciphertext)
     assert Connectors.configured_providers() == ["gmail"]
@@ -177,7 +177,7 @@ defmodule Manifold.ConnectorsTest do
     assert {:ok, account} =
              Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
 
-    {:ok, other_mailbox} = Accounts.create_mailbox(domain, %{local_part: "other"})
+    {:ok, other_mailbox} = Accounts.create_account(domain, %{local_part: "other"})
 
     assert {:error, %{class: :permanent, reason: :mailbox_reassignment_not_allowed}} =
              Connectors.complete_authorization(
@@ -186,9 +186,9 @@ defmodule Manifold.ConnectorsTest do
                consumed(other_mailbox.id)
              )
 
-    persisted = Repo.get!(ExternalAccount, account.id)
-    assert persisted.mailbox_id == mailbox.id
-    assert Repo.aggregate(ExternalAccount, :count) == 1
+    persisted = Repo.get!(ReceiveMethod, account.id)
+    assert persisted.account_id == mailbox.id
+    assert Repo.aggregate(ReceiveMethod, :count) == 1
   end
 
   test "sync enqueue is unique and disconnect invalidates credentials", %{mailbox: mailbox} do

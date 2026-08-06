@@ -375,13 +375,13 @@ defmodule Manifold.Ingest do
 
     mailboxes =
       Enum.map(mailbox_ids, fn mailbox_id ->
-        mailbox = Accounts.get_mailbox!(mailbox_id)
+        mailbox = Accounts.get_account!(mailbox_id)
 
         %{
           id: mailbox.id,
           local_part: mailbox.local_part,
           domain_id: mailbox.domain_id,
-          display_name: mailbox.display_name
+          display_name: mailbox.name
         }
       end)
 
@@ -801,7 +801,7 @@ defmodule Manifold.Ingest do
              Error.new(:temporary, :object_store_failed, "delivery has no storage domain")}
 
           mailbox_id ->
-            Accounts.mailbox_domain_id(mailbox_id)
+            Accounts.account_domain_id(mailbox_id)
         end
     end
   end
@@ -1266,7 +1266,7 @@ defmodule Manifold.Ingest do
   end
 
   defp validate_external_mailbox(source) do
-    case Accounts.active_mailbox_domain_id(source.mailbox_id) do
+    case Accounts.active_account_domain_id(source.mailbox_id) do
       {:ok, domain_id} when domain_id == source.storage_domain_id ->
         :ok
 

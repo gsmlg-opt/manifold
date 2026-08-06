@@ -13,7 +13,7 @@ defmodule ManifoldWeb.MailLive.Index do
     {:ok,
      assign(socket,
        page_title: "Mail",
-       mailboxes: Accounts.list_mailboxes(),
+       mailboxes: Accounts.list_accounts(),
        mailbox: nil,
        folders: [],
        folder: nil,
@@ -627,8 +627,7 @@ defmodule ManifoldWeb.MailLive.Index do
         </nav>
 
         <div class="folder-admin-links">
-          <.link navigate={~p"/mailboxes"}>Manage mailboxes</.link>
-          <.link navigate={~p"/domains"}>Manage domains</.link>
+          <.link navigate={~p"/settings/accounts"}>Manage accounts</.link>
         </div>
       </aside>
 
@@ -636,7 +635,7 @@ defmodule ManifoldWeb.MailLive.Index do
         <.dm_mdi name="email-plus-outline" class="empty-icon" />
         <h1>Connect an email account</h1>
         <.link navigate={~p"/settings/accounts/new"} class="text-command">Add account</.link>
-        <.link navigate={~p"/mailboxes"}>Manage local mailboxes</.link>
+        <.link navigate={~p"/settings/accounts"}>Manage accounts</.link>
       </div>
 
       <section

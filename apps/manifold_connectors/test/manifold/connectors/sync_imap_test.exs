@@ -73,7 +73,7 @@ defmodule Manifold.Connectors.SyncImapTest do
     assert delivery.source_kind == "provider_import"
 
     assert Repo.get_by!(MailboxEntry, inbound_delivery_id: mapping.inbound_delivery_id).mailbox_id ==
-             account.mailbox_id
+             account.account_id
 
     assert :ok = Connectors.sync_account(account.id)
   end

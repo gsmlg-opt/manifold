@@ -122,7 +122,7 @@ defmodule Manifold.SMTPTest do
 
   test "multiple recipients are preserved" do
     %{domain: domain} = mailbox_fixture()
-    {:ok, _mailbox} = Accounts.create_mailbox(domain, %{local_part: "second"})
+    {:ok, _mailbox} = Accounts.create_account(domain, %{local_part: "second"})
     port = start_smtp!()
     socket = connect!(port)
 
@@ -572,7 +572,7 @@ defmodule Manifold.SMTPTest do
   defp mailbox_fixture do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "smtp#{suffix}.test"})
-    {:ok, mailbox} = Accounts.create_mailbox(domain, %{local_part: "inbox"})
+    {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "inbox"})
     %{domain: domain, mailbox: mailbox}
   end
 

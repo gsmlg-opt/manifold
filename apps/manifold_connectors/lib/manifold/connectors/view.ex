@@ -1,12 +1,13 @@
-defmodule Manifold.Connectors.View.Account do
+defmodule Manifold.Connectors.View.ReceiveMethod do
   @moduledoc false
 
   @enforce_keys [
     :id,
-    :mailbox_id,
-    :provider,
+    :account_id,
+    :kind,
     :email_address,
     :status,
+    :enabled,
     :sync_enabled,
     :last_attempted_at,
     :last_synced_at,
@@ -16,10 +17,11 @@ defmodule Manifold.Connectors.View.Account do
 
   @type t :: %__MODULE__{
           id: Ecto.UUID.t(),
-          mailbox_id: Ecto.UUID.t(),
-          provider: String.t(),
+          account_id: Ecto.UUID.t(),
+          kind: String.t(),
           email_address: String.t(),
           status: String.t(),
+          enabled: boolean(),
           sync_enabled: boolean(),
           last_attempted_at: DateTime.t() | nil,
           last_synced_at: DateTime.t() | nil,

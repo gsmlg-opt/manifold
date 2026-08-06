@@ -31,7 +31,7 @@ defmodule Manifold.Connectors.OAuthTest do
 
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "oauth#{suffix}.test"})
-    {:ok, mailbox} = Accounts.create_mailbox(domain, %{local_part: "person"})
+    {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "person"})
     {:ok, mailbox: mailbox}
   end
 

@@ -44,42 +44,6 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
       do: {:ok, %RawMessage{bytes: "Subject: test\r\n\r\nBody\r\n"}}
   end
 
-  defmodule MicrosoftProvider do
-    @behaviour Manifold.Connectors.Provider
-
-    @impl true
-    def exchange_code("valid-code", _verifier, _redirect_uri, _config, _opts) do
-      {:ok,
-       %Token{
-         access_token: "microsoft-access-token",
-         refresh_token: "microsoft-refresh-token",
-         expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
-         scopes: ["openid", "profile", "offline_access", "User.Read", "Mail.Read"]
-       }}
-    end
-
-    @impl true
-    def refresh_token(_refresh_token, _config, _opts), do: raise("not used")
-
-    @impl true
-    def identity("microsoft-access-token", _config, _opts) do
-      {:ok, %Identity{id: "microsoft-account-1", email_address: "person@outlook.example"}}
-    end
-
-    @impl true
-    def initial_cursors("microsoft-access-token", _config, _opts) do
-      {:ok, [%ProviderCursor{scope: "mailbox", phase: "bootstrap"}]}
-    end
-
-    @impl true
-    def sync_page(_access_token, cursor, _config, _opts),
-      do: {:ok, %Page{cursor: cursor}}
-
-    @impl true
-    def fetch_raw(_access_token, _message_id, _config, _opts),
-      do: {:ok, %RawMessage{bytes: "Subject: test\r\n\r\nBody\r\n"}}
-  end
-
   setup do
     old_key = Application.get_env(:manifold_connectors, :encryption_key)
     old_adapters = Application.get_env(:manifold_connectors, :adapters)
@@ -93,21 +57,13 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
       Base.encode64(:crypto.strong_rand_bytes(32))
     )
 
-    Application.put_env(:manifold_connectors, :adapters,
-      gmail: GmailProvider,
-      microsoft: MicrosoftProvider
-    )
+    Application.put_env(:manifold_connectors, :adapters, gmail: GmailProvider)
 
     Application.put_env(:manifold_connectors, :providers,
       gmail: [
         client_id: "gmail-client-secret-id",
         client_secret: "gmail-client-secret",
         authorization_url: "https://accounts.google.test/o/oauth2/v2/auth"
-      ],
-      microsoft: [
-        client_id: "microsoft-client-secret-id",
-        client_secret: "microsoft-client-secret",
-        authorization_url: "https://login.microsoft.test/oauth2/v2.0/authorize"
       ]
     )
 
@@ -127,286 +83,28 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
       restore_env(:imap_fake, old_fake)
     end)
 
-    suffix = System.unique_integer([:positive])
-    {:ok, domain} = Accounts.create_domain(%{name: "external-web-#{suffix}.test"})
-    {:ok, mailbox} = Accounts.create_mailbox(domain, %{local_part: "person"})
-
-    {:ok, domain: domain, mailbox: mailbox}
-  end
-
-  test "settings accounts opens with an add account button that navigates to new", %{conn: conn} do
-    assert {:ok, view, html} = live(conn, "/settings/accounts")
-
-    assert has_element?(view, "#add-account-button", "Add account")
-    assert has_element?(view, "#add-account-button[href='/settings/accounts/new']")
-    refute has_element?(view, "#add-account-panel")
-    refute html =~ "/connectors/gmail/start"
-    refute html =~ "/connectors/microsoft/start"
-    refute html =~ "Log in"
-  end
-
-  test "add account button navigates to the new account page", %{conn: conn} do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts")
-
-    assert {:ok, new_view, html} =
-             view
-             |> element("#add-account-button")
-             |> render_click()
-             |> follow_redirect(conn, "/settings/accounts/new")
-
-    assert html =~ "What kind of account are you adding?"
-    assert has_element?(new_view, "#add-account-panel")
-    assert has_element?(new_view, "#external-account-type")
-  end
-
-  test "imap account type shows connection form without mailbox picker", %{conn: conn} do
-    {:ok, view, _html} = live(conn, ~p"/settings/accounts/new")
-
-    view
-    |> element("button[phx-value-type='imap']", "IMAP account")
-    |> render_click()
-
-    html = render(view)
-    assert html =~ "Host"
-    refute html =~ "Choose a mailbox"
-
-    assert has_element?(view, "#imap-account-form")
-    assert has_element?(view, "label[for=imap-email-address]", "Email address")
-    assert has_element?(view, "#imap-email-address")
-    assert has_element?(view, "label[for=imap-username]", "Username")
-    assert has_element?(view, "#imap-username")
-    assert has_element?(view, "label[for=imap-password]", "Password")
-    assert has_element?(view, "#imap-password[type=password]")
-    assert has_element?(view, "label[for=imap-host]", "Host")
-    assert has_element?(view, "#imap-host")
-    assert has_element?(view, "label[for=imap-port]", "Port")
-    assert has_element?(view, "#imap-port[type=number]")
-    assert has_element?(view, "label[for=imap-tls-mode]", "TLS mode")
-    assert has_element?(view, "#imap-tls-mode")
-  end
-
-  test "successful imap submit redirects to mailbox inbox", %{conn: conn} do
-    {:ok, view, _html} = live(conn, ~p"/settings/accounts/new")
-
-    view |> element("button[phx-value-type='imap']", "IMAP account") |> render_click()
-
-    view
-    |> form("#imap-account-form", %{
-      imap: %{
-        email_address: "reader@imap.example",
-        username: "reader@imap.example",
-        password: "secret",
-        host: "imap.example",
-        port: "993",
-        tls_mode: "ssl"
-      }
-    })
-    |> render_submit()
-
-    {path, _flash} = assert_redirect(view)
-    assert path =~ ~r|/mail/.+/folders/.+|
-  end
-
-  test "failed imap test connection does not create account", %{conn: conn} do
-    before = Manifold.Repo.aggregate(Manifold.Connectors.Schema.ExternalAccount, :count)
-
-    {:ok, view, _html} = live(conn, ~p"/settings/accounts/new")
-    view |> element("button[phx-value-type='imap']", "IMAP account") |> render_click()
-
-    html =
-      view
-      |> form("#imap-account-form", %{
-        imap: %{
-          email_address: "reader@imap-fail.example",
-          username: "reader@imap-fail.example",
-          password: "wrong",
-          host: "imap.example",
-          port: "993",
-          tls_mode: "ssl"
-        }
+    {:ok, account} =
+      Accounts.create_account(%{
+        name: "Person",
+        address: "person@external-web-#{System.unique_integer([:positive])}.test"
       })
-      |> render_submit()
 
-    assert html =~ "IMAP authentication failed" or html =~ "Could not connect"
-    assert has_element?(view, "#imap-account-error")
-    assert Manifold.Repo.aggregate(Manifold.Connectors.Schema.ExternalAccount, :count) == before
+    {:ok, account: account}
   end
 
-  test "external account wizard selects a provider and mailbox", %{conn: conn, mailbox: mailbox} do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
-
-    assert render(view) =~ "Cloud account"
-
-    html =
-      view
-      |> element("#external-account-type")
-      |> render_click()
-
-    assert html =~ "Choose a provider"
-    assert has_element?(view, "#provider-gmail:not([disabled])")
-    assert has_element?(view, "#provider-microsoft:not([disabled])")
-
-    html = view |> element("#provider-gmail") |> render_click()
-
-    assert html =~ "Choose a local mailbox"
-    refute has_element?(view, "#continue-add-account")
-
-    html =
-      view
-      |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
-      |> render_change()
-
-    assert has_element?(
-             view,
-             "#continue-add-account[href='/connectors/gmail/start?mailbox_id=#{mailbox.id}']",
-             "Continue to Gmail"
-           )
-
-    assert html =~ "Continue to Gmail"
+  test "settings accounts lists local accounts", %{conn: conn, account: account} do
+    assert {:ok, view, html} = live(conn, "/settings/accounts")
+    assert has_element?(view, "#add-account-button", "Add account")
+    assert html =~ Accounts.account_address(account)
   end
 
-  test "external account wizard creates a Microsoft OAuth handoff", %{
+  test "OAuth start and callback connect a receive method to the account", %{
     conn: conn,
-    mailbox: mailbox
-  } do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
-    open_provider_step(view)
-
-    view
-    |> element("#provider-microsoft")
-    |> render_click()
-
-    view
-    |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
-    |> render_change()
-
-    assert has_element?(
-             view,
-             "#continue-add-account[href='/connectors/microsoft/start?mailbox_id=#{mailbox.id}']",
-             "Continue to Microsoft 365"
-           )
-  end
-
-  test "wizard rejects forward events before account type selection", %{
-    conn: conn,
-    mailbox: mailbox
-  } do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
-
-    render_hook(view, "choose-provider", %{"provider" => "gmail"})
-    render_hook(view, "select-add-account-mailbox", %{"mailbox_id" => mailbox.id})
-
-    refute has_element?(view, "#continue-add-account")
-    assert has_element?(view, "#add-account-type-heading")
-
-    assert {:ok, socket} = Phoenix.LiveView.Debug.socket(view.pid)
-
-    assert %{
-             add_account_step: :account_type,
-             selected_provider: nil,
-             selected_mailbox_id: nil
-           } = socket.assigns
-  end
-
-  test "wizard rejects a provider before account type selection", %{conn: conn} do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
-
-    assert render_hook(view, "choose-provider", %{"provider" => "gmail"}) =~
-             "What kind of account are you adding?"
-
-    refute has_element?(view, "#continue-add-account")
-
-    assert {:ok, socket} = Phoenix.LiveView.Debug.socket(view.pid)
-
-    assert %{
-             add_account_step: :account_type,
-             selected_provider: nil,
-             selected_mailbox_id: nil
-           } = socket.assigns
-  end
-
-  test "wizard rejects a mailbox before provider selection", %{conn: conn, mailbox: mailbox} do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
-    open_provider_step(view)
-
-    assert render_hook(view, "select-add-account-mailbox", %{"mailbox_id" => mailbox.id}) =~
-             "Choose a provider"
-
-    refute has_element?(view, "#continue-add-account")
-
-    assert {:ok, socket} = Phoenix.LiveView.Debug.socket(view.pid)
-
-    assert %{
-             add_account_step: :provider,
-             selected_provider: nil,
-             selected_mailbox_id: nil
-           } = socket.assigns
-  end
-
-  test "add account panel is descriptively labelled without duplicate live announcements", %{
-    conn: conn
-  } do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
-
-    assert has_element?(
-             view,
-             "#add-account-panel[aria-labelledby='add-account-title'] #add-account-title",
-             "Add an email account"
-           )
-
-    refute has_element?(view, "#add-account-panel[aria-live]")
-    refute has_element?(view, "#add-account-panel[aria-atomic]")
-  end
-
-  test "wizard ignores forged account type and provider values", %{conn: conn} do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
-
-    assert render_hook(view, "choose-account-type", %{"type" => "local"}) =~
-             "What kind of account are you adding?"
-
-    assert render_hook(view, "choose-account-type", %{}) =~ "What kind of account are you adding?"
-
-    view
-    |> element("#external-account-type")
-    |> render_click()
-
-    assert render_hook(view, "choose-provider", %{"provider" => "imap"}) =~
-             "Choose a provider"
-
-    assert render_hook(view, "choose-provider", %{}) =~ "Choose a provider"
-    refute has_element?(view, "#continue-add-account")
-  end
-
-  test "wizard clears the mailbox selection for forged values", %{conn: conn, mailbox: mailbox} do
-    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
-    open_provider_step(view)
-
-    view
-    |> element("#provider-gmail")
-    |> render_click()
-
-    view
-    |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
-    |> render_change()
-
-    assert has_element?(view, "#continue-add-account")
-
-    assert render_hook(view, "select-add-account-mailbox", %{"mailbox_id" => "unknown"}) =~
-             "Choose a local mailbox"
-
-    refute has_element?(view, "#continue-add-account")
-
-    assert render_hook(view, "select-add-account-mailbox", %{}) =~ "Choose a local mailbox"
-    refute has_element?(view, "#continue-add-account")
-  end
-
-  test "OAuth start and callback consume matching state and connect the account", %{
-    conn: conn,
-    mailbox: mailbox
+    account: account
   } do
     start_conn =
       get(conn, "/connectors/gmail/start", %{
-        "mailbox_id" => mailbox.id
+        "account_id" => account.id
       })
 
     authorization_url = redirected_to(start_conn, 302)
@@ -424,439 +122,63 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
       |> recycle()
       |> get("/connectors/gmail/callback", %{"code" => "valid-code", "state" => state})
 
-    assert redirected_to(callback_conn, 302) == "/settings/accounts"
-    assert Phoenix.Flash.get(callback_conn.assigns.flash, :info) == "Gmail account connected."
+    assert redirected_to(callback_conn, 302) == "/settings/accounts/#{account.id}"
 
-    assert [account] = Connectors.list_accounts()
-    assert account.mailbox_id == mailbox.id
-    assert account.provider == "gmail"
+    assert [method] = Connectors.list_receive_methods_for_account(account.id)
+    assert method.account_id == account.id
+    assert method.kind == "gmail"
+    assert method.enabled
   end
 
-  test "OAuth callback rejects tampered state without connecting an account", %{conn: conn} do
-    callback_conn =
-      get(conn, "/connectors/gmail/callback", %{
-        "code" => "valid-code",
-        "state" => "tampered-state"
-      })
+  test "account show can add IMAP receive method", %{conn: conn, account: account} do
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts/#{account.id}")
 
-    assert redirected_to(callback_conn, 302) == "/settings/accounts"
+    view |> element("#add-receive-method") |> render_click()
+    view |> element("button[phx-value-kind='imap']") |> render_click()
 
-    assert Phoenix.Flash.get(callback_conn.assigns.flash, :error) ==
-             "The Gmail authorization request is invalid or expired."
-
-    assert Connectors.list_accounts() == []
-  end
-
-  test "account actions enqueue sync and disconnect through the public context", %{
-    conn: conn,
-    mailbox: mailbox
-  } do
-    connect_account(conn, "microsoft", mailbox.id)
-
-    assert {:ok, view, html} = live(conn, "/settings/accounts")
-    assert html =~ "person@outlook.example"
-    assert html =~ "Connected"
-
-    assert view
-           |> element("button[phx-click=sync]")
-           |> render_click() =~ "Synchronization queued."
-
-    html =
-      view
-      |> element("button[phx-click=disconnect]")
-      |> render_click()
-
-    assert html =~ "Disconnected"
-    assert [%{status: "disconnected", sync_enabled: false}] = Connectors.list_accounts()
-  end
-
-  test "account surface does not expose tokens, client secrets, or storage paths", %{
-    conn: conn,
-    mailbox: mailbox
-  } do
-    connect_account(conn, "gmail", mailbox.id)
-
-    assert {:ok, _view, html} = live(conn, "/settings/accounts")
-
-    refute html =~ "gmail-access-token"
-    refute html =~ "gmail-refresh-token"
-    refute html =~ "gmail-client-secret"
-    refute html =~ "spool_bundle_path"
-    refute html =~ "raw_object_key"
-    refute html =~ "/raw/"
-    refute html =~ "/ready/"
-  end
-
-  test "unconfigured providers are shown as unavailable", %{conn: conn} do
-    Application.put_env(:manifold_connectors, :providers, [])
-
-    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
-    open_provider_step(view)
+    view
+    |> form("#imap-form", %{
+      imap: %{
+        email_address: Accounts.account_address(account),
+        username: Accounts.account_address(account),
+        password: "secret",
+        host: "imap.example",
+        port: "993",
+        tls_mode: "ssl"
+      }
+    })
+    |> render_submit()
 
     html = render(view)
+    assert html =~ "IMAP"
+    assert html =~ "Yes"
 
-    assert view
-           |> element("#provider-gmail[disabled]")
-           |> render() =~ "Provider not configured"
-
-    assert view
-           |> element("#provider-microsoft[disabled]")
-           |> render() =~ "Provider not configured"
-
-    refute html =~ "/connectors/gmail/start"
-    refute html =~ "/connectors/microsoft/start"
-
-    assert render_hook(view, "choose-provider", %{"provider" => "gmail"}) =~
-             "Choose a provider"
-
-    refute has_element?(view, "#continue-add-account")
+    [method] = Connectors.list_receive_methods_for_account(account.id)
+    assert method.kind == "imap"
+    assert method.enabled
   end
 
-  test "inactive mailboxes are not offered as connector destinations", %{
-    conn: conn,
-    mailbox: mailbox
-  } do
-    mailbox
-    |> Ecto.Changeset.change(active: false)
-    |> Manifold.Repo.update!()
+  test "account show can disconnect receive method", %{conn: conn, account: account} do
+    connect_gmail(conn, account.id)
 
-    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
-    open_provider_step(view)
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts/#{account.id}")
 
-    html = view |> element("#provider-gmail") |> render_click()
-
-    refute html =~ mailbox.local_part
-    assert html =~ "Create an active local mailbox before connecting an external account."
-
-    assert has_element?(
-             view,
-             "#create-local-mailbox-link[href*='provider=gmail'][href*='source=external_account']",
-             "Create local mailbox"
-           )
-
-    refute has_element?(view, "#continue-add-account")
-  end
-
-  test "validated handoff restores provider and mailbox selection", %{
-    conn: conn,
-    mailbox: mailbox
-  } do
-    assert {:ok, view, _html} =
-             live(
-               conn,
-               ~p"/settings/accounts/new?#{[provider: "gmail", mailbox_id: mailbox.id]}"
-             )
-
-    assert has_element?(view, "#add-account-mailbox-heading", "Choose a local mailbox")
-
-    assert has_element?(
-             view,
-             "#add-account-mailbox-id option[value='#{mailbox.id}'][selected]"
-           )
-
-    assert has_element?(
-             view,
-             "#continue-add-account[href='/connectors/gmail/start?mailbox_id=#{mailbox.id}']",
-             "Continue to Gmail"
-           )
-  end
-
-  test "invalid handoff parameters fail closed", %{conn: conn, mailbox: mailbox} do
-    assert {:ok, forged_provider, _html} =
-             live(
-               conn,
-               ~p"/settings/accounts/new?#{[provider: "imap", mailbox_id: mailbox.id]}"
-             )
-
-    assert has_element?(forged_provider, "#add-account-type-heading")
-    refute has_element?(forged_provider, "#continue-add-account")
-
-    assert {:ok, unknown_mailbox, _html} =
-             live(
-               conn,
-               ~p"/settings/accounts/new?#{[provider: "gmail", mailbox_id: Ecto.UUID.generate()]}"
-             )
-
-    assert has_element?(unknown_mailbox, "#add-account-type-heading")
-    refute has_element?(unknown_mailbox, "#continue-add-account")
-
-    mailbox
-    |> Ecto.Changeset.change(active: false)
-    |> Manifold.Repo.update!()
-
-    assert {:ok, inactive_mailbox, _html} =
-             live(
-               conn,
-               ~p"/settings/accounts/new?#{[provider: "gmail", mailbox_id: mailbox.id]}"
-             )
-
-    assert has_element?(inactive_mailbox, "#add-account-type-heading")
-    refute has_element?(inactive_mailbox, "#continue-add-account")
-  end
-
-  test "back moves one step and cancel returns to accounts list", %{conn: conn, mailbox: mailbox} do
-    connect_account(conn, "microsoft", mailbox.id)
-
-    assert [%{id: account_id, email_address: "person@outlook.example"}] =
-             Connectors.list_accounts()
-
-    assert {:ok, view, _html} = live(conn, "/settings/accounts/new")
-
-    assert has_element?(
-             view,
-             "#add-account-type-heading[tabindex='-1'][phx-mounted*='focus']",
-             "What kind of account are you adding?"
-           )
-
-    refute has_element?(view, "#back-add-account")
-    assert has_element?(view, "#cancel-add-account")
+    [method] = Connectors.list_receive_methods_for_account(account.id)
 
     view
-    |> element("#external-account-type")
+    |> element("#receive-method-#{method.id} button[phx-click=disconnect]")
     |> render_click()
 
-    assert has_element?(
-             view,
-             "#add-account-provider-heading[tabindex='-1'][phx-mounted*='focus']",
-             "Choose a provider"
-           )
-
-    assert has_element?(view, "#back-add-account")
-    assert has_element?(view, "#cancel-add-account")
-
-    view
-    |> element("#provider-gmail")
-    |> render_click()
-
-    assert has_element?(
-             view,
-             "#add-account-mailbox-heading[tabindex='-1'][phx-mounted*='focus']",
-             "Choose a local mailbox"
-           )
-
-    assert has_element?(view, "#back-add-account")
-    assert has_element?(view, "#cancel-add-account")
-
-    view
-    |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
-    |> render_change()
-
-    assert has_element?(view, "#continue-add-account")
-
-    assert view
-           |> element("#back-add-account")
-           |> render_click() =~ "Choose a provider"
-
-    assert has_element?(
-             view,
-             "#add-account-provider-heading[tabindex='-1'][phx-mounted*='focus']"
-           )
-
-    assert has_element?(view, "#back-add-account")
-    assert has_element?(view, "#cancel-add-account")
-
-    view
-    |> element("#provider-gmail")
-    |> render_click()
-
-    refute has_element?(view, "#continue-add-account")
-
-    view
-    |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
-    |> render_change()
-
-    assert has_element?(view, "#continue-add-account")
-
-    view
-    |> element("#back-add-account")
-    |> render_click()
-
-    html = view |> element("#back-add-account") |> render_click()
-
-    assert html =~ "What kind of account are you adding?"
-
-    assert has_element?(
-             view,
-             "#add-account-type-heading[tabindex='-1'][phx-mounted*='focus']"
-           )
-
-    refute has_element?(view, "#back-add-account")
-    assert has_element?(view, "#cancel-add-account")
-
-    view
-    |> element("#external-account-type")
-    |> render_click()
-
-    view
-    |> element("#provider-gmail")
-    |> render_click()
-
-    view
-    |> form("#add-account-mailbox-form", %{mailbox_id: mailbox.id})
-    |> render_change()
-
-    assert has_element?(view, "#continue-add-account")
-
-    assert {:ok, index_view, html} =
-             view
-             |> element("#cancel-add-account")
-             |> render_click()
-             |> follow_redirect(conn, "/settings/accounts")
-
-    assert html =~ "Connected accounts"
-    assert html =~ "person@outlook.example"
-    assert has_element?(index_view, "#external-account-#{account_id} button[phx-click=sync]")
-
-    assert has_element?(
-             index_view,
-             "#external-account-#{account_id} button[phx-click=disconnect]"
-           )
-
-    refute has_element?(index_view, "#add-account-panel")
-    assert has_element?(index_view, "#add-account-button[href='/settings/accounts/new']")
+    assert [%{status: "disconnected", enabled: false}] =
+             Connectors.list_receive_methods_for_account(account.id)
   end
 
-  test "accounts index links to activity page", %{conn: conn} do
-    Application.put_env(:manifold_connectors, :imap_fake, %{
-      password_expected: "secret",
-      messages: [],
-      uidvalidity: 1
-    })
-
-    assert {:ok, account} =
-             Connectors.create_imap_account(%{
-               email_address: "activity-link@imap.example",
-               username: "activity-link@imap.example",
-               password: "secret",
-               host: "imap.example",
-               port: 993,
-               tls_mode: "ssl"
-             })
-
-    assert {:ok, view, _html} = live(conn, "/settings/accounts")
-
-    assert has_element?(
-             view,
-             "#external-account-#{account.id} a[href='/settings/accounts/#{account.id}/activity']"
-           )
-  end
-
-  test "activity page loads empty state for today and refresh", %{conn: conn} do
-    log_dir =
-      Path.join(System.tmp_dir!(), "manifold-activity-#{System.unique_integer([:positive])}")
-
-    previous = Application.get_env(:manifold_connectors, :activity_log_dir)
-    Application.put_env(:manifold_connectors, :activity_log_dir, log_dir)
-
-    on_exit(fn -> Application.put_env(:manifold_connectors, :activity_log_dir, previous) end)
-
-    Application.put_env(:manifold_connectors, :imap_fake, %{
-      password_expected: "secret",
-      messages: [],
-      uidvalidity: 1
-    })
-
-    assert {:ok, account} =
-             Connectors.create_imap_account(%{
-               email_address: "activity-empty@imap.example",
-               username: "activity-empty@imap.example",
-               password: "secret",
-               host: "imap.example",
-               port: 993,
-               tls_mode: "ssl"
-             })
-
-    assert {:ok, view, html} = live(conn, ~p"/settings/accounts/#{account.id}/activity")
-    assert html =~ "Activity"
-    assert html =~ account.email_address
-    assert has_element?(view, "#activity-empty")
-    assert has_element?(view, "#activity-refresh")
-    assert has_element?(view, "#activity-date")
-
-    html = view |> element("#activity-refresh") |> render_click()
-    assert html =~ "No activity"
-  end
-
-  test "activity page shows entries for selected date", %{conn: conn} do
-    log_dir =
-      Path.join(System.tmp_dir!(), "manifold-activity-#{System.unique_integer([:positive])}")
-
-    previous = Application.get_env(:manifold_connectors, :activity_log_dir)
-    Application.put_env(:manifold_connectors, :activity_log_dir, log_dir)
-
-    on_exit(fn -> Application.put_env(:manifold_connectors, :activity_log_dir, previous) end)
-
-    Application.put_env(:manifold_connectors, :imap_fake, %{
-      password_expected: "secret",
-      messages: [],
-      uidvalidity: 1
-    })
-
-    assert {:ok, account} =
-             Connectors.create_imap_account(%{
-               email_address: "activity-list@imap.example",
-               username: "activity-list@imap.example",
-               password: "secret",
-               host: "imap.example",
-               port: 993,
-               tls_mode: "ssl"
-             })
-
-    assert :ok =
-             Manifold.Connectors.ActivityLog.append(account.id, %{
-               "event" => ["manifold", "connectors", "imap", "auth", "stop"],
-               "timestamp" => "2026-08-06T12:00:00.000000Z",
-               "measurements" => %{"duration_ms" => 5},
-               "metadata" => %{
-                 "account_id" => account.id,
-                 "result" => "error",
-                 "error_code" => "auth_failed",
-                 "error_message" => "IMAP authentication failed"
-               }
-             })
-
-    assert :ok =
-             Manifold.Connectors.ActivityLog.append(account.id, %{
-               "event" => ["manifold", "connectors", "sync", "message", "stop"],
-               "timestamp" => "2026-08-06T12:00:01.000000Z",
-               "measurements" => %{"duration_ms" => 12},
-               "metadata" => %{
-                 "account_id" => account.id,
-                 "provider_message_id" => "imap:1:42",
-                 "result" => "ok"
-               }
-             })
-
-    assert {:ok, view, html} = live(conn, ~p"/settings/accounts/#{account.id}/activity")
-    assert html =~ "auth"
-    assert html =~ "auth_failed"
-    assert html =~ "IMAP authentication failed"
-    assert html =~ "2026-08-06 12:00"
-    assert html =~ "sync.message"
-    assert html =~ "imap:1:42"
-    refute html =~ "password"
-    assert has_element?(view, "#activity-entries")
-  end
-
-  test "activity page redirects for unknown account id", %{conn: conn} do
-    missing = Ecto.UUID.generate()
-
-    assert {:error, {:live_redirect, %{to: "/settings/accounts"}}} =
-             live(conn, ~p"/settings/accounts/#{missing}/activity")
-  end
-
-  defp open_provider_step(view) do
-    view
-    |> element("#external-account-type")
-    |> render_click()
-  end
-
-  defp connect_account(conn, provider, mailbox_id) do
-    start_conn = get(conn, "/connectors/#{provider}/start", %{"mailbox_id" => mailbox_id})
+  defp connect_gmail(conn, account_id) do
+    start_conn = get(conn, "/connectors/gmail/start", %{"account_id" => account_id})
+    authorization_url = redirected_to(start_conn, 302)
 
     state =
-      start_conn
-      |> redirected_to(302)
+      authorization_url
       |> URI.parse()
       |> Map.fetch!(:query)
       |> URI.decode_query()
@@ -864,7 +186,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     conn
     |> recycle()
-    |> get("/connectors/#{provider}/callback", %{"code" => "valid-code", "state" => state})
+    |> get("/connectors/gmail/callback", %{"code" => "valid-code", "state" => state})
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)

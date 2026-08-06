@@ -1,11 +1,11 @@
 defmodule Manifold.Connectors.Schema.ImapSupportTest do
   use Manifold.DataCase, async: true
 
-  alias Manifold.Connectors.Schema.{Credential, ExternalAccount, ImapSettings}
+  alias Manifold.Connectors.Schema.{Credential, ReceiveMethod, ImapSettings}
 
   test "external account accepts imap provider" do
     changeset =
-      ExternalAccount.changeset(%ExternalAccount{}, %{
+      ReceiveMethod.changeset(%ReceiveMethod{}, %{
         mailbox_id: Ecto.UUID.generate(),
         provider: "imap",
         provider_account_id: "imap:user@example.com",

@@ -128,7 +128,7 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
     {:ok, domain} = Accounts.create_domain(%{name: "compose#{suffix}.test"})
 
     {:ok, mailbox} =
-      Accounts.create_mailbox(domain, %{local_part: "inbox", display_name: "Local Inbox"})
+      Accounts.create_account(domain, %{local_part: "inbox", name: "Local Inbox"})
 
     %{mailbox | domain: domain}
   end
@@ -200,7 +200,7 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
           message_id: message_id,
           kind: kind,
           position: position,
-          display_name: display_name,
+          name: display_name,
           address: address,
           canonical_address: String.downcase(address, :ascii),
           inserted_at: now,

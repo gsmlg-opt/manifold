@@ -20,7 +20,7 @@ defmodule Manifold.Connectors.SyncTest do
 
   alias Manifold.Connectors.Schema.{
     Credential,
-    ExternalAccount,
+    ReceiveMethod,
     RemoteMessage,
     SyncCursor
   }
@@ -138,7 +138,7 @@ defmodule Manifold.Connectors.SyncTest do
 
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "sync#{suffix}.test"})
-    {:ok, mailbox} = Accounts.create_mailbox(domain, %{local_part: "person"})
+    {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "person"})
 
     assert {:ok, account} =
              Connectors.complete_authorization(
@@ -311,7 +311,7 @@ defmodule Manifold.Connectors.SyncTest do
 
     assert {:snooze, 45} = Connectors.sync_account(account.id)
     assert Repo.get!(SyncCursor, cursor.id).committed_cursor == "100"
-    assert Repo.get!(ExternalAccount, account.id).last_error_code == "rate_limited"
+    assert Repo.get!(ReceiveMethod, account.id).last_error_code == "rate_limited"
   end
 
   test "folder discovery tombstones remove obsolete synchronization lanes", %{
@@ -532,7 +532,7 @@ defmodule Manifold.Connectors.SyncTest do
 
     assert :ok = Connectors.sync_account(account.id)
     refute Repo.get(SyncCursor, cursor.id)
-    assert Repo.get!(ExternalAccount, account.id).status == "connected"
+    assert Repo.get!(ReceiveMethod, account.id).status == "connected"
   end
 
   test "message deleted between listing and raw fetch checkpoints a tombstone", %{
@@ -581,7 +581,7 @@ defmodule Manifold.Connectors.SyncTest do
 
     assert {:cancel, :account_disconnected} = Connectors.sync_account(account.id)
 
-    persisted = Repo.get!(ExternalAccount, account.id)
+    persisted = Repo.get!(ReceiveMethod, account.id)
     assert persisted.status == "disconnected"
     refute persisted.sync_enabled
     assert is_nil(persisted.last_error_code)

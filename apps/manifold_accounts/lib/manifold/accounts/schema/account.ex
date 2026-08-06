@@ -1,4 +1,4 @@
-defmodule Manifold.Accounts.Schema.Mailbox do
+defmodule Manifold.Accounts.Schema.Account do
   @moduledoc false
 
   use Manifold.Accounts.Schema
@@ -7,7 +7,7 @@ defmodule Manifold.Accounts.Schema.Mailbox do
   schema "mailboxes" do
     field(:local_part, :string)
     field(:canonical_local_part, :string)
-    field(:display_name, :string)
+    field(:name, :string, source: :display_name)
     field(:active, :boolean, default: true)
     field(:plus_addressing_enabled, :boolean, default: true)
 
@@ -16,9 +16,9 @@ defmodule Manifold.Accounts.Schema.Mailbox do
     timestamps(type: :utc_datetime_usec)
   end
 
-  def changeset(mailbox, attrs) do
-    mailbox
-    |> cast(attrs, [:domain_id, :local_part, :display_name, :active, :plus_addressing_enabled])
+  def changeset(account, attrs) do
+    account
+    |> cast(attrs, [:domain_id, :local_part, :name, :active, :plus_addressing_enabled])
     |> validate_required([:domain_id, :local_part])
     |> validate_format(:local_part, ~r/^[A-Za-z0-9.!#$%&'*+\-\/=?^_`{|}~]+$/)
     |> put_canonical_local_part()
