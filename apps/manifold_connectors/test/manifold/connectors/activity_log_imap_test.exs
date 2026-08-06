@@ -74,6 +74,19 @@ defmodule Manifold.Connectors.ActivityLogImapTest do
              entries,
              &(&1["event"] == ["manifold", "connectors", "imap", "auth", "stop"])
            )
+
+    message_entries =
+      Enum.filter(
+        entries,
+        &(&1["event"] == ["manifold", "connectors", "sync", "message", "stop"])
+      )
+
+    assert [%{"metadata" => message_meta} | _] = message_entries
+    assert message_meta["result"] == "ok"
+    assert message_meta["account_id"] == account.id
+    assert message_meta["provider_message_id"] == "imap:3:1"
+    refute Map.has_key?(message_meta, "password")
+    refute Map.has_key?(message_meta, "bytes")
   end
 
   test "auth failure after account exists writes failure summary entry" do

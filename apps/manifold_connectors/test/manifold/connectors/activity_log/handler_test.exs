@@ -78,6 +78,29 @@ defmodule Manifold.Connectors.ActivityLog.HandlerTest do
     assert meta["error_code"] == "auth_failed"
   end
 
+  test "sync message stop appends per-message activity", %{account_id: account_id} do
+    :telemetry.execute(
+      [:manifold, :connectors, :sync, :message, :stop],
+      %{duration_ms: 42},
+      %{
+        account_id: account_id,
+        provider: "imap",
+        provider_message_id: "imap:3:9",
+        result: :ok,
+        password: "secret",
+        raw_body: "From: x\r\n\r\nsecret"
+      }
+    )
+
+    assert {:ok, [entry]} = ActivityLog.read(account_id, Date.utc_today())
+    assert entry["event"] == ["manifold", "connectors", "sync", "message", "stop"]
+    assert entry["measurements"]["duration_ms"] == 42
+    assert entry["metadata"]["provider_message_id"] == "imap:3:9"
+    assert entry["metadata"]["result"] == "ok"
+    refute Map.has_key?(entry["metadata"], "password")
+    refute Map.has_key?(entry["metadata"], "raw_body")
+  end
+
   defp restore(_key, nil), do: :ok
   defp restore(key, value), do: Application.put_env(:manifold_connectors, key, value)
 end

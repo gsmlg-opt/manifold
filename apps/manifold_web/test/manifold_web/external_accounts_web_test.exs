@@ -815,10 +815,25 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
                }
              })
 
+    assert :ok =
+             Manifold.Connectors.ActivityLog.append(account.id, %{
+               "event" => ["manifold", "connectors", "sync", "message", "stop"],
+               "timestamp" => "2026-08-06T12:00:01.000000Z",
+               "measurements" => %{"duration_ms" => 12},
+               "metadata" => %{
+                 "account_id" => account.id,
+                 "provider_message_id" => "imap:1:42",
+                 "result" => "ok"
+               }
+             })
+
     assert {:ok, view, html} = live(conn, ~p"/settings/accounts/#{account.id}/activity")
     assert html =~ "auth"
     assert html =~ "auth_failed"
     assert html =~ "IMAP authentication failed"
+    assert html =~ "2026-08-06 12:00"
+    assert html =~ "sync.message"
+    assert html =~ "imap:1:42"
     refute html =~ "password"
     assert has_element?(view, "#activity-entries")
   end
