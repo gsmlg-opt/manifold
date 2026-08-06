@@ -62,4 +62,66 @@ defmodule Manifold.Connectors.Provider.IMAPTest do
     assert {:ok, %{bytes: ^raw, folder_kind: "inbox"}} =
              IMAP.fetch_raw(password, "imap:3:1", config, [])
   end
+
+  test "retain_session reuses one connection for sync_page and fetch_raw" do
+    password = "secret"
+    raw1 = "Subject: one\r\n\r\nHi\r\n"
+    raw2 = "Subject: two\r\n\r\nYo\r\n"
+    {:ok, connect_count} = Agent.start_link(fn -> 0 end)
+
+    config = [
+      host: "fake",
+      port: 993,
+      tls_mode: "ssl",
+      username: "user@example.com",
+      mailbox_path: "INBOX",
+      transport: Fake,
+      page_size: 10,
+      fake: %{
+        password_expected: password,
+        uidvalidity: 3,
+        messages: [{1, raw1}, {2, raw2}],
+        connect_count: connect_count
+      }
+    ]
+
+    assert {:ok, [cursor]} = IMAP.initial_cursors(password, config, [])
+
+    assert {:ok, page} = IMAP.sync_page(password, cursor, config, retain_session: true)
+    assert length(page.messages) == 2
+    assert Agent.get(connect_count, & &1) == 1
+
+    assert {:ok, %{bytes: ^raw1}} = IMAP.fetch_raw(password, "imap:3:1", config, [])
+    assert {:ok, %{bytes: ^raw2}} = IMAP.fetch_raw(password, "imap:3:2", config, [])
+    assert Agent.get(connect_count, & &1) == 1
+
+    assert :ok = IMAP.release_session()
+    assert Agent.get(connect_count, & &1) == 1
+  after
+    IMAP.release_session()
+  end
+
+  test "standalone fetch_raw still connects when no retained session" do
+    password = "secret"
+    raw = "Subject: one\r\n\r\nHi\r\n"
+    {:ok, connect_count} = Agent.start_link(fn -> 0 end)
+
+    config = [
+      host: "fake",
+      port: 993,
+      tls_mode: "ssl",
+      username: "user@example.com",
+      mailbox_path: "INBOX",
+      transport: Fake,
+      fake: %{
+        password_expected: password,
+        uidvalidity: 3,
+        messages: [{1, raw}],
+        connect_count: connect_count
+      }
+    ]
+
+    assert {:ok, _} = IMAP.fetch_raw(password, "imap:3:1", config, [])
+    assert Agent.get(connect_count, & &1) == 1
+  end
 end

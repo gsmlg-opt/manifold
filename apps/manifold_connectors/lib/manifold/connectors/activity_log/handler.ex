@@ -8,7 +8,8 @@ defmodule Manifold.Connectors.ActivityLog.Handler do
     [:manifold, :connectors, :imap, :connect, :stop],
     [:manifold, :connectors, :imap, :auth, :stop],
     [:manifold, :connectors, :imap, :select, :stop],
-    [:manifold, :connectors, :sync, :stop]
+    [:manifold, :connectors, :sync, :stop],
+    [:manifold, :connectors, :sync, :message, :stop]
   ]
 
   @allowed_metadata [
@@ -20,6 +21,7 @@ defmodule Manifold.Connectors.ActivityLog.Handler do
     :mailbox_path,
     :uidvalidity,
     :provider,
+    :provider_message_id,
     :result,
     :error_code,
     :error_message
