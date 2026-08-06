@@ -6,7 +6,16 @@ defmodule Manifold.Mail.Projector do
   alias Manifold.Core.Error
   alias Manifold.Mail.HtmlSanitizer
   alias Manifold.Mail.Folders
-  alias Manifold.Mail.{HeaderProjection, InboundSource, ParsedMessage, Parser, ProjectionResult}
+  alias Manifold.Mail.Charset
+
+  alias Manifold.Mail.{
+    EncodedWord,
+    HeaderProjection,
+    InboundSource,
+    ParsedMessage,
+    Parser,
+    ProjectionResult
+  }
 
   alias Manifold.Mail.Schema.{
     Attachment,
@@ -157,6 +166,9 @@ defmodule Manifold.Mail.Projector do
         Application.get_env(:manifold_mail, :parse_max_heap_words, 16_000_000)
       )
 
+    # Warm charset tables in the parent before the bounded parser task starts.
+    _ = Charset.decode("utf-8", "")
+
     task =
       Task.Supervisor.async_nolink(Manifold.Mail.TaskSupervisor, fn ->
         Process.flag(:max_heap_size, %{size: max_heap_words, kill: true, error_logger: false})
@@ -198,7 +210,10 @@ defmodule Manifold.Mail.Projector do
       end
 
     %ParsedMessage{
-      subject: header_value(headers, "subject") || "(Unparseable message)",
+      subject:
+        headers
+        |> header_value("subject")
+        |> EncodedWord.decode() || "(Unparseable message)",
       rfc_message_id: header_value(headers, "message-id"),
       in_reply_to: header_value(headers, "in-reply-to"),
       references: reference_ids(header_value(headers, "references")),

@@ -61,7 +61,9 @@ config :manifold_storage,
   blob_store_dir: Path.expand("../priv/blob_store/#{config_env()}", __DIR__)
 
 config :manifold_mail,
-  parser_version: 1,
+  # Bumped for GB2312/GBK/GB18030 charset decoding (CP936) and RFC2047 fallback.
+  # v4 re-runs rows stamped earlier before EncodedWord fallback existed.
+  parser_version: 4,
   sanitizer_version: 1,
   max_raw_bytes: 25 * 1024 * 1024,
   max_header_bytes: 256 * 1024,
@@ -71,7 +73,7 @@ config :manifold_mail,
   max_decoded_bytes: 100 * 1024 * 1024,
   max_attachment_bytes: 50 * 1024 * 1024,
   parse_timeout_ms: 30_000,
-  parse_max_heap_words: 16_000_000
+  parse_max_heap_words: 64_000_000
 
 config :manifold_ingest,
   reconciler_enabled: config_env() != :test,
