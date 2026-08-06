@@ -4,6 +4,10 @@ defmodule Manifold.Connectors.Provider.IMAP do
 
   Auth material is the plaintext mailbox password. Bodies are fetched via
   `fetch_raw/4`; `sync_page/4` only enumerates UIDs.
+
+  Pass `retain_session: true` in provider opts so `sync_page/4` keeps the
+  IMAP connection open for subsequent `fetch_raw/4` calls in the same process.
+  Call `release_session/0` when the page is finished.
   """
 
   @behaviour Manifold.Connectors.Provider
@@ -20,6 +24,7 @@ defmodule Manifold.Connectors.Provider.IMAP do
   }
 
   @default_page_size 50
+  @session_key {__MODULE__, :session}
 
   @impl true
   def identity(_password, config, _opts) do
@@ -47,10 +52,11 @@ defmodule Manifold.Connectors.Provider.IMAP do
   end
 
   @impl true
-  def sync_page(password, %SyncCursor{} = cursor, config, _opts) do
+  def sync_page(password, %SyncCursor{} = cursor, config, opts) do
     transport = transport(config)
     mailbox_path = Keyword.get(config, :mailbox_path, cursor.scope || "INBOX")
     page_size = Keyword.get(config, :page_size, @default_page_size)
+    retain? = Keyword.get(opts, :retain_session, false)
 
     with {:ok, conn} <- transport.connect(settings(password, config)),
          {:ok, %{uidvalidity: uidvalidity}} <- transport.select(conn, mailbox_path),
@@ -98,7 +104,17 @@ defmodule Manifold.Connectors.Provider.IMAP do
         }
       }
 
-      transport.logout(conn)
+      if retain? do
+        put_session(%{
+          transport: transport,
+          conn: conn,
+          uidvalidity: uidvalidity,
+          mailbox_path: mailbox_path
+        })
+      else
+        transport.logout(conn)
+      end
+
       {:ok, page}
     else
       {:error, %Error{} = error} ->
@@ -108,6 +124,47 @@ defmodule Manifold.Connectors.Provider.IMAP do
 
   @impl true
   def fetch_raw(password, remote_message_id, config, _opts) do
+    case get_session() do
+      %{transport: transport, conn: conn, uidvalidity: selected_uv, mailbox_path: mailbox_path} ->
+        fetch_raw_on_session(transport, conn, selected_uv, mailbox_path, remote_message_id)
+
+      nil ->
+        fetch_raw_standalone(password, remote_message_id, config)
+    end
+  end
+
+  @doc """
+  Closes a process-local IMAP session retained by `sync_page/4`.
+  """
+  @spec release_session() :: :ok
+  def release_session do
+    case Process.delete(@session_key) do
+      %{transport: transport, conn: conn} ->
+        transport.logout(conn)
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp fetch_raw_on_session(transport, conn, selected_uv, mailbox_path, remote_message_id) do
+    with {:ok, uidvalidity, uid} <- parse_remote_id(remote_message_id),
+         :ok <- ensure_uidvalidity(uidvalidity, selected_uv),
+         {:ok, bytes} <- transport.uid_fetch_rfc822(conn, uid) do
+      {:ok,
+       %RawMessage{
+         bytes: bytes,
+         folder_id: mailbox_path,
+         folder_kind: "inbox"
+       }}
+    else
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp fetch_raw_standalone(password, remote_message_id, config) do
     transport = transport(config)
     mailbox_path = Keyword.get(config, :mailbox_path, "INBOX")
     settings = Map.put(settings(password, config), :emit_activity, false)
@@ -130,6 +187,10 @@ defmodule Manifold.Connectors.Provider.IMAP do
         {:error, error}
     end
   end
+
+  defp put_session(session), do: Process.put(@session_key, session)
+
+  defp get_session, do: Process.get(@session_key)
 
   defp transport(config), do: Keyword.get(config, :transport, Client)
 

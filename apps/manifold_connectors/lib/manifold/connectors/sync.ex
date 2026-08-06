@@ -66,24 +66,49 @@ defmodule Manifold.Connectors.Sync do
          {:ok, adapter, config} <- runtime(account.provider),
          {:ok, config} <- enrich_runtime_config(account, config),
          {:ok, auth} <-
-           auth_material(account, adapter, config, now, provider_opts(opts)),
-         {:ok, %Page{} = page} <-
-           sync_page(adapter, auth, cursor, config, provider_opts(opts)),
-         messages = collapse_messages(page.messages),
-         :ok <-
-           process_messages(
-             messages,
-             account,
-             adapter,
-             config,
-             auth,
-             now,
-             opts
-           ),
-         :ok <- maybe_fault(opts, :after_page_before_cursor),
-         {:ok, more?} <- checkpoint(account, cursor, page, now) do
-      outcome = if more?, do: {:snooze, 1}, else: :ok
-      {:ok, account.provider, length(messages), outcome}
+           auth_material(account, adapter, config, now, provider_opts(opts)) do
+      opts = prepare_provider_session(account, adapter, opts)
+
+      try do
+        with {:ok, %Page{} = page} <-
+               sync_page(adapter, auth, cursor, config, provider_opts(opts)),
+             messages = collapse_messages(page.messages),
+             :ok <-
+               process_messages(
+                 messages,
+                 account,
+                 adapter,
+                 config,
+                 auth,
+                 now,
+                 opts
+               ),
+             :ok <- maybe_fault(opts, :after_page_before_cursor),
+             {:ok, more?} <- checkpoint(account, cursor, page, now) do
+          outcome = if more?, do: {:snooze, 1}, else: :ok
+          {:ok, account.provider, length(messages), outcome}
+        else
+          {:error, {:cursor_provider_error, cursor, %ProviderError{} = error}} ->
+            {:error, "imap", error, handle_cursor_provider_error(account_id, cursor, error, now)}
+
+          {:error, %ProviderError{} = error} ->
+            {:error, account.provider, error, handle_provider_error(account_id, error, now)}
+
+          {:error, %Error{} = error} ->
+            {:error, account.provider, error, handle_core_error(account_id, error, now)}
+
+          {:error, reason} ->
+            error =
+              Error.new(:temporary, :sync_failed, "connector synchronization failed", %{
+                reason: inspect(reason)
+              })
+
+            record_failure(account_id, error.class, error.reason, error.message, now)
+            {:error, account.provider, error, {:error, error}}
+        end
+      after
+        release_provider_session(adapter)
+      end
     else
       {:error, {:cursor_provider_error, cursor, %ProviderError{} = error}} ->
         {:error, "imap", error, handle_cursor_provider_error(account_id, cursor, error, now)}
@@ -102,6 +127,29 @@ defmodule Manifold.Connectors.Sync do
 
         record_failure(account_id, error.class, error.reason, error.message, now)
         {:error, "unknown", error, {:error, error}}
+    end
+  end
+
+  defp prepare_provider_session(%ExternalAccount{provider: "imap"}, adapter, opts) do
+    if function_exported?(adapter, :release_session, 0) do
+      Keyword.update(
+        opts,
+        :provider_opts,
+        [retain_session: true],
+        &Keyword.put(&1, :retain_session, true)
+      )
+    else
+      opts
+    end
+  end
+
+  defp prepare_provider_session(_account, _adapter, opts), do: opts
+
+  defp release_provider_session(adapter) do
+    if function_exported?(adapter, :release_session, 0) do
+      adapter.release_session()
+    else
+      :ok
     end
   end
 
@@ -415,16 +463,93 @@ defmodule Manifold.Connectors.Sync do
   end
 
   defp import_remote_message(message, account, adapter, config, token, now, opts) do
+    start = System.monotonic_time()
+
     case adapter.fetch_raw(token, message.id, config, provider_opts(opts)) do
       {:ok, %RawMessage{} = raw} ->
-        import_raw_message(message, raw, account, now, opts)
+        case import_raw_message(message, raw, account, now, opts) do
+          :ok ->
+            emit_message_stop(account, message.id, start, :ok)
+            :ok
+
+          {:error, reason} = error ->
+            emit_message_stop(account, message.id, start, reason)
+            error
+        end
 
       {:error, %ProviderError{code: :not_found}} ->
-        upsert_remote_message(account, %{message | deleted?: true}, nil, "deleted", now)
+        case upsert_remote_message(account, %{message | deleted?: true}, nil, "deleted", now) do
+          :ok ->
+            emit_message_stop(account, message.id, start, :ok)
+            :ok
+
+          {:error, reason} = upsert_error ->
+            emit_message_stop(account, message.id, start, reason)
+            upsert_error
+        end
 
       {:error, %ProviderError{} = error} ->
+        emit_message_stop(account, message.id, start, error)
         {:error, error}
     end
+  end
+
+  defp emit_message_stop(account, provider_message_id, start, :ok) do
+    :telemetry.execute(
+      [:manifold, :connectors, :sync, :message, :stop],
+      %{duration_ms: duration_ms(start)},
+      %{
+        account_id: account.id,
+        provider: account.provider,
+        provider_message_id: provider_message_id,
+        result: :ok
+      }
+    )
+  end
+
+  defp emit_message_stop(account, provider_message_id, start, %ProviderError{} = error) do
+    :telemetry.execute(
+      [:manifold, :connectors, :sync, :message, :stop],
+      %{duration_ms: duration_ms(start)},
+      %{
+        account_id: account.id,
+        provider: account.provider,
+        provider_message_id: provider_message_id,
+        result: :error,
+        error_code: error.code,
+        error_message: error.message
+      }
+    )
+  end
+
+  defp emit_message_stop(account, provider_message_id, start, %Error{} = error) do
+    :telemetry.execute(
+      [:manifold, :connectors, :sync, :message, :stop],
+      %{duration_ms: duration_ms(start)},
+      %{
+        account_id: account.id,
+        provider: account.provider,
+        provider_message_id: provider_message_id,
+        result: :error,
+        error_code: error.reason,
+        error_message: error.message
+      }
+    )
+  end
+
+  defp emit_message_stop(account, provider_message_id, start, reason) do
+    :telemetry.execute(
+      [:manifold, :connectors, :sync, :message, :stop],
+      %{duration_ms: duration_ms(start)},
+      %{
+        account_id: account.id,
+        provider: account.provider,
+        provider_message_id: provider_message_id,
+        result: :error,
+        error_code: :sync_message_failed,
+        error_message: inspect(reason)
+      }
+    )
   end
 
   defp import_raw_message(message, raw, account, now, opts) do

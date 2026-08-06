@@ -154,7 +154,9 @@ config :codepagex,
     :iso_8859_14,
     :iso_8859_15,
     :iso_8859_16,
-    "VENDORS/MICSFT/WINDOWS/CP1252"
+    "VENDORS/MICSFT/WINDOWS/CP1252",
+    # GB2312 / GBK / commonly-labeled GB18030 email bodies (QQ Exmail, etc.)
+    "VENDORS/MICSFT/WINDOWS/CP936"
   ]
 
 config :duskmoon_bundler,

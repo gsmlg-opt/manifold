@@ -7,6 +7,7 @@ defmodule Manifold.Connectors.IMAP.Fake do
 
   @impl true
   def connect(settings) when is_map(settings) do
+    bump_connect_count(settings)
     connect_start = System.monotonic_time()
     base_meta = base_meta(settings)
 
@@ -92,6 +93,13 @@ defmodule Manifold.Connectors.IMAP.Fake do
   def logout(conn) when is_pid(conn) do
     Agent.stop(conn)
     :ok
+  end
+
+  defp bump_connect_count(settings) do
+    case Map.get(settings, :connect_count) do
+      counter when is_pid(counter) -> Agent.update(counter, &(&1 + 1))
+      _ -> :ok
+    end
   end
 
   defp base_meta(settings) do

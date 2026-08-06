@@ -241,6 +241,43 @@ defmodule Manifold.Mail.ParserTest do
     assert Enum.find(parsed.headers, &(&1.normalized_name == "x-long")).value == "first second"
   end
 
+  test "decodes GB2312 encoded-word subject and base64 GBK body" do
+    # Subject "日报" as =?gb2312?B?yNWxqA==?=
+    # Body "你好" GBK bytes C4 E3 BA C3, base64 xOO6ww==
+    raw =
+      message("""
+      From: =?gb2312?B?uN/KwMP3?= <sender@example.test>
+      To: inbox@example.test
+      Subject: =?gb2312?B?yNWxqA==?=
+      Content-Type: text/plain; charset=gb2312
+      Content-Transfer-Encoding: base64
+
+      xOO6ww==
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.subject == "日报"
+    assert parsed.text_body == "你好"
+    assert hd(parsed.from).name == "高世明"
+  end
+
+  test "decodes quoted-printable UTF-8 body without mojibake" do
+    raw =
+      message("""
+      From: sender@example.net
+      To: inbox@example.test
+      Subject: =?UTF-8?Q?=E4=B8=96=E7=95=8C?=
+      Content-Type: text/plain; charset=utf-8
+      Content-Transfer-Encoding: quoted-printable
+
+      Ol=C3=A1, =E4=B8=96=E7=95=8C
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.subject == "世界"
+    assert parsed.text_body == "Olá, 世界"
+  end
+
   test "returns classified failures for malformed messages and enforced limits" do
     assert {:error, %{reason: :invalid_headers}} = Parser.parse("not-a-header\r\n\r\nbody")
 
