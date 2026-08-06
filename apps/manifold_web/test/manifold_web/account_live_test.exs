@@ -23,36 +23,45 @@ defmodule ManifoldWeb.AccountLiveTest do
     assert Accounts.account_address(account) == "alice@example.test"
   end
 
-  test "account show lists receive methods and allows placeholder", %{conn: conn} do
+  test "account show lists receive methods and can remove one", %{conn: conn} do
     {:ok, account} =
       Accounts.create_account(%{name: "Bob", address: "bob@example.test"})
+
+    {:ok, method} =
+      Connectors.create_placeholder_receive_method(account.id, "pop3")
 
     {:ok, show_view, html} = live(conn, ~p"/settings/accounts/#{account.id}")
     assert html =~ "bob@example.test"
     assert html =~ ~p"/settings/accounts/#{account.id}/receive_methods/new"
     assert html =~ ~p"/settings/accounts/#{account.id}/send_methods/new"
+    assert html =~ "POP3"
     assert html =~ "No send methods configured."
 
-    {:ok, new_view, _html} =
+    {:ok, new_view, html} =
       show_view
       |> element("#add-receive-method")
       |> render_click()
       |> follow_redirect(conn, ~p"/settings/accounts/#{account.id}/receive_methods/new")
 
+    refute html =~ ~s(phx-value-kind="pop3")
+    refute html =~ ~s(phx-value-kind="ews")
+    assert html =~ ~s(phx-value-kind="imap")
+    assert html =~ ~s(phx-value-kind="eas")
+
     {:ok, show_view, html} =
       new_view
-      |> element("button[phx-value-kind='pop3']")
+      |> element("a", "Cancel")
       |> render_click()
       |> follow_redirect(conn, ~p"/settings/accounts/#{account.id}")
 
     assert html =~ "POP3"
-    assert html =~ "Not_implemented"
-    assert render(show_view) =~ "POP3"
 
-    methods = Connectors.list_receive_methods_for_account(account.id)
-    assert length(methods) == 1
-    assert hd(methods).kind == "pop3"
-    refute hd(methods).enabled
+    show_view
+    |> element("#receive-method-#{method.id} button[phx-click=remove]")
+    |> render_click()
+
+    assert Connectors.list_receive_methods_for_account(account.id) == []
+    refute render(show_view) =~ "POP3"
   end
 
   test "account show can add smtp send method", %{conn: conn} do

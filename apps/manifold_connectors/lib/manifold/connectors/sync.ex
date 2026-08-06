@@ -1013,6 +1013,7 @@ defmodule Manifold.Connectors.Sync do
            host: settings.host,
            port: settings.port,
            path: settings.path,
+           domain: settings.domain,
            username: settings.username,
            device_id: settings.device_id,
            device_type: settings.device_type,

@@ -12,6 +12,7 @@ defmodule Manifold.Connectors.EAS.Transport do
           required(:device_id) => String.t(),
           required(:device_type) => String.t(),
           required(:protocol_version) => String.t(),
+          optional(:domain) => String.t() | nil,
           optional(:policy_key) => String.t() | nil,
           optional(:account_id) => String.t(),
           optional(:emit_activity) => boolean()

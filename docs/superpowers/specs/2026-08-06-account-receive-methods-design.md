@@ -15,7 +15,9 @@ Settings exposes **Accounts** only (name + email address). Domains are derived a
 
 - `/settings/accounts` — list accounts
 - `/settings/accounts/new` — create with name + address
-- `/settings/accounts/:id` — manage receive methods (add / enable / sync / disconnect)
+- `/settings/accounts/:id` — manage receive methods (add / enable / sync / disconnect / remove)
+- Add receive method offers only implemented kinds (`gmail`, `microsoft`, `imap`, `eas`);
+  `pop3` / `ews` placeholders are not creatable from the UI
 - Removed: `/domains`, `/aliases`, `/mailboxes` settings pages
 
 ## Recipient resolution

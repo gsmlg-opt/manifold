@@ -591,6 +591,48 @@ defmodule Manifold.Connectors do
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
+  @spec delete_receive_method(Ecto.UUID.t()) ::
+          {:ok, ReceiveMethod.t()} | {:error, Error.t()}
+  def delete_receive_method(method_id) do
+    Multi.new()
+    |> Multi.run(:method, fn repo, _changes ->
+      method =
+        ReceiveMethod
+        |> where([method], method.id == ^method_id)
+        |> lock("FOR UPDATE")
+        |> repo.one()
+
+      case method do
+        nil ->
+          {:error, Error.new(:permanent, :account_not_found, "receive method not found")}
+
+        %ReceiveMethod{} = method ->
+          {:ok, method}
+      end
+    end)
+    |> Multi.run(:cancel_jobs, fn repo, %{method: method} ->
+      {_count, _} =
+        Oban.Job
+        |> where([job], job.worker == ^inspect(SyncAccount))
+        |> where([job], job.state in ~w(available scheduled retryable suspended))
+        |> where(
+          [job],
+          fragment("?->>'external_account_id' = ?", job.args, ^method.id)
+        )
+        |> repo.delete_all()
+
+      {:ok, true}
+    end)
+    |> Multi.delete(:deleted, fn %{method: method} -> method end)
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{deleted: method}} -> {:ok, method}
+      {:error, _step, reason, _changes} -> {:error, reason}
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
   @doc false
   @spec sync_account(Ecto.UUID.t(), Keyword.t()) ::
           :ok | {:snooze, pos_integer()} | {:cancel, atom()} | {:error, term()}
@@ -996,12 +1038,62 @@ defmodule Manifold.Connectors do
   end
 
   defp discover_eas(settings) when is_map(settings) do
+    case do_discover_eas(settings) do
+      {:ok, _} = ok ->
+        ok
+
+      {:error, error} = first ->
+        if EASClient.gateway_html_400_error?(error) do
+          discover_eas_with_fallbacks(settings, error)
+        else
+          first
+        end
+    end
+  end
+
+  defp discover_eas_with_fallbacks(settings, original_error) do
+    # Re-run full connect/provision/FolderSync with QQ-friendly shapes.
+    # Version-only FolderSync retries are not enough after a bad Provision.
+    strategies = [
+      %{force_protocol_version: "14.0", prefer_base64_query: false, force_query_mode: :plain},
+      %{
+        force_protocol_version: "14.0",
+        prefer_base64_query: false,
+        force_query_mode: :plain,
+        skip_provision: true
+      },
+      %{force_protocol_version: "14.0", prefer_base64_query: true, force_query_mode: :base64},
+      %{
+        force_protocol_version: "14.0",
+        prefer_base64_query: true,
+        force_query_mode: :base64,
+        skip_provision: true
+      },
+      %{force_protocol_version: "12.1", prefer_base64_query: false, force_query_mode: :plain},
+      %{
+        force_protocol_version: "12.1",
+        prefer_base64_query: false,
+        force_query_mode: :plain,
+        skip_provision: true
+      }
+    ]
+
+    Enum.reduce_while(strategies, {:error, original_error}, fn strategy, acc ->
+      case do_discover_eas(Map.merge(settings, strategy)) do
+        {:ok, result} -> {:halt, {:ok, result}}
+        {:error, _} -> {:cont, acc}
+      end
+    end)
+  end
+
+  defp do_discover_eas(settings) when is_map(settings) do
     transport = eas_transport()
+    skip_provision? = Map.get(settings, :skip_provision) == true
 
     with {:ok, conn} <- transport.connect(settings),
-         {:ok, conn, %{policy_key: policy_key}} <- transport.provision(conn),
+         {:ok, conn, policy_key} <- discover_eas_provision(transport, conn, skip_provision?),
          {:ok, conn, %{sync_key: folder_sync_key, folders: folders}} <-
-           transport.folder_sync(conn, "0") do
+           discover_eas_folder_sync(transport, conn, skip_provision?) do
       collection_id = EASClient.inbox_collection_id(folders)
       transport.close(conn)
 
@@ -1011,7 +1103,9 @@ defmodule Manifold.Connectors do
            policy_key: policy_key,
            folder_sync_key: folder_sync_key,
            collection_id: collection_id,
-           device_id: settings.device_id
+           device_id: settings.device_id,
+           protocol_version:
+             Map.get(settings, :force_protocol_version) || settings.protocol_version
          }}
       else
         {:error,
@@ -1023,6 +1117,38 @@ defmodule Manifold.Connectors do
       end
     else
       {:error, %ProviderError{} = error} -> {:error, error}
+    end
+  end
+
+  defp discover_eas_provision(transport, conn, false) do
+    case transport.provision(conn) do
+      {:ok, conn, %{policy_key: policy_key}} -> {:ok, conn, policy_key}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp discover_eas_provision(_transport, conn, true) do
+    policy_key =
+      case conn do
+        %{policy_key: key} when is_binary(key) and key != "" -> key
+        _ -> "0"
+      end
+
+    {:ok, conn, policy_key}
+  end
+
+  defp discover_eas_folder_sync(transport, conn, skip_provision?) do
+    case transport.folder_sync(conn, "0") do
+      {:ok, _, _} = ok ->
+        ok
+
+      {:error, %ProviderError{code: :provision_required}} when skip_provision? ->
+        with {:ok, conn, _} <- transport.provision(conn) do
+          transport.folder_sync(conn, "0")
+        end
+
+      {:error, _} = error ->
+        error
     end
   end
 
@@ -1056,6 +1182,7 @@ defmodule Manifold.Connectors do
   defp eas_settings_from_attrs(attrs) do
     host = attr(attrs, :host)
     username = attr(attrs, :username) || attr(attrs, :email_address)
+    domain = blank_to_nil(attr(attrs, :domain))
     password = attr(attrs, :password)
     path = attr(attrs, :path) || EasSettings.default_path()
     port = parse_port(attr(attrs, :port) || 443)
@@ -1081,6 +1208,7 @@ defmodule Manifold.Connectors do
           host: host,
           port: port,
           path: path,
+          domain: domain,
           username: username,
           password: password,
           device_id: device_id,
@@ -1104,6 +1232,7 @@ defmodule Manifold.Connectors do
     |> maybe_put_trimmed(:username)
     |> maybe_put_trimmed(:email_address)
     |> maybe_put_trimmed(:path)
+    |> maybe_put_trimmed(:domain)
     |> maybe_put_password_without_spaces()
     |> maybe_put_normalized_port()
     |> maybe_put_device_id()
@@ -1120,7 +1249,9 @@ defmodule Manifold.Connectors do
   end
 
   defp generate_eas_device_id do
-    Ecto.UUID.generate() |> String.replace("-", "") |> String.slice(0, 32)
+    # MS-ASHTTP device IDs are typically 32 hex chars. Fake "Appl…" prefixes
+    # do not help against gateways that fingerprint TLS/UA (e.g. QQ Exmail).
+    :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
   end
 
   defp eas_provider_config(attrs, discovered) do
@@ -1128,11 +1259,14 @@ defmodule Manifold.Connectors do
       host: attr(attrs, :host),
       port: parse_port(attr(attrs, :port) || 443),
       path: attr(attrs, :path) || EasSettings.default_path(),
+      domain: blank_to_nil(attr(attrs, :domain)),
       username: attr(attrs, :username) || attr(attrs, :email_address),
       email_address: attr(attrs, :email_address),
       device_id: attr(attrs, :device_id) || discovered.device_id,
       device_type: attr(attrs, :device_type) || EasSettings.default_device_type(),
-      protocol_version: attr(attrs, :protocol_version) || EasSettings.default_protocol_version(),
+      protocol_version:
+        Map.get(discovered, :protocol_version) || attr(attrs, :protocol_version) ||
+          EasSettings.default_protocol_version(),
       policy_key: discovered.policy_key,
       collection_id: discovered.collection_id,
       folder_sync_key: discovered.folder_sync_key,
@@ -1143,12 +1277,16 @@ defmodule Manifold.Connectors do
   defp persist_eas_account(attrs, parsed, provider_account_id, mailbox, cursors, discovered, now) do
     password = attr(attrs, :password)
     username = attr(attrs, :username) || parsed.canonical
+    domain = blank_to_nil(attr(attrs, :domain))
     host = attr(attrs, :host)
     port = parse_port(attr(attrs, :port) || 443)
     path = attr(attrs, :path) || EasSettings.default_path()
     device_id = attr(attrs, :device_id) || discovered.device_id
     device_type = attr(attrs, :device_type) || EasSettings.default_device_type()
-    protocol_version = attr(attrs, :protocol_version) || EasSettings.default_protocol_version()
+
+    protocol_version =
+      Map.get(discovered, :protocol_version) || attr(attrs, :protocol_version) ||
+        EasSettings.default_protocol_version()
 
     Multi.new()
     |> Multi.run(:disable_others, fn repo, _changes ->
@@ -1186,6 +1324,7 @@ defmodule Manifold.Connectors do
         host: host,
         port: port,
         path: path,
+        domain: domain,
         username: username,
         device_id: device_id,
         device_type: device_type,
@@ -1315,6 +1454,18 @@ defmodule Manifold.Connectors do
       _ -> attrs
     end
   end
+
+  defp blank_to_nil(nil), do: nil
+  defp blank_to_nil(""), do: nil
+
+  defp blank_to_nil(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp blank_to_nil(_), do: nil
 
   defp maybe_put_password_without_spaces(attrs) do
     case attr(attrs, :password) do

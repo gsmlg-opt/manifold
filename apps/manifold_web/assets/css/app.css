@@ -501,7 +501,8 @@ code {
 
 .mailbox-setup-form,
 #account-form,
-#imap-account-form {
+#imap-account-form,
+#eas-account-form {
   display: grid;
   max-width: 560px;
   gap: 7px;
@@ -510,13 +511,18 @@ code {
 
 .mailbox-setup-form label,
 #account-form label,
-#imap-account-form label {
+#imap-account-form label,
+#eas-account-form label {
+  display: grid;
+  gap: 4px;
   color: var(--color-on-surface);
   font-size: 13px;
   font-weight: 700;
 }
 
-.mailbox-setup-form label span {
+.mailbox-setup-form label span,
+#imap-account-form label span,
+#eas-account-form label span {
   color: var(--color-on-surface-variant);
   font-weight: 500;
 }
@@ -525,7 +531,8 @@ code {
 .mailbox-setup-form select,
 #account-form input,
 #imap-account-form input,
-#imap-account-form select {
+#imap-account-form select,
+#eas-account-form input {
   width: 100%;
   min-width: 0;
   min-height: 42px;
@@ -540,7 +547,8 @@ code {
 .mailbox-setup-form select:focus,
 #account-form input:focus,
 #imap-account-form input:focus,
-#imap-account-form select:focus {
+#imap-account-form select:focus,
+#eas-account-form input:focus {
   border-color: var(--color-primary);
   outline: 2px solid color-mix(in oklch, var(--color-primary) 55%, transparent);
   outline-offset: 1px;
@@ -548,7 +556,8 @@ code {
 
 .mailbox-setup-form .settings-action,
 #account-form .settings-action,
-#imap-account-form .settings-action {
+#imap-account-form .settings-action,
+#eas-account-form .settings-action {
   width: fit-content;
   margin-top: 9px;
 }

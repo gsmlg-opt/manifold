@@ -55,6 +55,24 @@ defmodule Manifold.Connectors.EasAccountTest do
     assert settings.username == "DOMAIN\\reader"
     assert settings.policy_key == "12345"
     assert byte_size(settings.device_id) == 32
+    assert settings.device_id =~ ~r/^[0-9a-f]{32}$/
+    assert settings.domain == nil
+  end
+
+  test "create_eas_account stores optional domain" do
+    assert {:ok, account} =
+             Connectors.create_eas_account(%{
+               email_address: "reader@eas-domain.example",
+               username: "reader",
+               domain: "CORP",
+               password: "secret",
+               host: "mail.eas.example",
+               port: 443
+             })
+
+    settings = Repo.get_by!(EasSettings, external_account_id: account.id)
+    assert settings.domain == "CORP"
+    assert settings.username == "reader"
   end
 
   test "create_eas_account trims host and username whitespace" do

@@ -296,7 +296,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert Connectors.list_receive_methods_for_account(account.id) == []
   end
 
-  test "account show can disconnect receive method", %{conn: conn, account: account} do
+  test "account show can disconnect and remove receive method", %{conn: conn, account: account} do
     connect_gmail(conn, account.id)
 
     {:ok, view, _html} = live(conn, ~p"/settings/accounts/#{account.id}")
@@ -309,6 +309,12 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     assert [%{status: "disconnected", enabled: false}] =
              Connectors.list_receive_methods_for_account(account.id)
+
+    view
+    |> element("#receive-method-#{method.id} button[phx-click=remove]")
+    |> render_click()
+
+    assert Connectors.list_receive_methods_for_account(account.id) == []
   end
 
   defp connect_gmail(conn, account_id) do

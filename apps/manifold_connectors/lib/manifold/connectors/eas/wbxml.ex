@@ -78,7 +78,51 @@ defmodule Manifold.Connectors.EAS.WBXML do
       "Data" => 0x0A,
       "Status" => 0x0B,
       "RemoteWipe" => 0x0C,
-      "EASProvisionDoc" => 0x0D
+      "EASProvisionDoc" => 0x0D,
+      "DevicePasswordEnabled" => 0x0E,
+      "AlphanumericDevicePasswordRequired" => 0x0F,
+      "PasswordRecoveryEnabled" => 0x10,
+      "RequireStorageCardEncryption" => 0x11,
+      "AttachmentsEnabled" => 0x12,
+      "MinDevicePasswordLength" => 0x13,
+      "MaxInactivityTimeDeviceLock" => 0x14,
+      "MaxDevicePasswordFailedAttempts" => 0x15,
+      "MaxAttachmentSize" => 0x16,
+      "AllowSimpleDevicePassword" => 0x17,
+      "DevicePasswordExpiration" => 0x18,
+      "DevicePasswordHistory" => 0x19,
+      "AllowStorageCard" => 0x1A,
+      "AllowCamera" => 0x1B,
+      "RequireDeviceEncryption" => 0x1C,
+      "AllowUnsignedApplications" => 0x1D,
+      "AllowUnsignedInstallationPackages" => 0x1E,
+      "MinDevicePasswordComplexCharacters" => 0x1F,
+      "AllowWiFi" => 0x20,
+      "AllowTextMessaging" => 0x21,
+      "AllowPOPIMAPEmail" => 0x22,
+      "AllowBluetooth" => 0x23,
+      "AllowIrDA" => 0x24,
+      "RequireManualSyncWhenRoaming" => 0x25,
+      "AllowDesktopSync" => 0x26,
+      "MaxCalendarAgeFilter" => 0x27,
+      "AllowHTMLEmail" => 0x28,
+      "MaxEmailAgeFilter" => 0x29,
+      "MaxEmailBodyTruncationSize" => 0x2A,
+      "MaxEmailHTMLBodyTruncationSize" => 0x2B,
+      "RequireSignedSMIMEMessages" => 0x2C,
+      "RequireEncryptedSMIMEMessages" => 0x2D,
+      "RequireSignedSMIMEAlgorithm" => 0x2E,
+      "RequireEncryptionSMIMEAlgorithm" => 0x2F,
+      "AllowSMIMEEncryptionAlgorithmNegotiation" => 0x30,
+      "AllowSMIMESoftCerts" => 0x31,
+      "AllowBrowser" => 0x32,
+      "AllowConsumerEmail" => 0x33,
+      "AllowRemoteDesktop" => 0x34,
+      "AllowInternetSharing" => 0x35,
+      "UnapprovedInROMApplicationList" => 0x36,
+      "ApplicationName" => 0x37,
+      "ApprovedApplicationList" => 0x38,
+      "Hash" => 0x39
     },
     17 => %{
       "BodyPreference" => 0x05,
@@ -90,6 +134,23 @@ defmodule Manifold.Connectors.EAS.WBXML do
       "EstimatedDataSize" => 0x0C,
       "Truncated" => 0x0D,
       "NativeBodyType" => 0x16
+    },
+    # Code page 18: Settings (DeviceInformation lives here; required in Provision for 14.1).
+    18 => %{
+      "Settings" => 0x05,
+      "Status" => 0x06,
+      "Get" => 0x07,
+      "Set" => 0x08,
+      "DeviceInformation" => 0x16,
+      "Model" => 0x17,
+      "IMEI" => 0x18,
+      "FriendlyName" => 0x19,
+      "OS" => 0x1A,
+      "OSLanguage" => 0x1B,
+      "PhoneNumber" => 0x1C,
+      "UserAgent" => 0x20,
+      "EnableOutboundSMS" => 0x21,
+      "MobileOperator" => 0x22
     },
     20 => %{
       "ItemOperations" => 0x05,
@@ -127,10 +188,15 @@ defmodule Manifold.Connectors.EAS.WBXML do
   end
 
   @spec decode(binary()) :: {:ok, node_t()} | {:error, :invalid_wbxml}
-  def decode(<<0x03, _public, _charset, 0x00, rest::binary>>) do
-    case decode_nodes(rest, 0, []) do
-      {:ok, [root], _rest, _page} -> {:ok, root}
-      {:ok, [root | _], _rest, _page} -> {:ok, root}
+  def decode(<<0x03, rest::binary>>) do
+    with {:ok, _public_id, rest} <- decode_mb_u_int32(rest),
+         {:ok, _charset, rest} <- decode_mb_u_int32(rest),
+         {:ok, string_table_len, rest} <- decode_mb_u_int32(rest),
+         true <- byte_size(rest) >= string_table_len,
+         <<_string_table::binary-size(string_table_len), body::binary>> <- rest,
+         {:ok, [root | _], _rest, _page} <- decode_nodes(body, 0, []) do
+      {:ok, root}
+    else
       _ -> {:error, :invalid_wbxml}
     end
   end
@@ -255,28 +321,51 @@ defmodule Manifold.Connectors.EAS.WBXML do
   end
 
   defp decode_nodes(<<token, rest::binary>>, page, acc) when token >= 0x05 do
+    has_attrs? = band(token, 0x80) != 0
     has_content? = band(token, 0x40) != 0
     tag_token = band(token, 0x3F)
+    name = Map.get(@page_by_token[page] || %{}, tag_token) || "_u#{tag_token}"
 
-    case Map.get(@page_by_token[page] || %{}, tag_token) do
-      nil ->
-        {:error, :invalid_wbxml}
+    with {:ok, rest} <- maybe_skip_attributes(rest, has_attrs?) do
+      cond do
+        not has_content? ->
+          decode_nodes(rest, page, [{page, name, :empty} | acc])
 
-      name when not has_content? ->
-        decode_nodes(rest, page, [{page, name, :empty} | acc])
+        true ->
+          case decode_nodes(rest, page, []) do
+            {:ok, children, rest, page_after} ->
+              decode_nodes(rest, page_after, [{page, name, children} | acc])
 
-      name ->
-        case decode_nodes(rest, page, []) do
-          {:ok, children, rest, page_after} ->
-            decode_nodes(rest, page_after, [{page, name, children} | acc])
-
-          error ->
-            error
-        end
+            error ->
+              error
+          end
+      end
     end
   end
 
   defp decode_nodes(_, _, _), do: {:error, :invalid_wbxml}
+
+  # ActiveSync does not use attributes; skip them if a nonconformant server sends any.
+  defp maybe_skip_attributes(rest, false), do: {:ok, rest}
+
+  defp maybe_skip_attributes(rest, true) do
+    case skip_attributes(rest) do
+      {:ok, rest} -> {:ok, rest}
+      :error -> {:error, :invalid_wbxml}
+    end
+  end
+
+  defp skip_attributes(<<@end_tag, rest::binary>>), do: {:ok, rest}
+  defp skip_attributes(<<>>), do: :error
+
+  defp skip_attributes(<<@str_i, rest::binary>>) do
+    case :binary.split(rest, <<0>>) do
+      [_str, rest] -> skip_attributes(rest)
+      _ -> :error
+    end
+  end
+
+  defp skip_attributes(<<_byte, rest::binary>>), do: skip_attributes(rest)
 
   defp decode_mb_u_int32(bin), do: decode_mb_u_int32(bin, 0, 0)
 

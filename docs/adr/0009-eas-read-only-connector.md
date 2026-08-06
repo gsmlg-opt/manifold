@@ -20,10 +20,19 @@ Extend `manifold_connectors` with `provider = "eas"`:
 - Password credentials encrypted with the existing `Manifold.Connectors.Crypto`
   AES-GCM envelopes (`secret_kind = "password"`).
 - Per-account EAS settings (`host`, `port`, `path` defaulting to
-  `/Microsoft-Server-ActiveSync`, `username`, stable `device_id` /
-  `device_type`, `protocol_version` defaulting to `14.1`, and `policy_key`
-  after Provision).
+  `/Microsoft-Server-ActiveSync`, optional `domain`, `username`, stable
+  `device_id` / phone-like `device_type`, `protocol_version` defaulting to
+  `14.0`, and `policy_key` after Provision). When `domain` is set, Basic Auth
+  uses `DOMAIN\\username` while the `User` query parameter keeps the username.
 - Basic Auth over HTTPS with TLS certificate verification on by default.
+  Clients negotiate `MS-ASProtocolVersions` from OPTIONS and fall back on HTTP
+  400 (common for unsupported protocol versions). Per MS-ASPROV, protocol
+  **14.1+** Provision includes Settings `DeviceInformation`; **14.0/12.x**
+  MUST NOT put DeviceInformation in Provision and use the Settings command
+  instead (QQ Exmail documents 14.0 only). Request query shape follows Apple
+  Mail (`User`/`DeviceId`/`DeviceType`/`Cmd`, `Appl…` DeviceId, unencoded `@`
+  in User). QQ hosts prefer MS-ASHTTP base64 query; gateway HTML 400 retries
+  the other encoding and discover re-runs with 14.0 / skip-Provision.
 - Inbox **content** synchronization via Provision → FolderSync → Sync →
   ItemOperations Fetch (MIME) into `Ingest.import_external` with
   `source_kind = "provider_import"` (no delete/move/send write-back).

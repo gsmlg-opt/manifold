@@ -64,6 +64,19 @@ defmodule ManifoldWeb.AccountLive.Show do
     end
   end
 
+  def handle_event("remove", %{"id" => method_id}, socket) do
+    case Connectors.delete_receive_method(method_id) do
+      {:ok, _} ->
+        {:noreply,
+         socket
+         |> refresh_methods()
+         |> put_flash(:info, "Receive method removed.")}
+
+      {:error, _} ->
+        {:noreply, put_flash(socket, :error, "Could not remove receive method.")}
+    end
+  end
+
   def handle_event("enable-send", %{"id" => method_id}, socket) do
     case Connectors.enable_send_method(method_id) do
       {:ok, _} ->
@@ -183,6 +196,16 @@ defmodule ManifoldWeb.AccountLive.Show do
                     title="Disconnect"
                   >
                     <.dm_mdi name="link-off" />
+                  </button>
+                  <button
+                    type="button"
+                    class="settings-icon-button settings-icon-button-danger"
+                    phx-click="remove"
+                    phx-value-id={method.id}
+                    data-confirm="Remove this receive method permanently?"
+                    title="Remove"
+                  >
+                    <.dm_mdi name="delete-outline" />
                   </button>
                 </div>
               </td>

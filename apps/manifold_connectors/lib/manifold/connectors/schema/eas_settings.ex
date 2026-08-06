@@ -5,14 +5,19 @@ defmodule Manifold.Connectors.Schema.EasSettings do
   import Ecto.Changeset
 
   @default_path "/Microsoft-Server-ActiveSync"
-  @default_device_type "Manifold"
-  @default_protocol_version "14.1"
+  # Many ActiveSync gateways (including consumer/enterprise SaaS) expect a
+  # phone-like DeviceType rather than a custom product name.
+  @default_device_type "iPhone"
+  # QQ Exmail officially documents 14.0; 14.1 DeviceInformation-in-Provision
+  # is rejected by their nginx gateway on subsequent FolderSync.
+  @default_protocol_version "14.0"
 
   schema "connector_eas_settings" do
     field(:external_account_id, :binary_id)
     field(:host, :string)
     field(:port, :integer)
     field(:path, :string, default: @default_path)
+    field(:domain, :string)
     field(:username, :string)
     field(:device_id, :string)
     field(:device_type, :string, default: @default_device_type)
@@ -39,12 +44,14 @@ defmodule Manifold.Connectors.Schema.EasSettings do
       :host,
       :port,
       :path,
+      :domain,
       :username,
       :device_id,
       :device_type,
       :protocol_version,
       :policy_key
     ])
+    |> update_change(:domain, &blank_to_nil/1)
     |> validate_required([
       :external_account_id,
       :host,
@@ -58,6 +65,7 @@ defmodule Manifold.Connectors.Schema.EasSettings do
     |> validate_number(:port, greater_than: 0, less_than_or_equal_to: 65_535)
     |> validate_length(:host, min: 1, max: 253)
     |> validate_length(:path, min: 1, max: 255)
+    |> validate_length(:domain, max: 255)
     |> validate_length(:username, min: 1, max: 320)
     |> validate_length(:device_id, min: 1, max: 32)
     |> validate_length(:device_type, min: 1, max: 32)
@@ -65,4 +73,15 @@ defmodule Manifold.Connectors.Schema.EasSettings do
     |> validate_length(:policy_key, max: 64)
     |> unique_constraint(:external_account_id)
   end
+
+  defp blank_to_nil(nil), do: nil
+
+  defp blank_to_nil(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp blank_to_nil(value), do: value
 end

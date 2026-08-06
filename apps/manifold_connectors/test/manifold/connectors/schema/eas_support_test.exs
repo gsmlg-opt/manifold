@@ -28,14 +28,32 @@ defmodule Manifold.Connectors.Schema.EasSupportTest do
         host: "mail.example.com",
         port: 443,
         path: "/Microsoft-Server-ActiveSync",
-        username: "DOMAIN\\user",
-        device_id: String.duplicate("a", 32),
-        device_type: "Manifold",
+        domain: "CORP",
+        username: "user",
+        device_id: String.duplicate("a", 16),
+        device_type: "iPhone",
         protocol_version: "14.1",
         policy_key: "12345"
       })
 
     assert good.valid?
+    assert Ecto.Changeset.get_change(good, :domain) == "CORP"
+
+    blank_domain =
+      EasSettings.changeset(%EasSettings{}, %{
+        external_account_id: Ecto.UUID.generate(),
+        host: "mail.example.com",
+        port: 443,
+        path: "/Microsoft-Server-ActiveSync",
+        domain: "  ",
+        username: "user",
+        device_id: "abc123",
+        device_type: "iPhone",
+        protocol_version: "14.1"
+      })
+
+    assert blank_domain.valid?
+    assert Ecto.Changeset.get_change(blank_domain, :domain) == nil
 
     bad =
       EasSettings.changeset(%EasSettings{}, %{
@@ -45,7 +63,7 @@ defmodule Manifold.Connectors.Schema.EasSupportTest do
         path: "/Microsoft-Server-ActiveSync",
         username: "user",
         device_id: "abc",
-        device_type: "Manifold",
+        device_type: "iPhone",
         protocol_version: "14.1"
       })
 

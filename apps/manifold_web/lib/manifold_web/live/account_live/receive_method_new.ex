@@ -38,7 +38,7 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
 
   @impl Phoenix.LiveView
   def handle_event("choose-kind", %{"kind" => kind}, socket)
-      when kind in ["gmail", "microsoft", "imap", "pop3", "eas", "ews"] do
+      when kind in ["gmail", "microsoft", "imap", "eas"] do
     cond do
       kind in ["gmail", "microsoft"] ->
         if kind in socket.assigns.configured_providers do
@@ -66,18 +66,6 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
            eas_error: nil,
            eas_notice: nil
          )}
-
-      true ->
-        case Connectors.create_placeholder_receive_method(socket.assigns.account.id, kind) do
-          {:ok, _method} ->
-            {:noreply,
-             socket
-             |> put_flash(:info, "#{kind_label(kind)} placeholder added (not implemented yet).")
-             |> push_navigate(to: ~p"/settings/accounts/#{socket.assigns.account.id}")}
-
-          {:error, _} ->
-            {:noreply, put_flash(socket, :error, "Could not add #{kind_label(kind)}.")}
-        end
     end
   end
 
@@ -281,8 +269,7 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
         <div>
           <h1>Add receive method</h1>
           <p class="settings-intro">
-            Connect a source that imports mail into {@account.name || @account.local_part}
-            ({@address}).
+            Connect a source that imports mail into {@account.name || @account.local_part} ({@address}).
           </p>
         </div>
         <div class="settings-heading-actions">
@@ -303,7 +290,7 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
 
           <div class="add-account-choices">
             <button
-              :for={kind <- ~w(gmail microsoft imap pop3 eas ews)}
+              :for={kind <- ~w(gmail microsoft imap eas)}
               type="button"
               class="add-account-choice"
               phx-click="choose-kind"
@@ -366,11 +353,21 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
             </label>
             <label>
               Host
-              <input type="text" name={@imap_form[:host].name} value={@imap_form[:host].value} required />
+              <input
+                type="text"
+                name={@imap_form[:host].name}
+                value={@imap_form[:host].value}
+                required
+              />
             </label>
             <label>
               Port
-              <input type="number" name={@imap_form[:port].name} value={@imap_form[:port].value} required />
+              <input
+                type="number"
+                name={@imap_form[:port].name}
+                value={@imap_form[:port].value}
+                required
+              />
             </label>
             <label>
               TLS mode
@@ -440,6 +437,11 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
           </div>
           <p :if={@eas_error} class="settings-error">{@eas_error}</p>
           <p :if={@eas_notice} class="settings-success">{@eas_notice}</p>
+          <p class="settings-hint">
+            For Tencent Exmail (ex.exmail.qq.com), prefer IMAP receive method
+            (imap.exmail.qq.com:993). Their ActiveSync gateway typically rejects
+            non-phone clients with HTTP 400.
+          </p>
           <.form
             for={@eas_form}
             id="eas-account-form"
@@ -457,20 +459,30 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
             </label>
             <label>
               Host
+              <span class="settings-hint">Server hostname (e.g. ex.exmail.qq.com). Not Domain.</span>
               <input type="text" name={@eas_form[:host].name} value={@eas_form[:host].value} required />
             </label>
             <label>
               Port
-              <input type="number" name={@eas_form[:port].name} value={@eas_form[:port].value} required />
+              <input
+                type="number"
+                name={@eas_form[:port].name}
+                value={@eas_form[:port].value}
+                required
+              />
             </label>
             <label>
-              Path
-              <span class="settings-hint">Usually /Microsoft-Server-ActiveSync</span>
+              Path <span class="settings-hint">Usually /Microsoft-Server-ActiveSync</span>
               <input type="text" name={@eas_form[:path].name} value={@eas_form[:path].value} required />
             </label>
             <label>
+              Domain
+              <span class="settings-hint">Optional. Used as DOMAIN\\user for Basic Auth when set.</span>
+              <input type="text" name={@eas_form[:domain].name} value={@eas_form[:domain].value} />
+            </label>
+            <label>
               Username
-              <span class="settings-hint">May be DOMAIN\\user or user@domain</span>
+              <span class="settings-hint">Email or DOMAIN\\user (domain field preferred when separate)</span>
               <input
                 type="text"
                 name={@eas_form[:username].name}
@@ -547,6 +559,7 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
       "host" => form[:host].value,
       "port" => form[:port].value,
       "path" => form[:path].value,
+      "domain" => form[:domain].value,
       "username" => form[:username].value,
       "password" => form[:password].value
     }
@@ -577,6 +590,7 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
         "host" => "",
         "port" => "443",
         "path" => "/Microsoft-Server-ActiveSync",
+        "domain" => "",
         "username" => address,
         "password" => ""
       },
@@ -587,17 +601,13 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
   defp kind_label("gmail"), do: "Gmail"
   defp kind_label("microsoft"), do: "Microsoft Graph"
   defp kind_label("imap"), do: "IMAP"
-  defp kind_label("pop3"), do: "POP3"
   defp kind_label("eas"), do: "EAS"
-  defp kind_label("ews"), do: "EWS"
   defp kind_label(kind), do: kind
 
   defp kind_icon("gmail"), do: "gmail"
   defp kind_icon("microsoft"), do: "microsoft"
   defp kind_icon("imap"), do: "email-outline"
-  defp kind_icon("pop3"), do: "inbox-arrow-down-outline"
   defp kind_icon("eas"), do: "cellphone-link"
-  defp kind_icon("ews"), do: "microsoft-outlook"
   defp kind_icon(_), do: "email-outline"
 
   defp kind_description("gmail", configured) do
@@ -615,8 +625,6 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
   defp kind_description("eas", _configured),
     do: "Exchange ActiveSync — host, username, and password"
 
-  defp kind_description("pop3", _configured), do: "Placeholder — not implemented yet"
-  defp kind_description("ews", _configured), do: "Placeholder — not implemented yet"
   defp kind_description(_, _), do: ""
 
   defp format_error(%Error{message: message}), do: message

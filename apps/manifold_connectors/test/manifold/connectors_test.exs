@@ -216,6 +216,26 @@ defmodule Manifold.ConnectorsTest do
              Connectors.enqueue_sync(account.id)
   end
 
+  test "delete_receive_method removes the method and pending sync jobs", %{mailbox: mailbox} do
+    assert {:ok, account} =
+             Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
+
+    assert {:ok, _job} = Connectors.enqueue_sync(account.id)
+
+    assert {:ok, deleted} = Connectors.delete_receive_method(account.id)
+    assert deleted.id == account.id
+    assert is_nil(Repo.get(ReceiveMethod, account.id))
+
+    assert Repo.aggregate(
+             from(job in Oban.Job,
+               where:
+                 job.worker == ^inspect(SyncAccount) and
+                   fragment("?->>'external_account_id' = ?", job.args, ^account.id)
+             ),
+             :count
+           ) == 0
+  end
+
   test "provider message IDs are case-sensitive", %{mailbox: mailbox} do
     assert {:ok, account} =
              Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
@@ -238,10 +258,11 @@ defmodule Manifold.ConnectorsTest do
     assert :ok = PollAccounts.perform(%Oban.Job{args: %{}})
 
     query =
-      from job in Oban.Job,
+      from(job in Oban.Job,
         where:
           job.worker == ^inspect(SyncAccount) and
             fragment("?->>'external_account_id' = ?", job.args, ^account.id)
+      )
 
     assert Repo.aggregate(query, :count) == 1
 
