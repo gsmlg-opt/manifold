@@ -696,6 +696,7 @@ defmodule Manifold.Connectors.Sync do
            tls_mode: settings.tls_mode,
            username: settings.username,
            mailbox_path: settings.mailbox_path,
+           account_id: account.id,
            transport: transport,
            fake: if(is_map(fake), do: fake, else: %{})
          )}

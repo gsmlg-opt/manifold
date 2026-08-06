@@ -17,29 +17,71 @@ defmodule Manifold.Connectors.IMAP.Client do
     tls_mode = Map.fetch!(settings, :tls_mode)
     username = settings |> Map.fetch!(:username) |> normalize_text()
     password = Map.fetch!(settings, :password)
+    base_meta = imap_base_meta(settings, host, port, tls_mode)
+
+    connect_start = System.monotonic_time()
 
     with {:ok, host} <- require_host(host),
          {:ok, port} <- require_port(port),
-         {:ok, conn} <- open_and_greet_safe(host, port, tls_mode),
-         {:ok, conn} <-
-           command(conn, "LOGIN #{quote_string(username)} #{quote_string(password)}", auth: true) do
-      put_conn(conn)
-      {:ok, conn}
+         {:ok, conn} <- open_and_greet_safe(host, port, tls_mode) do
+      emit_imap([:manifold, :connectors, :imap, :connect, :stop], connect_start, base_meta, :ok)
+      Process.put({__MODULE__, :activity_meta}, base_meta)
+
+      auth_start = System.monotonic_time()
+      auth_meta = Map.put(base_meta, :username, username)
+
+      case command(conn, "LOGIN #{quote_string(username)} #{quote_string(password)}", auth: true) do
+        {:ok, conn} ->
+          emit_imap([:manifold, :connectors, :imap, :auth, :stop], auth_start, auth_meta, :ok)
+          put_conn(conn)
+          {:ok, conn}
+
+        {:error, %Error{} = error} ->
+          emit_imap([:manifold, :connectors, :imap, :auth, :stop], auth_start, auth_meta, error)
+          {:error, error}
+      end
     else
       {:error, %Error{} = error} ->
+        emit_imap(
+          [:manifold, :connectors, :imap, :connect, :stop],
+          connect_start,
+          base_meta,
+          error
+        )
+
         {:error, error}
 
       {:error, :timeout} ->
-        {:error, %Error{class: :temporary, code: :timeout, message: "IMAP connection timed out"}}
+        error = %Error{class: :temporary, code: :timeout, message: "IMAP connection timed out"}
+
+        emit_imap(
+          [:manifold, :connectors, :imap, :connect, :stop],
+          connect_start,
+          base_meta,
+          error
+        )
+
+        {:error, error}
 
       {:error, reason} ->
-        {:error, connect_failed_error(reason)}
+        error = connect_failed_error(reason)
+
+        emit_imap(
+          [:manifold, :connectors, :imap, :connect, :stop],
+          connect_start,
+          base_meta,
+          error
+        )
+
+        {:error, error}
     end
   end
 
   @impl true
   def select(conn, mailbox_path) when is_binary(mailbox_path) do
     conn = get_conn(conn)
+    start = System.monotonic_time()
+    meta = Map.put(imap_conn_meta(conn), :mailbox_path, mailbox_path)
 
     case command(conn, "SELECT #{quote_mailbox(mailbox_path)}") do
       {:ok, conn, lines} ->
@@ -47,13 +89,22 @@ defmodule Manifold.Connectors.IMAP.Client do
 
         case parse_uidvalidity(lines) do
           {:ok, uidvalidity} ->
+            emit_imap(
+              [:manifold, :connectors, :imap, :select, :stop],
+              start,
+              Map.put(meta, :uidvalidity, uidvalidity),
+              :ok
+            )
+
             {:ok, %{uidvalidity: uidvalidity, uidnext: parse_uidnext(lines)}}
 
-          {:error, _} = error ->
-            error
+          {:error, %Error{} = error} ->
+            emit_imap([:manifold, :connectors, :imap, :select, :stop], start, meta, error)
+            {:error, error}
         end
 
       {:error, %Error{} = error} ->
+        emit_imap([:manifold, :connectors, :imap, :select, :stop], start, meta, error)
         {:error, error}
     end
   end
@@ -92,6 +143,7 @@ defmodule Manifold.Connectors.IMAP.Client do
     _ = command(conn, "LOGOUT")
     close_socket(conn.socket)
     delete_conn()
+    Process.delete({__MODULE__, :activity_meta})
     :ok
   end
 
@@ -426,4 +478,37 @@ defmodule Manifold.Connectors.IMAP.Client do
   defp get_conn(%__MODULE__{} = conn), do: Process.get({__MODULE__, :conn}, conn)
   defp get_conn(other), do: Process.get({__MODULE__, :conn}, other)
   defp delete_conn, do: Process.delete({__MODULE__, :conn})
+
+  defp imap_base_meta(settings, host, port, tls_mode) do
+    %{host: host, port: port, tls_mode: tls_mode, provider: "imap"}
+    |> then(fn m ->
+      case Map.get(settings, :account_id) do
+        id when is_binary(id) -> Map.put(m, :account_id, id)
+        _ -> m
+      end
+    end)
+  end
+
+  defp imap_conn_meta(_conn) do
+    Process.get({__MODULE__, :activity_meta}, %{provider: "imap"})
+  end
+
+  defp emit_imap(event, start, meta, :ok) do
+    :telemetry.execute(event, %{duration_ms: duration_ms(start)}, Map.put(meta, :result, :ok))
+  end
+
+  defp emit_imap(event, start, meta, %Error{} = error) do
+    :telemetry.execute(
+      event,
+      %{duration_ms: duration_ms(start)},
+      meta
+      |> Map.put(:result, :error)
+      |> Map.put(:error_code, error.code)
+      |> Map.put(:error_message, error.message)
+    )
+  end
+
+  defp duration_ms(start) do
+    System.convert_time_unit(System.monotonic_time() - start, :native, :millisecond)
+  end
 end

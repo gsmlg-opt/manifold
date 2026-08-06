@@ -142,6 +142,12 @@ defmodule Manifold.Connectors.Provider.IMAP do
       mailbox_path: Keyword.get(config, :mailbox_path, "INBOX")
     }
 
+    base =
+      case Keyword.get(config, :account_id) do
+        id when is_binary(id) -> Map.put(base, :account_id, id)
+        _ -> base
+      end
+
     case Keyword.get(config, :fake) do
       %{} = fake -> Map.merge(base, fake)
       _ -> base
