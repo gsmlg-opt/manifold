@@ -35,7 +35,7 @@ WORKDIR /app
 ENV MIX_ENV=prod
 ENV RELEASE_NAME=${RELEASE}
 
-# Build-only placeholders; real secrets must be provided at runtime.
+# Build-only placeholders for prod config evaluation (builder stage only).
 ENV SECRET_KEY_BASE=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ENV MANIFOLD_CONNECTOR_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 

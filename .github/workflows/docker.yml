@@ -12,6 +12,29 @@ on:
         required: true
         default: "main"
         type: string
+      update_release_notes:
+        description: "Append Docker image tags to the GitHub release notes"
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      version:
+        description: "Image version (e.g. 0.2.0)"
+        required: true
+        type: string
+      git_ref:
+        description: "Git ref to build from"
+        required: true
+        type: string
+      update_release_notes:
+        description: "Append Docker image tags to the GitHub release notes"
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      GHCR_TOKEN:
+        required: true
   release:
     types: [published]
 
@@ -46,10 +69,12 @@ jobs:
             TAG="${{ github.event.release.tag_name }}"
             VERSION="${TAG#v}"
             REF="$TAG"
+            UPDATE_NOTES=true
           else
             VERSION="${{ inputs.version }}"
             VERSION="${VERSION#v}"
             REF="${{ inputs.git_ref }}"
+            UPDATE_NOTES="${{ inputs.update_release_notes }}"
           fi
 
           if [ -z "$VERSION" ]; then
@@ -59,6 +84,7 @@ jobs:
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "update_notes=$UPDATE_NOTES" >> "$GITHUB_OUTPUT"
           echo "image=${{ env.REGISTRY }}/gsmlg-dev/${{ matrix.image_name }}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
@@ -102,14 +128,23 @@ jobs:
   update-release-notes:
     name: Update release notes
     needs: build
-    if: github.event_name == 'release'
+    if: >-
+      github.event_name == 'release' ||
+      inputs.update_release_notes == true ||
+      inputs.update_release_notes == 'true'
     runs-on: ubuntu-latest
 
     steps:
       - name: Resolve version
         id: meta
         run: |
-          TAG="${{ github.event.release.tag_name }}"
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            VERSION="${{ inputs.version }}"
+            VERSION="${VERSION#v}"
+            TAG="v${VERSION}"
+          fi
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"

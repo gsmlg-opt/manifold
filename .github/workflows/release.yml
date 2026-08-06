@@ -123,3 +123,14 @@ jobs:
             --title "v${RELEASE_VERSION}" \
             manifold-${RELEASE_VERSION}.tar.gz \
             manifold-edge-${RELEASE_VERSION}.tar.gz
+
+  docker:
+    name: Docker images
+    needs: release
+    uses: ./.github/workflows/docker.yml
+    with:
+      version: ${{ inputs.version }}
+      git_ref: v${{ inputs.version }}
+      update_release_notes: true
+    secrets:
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
