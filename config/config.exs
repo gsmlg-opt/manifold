@@ -35,6 +35,8 @@ config :manifold_connectors,
     gmail: Manifold.Connectors.Provider.Gmail,
     microsoft: Manifold.Connectors.Provider.MicrosoftGraph
   ],
+  activity_log_dir: "log/connectors",
+  activity_log_retention_days: 14,
   providers: [
     gmail: [
       authorization_url: "https://accounts.google.com/o/oauth2/v2/auth",

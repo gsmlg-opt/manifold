@@ -14,6 +14,8 @@ config :manifold_data, Oban, testing: :manual, queues: false, plugins: false
 
 config :manifold_connectors,
   encryption_key: "A/6Bm4le6HQiXyh+gE1NQr2+RLEcEpZ/JSPBt4y1Lrk=",
+  activity_log_dir: Path.expand("../tmp/test_activity_logs", __DIR__),
+  activity_log_retention_days: 14,
   providers: [
     gmail: [
       authorization_url: "https://accounts.google.invalid/authorize",

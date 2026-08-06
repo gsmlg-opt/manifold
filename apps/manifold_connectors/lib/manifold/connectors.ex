@@ -7,6 +7,7 @@ defmodule Manifold.Connectors do
 
   alias Ecto.Multi
   alias Manifold.Accounts
+  alias Manifold.Connectors.ActivityLog
   alias Manifold.Connectors.Crypto
   alias Manifold.Connectors.IMAP.Client
   alias Manifold.Connectors.Jobs.SyncAccount
@@ -167,6 +168,14 @@ defmodule Manifold.Connectors do
   rescue
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
+
+  @spec list_activity_dates(Ecto.UUID.t()) :: {:ok, [Date.t()]} | {:error, :invalid_account_id}
+  def list_activity_dates(account_id), do: ActivityLog.list_dates(account_id)
+
+  @spec read_activity(Ecto.UUID.t(), Date.t(), pos_integer()) ::
+          {:ok, [map()]} | {:error, :invalid_account_id}
+  def read_activity(account_id, date, limit \\ 200),
+    do: ActivityLog.read(account_id, date, limit)
 
   @spec enqueue_sync(Ecto.UUID.t()) :: {:ok, Oban.Job.t()} | {:error, Error.t() | term()}
   def enqueue_sync(account_id) do
