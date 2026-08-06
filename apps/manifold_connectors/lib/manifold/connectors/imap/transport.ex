@@ -18,6 +18,17 @@ defmodule Manifold.Connectors.IMAP.Transport do
               | {:error, Manifold.Connectors.Provider.Error.t()}
   @callback uid_search(conn(), String.t()) ::
               {:ok, [pos_integer()]} | {:error, Manifold.Connectors.Provider.Error.t()}
+  @callback uid_fetch_flags(conn(), [pos_integer()]) ::
+              {:ok,
+               %{
+                 optional(pos_integer()) => %{
+                   flags: [String.t()],
+                   received_at: DateTime.t() | nil
+                 }
+               }}
+              | {:error, Manifold.Connectors.Provider.Error.t()}
+  @callback uid_store_flags(conn(), pos_integer(), :add | :remove, [String.t()]) ::
+              :ok | {:error, Manifold.Connectors.Provider.Error.t()}
   @callback uid_fetch_rfc822(conn(), pos_integer()) ::
               {:ok, binary()} | {:error, Manifold.Connectors.Provider.Error.t()}
   @callback logout(conn()) :: :ok

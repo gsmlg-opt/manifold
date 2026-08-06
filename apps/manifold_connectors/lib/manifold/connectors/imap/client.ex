@@ -125,6 +125,38 @@ defmodule Manifold.Connectors.IMAP.Client do
   end
 
   @impl true
+  def uid_fetch_flags(_conn, []), do: {:ok, %{}}
+
+  def uid_fetch_flags(conn, uids) when is_list(uids) do
+    conn = get_conn(conn)
+    set = Enum.map_join(uids, ",", &Integer.to_string/1)
+
+    case command(conn, "UID FETCH #{set} (FLAGS INTERNALDATE)") do
+      {:ok, conn, lines} ->
+        put_conn(conn)
+        parse_flags_response(lines)
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  @impl true
+  def uid_store_flags(conn, uid, op, flags)
+      when is_integer(uid) and op in [:add, :remove] and is_list(flags) do
+    conn = get_conn(conn)
+
+    case command(conn, store_flags_command(uid, op, flags)) do
+      {:ok, conn, _lines} ->
+        put_conn(conn)
+        :ok
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  @impl true
   def uid_fetch_rfc822(conn, uid) when is_integer(uid) do
     conn = get_conn(conn)
 
@@ -193,6 +225,70 @@ defmodule Manifold.Connectors.IMAP.Client do
   end
 
   @doc false
+  def parse_flags_response(lines) when is_list(lines) do
+    meta_by_uid =
+      Enum.reduce(lines, %{}, fn line, acc ->
+        case parse_fetch_flags_line(String.trim(line)) do
+          {:ok, uid, meta} -> Map.put(acc, uid, meta)
+          :error -> acc
+        end
+      end)
+
+    {:ok, meta_by_uid}
+  end
+
+  @doc false
+  def parse_internal_date(nil), do: {:ok, nil}
+
+  def parse_internal_date(value) when is_binary(value) do
+    value = value |> String.trim() |> String.trim("\"")
+
+    case Regex.run(
+           ~r/^(\d{1,2})-([A-Za-z]{3})-(\d{4}) (\d{2}):(\d{2}):(\d{2}) ([+-]\d{4})$/,
+           value
+         ) do
+      [_, day, mon, year, hour, minute, second, offset] ->
+        with {:ok, month} <- imap_month(mon),
+             {:ok, naive} <-
+               NaiveDateTime.new(
+                 String.to_integer(year),
+                 month,
+                 String.to_integer(day),
+                 String.to_integer(hour),
+                 String.to_integer(minute),
+                 String.to_integer(second)
+               ) do
+          utc =
+            naive
+            |> DateTime.from_naive!("Etc/UTC")
+            |> DateTime.add(-offset_seconds(offset), :second)
+            |> Map.put(:microsecond, {0, 6})
+
+          {:ok, utc}
+        else
+          _ -> {:ok, nil}
+        end
+
+      nil ->
+        {:ok, nil}
+    end
+  end
+
+  def parse_internal_date(_value), do: {:ok, nil}
+
+  @doc false
+  def seen?(flags) when is_list(flags) do
+    Enum.any?(flags, fn flag -> String.downcase(flag) == "\\seen" end)
+  end
+
+  @doc false
+  def store_flags_command(uid, op, flags)
+      when is_integer(uid) and op in [:add, :remove] and is_list(flags) do
+    prefix = if(op == :add, do: "+FLAGS", else: "-FLAGS")
+    "UID STORE #{uid} #{prefix} (#{Enum.join(flags, " ")})"
+  end
+
+  @doc false
   def extract_rfc822(lines) when is_list(lines) do
     blob = Enum.join(lines, "\r\n")
 
@@ -212,6 +308,65 @@ defmodule Manifold.Connectors.IMAP.Client do
         {:error,
          %Error{class: :temporary, code: :fetch_parse_failed, message: "RFC822 parse failed"}}
     end
+  end
+
+  defp parse_fetch_flags_line(line) do
+    with [_ | _] <- Regex.run(~r/^\* \d+ FETCH \(/i, line),
+         [_, uid_str] <- Regex.run(~r/\bUID (\d+)\b/i, line) do
+      flags =
+        case Regex.run(~r/\bFLAGS \(([^)]*)\)/i, line) do
+          [_, flags_body] ->
+            flags_body
+            |> String.split(~r/\s+/, trim: true)
+            |> Enum.reject(&(&1 == ""))
+
+          nil ->
+            []
+        end
+
+      received_at =
+        case Regex.run(~r/\bINTERNALDATE "([^"]+)"/i, line) do
+          [_, date] ->
+            case parse_internal_date(date) do
+              {:ok, %DateTime{} = dt} -> dt
+              _ -> nil
+            end
+
+          nil ->
+            nil
+        end
+
+      {:ok, String.to_integer(uid_str), %{flags: flags, received_at: received_at}}
+    else
+      _ -> :error
+    end
+  end
+
+  defp imap_month(mon) do
+    Map.fetch(
+      %{
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12
+      },
+      String.downcase(mon)
+    )
+  end
+
+  defp offset_seconds(<<sign::binary-size(1), hh::binary-size(2), mm::binary-size(2)>>) do
+    hours = String.to_integer(hh)
+    minutes = String.to_integer(mm)
+    seconds = hours * 3600 + minutes * 60
+    if sign == "-", do: -seconds, else: seconds
   end
 
   # --- Socket / protocol ---
@@ -239,7 +394,8 @@ defmodule Manifold.Connectors.IMAP.Client do
   @doc false
   def open_and_greet_for_test(host, port, tls_mode), do: open_and_greet_safe(host, port, tls_mode)
 
-  defp open_and_greet(host, port, "ssl") when is_binary(host) and is_integer(port) do
+  defp open_and_greet(host, port, tls_mode)
+       when tls_mode in ["ssl", "tls"] and is_binary(host) and is_integer(port) do
     host_charlist = String.to_charlist(host)
 
     with {:ok, socket} <-

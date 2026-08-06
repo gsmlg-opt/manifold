@@ -27,6 +27,27 @@ defmodule Manifold.Connectors.ImapAccountTest do
     :ok
   end
 
+  test "create_imap_account stores tls mode and strips spaces from password" do
+    Application.put_env(:manifold_connectors, :imap_fake, %{
+      password_expected: "abcdefghijklmnop",
+      messages: [],
+      uidvalidity: 1
+    })
+
+    assert {:ok, account} =
+             Connectors.create_imap_account(%{
+               email_address: "reader@imap.example",
+               username: "reader@imap.example",
+               password: "abcd efgh ijkl mnop",
+               host: "imap.example",
+               port: 993,
+               tls_mode: "tls"
+             })
+
+    settings = Repo.get_by!(ImapSettings, external_account_id: account.id)
+    assert settings.tls_mode == "tls"
+  end
+
   test "create_imap_account auto-creates mailbox and stores password credential" do
     assert {:ok, account} =
              Connectors.create_imap_account(%{
@@ -35,7 +56,7 @@ defmodule Manifold.Connectors.ImapAccountTest do
                password: "secret",
                host: "imap.example",
                port: 993,
-               tls_mode: "ssl"
+               tls_mode: "tls"
              })
 
     assert account.kind == "imap"
@@ -61,7 +82,7 @@ defmodule Manifold.Connectors.ImapAccountTest do
                password: "secret",
                host: " imap.example ",
                port: "993",
-               tls_mode: "ssl"
+               tls_mode: "tls"
              })
 
     settings = Repo.get_by!(ImapSettings, external_account_id: account.id)
@@ -81,7 +102,7 @@ defmodule Manifold.Connectors.ImapAccountTest do
                password: "wrong",
                host: "imap.example",
                port: 993,
-               tls_mode: "ssl"
+               tls_mode: "tls"
              })
 
     assert Repo.aggregate(ReceiveMethod, :count) == before
@@ -94,6 +115,18 @@ defmodule Manifold.Connectors.ImapAccountTest do
                username: "reader@imap.example",
                password: "secret",
                host: "",
+               port: 993,
+               tls_mode: "tls"
+             })
+  end
+
+  test "test_imap_connection still accepts legacy ssl tls_mode" do
+    assert :ok =
+             Connectors.test_imap_connection(%{
+               email_address: "reader@imap.example",
+               username: "reader@imap.example",
+               password: "secret",
+               host: "imap.example",
                port: 993,
                tls_mode: "ssl"
              })

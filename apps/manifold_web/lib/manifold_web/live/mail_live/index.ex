@@ -4,6 +4,7 @@ defmodule ManifoldWeb.MailLive.Index do
   import ManifoldWeb.MailComponents
 
   alias Manifold.Accounts
+  alias Manifold.Connectors
   alias Manifold.Mail
   alias Manifold.Outbound
   alias ManifoldWeb.MailNotifier
@@ -26,6 +27,7 @@ defmodule ManifoldWeb.MailLive.Index do
        draft_params: nil,
        sent_detail: nil,
        query: "",
+       unread_only: false,
        after_cursor: nil,
        subscribed_mailbox_id: nil
      )}
@@ -53,6 +55,7 @@ defmodule ManifoldWeb.MailLive.Index do
            draft_params: nil,
            sent_detail: nil,
            query: "",
+           unread_only: false,
            after_cursor: nil
          )}
 
@@ -72,6 +75,7 @@ defmodule ManifoldWeb.MailLive.Index do
            draft_params: draft_form_params(loaded.draft),
            sent_detail: loaded.sent_detail,
            query: loaded.query,
+           unread_only: loaded.unread_only,
            after_cursor: loaded.after_cursor
          )}
 
@@ -88,7 +92,23 @@ defmodule ManifoldWeb.MailLive.Index do
     {:noreply,
      push_patch(socket,
        to:
-         ~p"/mail/#{socket.assigns.mailbox.id}/folders/#{socket.assigns.folder.id}?#{[q: String.trim(query)]}"
+         folder_path(socket.assigns.mailbox.id, socket.assigns.folder.id,
+           q: String.trim(query),
+           unread: unread_param(socket.assigns.unread_only)
+         )
+     )}
+  end
+
+  def handle_event("toggle-unread-filter", _params, socket) do
+    unread_only = not socket.assigns.unread_only
+
+    {:noreply,
+     push_patch(socket,
+       to:
+         folder_path(socket.assigns.mailbox.id, socket.assigns.folder.id,
+           q: socket.assigns.query,
+           unread: unread_param(unread_only)
+         )
      )}
   end
 
@@ -102,6 +122,26 @@ defmodule ManifoldWeb.MailLive.Index do
 
       _other ->
         {:noreply, put_flash(socket, :error, "Mailbox is unavailable.")}
+    end
+  end
+
+  def handle_event("sync", _params, %{assigns: %{mailbox: mailbox}} = socket)
+      when not is_nil(mailbox) do
+    method =
+      mailbox.id
+      |> Connectors.list_receive_methods_for_account()
+      |> Enum.find(&(&1.enabled and &1.sync_enabled))
+
+    case method && Connectors.enqueue_sync(method.id) do
+      {:ok, _job} ->
+        {:noreply, put_flash(socket, :info, "Synchronization queued.")}
+
+      nil ->
+        {:noreply,
+         put_flash(socket, :error, "No enabled receive method is available to synchronize.")}
+
+      {:error, _reason} ->
+        {:noreply, put_flash(socket, :error, "Synchronization could not be queued.")}
     end
   end
 
@@ -214,16 +254,6 @@ defmodule ManifoldWeb.MailLive.Index do
   def handle_event("restore", %{"entry-id" => entry_id}, socket),
     do: move_and_return(socket, fn -> Mail.restore(socket.assigns.mailbox.id, [entry_id]) end)
 
-  def handle_event("move", %{"folder_id" => ""}, socket), do: {:noreply, socket}
-
-  def handle_event(
-        "move",
-        %{"entry_id" => entry_id, "folder_id" => folder_id},
-        socket
-      ) do
-    move_and_return(socket, fn -> Mail.move(socket.assigns.mailbox.id, [entry_id], folder_id) end)
-  end
-
   @impl true
   def handle_info(
         {:mailbox_changed, mailbox_id},
@@ -238,10 +268,12 @@ defmodule ManifoldWeb.MailLive.Index do
     with {:ok, folders} <- Mail.list_folders(mailbox.id),
          %{} = folder <- select_folder(folders, params["folder_id"]),
          query = String.trim(params["q"] || ""),
+         unread_only = unread_only?(params["unread"]),
          after_cursor = params["after"],
          {:ok, page} <-
            Mail.list_conversations(mailbox.id, folder.id,
              query: query,
+             unread_only: unread_only,
              after: after_cursor
            ),
          {:ok, conversation} <-
@@ -258,6 +290,7 @@ defmodule ManifoldWeb.MailLive.Index do
          draft: nil,
          sent_detail: nil,
          query: query,
+         unread_only: unread_only,
          after_cursor: after_cursor,
          page_title: conversation_title(conversation, folder)
        }}
@@ -328,6 +361,7 @@ defmodule ManifoldWeb.MailLive.Index do
         draft: nil,
         sent_detail: nil,
         query: "",
+        unread_only: false,
         after_cursor: nil,
         page_title: "Mail"
       },
@@ -377,7 +411,11 @@ defmodule ManifoldWeb.MailLive.Index do
         {:noreply,
          push_patch(socket,
            to:
-             ~p"/mail/#{socket.assigns.mailbox.id}/folders/#{socket.assigns.folder.id}?#{[q: socket.assigns.query, after: socket.assigns.after_cursor]}"
+             folder_path(socket.assigns.mailbox.id, socket.assigns.folder.id,
+               q: socket.assigns.query,
+               unread: unread_param(socket.assigns.unread_only),
+               after: socket.assigns.after_cursor
+             )
          )}
 
       {:error, _reason} ->
@@ -399,6 +437,7 @@ defmodule ManifoldWeb.MailLive.Index do
         "mailbox_id" => socket.assigns.mailbox.id,
         "folder_id" => socket.assigns.folder.id,
         "q" => socket.assigns.query,
+        "unread" => unread_param(socket.assigns.unread_only),
         "after" => socket.assigns.after_cursor
       }
       |> maybe_put_thread(socket.assigns.conversation)
@@ -410,6 +449,7 @@ defmodule ManifoldWeb.MailLive.Index do
           folder: loaded.folder,
           page: loaded.page,
           conversation: loaded.conversation,
+          unread_only: loaded.unread_only,
           after_cursor: loaded.after_cursor
         )
 
@@ -514,12 +554,30 @@ defmodule ManifoldWeb.MailLive.Index do
   defp maybe_put_thread(params, conversation),
     do: Map.put(params, "thread_id", conversation.thread_id)
 
-  defp mailbox_label(mailbox) do
-    mailbox.local_part <> "@" <> mailbox.domain.normalized_domain
+  defp unread_only?(value) when value in [true, "true", "1", 1], do: true
+  defp unread_only?(_value), do: false
+
+  defp unread_param(true), do: "1"
+  defp unread_param(_), do: nil
+
+  defp folder_path(mailbox_id, folder_id, opts) do
+    params =
+      opts
+      |> Enum.reject(fn {_key, value} -> value in [nil, "", false] end)
+
+    ~p"/mail/#{mailbox_id}/folders/#{folder_id}?#{params}"
   end
 
-  defp format_time(%DateTime{} = datetime) do
-    ManifoldWeb.Formatting.datetime(datetime)
+  defp folder_thread_path(mailbox_id, folder_id, thread_id, opts) do
+    params =
+      opts
+      |> Enum.reject(fn {_key, value} -> value in [nil, "", false] end)
+
+    ~p"/mail/#{mailbox_id}/folders/#{folder_id}/threads/#{thread_id}?#{params}"
+  end
+
+  defp mailbox_label(mailbox) do
+    mailbox.local_part <> "@" <> mailbox.domain.normalized_domain
   end
 
   defp format_size(bytes) when bytes < 1024, do: "#{bytes} B"
@@ -582,15 +640,28 @@ defmodule ManifoldWeb.MailLive.Index do
           </select>
         </form>
 
-        <button
-          :if={@mailbox}
-          id="compose-button"
-          type="button"
-          class="compose-button"
-          phx-click="compose"
-        >
-          <.dm_mdi name="pencil-outline" class="mail-icon" /> Compose
-        </button>
+        <div :if={@mailbox} class="compose-actions" role="group" aria-label="Mailbox actions">
+          <button
+            id="sync-button"
+            type="button"
+            class="sync-button"
+            phx-click="sync"
+            title="Sync mail now"
+          >
+            <.dm_mdi name="sync" class="mail-icon" />
+            <span>Sync</span>
+          </button>
+          <button
+            id="compose-button"
+            type="button"
+            class="compose-button"
+            phx-click="compose"
+            title="Compose new message"
+          >
+            <.dm_mdi name="pencil-outline" class="mail-icon" />
+            <span>Compose</span>
+          </button>
+        </div>
 
         <nav :if={@mailbox} class="folder-list">
           <.link
@@ -644,8 +715,27 @@ defmodule ManifoldWeb.MailLive.Index do
         aria-label="Conversations"
       >
         <header class="conversation-list-header">
-          <div>
-            <h1>{@folder.name}</h1>
+          <div class="conversation-list-heading">
+            <div class="conversation-title-row">
+              <h1>{@folder.name}</h1>
+              <span class="folder-total-count" title="Messages in this folder">
+                {@folder.total_count}
+              </span>
+              <button
+                id="unread-filter"
+                type="button"
+                class={["unread-filter", @unread_only && "is-active"]}
+                phx-click="toggle-unread-filter"
+                aria-pressed={to_string(@unread_only)}
+                title={if @unread_only, do: "Show all messages", else: "Show unread only"}
+              >
+                <.dm_mdi name="email-outline" class="mail-icon" />
+                <span>Unread</span>
+                <span :if={@folder.unread_count > 0} class="unread-filter-count">
+                  {@folder.unread_count}
+                </span>
+              </button>
+            </div>
             <span class="mailbox-address">{mailbox_label(@mailbox)}</span>
           </div>
           <form id="mail-search" phx-submit="search" class="mail-search">
@@ -662,14 +752,25 @@ defmodule ManifoldWeb.MailLive.Index do
 
         <div :if={@page.items == []} class="empty-folder">
           <.dm_mdi name="inbox-outline" class="empty-icon" />
-          <p>{if @query == "", do: "No messages in this folder", else: "No matching messages"}</p>
+          <p>
+            {cond do
+              @unread_only and @query == "" -> "No unread messages in this folder"
+              @unread_only -> "No matching unread messages"
+              @query == "" -> "No messages in this folder"
+              true -> "No matching messages"
+            end}
+          </p>
         </div>
 
         <nav class="conversation-items">
           <.link
             :for={item <- @page.items}
             navigate={
-              ~p"/mail/#{@mailbox.id}/folders/#{@folder.id}/threads/#{item.thread_id}?#{[q: @query, after: @after_cursor]}"
+              folder_thread_path(@mailbox.id, @folder.id, item.thread_id,
+                q: @query,
+                unread: unread_param(@unread_only),
+                after: @after_cursor
+              )
             }
             class={[
               "conversation-row",
@@ -681,9 +782,7 @@ defmodule ManifoldWeb.MailLive.Index do
             <div class="conversation-primary">
               <div class="conversation-meta">
                 <strong>{item.sender_name || item.sender_address || "Unknown sender"}</strong>
-                <time datetime={DateTime.to_iso8601(item.last_message_at)}>
-                  {format_time(item.last_message_at)}
-                </time>
+                <.datetime value={item.last_message_at} />
               </div>
               <div class="conversation-subject">
                 <span>{item.subject}</span>
@@ -707,7 +806,12 @@ defmodule ManifoldWeb.MailLive.Index do
         >
           <.link
             :if={@after_cursor}
-            patch={~p"/mail/#{@mailbox.id}/folders/#{@folder.id}?#{[q: @query]}"}
+            patch={
+              folder_path(@mailbox.id, @folder.id,
+                q: @query,
+                unread: unread_param(@unread_only)
+              )
+            }
             class="pagination-link"
           >
             First page
@@ -715,7 +819,11 @@ defmodule ManifoldWeb.MailLive.Index do
           <.link
             :if={@page.next_cursor}
             patch={
-              ~p"/mail/#{@mailbox.id}/folders/#{@folder.id}?#{[q: @query, after: @page.next_cursor]}"
+              folder_path(@mailbox.id, @folder.id,
+                q: @query,
+                unread: unread_param(@unread_only),
+                after: @page.next_cursor
+              )
             }
             class="pagination-link pagination-next"
           >
@@ -748,9 +856,7 @@ defmodule ManifoldWeb.MailLive.Index do
             <div class="conversation-primary">
               <div class="conversation-meta">
                 <strong>{item.subject}</strong>
-                <time datetime={DateTime.to_iso8601(item.updated_at)}>
-                  {format_time(item.updated_at)}
-                </time>
+                <.datetime value={item.updated_at} />
               </div>
               <p>{item.preview}</p>
             </div>
@@ -785,9 +891,7 @@ defmodule ManifoldWeb.MailLive.Index do
             <div class="conversation-primary">
               <div class="conversation-meta">
                 <strong>{Enum.join(item.recipients, ", ")}</strong>
-                <time :if={item.queued_at} datetime={DateTime.to_iso8601(item.queued_at)}>
-                  {format_time(item.queued_at)}
-                </time>
+                <.datetime value={item.queued_at} />
               </div>
               <div class="conversation-subject">
                 <span>{item.subject}</span>
@@ -911,9 +1015,7 @@ defmodule ManifoldWeb.MailLive.Index do
             </div>
             <ol>
               <li :for={event <- @sent_detail.events}>
-                <time datetime={DateTime.to_iso8601(event.occurred_at)}>
-                  {format_time(event.occurred_at)}
-                </time>
+                <.datetime value={event.occurred_at} />
                 <span>{outbound_event_label(event.event_type)}</span>
               </li>
             </ol>
@@ -929,7 +1031,11 @@ defmodule ManifoldWeb.MailLive.Index do
         <header class="reader-header">
           <.link
             patch={
-              ~p"/mail/#{@mailbox.id}/folders/#{@folder.id}?#{[q: @query, after: @after_cursor]}"
+              folder_path(@mailbox.id, @folder.id,
+                q: @query,
+                unread: unread_param(@unread_only),
+                after: @after_cursor
+              )
             }
             class="reader-back"
             aria-label="Back to message list"
@@ -948,9 +1054,7 @@ defmodule ManifoldWeb.MailLive.Index do
               <div class="sender-detail">
                 <strong>{message.sender_name || message.sender_address || "Unknown sender"}</strong>
                 <span :if={message.sender_name}>{message.sender_address}</span>
-                <time datetime={DateTime.to_iso8601(message.sent_at)}>
-                  {ManifoldWeb.Formatting.datetime_utc(message.sent_at)}
-                </time>
+                <.datetime value={message.received_at} />
               </div>
               <div class="message-actions">
                 <.mail_action
@@ -1034,15 +1138,6 @@ defmodule ManifoldWeb.MailLive.Index do
                 <.dm_mdi name="download" class="mail-icon" />
               </a>
             </div>
-
-            <form id={"move-form-#{message.entry_id}"} phx-change="move" class="move-form">
-              <input type="hidden" name="entry_id" value={message.entry_id} />
-              <label for={"move-#{message.entry_id}"}>Move to</label>
-              <select id={"move-#{message.entry_id}"} name="folder_id">
-                <option value="">Choose folder</option>
-                <option :for={folder <- @folders} value={folder.id}>{folder.name}</option>
-              </select>
-            </form>
           </article>
         </div>
       </article>

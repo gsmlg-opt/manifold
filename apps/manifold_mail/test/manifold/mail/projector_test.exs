@@ -58,6 +58,7 @@ defmodule Manifold.Mail.ProjectorTest do
     assert message.subject == "Projected"
     assert message.text_body == "This is searchable text"
     assert message.parse_state == "parsed"
+    assert message.received_at == source.received_at
     assert Repo.aggregate(Message, :count) == 1
     assert Repo.aggregate(MessageHeader, :count) >= 5
 
@@ -342,7 +343,7 @@ defmodule Manifold.Mail.ProjectorTest do
         plain_message("<concurrent-root@example.net>", "Concurrent", "root")
       )
 
-    assert {:ok, _root} = Mail.project_inbound(root)
+    assert {:ok, _root} = Mail.project_inbound(root, parser_version: 1, sanitizer_version: 1)
 
     replies =
       for index <- 1..2 do
@@ -361,7 +362,9 @@ defmodule Manifold.Mail.ProjectorTest do
     operations =
       [
         fn -> Mail.project_inbound(root, parser_version: 2, sanitizer_version: 1) end
-        | Enum.map(replies, fn reply -> fn -> Mail.project_inbound(reply) end end)
+        | Enum.map(replies, fn reply ->
+            fn -> Mail.project_inbound(reply, parser_version: 1, sanitizer_version: 1) end
+          end)
       ]
 
     assert [ok: {:ok, _rebuild}, ok: {:ok, _first}, ok: {:ok, _second}] =

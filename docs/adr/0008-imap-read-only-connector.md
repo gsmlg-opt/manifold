@@ -27,10 +27,12 @@ Extend `manifold_connectors` with `provider = "imap"`:
   asks for a domain.
 - Read-only INBOX synchronization via UID SEARCH / UID FETCH RFC822 into
   `Ingest.import_external` with `source_kind = "provider_import"`.
+- Bidirectional `\\Seen` synchronization: inbound FLAGS sync plus local
+  mark-read/unread write-back via `UID STORE ±FLAGS (\\Seen)`.
 - Test connection before persisting the account.
 
-POP3, JMAP, multi-folder sync, provider write-back, and per-account SMTP send
-remain out of scope.
+POP3, JMAP, multi-folder sync, and per-account SMTP send remain out of scope.
+Provider write-back beyond IMAP `\\Seen` remains out of scope.
 
 ## Consequences
 

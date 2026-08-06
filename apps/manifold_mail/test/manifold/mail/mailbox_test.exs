@@ -46,6 +46,27 @@ defmodule Manifold.Mail.MailboxTest do
     assert second_page.next_cursor == nil
   end
 
+  test "unread_only filters conversations that still have unread entries" do
+    mailbox_id = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox_id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    now = DateTime.utc_now()
+
+    unread = thread_fixture(mailbox_id, inbox.id, "Unread", now, 1)
+    read = thread_fixture(mailbox_id, inbox.id, "Read", DateTime.add(now, -30), 1)
+
+    assert {:ok, 1} = Mail.mark_read(mailbox_id, Enum.map(read.entries, & &1.id), true)
+
+    assert {:ok, %{items: [only_unread]}} =
+             Mail.list_conversations(mailbox_id, inbox.id, unread_only: true)
+
+    assert only_unread.thread_id == unread.thread.id
+    assert only_unread.unread
+
+    assert {:ok, %{items: both}} = Mail.list_conversations(mailbox_id, inbox.id)
+    assert length(both) == 2
+  end
+
   test "conversation detail is folder scoped" do
     mailbox_id = mailbox_fixture()
     assert {:ok, folders} = Mail.list_folders(mailbox_id)
@@ -131,6 +152,40 @@ defmodule Manifold.Mail.MailboxTest do
     assert archived_thread_id == split_thread.id
     assert %DateTime{} = archived_last_message_at
     assert archived_last_message_at == now
+  end
+
+  test "conversation ordering and display prefer received_at over sent_at" do
+    mailbox_id = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox_id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+
+    older_sent = ~U[2026-08-01 10:00:00.000000Z]
+    newer_received = ~U[2026-08-06 12:00:00.000000Z]
+    newer_sent = ~U[2026-08-05 10:00:00.000000Z]
+    older_received = ~U[2026-08-04 12:00:00.000000Z]
+
+    late_arrival =
+      projected_message_fixture(mailbox_id, inbox.id, nil, "Late arrival", older_sent,
+        received_at: newer_received
+      )
+
+    early_arrival =
+      projected_message_fixture(mailbox_id, inbox.id, nil, "Early arrival", newer_sent,
+        received_at: older_received
+      )
+
+    assert {:ok, page} = Mail.list_conversations(mailbox_id, inbox.id)
+
+    assert [
+             %{thread_id: first_id, last_message_at: ^newer_received, subject: "Late arrival"},
+             %{thread_id: second_id, last_message_at: ^older_received, subject: "Early arrival"}
+           ] = page.items
+
+    assert first_id == late_arrival.entry.thread_id
+    assert second_id == early_arrival.entry.thread_id
+
+    assert {:ok, conversation} = Mail.get_conversation(mailbox_id, late_arrival.entry.thread_id)
+    assert [%{received_at: ^newer_received, sent_at: ^older_sent}] = conversation.messages
   end
 
   test "quarantined entries cannot expose conversation bodies or attachments" do
@@ -429,10 +484,23 @@ defmodule Manifold.Mail.MailboxTest do
     }
   end
 
-  defp projected_message_fixture(mailbox_id, folder_id, thread_id, subject, sent_at) do
+  defp projected_message_fixture(mailbox_id, folder_id, thread_id, subject, sent_at, opts \\ []) do
     now = DateTime.utc_now()
     delivery_id = Ecto.UUID.generate()
     storage_domain_id = mailbox_domain_id(mailbox_id)
+    received_at = Keyword.get(opts, :received_at)
+
+    thread_id =
+      thread_id ||
+        %Thread{}
+        |> Thread.changeset(%{
+          mailbox_id: mailbox_id,
+          subject_summary: subject,
+          last_message_at: received_at || sent_at || now,
+          message_count: 1
+        })
+        |> Repo.insert!()
+        |> Map.fetch!(:id)
 
     Repo.insert_all("inbound_deliveries", [
       %{
@@ -441,7 +509,7 @@ defmodule Manifold.Mail.MailboxTest do
         storage_domain_id: Ecto.UUID.dump!(storage_domain_id),
         peer_ip: "127.0.0.1",
         envelope_from: "sender@example.test",
-        received_at: now,
+        received_at: received_at || now,
         raw_size: 1,
         raw_sha256: String.duplicate("0", 64),
         spool_bundle_path: "/removed",
@@ -461,6 +529,7 @@ defmodule Manifold.Mail.MailboxTest do
         sender_name: "Sender",
         sender_address: "sender@example.test",
         sent_at: sent_at,
+        received_at: received_at,
         text_body: "Body for #{subject}",
         sanitized_html: "<p>Body for #{subject}</p>",
         parser_version: 1,

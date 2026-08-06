@@ -34,4 +34,44 @@ defmodule Manifold.Connectors.IMAP.ClientProtocolTest do
 
     assert {:ok, ^raw} = Client.extract_rfc822(lines)
   end
+
+  test "parse_flags_response maps uid to flags and INTERNALDATE" do
+    lines = [
+      "* 1 FETCH (FLAGS (\\Seen \\Answered) UID 10 INTERNALDATE \"06-Aug-2026 15:20:33 +0800\")",
+      "* 2 FETCH (UID 11 FLAGS (\\Flagged) INTERNALDATE \"01-Jan-2026 00:00:00 +0000\")",
+      "* 3 FETCH (UID 12 FLAGS ())",
+      "A6 OK FETCH completed"
+    ]
+
+    assert {:ok, meta} = Client.parse_flags_response(lines)
+    assert meta[10].flags == ["\\Seen", "\\Answered"]
+    assert meta[10].received_at == ~U[2026-08-06 07:20:33.000000Z]
+    assert meta[11].flags == ["\\Flagged"]
+    assert meta[11].received_at == ~U[2026-01-01 00:00:00.000000Z]
+    assert meta[12].flags == []
+    assert meta[12].received_at == nil
+  end
+
+  test "parse_internal_date converts IMAP INTERNALDATE to UTC" do
+    assert {:ok, ~U[2026-08-06 07:20:33.000000Z]} =
+             Client.parse_internal_date("06-Aug-2026 15:20:33 +0800")
+
+    assert {:ok, ~U[2026-08-06 15:20:33.000000Z]} =
+             Client.parse_internal_date("\"06-Aug-2026 15:20:33 +0000\"")
+  end
+
+  test "seen? detects \\Seen flag case-insensitively" do
+    assert Client.seen?(["\\Seen"])
+    assert Client.seen?(["\\seen"])
+    refute Client.seen?(["\\Flagged"])
+    refute Client.seen?([])
+  end
+
+  test "store_flags_command builds add and remove STORE commands" do
+    assert Client.store_flags_command(10, :add, ["\\Seen"]) ==
+             "UID STORE 10 +FLAGS (\\Seen)"
+
+    assert Client.store_flags_command(10, :remove, ["\\Seen"]) ==
+             "UID STORE 10 -FLAGS (\\Seen)"
+  end
 end

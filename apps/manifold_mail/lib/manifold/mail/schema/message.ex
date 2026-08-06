@@ -15,6 +15,7 @@ defmodule Manifold.Mail.Schema.Message do
     field(:sender_name, :string)
     field(:sender_address, :string)
     field(:sent_at, :utc_datetime_usec)
+    field(:received_at, :utc_datetime_usec)
     field(:text_body, :string)
     field(:sanitized_html, :string)
     field(:parser_version, :integer)
@@ -38,6 +39,7 @@ defmodule Manifold.Mail.Schema.Message do
       :sender_name,
       :sender_address,
       :sent_at,
+      :received_at,
       :text_body,
       :sanitized_html,
       :parser_version,

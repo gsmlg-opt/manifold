@@ -37,6 +37,28 @@ defmodule Manifold.Mail.ParserTest do
              ]
   end
 
+  test "parses Date header strings into sent_at" do
+    raw =
+      message("""
+      From: Alice Example <alice@example.net>
+      To: Inbox <inbox@example.test>
+      Subject: Dated
+      Date: Mon, 27 Jan 2020 04:03:43 +0800
+      Message-ID: <dated-1@example.net>
+      Content-Type: text/plain; charset=utf-8
+
+      Hello.
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.sent_at == ~U[2020-01-26 20:03:43.000000Z]
+  end
+
+  test "parse_datetime accepts RFC2822 strings" do
+    assert Parser.parse_datetime("Mon, 27 Jan 2020 04:03:43 +0800") ==
+             ~U[2020-01-26 20:03:43.000000Z]
+  end
+
   test "selects multipart alternatives and extracts an attachment" do
     raw =
       message("""
@@ -259,6 +281,36 @@ defmodule Manifold.Mail.ParserTest do
     assert parsed.subject == "日报"
     assert parsed.text_body == "你好"
     assert hd(parsed.from).name == "高世明"
+  end
+
+  test "decodes unlabeled GBK subject and from display name" do
+    # Tencent-style 8-bit headers without RFC 2047 encoded-words.
+    subject_gbk =
+      <<0xCC, 0xDA, 0xD1, 0xB6, 0xD3, 0xF2, 0xC3, 0xFB, 0xD3, 0xCA, 0xCF, 0xE4, 0xA3, 0xBA, 0xD3,
+        0xF2, 0xC3, 0xFB, 0xD3, 0xCA, 0xCF, 0xE4, 0xD5, 0xCB, 0xBA, 0xC5, " org@gs">>
+
+    from_name_gbk = <<0xCC, 0xDA, 0xD1, 0xB6>>
+    body_gbk = <<0xC4, 0xE3, 0xBA, 0xC3>>
+
+    raw =
+      "From: " <>
+        from_name_gbk <>
+        " <noreply@exmail.qq.com>\r\n" <>
+        "To: inbox@example.test\r\n" <>
+        "Subject: " <>
+        subject_gbk <>
+        "\r\n" <>
+        "Content-Type: text/plain; charset=gbk\r\n" <>
+        "Content-Transfer-Encoding: 8bit\r\n\r\n" <>
+        body_gbk <>
+        "\r\n"
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.subject == "腾讯域名邮箱：域名邮箱账号 org@gs"
+    assert hd(parsed.from).name == "腾讯"
+    assert hd(parsed.from).address == "noreply@exmail.qq.com"
+    assert parsed.text_body == "你好"
+    refute String.starts_with?(parsed.subject, "ÌÚÑ¶")
   end
 
   test "decodes quoted-printable UTF-8 body without mojibake" do

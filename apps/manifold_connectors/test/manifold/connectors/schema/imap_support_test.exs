@@ -6,11 +6,12 @@ defmodule Manifold.Connectors.Schema.ImapSupportTest do
   test "external account accepts imap provider" do
     changeset =
       ReceiveMethod.changeset(%ReceiveMethod{}, %{
-        mailbox_id: Ecto.UUID.generate(),
-        provider: "imap",
+        account_id: Ecto.UUID.generate(),
+        kind: "imap",
         provider_account_id: "imap:user@example.com",
         email_address: "user@example.com",
         status: "connected",
+        enabled: true,
         sync_enabled: true,
         granted_scopes: []
       })
@@ -50,12 +51,24 @@ defmodule Manifold.Connectors.Schema.ImapSupportTest do
         external_account_id: Ecto.UUID.generate(),
         host: "imap.example.com",
         port: 993,
-        tls_mode: "ssl",
+        tls_mode: "tls",
         username: "user@example.com",
         mailbox_path: "INBOX"
       })
 
     assert good.valid?
+
+    legacy_ssl =
+      ImapSettings.changeset(%ImapSettings{}, %{
+        external_account_id: Ecto.UUID.generate(),
+        host: "imap.example.com",
+        port: 993,
+        tls_mode: "ssl",
+        username: "user@example.com",
+        mailbox_path: "INBOX"
+      })
+
+    assert legacy_ssl.valid?
 
     bad =
       ImapSettings.changeset(%ImapSettings{}, %{

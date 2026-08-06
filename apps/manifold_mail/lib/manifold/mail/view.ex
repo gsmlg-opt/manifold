@@ -60,6 +60,7 @@ defmodule Manifold.Mail.View.Message do
     :sender_name,
     :sender_address,
     :sent_at,
+    :received_at,
     :text_body,
     :has_html,
     :read,
@@ -68,7 +69,20 @@ defmodule Manifold.Mail.View.Message do
   ]
   defstruct @enforce_keys
 
-  @type t :: %__MODULE__{}
+  @type t :: %__MODULE__{
+          id: Ecto.UUID.t(),
+          entry_id: Ecto.UUID.t(),
+          subject: String.t(),
+          sender_name: String.t() | nil,
+          sender_address: String.t() | nil,
+          sent_at: DateTime.t() | nil,
+          received_at: DateTime.t(),
+          text_body: String.t() | nil,
+          has_html: boolean(),
+          read: boolean(),
+          starred: boolean(),
+          attachments: [Manifold.Mail.View.Attachment.t()]
+        }
 end
 
 defmodule Manifold.Mail.View.Conversation do

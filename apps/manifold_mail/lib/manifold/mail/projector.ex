@@ -217,6 +217,7 @@ defmodule Manifold.Mail.Projector do
       rfc_message_id: header_value(headers, "message-id"),
       in_reply_to: header_value(headers, "in-reply-to"),
       references: reference_ids(header_value(headers, "references")),
+      sent_at: Manifold.Mail.Parser.parse_datetime(header_value(headers, "date")),
       headers: headers
     }
   end
@@ -400,6 +401,7 @@ defmodule Manifold.Mail.Projector do
       sender_name: sender && clean_text(sender.name),
       sender_address: sender && clean_text(sender.address),
       sent_at: parsed.sent_at,
+      received_at: source.received_at,
       text_body: clean_text(parsed.text_body),
       sanitized_html: parsed.html_body |> clean_text() |> HtmlSanitizer.sanitize(),
       parser_version: versions.parser_version,
@@ -552,7 +554,7 @@ defmodule Manifold.Mail.Projector do
         Thread.changeset(%Thread{}, %{
           mailbox_id: mailbox_id,
           subject_summary: thread_subject(message.subject),
-          last_message_at: message.sent_at || source.received_at,
+          last_message_at: message.received_at || message.sent_at || source.received_at,
           message_count: 0
         })
         |> Repo.insert()
@@ -567,7 +569,15 @@ defmodule Manifold.Mail.Projector do
         where: entry.thread_id == ^thread_id,
         select: %{
           count: count(entry.id),
-          last_message_at: max(fragment("COALESCE(?, ?)", message.sent_at, entry.inserted_at))
+          last_message_at:
+            max(
+              fragment(
+                "COALESCE(?, ?, ?)",
+                message.received_at,
+                message.sent_at,
+                entry.inserted_at
+              )
+            )
         }
       )
       |> Repo.one!()

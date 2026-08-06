@@ -2,6 +2,7 @@ defmodule Manifold.Mail.HeaderProjection do
   @moduledoc false
 
   alias Manifold.Core.Error
+  alias Manifold.Mail.Charset
 
   @field_name ~r/\A[!-9;-~]+\z/
 
@@ -43,7 +44,7 @@ defmodule Manifold.Mail.HeaderProjection do
       <<first, _rest::binary>> = continuation, {:ok, [previous | headers]}
       when first in [?\s, ?\t] ->
         {name, value} = previous
-        unfolded = value <> " " <> String.trim_leading(utf8(continuation))
+        unfolded = value <> " " <> String.trim_leading(continuation)
         {:cont, {:ok, [{name, unfolded} | headers]}}
 
       <<first, _rest::binary>>, {:ok, []} when first in [?\s, ?\t] ->
@@ -79,13 +80,7 @@ defmodule Manifold.Mail.HeaderProjection do
   defp within_limit(value, limit, _reason) when value <= limit, do: :ok
   defp within_limit(_value, _limit, reason), do: {:error, error(reason, "header limit exceeded")}
 
-  defp utf8(binary) do
-    if String.valid?(binary) do
-      binary
-    else
-      :unicode.characters_to_binary(binary, :latin1, :utf8)
-    end
-  end
+  defp utf8(binary), do: Charset.ensure_utf8(binary)
 
   defp error(reason, message), do: Error.new(:permanent, reason, message)
 end

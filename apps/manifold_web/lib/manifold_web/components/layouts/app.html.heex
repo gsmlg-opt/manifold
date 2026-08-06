@@ -1,15 +1,22 @@
-<div class="app-shell">
-  <header class="app-header">
-    <.link navigate={~p"/"} class="brand">
-      <.dm_mdi name="email-multiple-outline" class="brand-icon" /> Manifold
-    </.link>
-    <nav aria-label="Application">
-      <.nav_link to={~p"/"}>Mail</.nav_link>
-      <.nav_link to={~p"/deliveries"}>Operations</.nav_link>
-      <.nav_link to={~p"/cloud"}>Cloud</.nav_link>
-      <.nav_link to={~p"/settings/accounts"}>Settings</.nav_link>
-    </nav>
-  </header>
+<div class="app-shell min-h-screen bg-surface text-on-surface">
+  <.dm_appbar
+    id="app-appbar"
+    title="Manifold"
+    title_to={~p"/"}
+    class="appbar-primary appbar-sticky"
+    nav_label="Application"
+  >
+    <:logo>
+      <.dm_mdi name="email-multiple-outline" class="brand-icon size-6" />
+    </:logo>
+    <:menu to={~p"/"}>Mail</:menu>
+    <:menu to={~p"/deliveries"}>Operations</:menu>
+    <:menu to={~p"/cloud"}>Cloud</:menu>
+    <:menu to={~p"/settings/accounts"}>Settings</:menu>
+    <:user_profile>
+      <.dm_theme_switcher id="app-theme-switcher" phx-update="ignore" />
+    </:user_profile>
+  </.dm_appbar>
   <main class="content">
     <.flash_group flash={@flash} />
     {@inner_content}

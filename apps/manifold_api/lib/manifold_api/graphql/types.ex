@@ -70,6 +70,7 @@ defmodule ManifoldAPI.GraphQL.Types do
     field(:sender_name, :string)
     field(:sender_address, :string)
     field(:sent_at, :string)
+    field(:received_at, :string)
     field(:text_body, :string)
     field(:has_html, non_null(:boolean))
     field(:read, non_null(:boolean))

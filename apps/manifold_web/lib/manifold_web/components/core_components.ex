@@ -18,12 +18,29 @@ defmodule ManifoldWeb.CoreComponents do
     """
   end
 
-  attr(:to, :string, required: true)
-  slot(:inner_block, required: true)
+  @doc """
+  Renders an absolute timestamp that the browser reformats to the local timezone.
 
-  def nav_link(assigns) do
+  Server-side text is UTC wall-clock as a no-JS fallback; `<mf-datetime>` replaces
+  it with the browser-local `YYYY-MM-DD HH:MM` (or `date` / `time` via `format`).
+  """
+  attr(:value, :any, default: nil, doc: "DateTime, NaiveDateTime, or nil")
+  attr(:format, :string, default: "datetime", values: ~w(datetime date time))
+  attr(:rest, :global)
+
+  def datetime(%{value: nil} = assigns) do
+    ~H""
+  end
+
+  def datetime(assigns) do
     ~H"""
-    <.link navigate={@to} class="nav-link">{render_slot(@inner_block)}</.link>
+    <mf-datetime datetime={datetime_iso(@value)} format={@format} {@rest}>
+      {ManifoldWeb.Formatting.datetime(@value)}
+    </mf-datetime>
     """
   end
+
+  defp datetime_iso(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
+  defp datetime_iso(%NaiveDateTime{} = datetime), do: NaiveDateTime.to_iso8601(datetime) <> "Z"
+  defp datetime_iso(other) when is_binary(other), do: other
 end

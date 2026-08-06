@@ -192,6 +192,39 @@ defmodule Manifold.Accounts do
     do_create_account(domain, attrs)
   end
 
+  @doc """
+  Updates an account display name and email address.
+
+  The domain portion of the address is derived automatically (created if missing).
+  Changing the address advances the recipient route revision.
+  """
+  @spec update_account(Account.t(), map()) :: create_result(Account.t())
+  def update_account(%Account{} = account, attrs) when is_map(attrs) do
+    attrs = stringify_keys(attrs)
+    address = Map.get(attrs, "address") || Map.get(attrs, :address)
+    name = Map.get(attrs, "name") || Map.get(attrs, :name)
+
+    with {:ok, parsed} <- parse_required_address(address) do
+      Repo.transaction(fn ->
+        domain = ensure_domain!(parsed.domain)
+
+        case do_update_account(account, %{
+               domain_id: domain.id,
+               local_part: parsed.local_part,
+               name: name
+             }) do
+          {:ok, updated} -> Repo.preload(updated, :domain, force: true)
+          {:error, changeset} -> Repo.rollback(changeset)
+        end
+      end)
+      |> case do
+        {:ok, account} -> {:ok, account}
+        {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
   @spec ensure_account_for_address(String.t()) ::
           {:ok, Account.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def ensure_account_for_address(address) when is_binary(address) do
@@ -287,6 +320,22 @@ defmodule Manifold.Accounts do
     %Account{}
     |> Account.changeset(attrs)
     |> insert_routing_resource()
+  end
+
+  defp do_update_account(%Account{} = account, attrs) do
+    changeset = Account.changeset(account, attrs)
+
+    if routing_fields_changed?(changeset) do
+      update_routing_resource(changeset)
+    else
+      Repo.update(changeset)
+    end
+  end
+
+  defp routing_fields_changed?(%Ecto.Changeset{} = changeset) do
+    Ecto.Changeset.changed?(changeset, :domain_id) or
+      Ecto.Changeset.changed?(changeset, :local_part) or
+      Ecto.Changeset.changed?(changeset, :canonical_local_part)
   end
 
   defp ensure_domain!(normalized_or_name) do
@@ -390,19 +439,35 @@ defmodule Manifold.Accounts do
   end
 
   defp insert_routing_resource(changeset) do
-    Ecto.Multi.new()
-    |> Ecto.Multi.insert(:resource, changeset)
-    |> Ecto.Multi.update_all(
-      :route_revision,
-      RouteRevision,
-      inc: [revision: 1],
-      set: [updated_at: DateTime.utc_now()]
-    )
+    persist_routing_resource(changeset, :insert)
+  end
+
+  defp update_routing_resource(changeset) do
+    persist_routing_resource(changeset, :update)
+  end
+
+  defp persist_routing_resource(changeset, operation) when operation in [:insert, :update] do
+    multi =
+      Ecto.Multi.new()
+      |> then(fn multi ->
+        case operation do
+          :insert -> Ecto.Multi.insert(multi, :resource, changeset)
+          :update -> Ecto.Multi.update(multi, :resource, changeset)
+        end
+      end)
+      |> Ecto.Multi.update_all(
+        :route_revision,
+        RouteRevision,
+        inc: [revision: 1],
+        set: [updated_at: DateTime.utc_now()]
+      )
+
+    multi
     |> Repo.transaction()
     |> case do
       {:ok, %{resource: resource}} -> {:ok, resource}
       {:error, :resource, changeset, _changes} -> {:error, changeset}
-      {:error, operation, reason, _changes} -> {:error, {operation, reason}}
+      {:error, failed_operation, reason, _changes} -> {:error, {failed_operation, reason}}
     end
   end
 

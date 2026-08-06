@@ -16,6 +16,7 @@ defmodule Manifold.Connectors.Sync do
     ConnectorEvent,
     Credential,
     ReceiveMethod,
+    EasSettings,
     ImapSettings,
     RemoteMessage,
     SyncCursor
@@ -24,6 +25,7 @@ defmodule Manifold.Connectors.Sync do
   alias Manifold.Core.Error
   alias Manifold.Ingest
   alias Manifold.Ingest.ExternalSource
+  alias Manifold.Mail
   alias Manifold.Repo
 
   @refresh_skew_seconds 60
@@ -60,6 +62,46 @@ defmodule Manifold.Connectors.Sync do
          Error.new(:temporary, :database_unavailable, "connector database is unavailable")}
     end
   end
+
+  @spec push_remote_read(Ecto.UUID.t(), boolean()) ::
+          :ok | {:error, Error.t() | ProviderError.t()}
+  def push_remote_read(remote_message_id, read?) when is_boolean(read?) do
+    query =
+      from(remote in RemoteMessage,
+        join: account in ReceiveMethod,
+        on: account.id == remote.external_account_id,
+        where: remote.id == ^remote_message_id and account.kind in ["imap", "eas"],
+        select: {remote, account}
+      )
+
+    case Repo.one(query) do
+      {%RemoteMessage{} = remote, %ReceiveMethod{} = account} ->
+        now = DateTime.utc_now()
+
+        with {:ok, adapter, config} <- runtime(account.kind),
+             {:ok, config} <- enrich_runtime_config(account, config),
+             {:ok, password} <- auth_material(account, adapter, config, now, []),
+             :ok <- adapter.set_read(password, remote.provider_message_id, read?, config) do
+          remote
+          |> RemoteMessage.changeset(%{remote_read: read?, synced_at: now})
+          |> Repo.update!()
+
+          :ok
+        end
+
+      nil ->
+        {:error,
+         Error.new(:permanent, :remote_message_not_found, "connector message was not found")}
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error, Error.new(:temporary, :database_unavailable, "connector database is unavailable")}
+  end
+
+  @doc false
+  @spec push_imap_read(Ecto.UUID.t(), boolean()) ::
+          :ok | {:error, Error.t() | ProviderError.t()}
+  def push_imap_read(remote_message_id, read?), do: push_remote_read(remote_message_id, read?)
 
   defp do_run(account_id, now, opts) do
     with {:ok, account, cursor} <- begin_sync(account_id, now),
@@ -130,7 +172,8 @@ defmodule Manifold.Connectors.Sync do
     end
   end
 
-  defp prepare_provider_session(%ReceiveMethod{kind: "imap"}, adapter, opts) do
+  defp prepare_provider_session(%ReceiveMethod{kind: kind}, adapter, opts)
+       when kind in ["imap", "eas"] do
     if function_exported?(adapter, :release_session, 0) do
       Keyword.update(
         opts,
@@ -301,6 +344,28 @@ defmodule Manifold.Connectors.Sync do
            :permanent,
            :credential_kind_mismatch,
            "IMAP account requires a password credential"
+         )}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp auth_material(%ReceiveMethod{kind: "eas"} = account, _adapter, _config, _now, _opts) do
+    with %Credential{secret_kind: "password", password_ciphertext: cipher} <-
+           Repo.get_by(Credential, external_account_id: account.id),
+         {:ok, password} <- Crypto.decrypt(cipher, credential_context(account.id, :eas_password)) do
+      {:ok, password}
+    else
+      nil ->
+        {:error, Error.new(:permanent, :credential_missing, "connector credential is missing")}
+
+      %Credential{} ->
+        {:error,
+         Error.new(
+           :permanent,
+           :credential_kind_mismatch,
+           "EAS account requires a password credential"
          )}
 
       {:error, _} = error ->
@@ -580,7 +645,7 @@ defmodule Manifold.Connectors.Sync do
   end
 
   defp validate_raw_size(raw) when is_binary(raw) do
-    max_bytes = Application.get_env(:manifold_mail, :max_raw_bytes, 25 * 1024 * 1024)
+    max_bytes = Application.get_env(:manifold_mail, :max_raw_bytes, 100 * 1024 * 1024)
 
     if byte_size(raw) <= max_bytes do
       :ok
@@ -604,8 +669,9 @@ defmodule Manifold.Connectors.Sync do
         folder_id: message.folder_id || raw.folder_id,
         folder_kind: message.folder_kind || raw.folder_kind || folder_kind(labels),
         labels: labels,
-        read?: if(message.labels == [], do: raw.read?, else: message.read?),
-        starred?: if(message.labels == [], do: raw.starred?, else: message.starred?)
+        read?: if(message.labels == [], do: message.read? or raw.read?, else: message.read?),
+        starred?:
+          if(message.labels == [], do: message.starred? or raw.starred?, else: message.starred?)
     }
   end
 
@@ -657,12 +723,15 @@ defmodule Manifold.Connectors.Sync do
 
       delivery_id = delivery_id || (existing && existing.inbound_delivery_id)
 
+      provider_received_at =
+        message.received_at || (existing && existing.provider_received_at)
+
       attrs = %{
         external_account_id: account.id,
         provider_message_id: message.id,
         provider_thread_id: message.thread_id,
         inbound_delivery_id: delivery_id,
-        provider_received_at: message.received_at,
+        provider_received_at: provider_received_at,
         remote_folder_id: message.folder_id,
         remote_folder_kind: message.folder_kind || folder_kind(message.labels),
         remote_labels: Enum.sort(message.labels),
@@ -688,6 +757,11 @@ defmodule Manifold.Connectors.Sync do
             |> RemoteMessage.changeset(attrs)
             |> Repo.update!()
         end
+
+      if is_binary(remote.inbound_delivery_id) and
+           match?(%DateTime{}, remote.provider_received_at) do
+        Mail.set_received_at(remote.inbound_delivery_id, remote.provider_received_at)
+      end
 
       if is_binary(remote.inbound_delivery_id) do
         ensure_remote_state_job(remote.id)
@@ -861,6 +935,12 @@ defmodule Manifold.Connectors.Sync do
     {:ok, adapter, []}
   end
 
+  defp runtime("eas") do
+    adapters = Application.get_env(:manifold_connectors, :adapters, [])
+    adapter = Keyword.get(adapters, :eas) || Manifold.Connectors.Provider.EAS
+    {:ok, adapter, []}
+  end
+
   defp runtime(provider) when provider in ["gmail", "microsoft"] do
     key = String.to_existing_atom(provider)
     adapters = Application.get_env(:manifold_connectors, :adapters, [])
@@ -913,6 +993,40 @@ defmodule Manifold.Connectors.Sync do
       nil ->
         {:error,
          Error.new(:permanent, :imap_settings_missing, "IMAP settings are missing for account")}
+    end
+  end
+
+  defp enrich_runtime_config(%ReceiveMethod{kind: "eas"} = account, config) do
+    case Repo.get_by(EasSettings, external_account_id: account.id) do
+      %EasSettings{} = settings ->
+        transport =
+          Application.get_env(
+            :manifold_connectors,
+            :eas_transport,
+            Manifold.Connectors.EAS.Client
+          )
+
+        fake = Application.get_env(:manifold_connectors, :eas_fake, %{})
+
+        {:ok,
+         Keyword.merge(config,
+           host: settings.host,
+           port: settings.port,
+           path: settings.path,
+           username: settings.username,
+           device_id: settings.device_id,
+           device_type: settings.device_type,
+           protocol_version: settings.protocol_version,
+           policy_key: settings.policy_key,
+           email_address: account.email_address,
+           account_id: account.id,
+           transport: transport,
+           fake: if(is_map(fake), do: fake, else: %{})
+         )}
+
+      nil ->
+        {:error,
+         Error.new(:permanent, :eas_settings_missing, "EAS settings are missing for account")}
     end
   end
 

@@ -65,7 +65,9 @@ defmodule Manifold.ConfigTest do
 
     assert connectors[:adapters] == [
              gmail: Manifold.Connectors.Provider.Gmail,
-             microsoft: Manifold.Connectors.Provider.MicrosoftGraph
+             microsoft: Manifold.Connectors.Provider.MicrosoftGraph,
+             imap: Manifold.Connectors.Provider.IMAP,
+             eas: Manifold.Connectors.Provider.EAS
            ]
 
     assert connectors[:providers][:gmail][:base_url] == "https://gmail.invalid"

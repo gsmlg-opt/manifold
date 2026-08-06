@@ -73,12 +73,20 @@ defmodule ManifoldWeb.AccountLive.Index do
               </td>
               <td data-label="Methods">{length(row.methods)}</td>
               <td data-label="Actions">
-                <.link
-                  navigate={~p"/settings/accounts/#{row.account.id}"}
-                  class="settings-action"
-                >
-                  Manage
-                </.link>
+                <div class="account-actions">
+                  <.link
+                    navigate={~p"/settings/accounts/#{row.account.id}/edit"}
+                    class="settings-action"
+                  >
+                    Edit
+                  </.link>
+                  <.link
+                    navigate={~p"/settings/accounts/#{row.account.id}"}
+                    class="settings-action"
+                  >
+                    Manage
+                  </.link>
+                </div>
               </td>
             </tr>
             <tr :if={@accounts == []}>

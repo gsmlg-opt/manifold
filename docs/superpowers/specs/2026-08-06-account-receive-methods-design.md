@@ -8,8 +8,8 @@ Settings exposes **Accounts** only (name + email address). Domains are derived a
 
 - `Manifold.Accounts.Schema.Account` — table still `mailboxes`; `name` maps to `display_name`
 - `Manifold.Connectors.Schema.ReceiveMethod` — table still `connector_accounts`; `kind` maps to `provider`, `account_id` maps to `mailbox_id`; new `enabled` boolean with partial unique index (one enabled method per account)
-- Implemented kinds: `gmail`, `microsoft`, `imap`
-- Placeholder kinds: `pop3`, `eas`, `ews` (`status: not_implemented`, never synced)
+- Implemented kinds: `gmail`, `microsoft`, `imap`, `eas`
+- Placeholder kinds: `pop3`, `ews` (`status: not_implemented`, never synced)
 
 ## UI
 

@@ -33,7 +33,9 @@ config :manifold_data, Oban,
 config :manifold_connectors,
   adapters: [
     gmail: Manifold.Connectors.Provider.Gmail,
-    microsoft: Manifold.Connectors.Provider.MicrosoftGraph
+    microsoft: Manifold.Connectors.Provider.MicrosoftGraph,
+    imap: Manifold.Connectors.Provider.IMAP,
+    eas: Manifold.Connectors.Provider.EAS
   ],
   activity_log_dir: "log/connectors",
   activity_log_retention_days: 14,
@@ -61,11 +63,12 @@ config :manifold_storage,
   blob_store_dir: Path.expand("../priv/blob_store/#{config_env()}", __DIR__)
 
 config :manifold_mail,
-  # Bumped for GB2312/GBK/GB18030 charset decoding (CP936) and RFC2047 fallback.
-  # v4 re-runs rows stamped earlier before EncodedWord fallback existed.
-  parser_version: 4,
+  # Bumped for unlabeled GBK/CP936 Subject/From headers (no RFC 2047).
+  # v5 reprojects rows permanently mojibaked by the previous latin1 header fallback.
+  parser_version: 5,
   sanitizer_version: 1,
-  max_raw_bytes: 25 * 1024 * 1024,
+  # Must cover base64-encoded attachments up to max_attachment_bytes (~4/3 expansion).
+  max_raw_bytes: 100 * 1024 * 1024,
   max_header_bytes: 256 * 1024,
   max_headers: 1_000,
   max_mime_depth: 20,
@@ -180,6 +183,10 @@ config :duskmoon_bundler, :manifold_web,
     css: Path.expand("../apps/manifold_web/assets/css/app.css", __DIR__),
     sources: [
       %{base: Path.expand("../apps/manifold_web/lib", __DIR__), pattern: "**/*.{ex,exs,heex}"},
+      %{
+        base: Path.expand("../deps/phoenix_duskmoon/lib/phoenix_duskmoon", __DIR__),
+        pattern: "**/*.{ex,heex}"
+      },
       %{
         base: Path.expand("../apps/manifold_web/assets", __DIR__),
         pattern: "**/*.{css,js,ts,jsx,tsx}"

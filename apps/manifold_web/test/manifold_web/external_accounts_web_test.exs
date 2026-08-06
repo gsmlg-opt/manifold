@@ -50,6 +50,8 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     old_providers = Application.get_env(:manifold_connectors, :providers)
     old_transport = Application.get_env(:manifold_connectors, :imap_transport)
     old_fake = Application.get_env(:manifold_connectors, :imap_fake)
+    old_eas_transport = Application.get_env(:manifold_connectors, :eas_transport)
+    old_eas_fake = Application.get_env(:manifold_connectors, :eas_fake)
 
     Application.put_env(
       :manifold_connectors,
@@ -75,12 +77,21 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
       uidvalidity: 1
     })
 
+    Application.put_env(:manifold_connectors, :eas_transport, Manifold.Connectors.EAS.Fake)
+
+    Application.put_env(:manifold_connectors, :eas_fake, %{
+      password_expected: "secret",
+      messages: []
+    })
+
     on_exit(fn ->
       restore_env(:encryption_key, old_key)
       restore_env(:adapters, old_adapters)
       restore_env(:providers, old_providers)
       restore_env(:imap_transport, old_transport)
       restore_env(:imap_fake, old_fake)
+      restore_env(:eas_transport, old_eas_transport)
+      restore_env(:eas_fake, old_eas_fake)
     end)
 
     {:ok, account} =
@@ -131,31 +142,158 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
   end
 
   test "account show can add IMAP receive method", %{conn: conn, account: account} do
-    {:ok, view, _html} = live(conn, ~p"/settings/accounts/#{account.id}")
+    {:ok, view, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/receive_methods/new")
 
-    view |> element("#add-receive-method") |> render_click()
+    view |> element("button[phx-value-kind='imap']") |> render_click()
+
+    html =
+      view
+      |> form("#imap-account-form", %{
+        imap: %{
+          email_address: Accounts.account_address(account),
+          username: Accounts.account_address(account),
+          password: "secret",
+          host: "imap.example",
+          port: "993",
+          tls_mode: "tls"
+        }
+      })
+      |> render_submit()
+
+    assert html =~ "Saving"
+    assert_redirect(view, ~p"/settings/accounts/#{account.id}")
+
+    {:ok, show_view, html} = live(conn, ~p"/settings/accounts/#{account.id}")
+    assert html =~ "IMAP"
+    assert html =~ "Yes"
+    assert render(show_view) =~ "IMAP"
+
+    [method] = Connectors.list_receive_methods_for_account(account.id)
+    assert method.kind == "imap"
+    assert method.enabled
+  end
+
+  test "account show can add EAS receive method", %{conn: conn, account: account} do
+    {:ok, view, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/receive_methods/new")
+
+    view |> element("button[phx-value-kind='eas']") |> render_click()
+
+    html =
+      view
+      |> form("#eas-account-form", %{
+        eas: %{
+          email_address: Accounts.account_address(account),
+          username: Accounts.account_address(account),
+          password: "secret",
+          host: "mail.example",
+          port: "443",
+          path: "/Microsoft-Server-ActiveSync"
+        }
+      })
+      |> render_submit()
+
+    assert html =~ "Saving"
+    assert_redirect(view, ~p"/settings/accounts/#{account.id}")
+
+    {:ok, show_view, html} = live(conn, ~p"/settings/accounts/#{account.id}")
+    assert html =~ "EAS"
+    assert html =~ "Yes"
+    assert render(show_view) =~ "EAS"
+
+    [method] = Connectors.list_receive_methods_for_account(account.id)
+    assert method.kind == "eas"
+    assert method.enabled
+  end
+
+  test "eas test connection succeeds without creating a receive method", %{
+    conn: conn,
+    account: account
+  } do
+    {:ok, view, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/receive_methods/new")
+
+    view |> element("button[phx-value-kind='eas']") |> render_click()
+
+    view
+    |> form("#eas-account-form", %{
+      eas: %{
+        email_address: Accounts.account_address(account),
+        username: Accounts.account_address(account),
+        password: "secret",
+        host: "mail.example",
+        port: "443",
+        path: "/Microsoft-Server-ActiveSync"
+      }
+    })
+    |> render_change()
+
+    html = view |> element("#test-eas-connection") |> render_click()
+
+    refute html =~ "Connection succeeded."
+    html = render_async(view)
+    assert html =~ "Connection succeeded."
+    assert Connectors.list_receive_methods_for_account(account.id) == []
+  end
+
+  test "imap test connection succeeds without creating a receive method", %{
+    conn: conn,
+    account: account
+  } do
+    {:ok, view, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/receive_methods/new")
+
     view |> element("button[phx-value-kind='imap']") |> render_click()
 
     view
-    |> form("#imap-form", %{
+    |> form("#imap-account-form", %{
       imap: %{
         email_address: Accounts.account_address(account),
         username: Accounts.account_address(account),
         password: "secret",
         host: "imap.example",
         port: "993",
-        tls_mode: "ssl"
+        tls_mode: "tls"
       }
     })
-    |> render_submit()
+    |> render_change()
 
-    html = render(view)
-    assert html =~ "IMAP"
-    assert html =~ "Yes"
+    html = view |> element("#test-imap-connection") |> render_click()
 
-    [method] = Connectors.list_receive_methods_for_account(account.id)
-    assert method.kind == "imap"
-    assert method.enabled
+    refute html =~ "Connection succeeded."
+    html = render_async(view)
+    assert html =~ "Connection succeeded."
+    assert Connectors.list_receive_methods_for_account(account.id) == []
+  end
+
+  test "imap test connection failure does not create a receive method", %{
+    conn: conn,
+    account: account
+  } do
+    {:ok, view, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/receive_methods/new")
+
+    view |> element("button[phx-value-kind='imap']") |> render_click()
+
+    view
+    |> form("#imap-account-form", %{
+      imap: %{
+        email_address: Accounts.account_address(account),
+        username: Accounts.account_address(account),
+        password: "wrong",
+        host: "imap.example",
+        port: "993",
+        tls_mode: "tls"
+      }
+    })
+    |> render_change()
+
+    view |> element("#test-imap-connection") |> render_click()
+
+    html = render_async(view)
+    assert html =~ "IMAP authentication failed"
+    assert Connectors.list_receive_methods_for_account(account.id) == []
   end
 
   test "account show can disconnect receive method", %{conn: conn, account: account} do

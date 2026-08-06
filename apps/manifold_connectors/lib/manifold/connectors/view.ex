@@ -28,3 +28,30 @@ defmodule Manifold.Connectors.View.ReceiveMethod do
           last_error: String.t() | nil
         }
 end
+
+defmodule Manifold.Connectors.View.SendMethod do
+  @moduledoc false
+
+  @enforce_keys [
+    :id,
+    :account_id,
+    :kind,
+    :email_address,
+    :status,
+    :enabled,
+    :last_verified_at,
+    :last_error
+  ]
+  defstruct @enforce_keys
+
+  @type t :: %__MODULE__{
+          id: Ecto.UUID.t(),
+          account_id: Ecto.UUID.t(),
+          kind: String.t(),
+          email_address: String.t(),
+          status: String.t(),
+          enabled: boolean(),
+          last_verified_at: DateTime.t() | nil,
+          last_error: String.t() | nil
+        }
+end

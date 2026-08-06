@@ -31,10 +31,10 @@ defmodule Manifold.Connectors.Schema.ReceiveMethod do
   def kinds, do: @kinds
 
   @spec implemented_kinds() :: [String.t()]
-  def implemented_kinds, do: ~w(gmail microsoft imap)
+  def implemented_kinds, do: ~w(gmail microsoft imap eas)
 
   @spec placeholder_kinds() :: [String.t()]
-  def placeholder_kinds, do: ~w(pop3 eas ews)
+  def placeholder_kinds, do: ~w(pop3 ews)
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(receive_method, attrs) do

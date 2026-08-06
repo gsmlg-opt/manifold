@@ -12,7 +12,8 @@ defmodule Manifold.Mail do
     InboundSource,
     Mailbox,
     ProjectionResult,
-    Projector
+    Projector,
+    ReceivedAt
   }
 
   @spec add_acceptance_entries(
@@ -64,6 +65,12 @@ defmodule Manifold.Mail do
   defdelegate apply_external_state(mailbox_id, inbound_delivery_id, state),
     to: ExternalState,
     as: :apply
+
+  @doc """
+  Persists provider mailbox receive time onto the projected message and delivery.
+  """
+  @spec set_received_at(Ecto.UUID.t(), DateTime.t()) :: :ok
+  defdelegate set_received_at(inbound_delivery_id, received_at), to: ReceivedAt, as: :set
 
   @spec stale_projection_delivery_ids(pos_integer(), pos_integer(), Keyword.t()) ::
           [Ecto.UUID.t()]

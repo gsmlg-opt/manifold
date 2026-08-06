@@ -90,6 +90,7 @@ defmodule ManifoldAPI.JSON do
       sender_name: message.sender_name,
       sender_address: message.sender_address,
       sent_at: datetime(message.sent_at),
+      received_at: datetime(message.received_at),
       text_body: message.text_body,
       has_html: message.has_html,
       read: message.read,

@@ -34,6 +34,60 @@ defmodule Manifold.AccountsTest do
     assert Accounts.account_address(account) == "Alice@example.com"
   end
 
+  test "update_account changes name without advancing route revision" do
+    assert {:ok, account} =
+             Accounts.create_account(%{name: "Alice", address: "alice@example.com"})
+
+    assert {:ok, first} = Accounts.recipient_snapshot()
+
+    assert {:ok, updated} =
+             Accounts.update_account(account, %{name: "Alicia", address: "alice@example.com"})
+
+    assert updated.name == "Alicia"
+    assert Accounts.account_address(updated) == "alice@example.com"
+
+    assert {:ok, unchanged} = Accounts.recipient_snapshot()
+    assert unchanged.revision == first.revision
+  end
+
+  test "update_account changes address and advances route revision" do
+    assert {:ok, account} =
+             Accounts.create_account(%{name: "Alice", address: "alice@example.com"})
+
+    assert {:ok, _domain} = Accounts.create_domain(%{name: "new-domain.example", active: true})
+    assert {:ok, first} = Accounts.recipient_snapshot()
+
+    assert {:ok, updated} =
+             Accounts.update_account(account, %{
+               name: "Alice",
+               address: "alice@new-domain.example"
+             })
+
+    assert Accounts.account_address(updated) == "alice@new-domain.example"
+    assert updated.domain.normalized_domain == "new-domain.example"
+
+    assert {:ok, changed} = Accounts.recipient_snapshot()
+    assert changed.revision == first.revision + 1
+
+    assert {:ok, _route} = Accounts.resolve_recipient("alice@new-domain.example")
+
+    assert {:error, %{reason: :unknown_recipient}} =
+             Accounts.resolve_recipient("alice@example.com")
+  end
+
+  test "update_account rejects duplicate address" do
+    assert {:ok, _first} =
+             Accounts.create_account(%{name: "One", address: "taken@example.com"})
+
+    assert {:ok, second} =
+             Accounts.create_account(%{name: "Two", address: "free@example.com"})
+
+    assert {:error, changeset} =
+             Accounts.update_account(second, %{name: "Two", address: "taken@example.com"})
+
+    assert {"has already been taken", _} = changeset.errors[:local_part]
+  end
+
   test "exact active account lookup" do
     %{domain: domain, account: account} = account_fixture()
 

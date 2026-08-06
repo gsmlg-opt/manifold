@@ -42,6 +42,25 @@ defmodule Manifold.Mail.Charset do
     end
   end
 
+  @doc """
+  Ensures a binary is a UTF-8 string.
+
+  Unlabeled 8-bit mail headers from Chinese providers are often raw GBK/CP936
+  without RFC 2047 encoded-words. Prefer a clean CP936 decode over latin1 so
+  those subjects do not permanently mojibake.
+  """
+  @spec ensure_utf8(binary()) :: String.t()
+  def ensure_utf8(binary) when is_binary(binary) do
+    if String.valid?(binary) do
+      binary
+    else
+      case convert_cp936_clean(binary) do
+        {:ok, converted} -> converted
+        :error -> :unicode.characters_to_binary(binary, :latin1, :utf8)
+      end
+    end
+  end
+
   defp normalize(charset) do
     charset
     |> String.trim()
@@ -52,15 +71,18 @@ defmodule Manifold.Mail.Charset do
   defp convert(binary, encoding) do
     case Codepagex.to_string(binary, encoding, Codepagex.use_utf_replacement()) do
       {:ok, converted, _replacements} -> converted
+      {:ok, converted} -> converted
       {:error, _reason} -> ensure_utf8(binary)
     end
   end
 
-  defp ensure_utf8(binary) do
-    if String.valid?(binary) do
-      binary
-    else
-      :unicode.characters_to_binary(binary, :latin1, :utf8)
+  defp convert_cp936_clean(binary) do
+    case Codepagex.to_string(binary, @cp936, Codepagex.use_utf_replacement()) do
+      {:ok, converted, 0} -> {:ok, converted}
+      {:ok, converted, nil} -> {:ok, converted}
+      {:ok, converted} -> {:ok, converted}
+      {:ok, _converted, _replacements} -> :error
+      {:error, _reason} -> :error
     end
   end
 end

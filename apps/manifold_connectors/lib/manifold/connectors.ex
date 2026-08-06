@@ -10,10 +10,13 @@ defmodule Manifold.Connectors do
   alias Manifold.Connectors.ActivityLog
   alias Manifold.Connectors.Crypto
   alias Manifold.Connectors.IMAP.Client
+  alias Manifold.Connectors.EAS.Client, as: EASClient
+  alias Manifold.Connectors.SMTP.Client, as: SmtpClient
   alias Manifold.Connectors.Jobs.SyncAccount
   alias Manifold.Connectors.OAuth.Consumed
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.IMAP, as: ProviderIMAP
+  alias Manifold.Connectors.Provider.EAS, as: ProviderEAS
   alias Manifold.Connectors.Provider.{Identity, Token}
   alias Manifold.Connectors.Sync
 
@@ -21,8 +24,12 @@ defmodule Manifold.Connectors do
     ConnectorEvent,
     Credential,
     ReceiveMethod,
+    EasSettings,
     ImapSettings,
     RemoteMessage,
+    SendCredential,
+    SendMethod,
+    SmtpSettings,
     SyncCursor
   }
 
@@ -128,7 +135,7 @@ defmodule Manifold.Connectors do
   @spec create_placeholder_receive_method(Ecto.UUID.t(), String.t(), map()) ::
           {:ok, ReceiveMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def create_placeholder_receive_method(account_id, kind, attrs \\ %{})
-      when kind in ["pop3", "eas", "ews"] do
+      when kind in ["pop3", "ews"] do
     email =
       Map.get(attrs, :email_address) || Map.get(attrs, "email_address") ||
         case Accounts.get_account(account_id) do
@@ -236,6 +243,213 @@ defmodule Manifold.Connectors do
          code: :connect_failed,
          message: "IMAP connect failed: #{Exception.message(e)}"
        }}
+  end
+
+  @spec test_eas_connection(map()) :: :ok | {:error, Error.t() | ProviderError.t()}
+  def test_eas_connection(attrs) when is_map(attrs) do
+    attrs = normalize_eas_attrs(attrs)
+
+    with {:ok, settings} <- eas_settings_from_attrs(attrs),
+         {:ok, _discovered} <- discover_eas(settings) do
+      :ok
+    end
+  rescue
+    e in [ArgumentError, ErlangError, FunctionClauseError] ->
+      {:error,
+       %ProviderError{
+         class: :temporary,
+         code: :connect_failed,
+         message: "EAS connect failed: #{Exception.message(e)}"
+       }}
+  end
+
+  @spec create_eas_account(map()) ::
+          {:ok, ReceiveMethod.t()}
+          | {:error, Error.t() | Ecto.Changeset.t() | ProviderError.t()}
+  def create_eas_account(attrs) when is_map(attrs) do
+    attrs = normalize_eas_attrs(attrs)
+    now = DateTime.utc_now()
+    account_id = attr(attrs, :account_id)
+
+    with {:ok, parsed} <- Address.parse(attr(attrs, :email_address) || ""),
+         provider_account_id <- "eas:" <> parsed.canonical,
+         :ok <- reject_duplicate_eas(parsed.canonical, provider_account_id),
+         {:ok, settings} <- eas_settings_from_attrs(attrs),
+         {:ok, discovered} <- discover_eas(settings),
+         {:ok, mailbox} <- resolve_imap_account(account_id, parsed.canonical),
+         {:ok, cursors} <-
+           ProviderEAS.initial_cursors(
+             attr(attrs, :password),
+             eas_provider_config(attrs, discovered),
+             []
+           ) do
+      persist_eas_account(attrs, parsed, provider_account_id, mailbox, cursors, discovered, now)
+    else
+      {:error, %ProviderError{} = error} -> {:error, error}
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    e in [DBConnection.ConnectionError, Postgrex.Error] ->
+      {:error, database_error(e)}
+
+    e in [ArgumentError, ErlangError, FunctionClauseError] ->
+      {:error,
+       %ProviderError{
+         class: :temporary,
+         code: :connect_failed,
+         message: "EAS connect failed: #{Exception.message(e)}"
+       }}
+  end
+
+  @spec list_send_methods_for_account(Ecto.UUID.t()) :: [View.SendMethod.t()]
+  def list_send_methods_for_account(account_id) do
+    SendMethod
+    |> where([m], m.account_id == ^account_id)
+    |> order_by([m], desc: m.enabled, asc: m.kind, asc: m.id)
+    |> Repo.all()
+    |> Enum.map(&send_method_view/1)
+  end
+
+  @spec test_smtp_connection(map()) :: :ok | {:error, Error.t() | ProviderError.t()}
+  def test_smtp_connection(attrs) when is_map(attrs) do
+    attrs = normalize_smtp_attrs(attrs)
+
+    with {:ok, settings} <- smtp_settings_from_attrs(attrs) do
+      transport = smtp_transport()
+
+      case transport.connect(settings) do
+        {:ok, conn} ->
+          transport.quit(conn)
+          :ok
+
+        {:error, %ProviderError{} = error} ->
+          {:error, error}
+      end
+    end
+  rescue
+    e in [ArgumentError, ErlangError, FunctionClauseError] ->
+      {:error,
+       %ProviderError{
+         class: :temporary,
+         code: :connect_failed,
+         message: "SMTP connect failed: #{Exception.message(e)}"
+       }}
+  end
+
+  @spec create_smtp_send_method(map()) ::
+          {:ok, SendMethod.t()}
+          | {:error, Error.t() | Ecto.Changeset.t() | ProviderError.t()}
+  def create_smtp_send_method(attrs) when is_map(attrs) do
+    attrs = normalize_smtp_attrs(attrs)
+    now = DateTime.utc_now()
+    skip_test? = truthy?(attr(attrs, :skip_test))
+    account_id = attr(attrs, :account_id)
+
+    with {:ok, parsed} <- Address.parse(attr(attrs, :email_address) || ""),
+         :ok <- maybe_test_smtp(attrs, skip_test?),
+         {:ok, mailbox} <- resolve_send_account(account_id) do
+      persist_smtp_send_method(attrs, parsed, mailbox, now)
+    else
+      {:error, %ProviderError{} = error} -> {:error, error}
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    e in [DBConnection.ConnectionError, Postgrex.Error] ->
+      {:error, database_error(e)}
+
+    e in [ArgumentError, ErlangError, FunctionClauseError] ->
+      {:error,
+       %ProviderError{
+         class: :temporary,
+         code: :connect_failed,
+         message: "SMTP connect failed: #{Exception.message(e)}"
+       }}
+  end
+
+  @spec enable_send_method(Ecto.UUID.t()) ::
+          {:ok, SendMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
+  def enable_send_method(send_method_id) do
+    Repo.transaction(fn ->
+      method =
+        SendMethod
+        |> where([m], m.id == ^send_method_id)
+        |> lock("FOR UPDATE")
+        |> Repo.one()
+
+      case method do
+        nil ->
+          Repo.rollback(Error.new(:permanent, :account_not_found, "send method not found"))
+
+        %SendMethod{status: "disconnected"} ->
+          Repo.rollback(
+            Error.new(:permanent, :account_disconnected, "send method is disconnected")
+          )
+
+        %SendMethod{} = method ->
+          disable_other_send_methods(Repo, method.account_id, except_id: method.id)
+
+          case SendMethod.changeset(method, %{enabled: true}) |> Repo.update() do
+            {:ok, updated} -> updated
+            {:error, changeset} -> Repo.rollback(changeset)
+          end
+      end
+    end)
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  @spec disconnect_send_method(Ecto.UUID.t()) ::
+          {:ok, SendMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
+  def disconnect_send_method(send_method_id) do
+    now = DateTime.utc_now()
+
+    Multi.new()
+    |> Multi.run(:method, fn repo, _changes ->
+      method =
+        SendMethod
+        |> where([m], m.id == ^send_method_id)
+        |> lock("FOR UPDATE")
+        |> repo.one()
+
+      case method do
+        nil ->
+          {:error, Error.new(:permanent, :account_not_found, "send method not found")}
+
+        %SendMethod{status: "disconnected"} = disconnected ->
+          {:ok, disconnected}
+
+        %SendMethod{} = method ->
+          method
+          |> SendMethod.changeset(%{
+            status: "disconnected",
+            enabled: false,
+            disconnected_at: now,
+            last_error_class: nil,
+            last_error_code: nil,
+            last_error_message: nil
+          })
+          |> repo.update()
+      end
+    end)
+    |> Multi.delete_all(
+      :credentials,
+      from(c in SendCredential, where: c.send_method_id == ^send_method_id)
+    )
+    |> Multi.delete_all(
+      :settings,
+      from(s in SmtpSettings, where: s.send_method_id == ^send_method_id)
+    )
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{method: method}} -> {:ok, method}
+      {:error, _step, reason, _changes} -> {:error, reason}
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
   defp resolve_imap_account(nil, address), do: Accounts.ensure_account_for_address(address)
@@ -416,6 +630,72 @@ defmodule Manifold.Connectors do
     end
   rescue
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  @doc """
+  Enqueues remote read write-back jobs for local mailbox entries (IMAP and EAS).
+  """
+  @spec enqueue_read_push([Ecto.UUID.t()], boolean()) :: :ok
+  def enqueue_read_push(entry_ids, read?)
+      when is_list(entry_ids) and is_boolean(read?) do
+    alias Manifold.Connectors.Jobs.PushRemoteRead
+    alias Manifold.Mail.Schema.MailboxEntry
+
+    remotes =
+      from(entry in MailboxEntry,
+        join: remote in RemoteMessage,
+        on: remote.inbound_delivery_id == entry.inbound_delivery_id,
+        join: method in ReceiveMethod,
+        on: method.id == remote.external_account_id,
+        where:
+          entry.id in ^entry_ids and method.kind in ["imap", "eas"] and
+            method.status != "disconnected",
+        select: remote
+      )
+      |> Repo.all()
+
+    Enum.each(remotes, fn remote ->
+      remote
+      |> RemoteMessage.changeset(%{remote_read: read?})
+      |> Repo.update!()
+
+      replace_push_read_job(remote.id, read?)
+    end)
+
+    :ok
+  end
+
+  @doc false
+  @spec enqueue_imap_read_push([Ecto.UUID.t()], boolean()) :: :ok
+  def enqueue_imap_read_push(entry_ids, read?), do: enqueue_read_push(entry_ids, read?)
+
+  @doc false
+  @spec push_remote_read(Ecto.UUID.t(), boolean()) ::
+          :ok | {:error, Error.t() | ProviderError.t()}
+  def push_remote_read(remote_message_id, read?) when is_boolean(read?) do
+    Sync.push_remote_read(remote_message_id, read?)
+  end
+
+  @doc false
+  @spec push_imap_read(Ecto.UUID.t(), boolean()) ::
+          :ok | {:error, Error.t() | ProviderError.t()}
+  def push_imap_read(remote_message_id, read?), do: push_remote_read(remote_message_id, read?)
+
+  defp replace_push_read_job(remote_message_id, read?) do
+    alias Manifold.Connectors.Jobs.PushRemoteRead
+
+    Oban.Job
+    |> where([job], job.worker == ^inspect(PushRemoteRead))
+    |> where([job], job.state in ~w(available scheduled retryable))
+    |> where(
+      [job],
+      fragment("?->>'remote_message_id' = ?", job.args, ^remote_message_id)
+    )
+    |> Repo.delete_all()
+
+    %{"remote_message_id" => remote_message_id, "read" => read?}
+    |> PushRemoteRead.new()
+    |> Repo.insert!()
   end
 
   defp persist_authorization(provider, consumed, token, identity, cursors, now, opts) do
@@ -683,6 +963,19 @@ defmodule Manifold.Connectors do
     }
   end
 
+  defp send_method_view(method) do
+    %View.SendMethod{
+      id: method.id,
+      account_id: method.account_id,
+      kind: method.kind,
+      email_address: method.email_address,
+      status: method.status,
+      enabled: method.enabled,
+      last_verified_at: method.last_verified_at,
+      last_error: method.last_error_message
+    }
+  end
+
   defp normalize_folder_kind(folder_kind) when folder_kind in ~w(inbox archive trash),
     do: folder_kind
 
@@ -692,6 +985,233 @@ defmodule Manifold.Connectors do
 
   defp imap_transport do
     Application.get_env(:manifold_connectors, :imap_transport, Client)
+  end
+
+  defp smtp_transport do
+    Application.get_env(:manifold_connectors, :smtp_transport, SmtpClient)
+  end
+
+  defp eas_transport do
+    Application.get_env(:manifold_connectors, :eas_transport, EASClient)
+  end
+
+  defp discover_eas(settings) when is_map(settings) do
+    transport = eas_transport()
+
+    with {:ok, conn} <- transport.connect(settings),
+         {:ok, conn, %{policy_key: policy_key}} <- transport.provision(conn),
+         {:ok, conn, %{sync_key: folder_sync_key, folders: folders}} <-
+           transport.folder_sync(conn, "0") do
+      collection_id = EASClient.inbox_collection_id(folders)
+      transport.close(conn)
+
+      if is_binary(collection_id) do
+        {:ok,
+         %{
+           policy_key: policy_key,
+           folder_sync_key: folder_sync_key,
+           collection_id: collection_id,
+           device_id: settings.device_id
+         }}
+      else
+        {:error,
+         %ProviderError{
+           class: :permanent,
+           code: :inbox_not_found,
+           message: "EAS Inbox folder was not found"
+         }}
+      end
+    else
+      {:error, %ProviderError{} = error} -> {:error, error}
+    end
+  end
+
+  defp reject_duplicate_eas(email_canonical, provider_account_id) do
+    conflict =
+      ReceiveMethod
+      |> where([account], account.status != "disconnected")
+      |> where(
+        [account],
+        account.provider_account_id == ^provider_account_id or
+          (account.kind == "eas" and
+             fragment("lower(?) = ?", account.email_address, ^email_canonical))
+      )
+      |> limit(1)
+      |> Repo.one()
+
+    case conflict do
+      nil ->
+        :ok
+
+      %ReceiveMethod{} ->
+        {:error,
+         Error.new(
+           :permanent,
+           :account_already_connected,
+           "an EAS account for this address is already connected"
+         )}
+    end
+  end
+
+  defp eas_settings_from_attrs(attrs) do
+    host = attr(attrs, :host)
+    username = attr(attrs, :username) || attr(attrs, :email_address)
+    password = attr(attrs, :password)
+    path = attr(attrs, :path) || EasSettings.default_path()
+    port = parse_port(attr(attrs, :port) || 443)
+    device_id = attr(attrs, :device_id) || generate_eas_device_id()
+    device_type = attr(attrs, :device_type) || EasSettings.default_device_type()
+    protocol_version = attr(attrs, :protocol_version) || EasSettings.default_protocol_version()
+
+    cond do
+      not is_binary(host) or host == "" ->
+        {:error, Error.new(:permanent, :invalid_eas_settings, "EAS host is required")}
+
+      not is_binary(username) or username == "" ->
+        {:error, Error.new(:permanent, :invalid_eas_settings, "EAS username is required")}
+
+      not is_binary(password) or password == "" ->
+        {:error, Error.new(:permanent, :invalid_eas_settings, "EAS password is required")}
+
+      not is_integer(port) ->
+        {:error, Error.new(:permanent, :invalid_eas_settings, "EAS port is invalid")}
+
+      true ->
+        settings = %{
+          host: host,
+          port: port,
+          path: path,
+          username: username,
+          password: password,
+          device_id: device_id,
+          device_type: device_type,
+          protocol_version: protocol_version,
+          policy_key: attr(attrs, :policy_key)
+        }
+
+        fake = Application.get_env(:manifold_connectors, :eas_fake, %{})
+
+        {:ok,
+         settings
+         |> Map.merge(if(is_map(fake), do: fake, else: %{}))
+         |> maybe_merge_attr_fake(attrs)}
+    end
+  end
+
+  defp normalize_eas_attrs(attrs) when is_map(attrs) do
+    attrs
+    |> maybe_put_trimmed(:host)
+    |> maybe_put_trimmed(:username)
+    |> maybe_put_trimmed(:email_address)
+    |> maybe_put_trimmed(:path)
+    |> maybe_put_password_without_spaces()
+    |> maybe_put_normalized_port()
+    |> maybe_put_device_id()
+  end
+
+  defp maybe_put_device_id(attrs) do
+    case attr(attrs, :device_id) do
+      value when is_binary(value) and value != "" ->
+        put_attr(attrs, :device_id, String.slice(String.trim(value), 0, 32))
+
+      _ ->
+        put_attr(attrs, :device_id, generate_eas_device_id())
+    end
+  end
+
+  defp generate_eas_device_id do
+    Ecto.UUID.generate() |> String.replace("-", "") |> String.slice(0, 32)
+  end
+
+  defp eas_provider_config(attrs, discovered) do
+    [
+      host: attr(attrs, :host),
+      port: parse_port(attr(attrs, :port) || 443),
+      path: attr(attrs, :path) || EasSettings.default_path(),
+      username: attr(attrs, :username) || attr(attrs, :email_address),
+      email_address: attr(attrs, :email_address),
+      device_id: attr(attrs, :device_id) || discovered.device_id,
+      device_type: attr(attrs, :device_type) || EasSettings.default_device_type(),
+      protocol_version: attr(attrs, :protocol_version) || EasSettings.default_protocol_version(),
+      policy_key: discovered.policy_key,
+      collection_id: discovered.collection_id,
+      folder_sync_key: discovered.folder_sync_key,
+      transport: eas_transport()
+    ]
+  end
+
+  defp persist_eas_account(attrs, parsed, provider_account_id, mailbox, cursors, discovered, now) do
+    password = attr(attrs, :password)
+    username = attr(attrs, :username) || parsed.canonical
+    host = attr(attrs, :host)
+    port = parse_port(attr(attrs, :port) || 443)
+    path = attr(attrs, :path) || EasSettings.default_path()
+    device_id = attr(attrs, :device_id) || discovered.device_id
+    device_type = attr(attrs, :device_type) || EasSettings.default_device_type()
+    protocol_version = attr(attrs, :protocol_version) || EasSettings.default_protocol_version()
+
+    Multi.new()
+    |> Multi.run(:disable_others, fn repo, _changes ->
+      disable_other_methods(repo, mailbox.id)
+      {:ok, :ok}
+    end)
+    |> Multi.insert(:account, fn _changes ->
+      ReceiveMethod.changeset(%ReceiveMethod{}, %{
+        account_id: mailbox.id,
+        kind: "eas",
+        provider_account_id: provider_account_id,
+        email_address: parsed.canonical,
+        status: "connected",
+        enabled: true,
+        sync_enabled: true,
+        granted_scopes: []
+      })
+    end)
+    |> Multi.run(:credential, fn repo, %{account: account} ->
+      with {:ok, ciphertext} <-
+             Crypto.encrypt(password, credential_context(account.id, :eas_password)) do
+        Credential.changeset(%Credential{}, %{
+          external_account_id: account.id,
+          key_version: 1,
+          secret_kind: "password",
+          password_ciphertext: ciphertext,
+          refresh_token_ciphertext: nil
+        })
+        |> repo.insert()
+      end
+    end)
+    |> Multi.insert(:eas_settings, fn %{account: account} ->
+      EasSettings.changeset(%EasSettings{}, %{
+        external_account_id: account.id,
+        host: host,
+        port: port,
+        path: path,
+        username: username,
+        device_id: device_id,
+        device_type: device_type,
+        protocol_version: protocol_version,
+        policy_key: discovered.policy_key
+      })
+    end)
+    |> Multi.run(:cursors, fn repo, %{account: account} ->
+      replace_cursors(repo, account.id, cursors, now)
+    end)
+    |> Multi.insert(:event, fn %{account: account} ->
+      ConnectorEvent.changeset(%ConnectorEvent{}, %{
+        external_account_id: account.id,
+        event_type: "connected",
+        metadata: %{provider: "eas"},
+        occurred_at: now
+      })
+    end)
+    |> Multi.run(:job, fn repo, %{account: account} ->
+      {:ok, ensure_sync_job(repo, account.id)}
+    end)
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{account: account}} -> {:ok, account}
+      {:error, _step, reason, _changes} -> {:error, reason}
+    end
   end
 
   defp attr(attrs, key) when is_atom(key) do
@@ -740,7 +1260,7 @@ defmodule Manifold.Connectors do
     host = attr(attrs, :host)
     username = attr(attrs, :username) || attr(attrs, :email_address)
     password = attr(attrs, :password)
-    tls_mode = attr(attrs, :tls_mode) || "ssl"
+    tls_mode = attr(attrs, :tls_mode) || "tls"
     mailbox_path = attr(attrs, :mailbox_path) || "INBOX"
     port = parse_port(attr(attrs, :port) || 993)
 
@@ -754,7 +1274,7 @@ defmodule Manifold.Connectors do
       not is_binary(password) or password == "" ->
         {:error, Error.new(:permanent, :invalid_imap_settings, "IMAP password is required")}
 
-      tls_mode not in ["ssl", "starttls"] ->
+      tls_mode not in ["ssl", "tls", "starttls"] ->
         {:error, Error.new(:permanent, :invalid_imap_settings, "IMAP tls_mode is invalid")}
 
       not is_integer(port) ->
@@ -785,6 +1305,7 @@ defmodule Manifold.Connectors do
     |> maybe_put_trimmed(:username)
     |> maybe_put_trimmed(:email_address)
     |> maybe_put_trimmed(:mailbox_path)
+    |> maybe_put_password_without_spaces()
     |> maybe_put_normalized_port()
   end
 
@@ -792,6 +1313,16 @@ defmodule Manifold.Connectors do
     case attr(attrs, key) do
       value when is_binary(value) -> put_attr(attrs, key, String.trim(value))
       _ -> attrs
+    end
+  end
+
+  defp maybe_put_password_without_spaces(attrs) do
+    case attr(attrs, :password) do
+      value when is_binary(value) ->
+        put_attr(attrs, :password, value |> String.trim() |> String.replace(" ", ""))
+
+      _ ->
+        attrs
     end
   end
 
@@ -835,7 +1366,7 @@ defmodule Manifold.Connectors do
     [
       host: attr(attrs, :host),
       port: parse_port(attr(attrs, :port) || 993),
-      tls_mode: attr(attrs, :tls_mode) || "ssl",
+      tls_mode: attr(attrs, :tls_mode) || "tls",
       username: attr(attrs, :username) || attr(attrs, :email_address),
       mailbox_path: attr(attrs, :mailbox_path) || "INBOX",
       transport: imap_transport()
@@ -847,7 +1378,7 @@ defmodule Manifold.Connectors do
     username = attr(attrs, :username) || parsed.canonical
     host = attr(attrs, :host)
     port = parse_port(attr(attrs, :port) || 993)
-    tls_mode = attr(attrs, :tls_mode) || "ssl"
+    tls_mode = attr(attrs, :tls_mode) || "tls"
     mailbox_path = attr(attrs, :mailbox_path) || "INBOX"
 
     Multi.new()
@@ -907,6 +1438,143 @@ defmodule Manifold.Connectors do
     |> Repo.transaction()
     |> case do
       {:ok, %{account: account}} -> {:ok, account}
+      {:error, _step, reason, _changes} -> {:error, reason}
+    end
+  end
+
+  defp resolve_send_account(account_id) when is_binary(account_id) do
+    case Accounts.get_account(account_id) do
+      nil -> {:error, Error.new(:permanent, :account_not_found, "account not found")}
+      account -> {:ok, account}
+    end
+  end
+
+  defp resolve_send_account(_) do
+    {:error, Error.new(:permanent, :account_not_found, "account not found")}
+  end
+
+  defp maybe_test_smtp(_attrs, true), do: :ok
+
+  defp maybe_test_smtp(attrs, false) do
+    case test_smtp_connection(attrs) do
+      :ok -> :ok
+      {:error, %ProviderError{} = error} -> {:error, error}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  defp disable_other_send_methods(repo, account_id, opts \\ []) do
+    except_id = Keyword.get(opts, :except_id)
+
+    query =
+      SendMethod
+      |> where([m], m.account_id == ^account_id and m.enabled == true)
+
+    query =
+      if except_id do
+        where(query, [m], m.id != ^except_id)
+      else
+        query
+      end
+
+    repo.update_all(query, set: [enabled: false, updated_at: DateTime.utc_now()])
+  end
+
+  defp smtp_settings_from_attrs(attrs) do
+    host = attr(attrs, :host)
+    username = attr(attrs, :username) || attr(attrs, :email_address)
+    password = attr(attrs, :password)
+    tls_mode = attr(attrs, :tls_mode) || "tls"
+    port = parse_port(attr(attrs, :port) || 465)
+
+    cond do
+      not is_binary(host) or host == "" ->
+        {:error, Error.new(:permanent, :invalid_smtp_settings, "SMTP host is required")}
+
+      not is_binary(username) or username == "" ->
+        {:error, Error.new(:permanent, :invalid_smtp_settings, "SMTP username is required")}
+
+      not is_binary(password) or password == "" ->
+        {:error, Error.new(:permanent, :invalid_smtp_settings, "SMTP password is required")}
+
+      tls_mode not in ["ssl", "tls", "starttls"] ->
+        {:error, Error.new(:permanent, :invalid_smtp_settings, "SMTP tls_mode is invalid")}
+
+      not is_integer(port) ->
+        {:error, Error.new(:permanent, :invalid_smtp_settings, "SMTP port is invalid")}
+
+      true ->
+        settings = %{
+          host: host,
+          port: port,
+          tls_mode: tls_mode,
+          username: username,
+          password: password
+        }
+
+        fake = Application.get_env(:manifold_connectors, :smtp_fake, %{})
+
+        {:ok,
+         settings
+         |> Map.merge(if(is_map(fake), do: fake, else: %{}))
+         |> maybe_merge_attr_fake(attrs)}
+    end
+  end
+
+  defp normalize_smtp_attrs(attrs) when is_map(attrs) do
+    attrs
+    |> maybe_put_trimmed(:host)
+    |> maybe_put_trimmed(:username)
+    |> maybe_put_trimmed(:email_address)
+    |> maybe_put_password_without_spaces()
+    |> maybe_put_normalized_port()
+  end
+
+  defp persist_smtp_send_method(attrs, parsed, mailbox, now) do
+    password = attr(attrs, :password)
+    username = attr(attrs, :username) || parsed.canonical
+    host = attr(attrs, :host)
+    port = parse_port(attr(attrs, :port) || 465)
+    tls_mode = attr(attrs, :tls_mode) || "tls"
+
+    Multi.new()
+    |> Multi.run(:disable_others, fn repo, _changes ->
+      disable_other_send_methods(repo, mailbox.id)
+      {:ok, :ok}
+    end)
+    |> Multi.insert(:method, fn _changes ->
+      SendMethod.changeset(%SendMethod{}, %{
+        account_id: mailbox.id,
+        kind: "smtp",
+        email_address: parsed.canonical,
+        status: "connected",
+        enabled: true,
+        last_verified_at: now
+      })
+    end)
+    |> Multi.run(:credential, fn repo, %{method: method} ->
+      with {:ok, ciphertext} <-
+             Crypto.encrypt(password, credential_context(method.id, :smtp_password)) do
+        SendCredential.changeset(%SendCredential{}, %{
+          send_method_id: method.id,
+          key_version: 1,
+          password_ciphertext: ciphertext
+        })
+        |> repo.insert()
+      end
+    end)
+    |> Multi.insert(:smtp_settings, fn %{method: method} ->
+      SmtpSettings.changeset(%SmtpSettings{}, %{
+        send_method_id: method.id,
+        host: host,
+        port: port,
+        tls_mode: tls_mode,
+        username: username
+      })
+    end)
+    |> Repo.transaction()
+    |> case do
+      {:ok, %{method: method}} -> {:ok, method}
       {:error, _step, reason, _changes} -> {:error, reason}
     end
   end

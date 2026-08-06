@@ -4,7 +4,9 @@ defmodule Manifold.Connectors.Schema.ImapSettings do
   use Manifold.Connectors.Schema
   import Ecto.Changeset
 
-  @tls_modes ~w(ssl starttls)
+  # `ssl` and `tls` are both implicit TLS (handshake on connect).
+  # Prefer `tls` for new settings; `ssl` is kept for backward compatibility.
+  @tls_modes ~w(ssl tls starttls)
 
   schema "connector_imap_settings" do
     field(:external_account_id, :binary_id)

@@ -76,6 +76,7 @@ defmodule Manifold.Mail.Mailbox do
   def list_conversations(mailbox_id, folder_id, opts \\ []) do
     limit = opts |> Keyword.get(:limit, @default_limit) |> min(@max_limit) |> max(1)
     query = opts |> Keyword.get(:query, "") |> String.trim() |> String.slice(0, 200)
+    unread_only? = Keyword.get(opts, :unread_only, false) in [true, "true", "1", 1]
 
     if valid_uuids?([mailbox_id, folder_id]) and
          Folders.belongs_to_mailbox?(folder_id, mailbox_id) do
@@ -89,12 +90,20 @@ defmodule Manifold.Mail.Mailbox do
             entry.folder_id == ^folder_id and not entry.quarantined
         )
         |> maybe_search_threads(query)
+        |> maybe_unread_only(unread_only?)
         |> group_by([thread], thread.id)
         |> select([thread, entry, message], %{
           thread_id: thread.id,
           last_message_at:
             type(
-              max(fragment("COALESCE(?, ?)", message.sent_at, entry.inserted_at)),
+              max(
+                fragment(
+                  "COALESCE(?, ?, ?)",
+                  message.received_at,
+                  message.sent_at,
+                  entry.inserted_at
+                )
+              ),
               :utc_datetime_usec
             ),
           message_count: count(entry.id)
@@ -120,7 +129,13 @@ defmodule Manifold.Mail.Mailbox do
             entry.mailbox_id == ^mailbox_id and entry.folder_id == ^folder_id and
               entry.thread_id in ^thread_ids and not entry.quarantined,
           order_by: [
-            desc: fragment("COALESCE(?, ?)", message.sent_at, entry.inserted_at),
+            desc:
+              fragment(
+                "COALESCE(?, ?, ?)",
+                message.received_at,
+                message.sent_at,
+                entry.inserted_at
+              ),
             desc: entry.id
           ],
           select: %{
@@ -217,7 +232,13 @@ defmodule Manifold.Mail.Mailbox do
           entry.mailbox_id == ^mailbox_id and entry.thread_id == ^thread_id and
             not entry.quarantined,
         order_by: [
-          asc: fragment("COALESCE(?, ?)", message.sent_at, entry.inserted_at),
+          asc:
+            fragment(
+              "COALESCE(?, ?, ?)",
+              message.received_at,
+              message.sent_at,
+              entry.inserted_at
+            ),
           asc: entry.id
         ],
         select: %{entry: entry, message: message}
@@ -297,7 +318,22 @@ defmodule Manifold.Mail.Mailbox do
   @spec mark_read(Ecto.UUID.t(), [Ecto.UUID.t()], boolean()) ::
           {:ok, non_neg_integer()} | {:error, Error.t()}
   def mark_read(mailbox_id, entry_ids, read?) when is_boolean(read?) do
-    update_entries(mailbox_id, entry_ids, read_at: if(read?, do: DateTime.utc_now(), else: nil))
+    result =
+      update_entries(mailbox_id, entry_ids, read_at: if(read?, do: DateTime.utc_now(), else: nil))
+
+    case result do
+      {:ok, count} when count > 0 ->
+        :telemetry.execute(
+          [:manifold, :mail, :mailbox, :read_changed],
+          %{entry_count: count},
+          %{mailbox_id: mailbox_id, entry_ids: entry_ids, read?: read?}
+        )
+
+        result
+
+      other ->
+        other
+    end
   end
 
   @spec set_starred(Ecto.UUID.t(), [Ecto.UUID.t()], boolean()) ::
@@ -495,6 +531,12 @@ defmodule Manifold.Mail.Mailbox do
     )
   end
 
+  defp maybe_unread_only(query, false), do: query
+
+  defp maybe_unread_only(query, true) do
+    having(query, [_thread, entry, _message], fragment("BOOL_OR(? IS NULL)", entry.read_at))
+  end
+
   defp maybe_after_thread_cursor(query, nil), do: query
 
   defp maybe_after_thread_cursor(query, cursor) do
@@ -578,7 +620,8 @@ defmodule Manifold.Mail.Mailbox do
       subject: message.subject || "(No subject)",
       sender_name: message.sender_name,
       sender_address: message.sender_address,
-      sent_at: message.sent_at || entry.inserted_at,
+      sent_at: message.sent_at,
+      received_at: message.received_at || message.sent_at || entry.inserted_at,
       text_body: message.text_body,
       has_html: is_binary(message.sanitized_html),
       read: not is_nil(entry.read_at),

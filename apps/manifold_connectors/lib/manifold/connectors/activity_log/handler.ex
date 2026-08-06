@@ -8,6 +8,9 @@ defmodule Manifold.Connectors.ActivityLog.Handler do
     [:manifold, :connectors, :imap, :connect, :stop],
     [:manifold, :connectors, :imap, :auth, :stop],
     [:manifold, :connectors, :imap, :select, :stop],
+    [:manifold, :connectors, :eas, :connect, :stop],
+    [:manifold, :connectors, :eas, :auth, :stop],
+    [:manifold, :connectors, :eas, :provision, :stop],
     [:manifold, :connectors, :sync, :stop],
     [:manifold, :connectors, :sync, :message, :stop]
   ]
@@ -20,6 +23,7 @@ defmodule Manifold.Connectors.ActivityLog.Handler do
     :username,
     :mailbox_path,
     :uidvalidity,
+    :policy_key,
     :provider,
     :provider_message_id,
     :result,

@@ -57,8 +57,9 @@ The current milestones intentionally do not implement rich-text composition,
 outbound attachments, bundled DNS authentication engines, bundled spam or
 malware engines, POP3, JMAP, provider push notifications, Gmail or
 Microsoft mailbox mutation, provider-backed sending, or cloud provider hosting.
-Read-only IMAP INBOX import is supported via the connectors application; POP3
-and JMAP remain out of scope. Production authentication and scanning engines
+Read-only IMAP and Exchange ActiveSync (EAS) Inbox import are supported via the
+connectors application; POP3 and JMAP remain out of scope. Production
+authentication and scanning engines
 plug into the Milestone 4 adapter boundaries. The optional edge is ingress-only
 and never performs outbound MX delivery.
 

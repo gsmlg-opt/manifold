@@ -37,7 +37,7 @@ defmodule Manifold.Mail.Parser do
     config = Application.get_all_env(:manifold_mail)
 
     %{
-      max_raw_bytes: value(opts, config, :max_raw_bytes, 25 * 1024 * 1024),
+      max_raw_bytes: value(opts, config, :max_raw_bytes, 100 * 1024 * 1024),
       max_header_bytes: value(opts, config, :max_header_bytes, 256 * 1024),
       max_headers: value(opts, config, :max_headers, 1_000),
       max_mime_depth: value(opts, config, :max_mime_depth, 20),
@@ -51,8 +51,10 @@ defmodule Manifold.Mail.Parser do
     do: Keyword.get(opts, key, Keyword.get(config, key, default))
 
   defp parse_mail(raw) do
+    normalized = normalize_unlabeled_header_bytes(raw)
+
     message =
-      Mail.Parsers.RFC2822.parse(raw,
+      Mail.Parsers.RFC2822.parse(normalized,
         charset_handler: &Charset.decode/2
       )
 
@@ -64,6 +66,34 @@ defmodule Manifold.Mail.Parser do
   rescue
     _error in [ArgumentError, CaseClauseError, FunctionClauseError, MatchError] ->
       {:error, error(:malformed_mime, "message MIME structure could not be parsed")}
+  end
+
+  # Chinese MUAs often emit raw GBK in Subject/From without RFC 2047. The mail
+  # library walks headers as UTF-8 codepoints and crashes on those bytes; rewrite
+  # unlabeled 8-bit header lines to UTF-8 before MIME parse.
+  defp normalize_unlabeled_header_bytes(raw) do
+    case :binary.match(raw, ["\r\n\r\n", "\n\n"]) do
+      {index, length} ->
+        headers = binary_part(raw, 0, index)
+        separator_and_body = binary_part(raw, index, byte_size(raw) - index)
+
+        if String.valid?(headers) do
+          raw
+        else
+          normalize_header_block(headers, length) <> separator_and_body
+        end
+
+      :nomatch ->
+        raw
+    end
+  end
+
+  defp normalize_header_block(headers, sep_length) do
+    line_sep = if sep_length == 4, do: "\r\n", else: "\n"
+
+    headers
+    |> :binary.split([line_sep], [:global])
+    |> Enum.map_join(line_sep, &Charset.ensure_utf8/1)
   end
 
   defp malformed_multipart?(%Message{multipart: false} = message) do
@@ -346,10 +376,30 @@ defmodule Manifold.Mail.Parser do
 
   defp datetime_header(message, key) do
     case Message.get_header(message, key) do
-      %DateTime{} = datetime -> datetime
+      %DateTime{} = datetime ->
+        ensure_usec(datetime)
+
+      value when is_binary(value) ->
+        parse_datetime(value)
+
+      _other ->
+        nil
+    end
+  end
+
+  @doc false
+  def parse_datetime(value) when is_binary(value) do
+    case Mail.Parsers.RFC2822.to_datetime(String.trim(value)) do
+      %DateTime{} = datetime -> ensure_usec(datetime)
+      {:error, _reason} -> nil
       _other -> nil
     end
   end
+
+  def parse_datetime(_value), do: nil
+
+  defp ensure_usec(%DateTime{microsecond: {us, _}} = datetime),
+    do: %{datetime | microsecond: {us, 6}}
 
   defp body(%Message{body: body}) when is_binary(body), do: body
   defp body(_message), do: ""

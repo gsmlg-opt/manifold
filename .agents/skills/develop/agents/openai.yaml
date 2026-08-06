@@ -1,0 +1,4 @@
+interface:
+  display_name: "Develop"
+  short_description: "Developer workflow guidance for feature and task implementation."
+  default_prompt: "Use this skill for planning and executing feature/module/task development work in this repository."

@@ -37,6 +37,8 @@ defmodule ManifoldWeb do
       use Phoenix.LiveView,
         layout: {ManifoldWeb.Layouts, :app}
 
+      on_mount({ManifoldWeb.Hooks.Theme, :default})
+
       unquote(html_helpers())
     end
   end
