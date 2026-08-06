@@ -32,8 +32,36 @@ defmodule Manifold.Connectors.Sync do
   @spec run(Ecto.UUID.t(), Keyword.t()) ::
           :ok | {:snooze, pos_integer()} | {:cancel, atom()} | {:error, term()}
   def run(account_id, opts \\ []) do
+    start = System.monotonic_time()
     now = Keyword.get(opts, :now, DateTime.utc_now())
 
+    try do
+      case do_run(account_id, now, opts) do
+        {:ok, provider, message_count, outcome} ->
+          emit_sync_stop(account_id, start, provider, :ok, %{
+            message_count: message_count,
+            page_count: 1
+          })
+
+          outcome
+
+        {:error, provider, error, outcome} ->
+          emit_sync_stop(account_id, start, provider, error, %{message_count: 0, page_count: 0})
+          outcome
+      end
+    rescue
+      DBConnection.ConnectionError ->
+        emit_sync_stop(account_id, start, "unknown", :database_unavailable, %{
+          message_count: 0,
+          page_count: 0
+        })
+
+        {:error,
+         Error.new(:temporary, :database_unavailable, "connector database is unavailable")}
+    end
+  end
+
+  defp do_run(account_id, now, opts) do
     with {:ok, account, cursor} <- begin_sync(account_id, now),
          {:ok, adapter, config} <- runtime(account.provider),
          {:ok, config} <- enrich_runtime_config(account, config),
@@ -41,9 +69,10 @@ defmodule Manifold.Connectors.Sync do
            auth_material(account, adapter, config, now, provider_opts(opts)),
          {:ok, %Page{} = page} <-
            sync_page(adapter, auth, cursor, config, provider_opts(opts)),
+         messages = collapse_messages(page.messages),
          :ok <-
            process_messages(
-             collapse_messages(page.messages),
+             messages,
              account,
              adapter,
              config,
@@ -53,16 +82,17 @@ defmodule Manifold.Connectors.Sync do
            ),
          :ok <- maybe_fault(opts, :after_page_before_cursor),
          {:ok, more?} <- checkpoint(account, cursor, page, now) do
-      if more?, do: {:snooze, 1}, else: :ok
+      outcome = if more?, do: {:snooze, 1}, else: :ok
+      {:ok, account.provider, length(messages), outcome}
     else
       {:error, {:cursor_provider_error, cursor, %ProviderError{} = error}} ->
-        handle_cursor_provider_error(account_id, cursor, error, now)
+        {:error, "imap", error, handle_cursor_provider_error(account_id, cursor, error, now)}
 
       {:error, %ProviderError{} = error} ->
-        handle_provider_error(account_id, error, now)
+        {:error, "imap", error, handle_provider_error(account_id, error, now)}
 
       {:error, %Error{} = error} ->
-        handle_core_error(account_id, error, now)
+        {:error, "unknown", error, handle_core_error(account_id, error, now)}
 
       {:error, reason} ->
         error =
@@ -71,11 +101,62 @@ defmodule Manifold.Connectors.Sync do
           })
 
         record_failure(account_id, error.class, error.reason, error.message, now)
-        {:error, error}
+        {:error, "unknown", error, {:error, error}}
     end
-  rescue
-    DBConnection.ConnectionError ->
-      {:error, Error.new(:temporary, :database_unavailable, "connector database is unavailable")}
+  end
+
+  defp emit_sync_stop(account_id, start, provider, :ok, counts) do
+    :telemetry.execute(
+      [:manifold, :connectors, :sync, :stop],
+      Map.merge(%{duration_ms: duration_ms(start)}, counts),
+      %{account_id: account_id, provider: provider, result: :ok}
+    )
+  end
+
+  defp emit_sync_stop(account_id, start, provider, %ProviderError{} = error, counts) do
+    :telemetry.execute(
+      [:manifold, :connectors, :sync, :stop],
+      Map.merge(%{duration_ms: duration_ms(start)}, counts),
+      %{
+        account_id: account_id,
+        provider: provider,
+        result: :error,
+        error_code: error.code,
+        error_message: error.message
+      }
+    )
+  end
+
+  defp emit_sync_stop(account_id, start, provider, %Error{} = error, counts) do
+    :telemetry.execute(
+      [:manifold, :connectors, :sync, :stop],
+      Map.merge(%{duration_ms: duration_ms(start)}, counts),
+      %{
+        account_id: account_id,
+        provider: provider,
+        result: :error,
+        error_code: error.reason,
+        error_message: error.message
+      }
+    )
+  end
+
+  defp emit_sync_stop(account_id, start, provider, :database_unavailable, counts) do
+    :telemetry.execute(
+      [:manifold, :connectors, :sync, :stop],
+      Map.merge(%{duration_ms: duration_ms(start)}, counts),
+      %{
+        account_id: account_id,
+        provider: provider,
+        result: :error,
+        error_code: :database_unavailable,
+        error_message: "connector database is unavailable"
+      }
+    )
+  end
+
+  defp duration_ms(start) do
+    System.convert_time_unit(System.monotonic_time() - start, :native, :millisecond)
   end
 
   defp sync_page(adapter, access_token, cursor, config, opts) do
