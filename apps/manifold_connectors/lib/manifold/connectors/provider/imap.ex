@@ -110,9 +110,10 @@ defmodule Manifold.Connectors.Provider.IMAP do
   def fetch_raw(password, remote_message_id, config, _opts) do
     transport = transport(config)
     mailbox_path = Keyword.get(config, :mailbox_path, "INBOX")
+    settings = Map.put(settings(password, config), :emit_activity, false)
 
     with {:ok, uidvalidity, uid} <- parse_remote_id(remote_message_id),
-         {:ok, conn} <- transport.connect(settings(password, config)),
+         {:ok, conn} <- transport.connect(settings),
          {:ok, %{uidvalidity: selected_uv}} <- transport.select(conn, mailbox_path),
          :ok <- ensure_uidvalidity(uidvalidity, selected_uv),
          {:ok, bytes} <- transport.uid_fetch_rfc822(conn, uid) do

@@ -7,6 +7,9 @@
 /.direnv/
 /.superpowers/
 /.trees/
+/.worktrees/
+/log/
+/tmp/
 /node_modules/
 /apps/manifold_web/.duskmoon_bundler/
 /apps/manifold_web/node_modules/

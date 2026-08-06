@@ -18,6 +18,7 @@ defmodule Manifold.Connectors.IMAP.Client do
     username = settings |> Map.fetch!(:username) |> normalize_text()
     password = Map.fetch!(settings, :password)
     base_meta = imap_base_meta(settings, host, port, tls_mode)
+    Process.put({__MODULE__, :emit_activity}, Map.get(settings, :emit_activity, true))
 
     connect_start = System.monotonic_time()
 
@@ -144,6 +145,7 @@ defmodule Manifold.Connectors.IMAP.Client do
     close_socket(conn.socket)
     delete_conn()
     Process.delete({__MODULE__, :activity_meta})
+    Process.delete({__MODULE__, :emit_activity})
     :ok
   end
 
@@ -494,18 +496,22 @@ defmodule Manifold.Connectors.IMAP.Client do
   end
 
   defp emit_imap(event, start, meta, :ok) do
-    :telemetry.execute(event, %{duration_ms: duration_ms(start)}, Map.put(meta, :result, :ok))
+    if Process.get({__MODULE__, :emit_activity}, true) != false do
+      :telemetry.execute(event, %{duration_ms: duration_ms(start)}, Map.put(meta, :result, :ok))
+    end
   end
 
   defp emit_imap(event, start, meta, %Error{} = error) do
-    :telemetry.execute(
-      event,
-      %{duration_ms: duration_ms(start)},
-      meta
-      |> Map.put(:result, :error)
-      |> Map.put(:error_code, error.code)
-      |> Map.put(:error_message, error.message)
-    )
+    if Process.get({__MODULE__, :emit_activity}, true) != false do
+      :telemetry.execute(
+        event,
+        %{duration_ms: duration_ms(start)},
+        meta
+        |> Map.put(:result, :error)
+        |> Map.put(:error_code, error.code)
+        |> Map.put(:error_message, error.message)
+      )
+    end
   end
 
   defp duration_ms(start) do

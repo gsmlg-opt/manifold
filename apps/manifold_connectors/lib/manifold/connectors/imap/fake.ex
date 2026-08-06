@@ -10,7 +10,13 @@ defmodule Manifold.Connectors.IMAP.Fake do
     connect_start = System.monotonic_time()
     base_meta = base_meta(settings)
 
-    emit([:manifold, :connectors, :imap, :connect, :stop], connect_start, base_meta, :ok)
+    emit(
+      [:manifold, :connectors, :imap, :connect, :stop],
+      connect_start,
+      base_meta,
+      :ok,
+      settings
+    )
 
     auth_start = System.monotonic_time()
     expected = Map.get(settings, :password_expected)
@@ -22,10 +28,24 @@ defmodule Manifold.Connectors.IMAP.Fake do
         message: "IMAP authentication failed"
       }
 
-      emit([:manifold, :connectors, :imap, :auth, :stop], auth_start, auth_meta(settings), error)
+      emit(
+        [:manifold, :connectors, :imap, :auth, :stop],
+        auth_start,
+        auth_meta(settings),
+        error,
+        settings
+      )
+
       {:error, error}
     else
-      emit([:manifold, :connectors, :imap, :auth, :stop], auth_start, auth_meta(settings), :ok)
+      emit(
+        [:manifold, :connectors, :imap, :auth, :stop],
+        auth_start,
+        auth_meta(settings),
+        :ok,
+        settings
+      )
+
       {:ok, pid} = Agent.start_link(fn -> %{settings: settings, selected: nil} end)
       {:ok, pid}
     end
@@ -44,7 +64,7 @@ defmodule Manifold.Connectors.IMAP.Fake do
       |> base_meta()
       |> Map.merge(%{mailbox_path: mailbox_path, uidvalidity: uidvalidity})
 
-    emit([:manifold, :connectors, :imap, :select, :stop], start, meta, :ok)
+    emit([:manifold, :connectors, :imap, :select, :stop], start, meta, :ok, settings)
     {:ok, %{uidvalidity: uidvalidity, uidnext: uidnext}}
   end
 
@@ -93,23 +113,27 @@ defmodule Manifold.Connectors.IMAP.Fake do
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
-  defp emit(event, start, meta, :ok) do
-    :telemetry.execute(
-      event,
-      %{duration_ms: now_ms(start)},
-      Map.put(meta, :result, :ok)
-    )
+  defp emit(event, start, meta, :ok, settings) do
+    if Map.get(settings, :emit_activity, true) != false do
+      :telemetry.execute(
+        event,
+        %{duration_ms: now_ms(start)},
+        Map.put(meta, :result, :ok)
+      )
+    end
   end
 
-  defp emit(event, start, meta, %Error{} = error) do
-    :telemetry.execute(
-      event,
-      %{duration_ms: now_ms(start)},
-      meta
-      |> Map.put(:result, :error)
-      |> Map.put(:error_code, error.code)
-      |> Map.put(:error_message, error.message)
-    )
+  defp emit(event, start, meta, %Error{} = error, settings) do
+    if Map.get(settings, :emit_activity, true) != false do
+      :telemetry.execute(
+        event,
+        %{duration_ms: now_ms(start)},
+        meta
+        |> Map.put(:result, :error)
+        |> Map.put(:error_code, error.code)
+        |> Map.put(:error_message, error.message)
+      )
+    end
   end
 
   defp now_ms(start) do

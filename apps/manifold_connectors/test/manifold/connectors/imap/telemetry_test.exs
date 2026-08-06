@@ -69,6 +69,26 @@ defmodule Manifold.Connectors.IMAP.TelemetryTest do
     Fake.logout(conn)
   end
 
+  test "Fake with emit_activity false does not emit telemetry" do
+    account_id = Ecto.UUID.generate()
+
+    assert {:ok, conn} =
+             Fake.connect(%{
+               host: "imap.example",
+               port: 993,
+               tls_mode: "ssl",
+               username: "user@example",
+               password: "secret",
+               password_expected: "secret",
+               account_id: account_id,
+               emit_activity: false
+             })
+
+    assert {:ok, _} = Fake.select(conn, "INBOX")
+    refute_receive {:telemetry, _, _, _}, 50
+    Fake.logout(conn)
+  end
+
   test "Fake auth failure emits connect ok and auth error" do
     account_id = Ecto.UUID.generate()
 
