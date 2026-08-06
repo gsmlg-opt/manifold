@@ -716,6 +716,120 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert has_element?(index_view, "#add-account-button[href='/settings/accounts/new']")
   end
 
+  test "accounts index links to activity page", %{conn: conn} do
+    Application.put_env(:manifold_connectors, :imap_fake, %{
+      password_expected: "secret",
+      messages: [],
+      uidvalidity: 1
+    })
+
+    assert {:ok, account} =
+             Connectors.create_imap_account(%{
+               email_address: "activity-link@imap.example",
+               username: "activity-link@imap.example",
+               password: "secret",
+               host: "imap.example",
+               port: 993,
+               tls_mode: "ssl"
+             })
+
+    assert {:ok, view, _html} = live(conn, "/settings/accounts")
+
+    assert has_element?(
+             view,
+             "#external-account-#{account.id} a[href='/settings/accounts/#{account.id}/activity']"
+           )
+  end
+
+  test "activity page loads empty state for today and refresh", %{conn: conn} do
+    log_dir =
+      Path.join(System.tmp_dir!(), "manifold-activity-#{System.unique_integer([:positive])}")
+
+    previous = Application.get_env(:manifold_connectors, :activity_log_dir)
+    Application.put_env(:manifold_connectors, :activity_log_dir, log_dir)
+
+    on_exit(fn -> Application.put_env(:manifold_connectors, :activity_log_dir, previous) end)
+
+    Application.put_env(:manifold_connectors, :imap_fake, %{
+      password_expected: "secret",
+      messages: [],
+      uidvalidity: 1
+    })
+
+    assert {:ok, account} =
+             Connectors.create_imap_account(%{
+               email_address: "activity-empty@imap.example",
+               username: "activity-empty@imap.example",
+               password: "secret",
+               host: "imap.example",
+               port: 993,
+               tls_mode: "ssl"
+             })
+
+    assert {:ok, view, html} = live(conn, ~p"/settings/accounts/#{account.id}/activity")
+    assert html =~ "Activity"
+    assert html =~ account.email_address
+    assert has_element?(view, "#activity-empty")
+    assert has_element?(view, "#activity-refresh")
+    assert has_element?(view, "#activity-date")
+
+    html = view |> element("#activity-refresh") |> render_click()
+    assert html =~ "No activity"
+  end
+
+  test "activity page shows entries for selected date", %{conn: conn} do
+    log_dir =
+      Path.join(System.tmp_dir!(), "manifold-activity-#{System.unique_integer([:positive])}")
+
+    previous = Application.get_env(:manifold_connectors, :activity_log_dir)
+    Application.put_env(:manifold_connectors, :activity_log_dir, log_dir)
+
+    on_exit(fn -> Application.put_env(:manifold_connectors, :activity_log_dir, previous) end)
+
+    Application.put_env(:manifold_connectors, :imap_fake, %{
+      password_expected: "secret",
+      messages: [],
+      uidvalidity: 1
+    })
+
+    assert {:ok, account} =
+             Connectors.create_imap_account(%{
+               email_address: "activity-list@imap.example",
+               username: "activity-list@imap.example",
+               password: "secret",
+               host: "imap.example",
+               port: 993,
+               tls_mode: "ssl"
+             })
+
+    assert :ok =
+             Manifold.Connectors.ActivityLog.append(account.id, %{
+               "event" => ["manifold", "connectors", "imap", "auth", "stop"],
+               "timestamp" => "2026-08-06T12:00:00.000000Z",
+               "measurements" => %{"duration_ms" => 5},
+               "metadata" => %{
+                 "account_id" => account.id,
+                 "result" => "error",
+                 "error_code" => "auth_failed",
+                 "error_message" => "IMAP authentication failed"
+               }
+             })
+
+    assert {:ok, view, html} = live(conn, ~p"/settings/accounts/#{account.id}/activity")
+    assert html =~ "auth"
+    assert html =~ "auth_failed"
+    assert html =~ "IMAP authentication failed"
+    refute html =~ "password"
+    assert has_element?(view, "#activity-entries")
+  end
+
+  test "activity page redirects for unknown account id", %{conn: conn} do
+    missing = Ecto.UUID.generate()
+
+    assert {:error, {:live_redirect, %{to: "/settings/accounts"}}} =
+             live(conn, ~p"/settings/accounts/#{missing}/activity")
+  end
+
   defp open_provider_step(view) do
     view
     |> element("#external-account-type")

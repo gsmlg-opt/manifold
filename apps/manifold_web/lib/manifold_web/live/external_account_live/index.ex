@@ -95,6 +95,16 @@ defmodule ManifoldWeb.ExternalAccountLive.Index do
               <td data-label="Last synchronized">{format_datetime(account.last_synced_at)}</td>
               <td data-label="Actions">
                 <div class="account-actions">
+                  <.link
+                    id={"activity-#{account.id}"}
+                    navigate={~p"/settings/accounts/#{account.id}/activity"}
+                    class="settings-icon-button"
+                    title="Activity"
+                    aria-label={"Activity for #{account.email_address}"}
+                  >
+                    <.dm_mdi name="history" />
+                    <span class="sr-only">Activity</span>
+                  </.link>
                   <button
                     type="button"
                     class="settings-icon-button"
