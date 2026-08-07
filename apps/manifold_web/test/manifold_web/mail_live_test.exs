@@ -2,9 +2,11 @@ defmodule ManifoldWeb.MailLiveTest do
   use ManifoldWeb.ConnCase, async: false
 
   import Phoenix.LiveViewTest
+  import Ecto.Query
 
   alias Manifold.Accounts
   alias Manifold.Connectors
+  alias Manifold.Connectors.Jobs.SyncAccount
   alias Manifold.Mail
   alias Manifold.Mail.Schema.{MailboxEntry, Message, Thread}
   alias Manifold.Repo
@@ -78,7 +80,9 @@ defmodule ManifoldWeb.MailLiveTest do
     refute filtered =~ read.message.subject
   end
 
-  test "sync queues the enabled receive method for the mailbox", %{conn: conn} do
+  test "sync queues job, disables button, and rotates icon until sync_job_changed false", %{
+    conn: conn
+  } do
     mailbox = mailbox_fixture()
 
     assert {:ok, method} =
@@ -92,9 +96,14 @@ defmodule ManifoldWeb.MailLiveTest do
                password: "secret"
              })
 
+    # create_imap_account enqueues an initial sync; clear it so the button is clickable
+    complete_sync_jobs!(method.id)
+
     assert {:ok, folders} = Mail.list_folders(mailbox.id)
     inbox = Enum.find(folders, &(&1.kind == "inbox"))
     assert {:ok, view, _html} = live(conn, ~p"/mail/#{mailbox.id}/folders/#{inbox.id}")
+
+    refute has_element?(view, "#sync-button[disabled]")
 
     html =
       view
@@ -102,7 +111,39 @@ defmodule ManifoldWeb.MailLiveTest do
       |> render_click()
 
     assert html =~ "Synchronization queued."
+    assert html =~ "is-syncing"
+    assert has_element?(view, "#sync-button[disabled]")
     assert Enum.any?(Repo.all(Oban.Job), &(&1.args["external_account_id"] == method.id))
+
+    send(view.pid, {:sync_job_changed, method.id, false})
+    html = render(view)
+    refute has_element?(view, "#sync-button[disabled]")
+    refute html =~ "is-syncing"
+  end
+
+  test "sync button starts disabled when an incomplete sync job already exists", %{conn: conn} do
+    mailbox = mailbox_fixture()
+
+    assert {:ok, method} =
+             Connectors.create_imap_account(%{
+               account_id: mailbox.id,
+               email_address: "inbox@#{mailbox.domain.normalized_domain}",
+               host: "imap.example.test",
+               port: 993,
+               tls_mode: "ssl",
+               username: "inbox@#{mailbox.domain.normalized_domain}",
+               password: "secret"
+             })
+
+    # Initial create already left an incomplete job; assert mount reflects it
+    assert Connectors.sync_job_running?(method.id)
+
+    assert {:ok, folders} = Mail.list_folders(mailbox.id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    assert {:ok, view, html} = live(conn, ~p"/mail/#{mailbox.id}/folders/#{inbox.id}")
+
+    assert html =~ "is-syncing"
+    assert has_element?(view, "#sync-button[disabled]")
   end
 
   defp mailbox_fixture do
@@ -178,6 +219,19 @@ defmodule ManifoldWeb.MailLiveTest do
       |> Repo.insert!()
 
     %{thread: thread, message: message, entry: entry}
+  end
+
+  defp complete_sync_jobs!(account_id) do
+    {count, _} =
+      Oban.Job
+      |> where([job], job.worker == ^inspect(SyncAccount))
+      |> where(
+        [job],
+        fragment("?->>'external_account_id' = ?", job.args, ^account_id)
+      )
+      |> Repo.update_all(set: [state: "completed"])
+
+    assert count >= 1
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)

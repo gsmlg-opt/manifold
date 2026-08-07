@@ -791,6 +791,30 @@ code {
   border-right: 1px solid color-mix(in oklch, var(--color-primary-content) 28%, transparent);
 }
 
+.compose-actions .sync-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+
+.compose-actions .sync-button.is-syncing .mail-icon {
+  animation: manifold-sync-rotate 0.9s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .compose-actions .sync-button.is-syncing .mail-icon {
+    animation: none;
+  }
+}
+
+@keyframes manifold-sync-rotate {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .compose-actions .sync-button:hover,
 .compose-actions .sync-button:focus-visible,
 .compose-actions .compose-button:hover,

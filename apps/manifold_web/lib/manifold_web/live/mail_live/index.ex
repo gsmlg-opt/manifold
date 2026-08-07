@@ -8,6 +8,7 @@ defmodule ManifoldWeb.MailLive.Index do
   alias Manifold.Mail
   alias Manifold.Outbound
   alias ManifoldWeb.MailNotifier
+  alias ManifoldWeb.SyncNotifier
 
   @impl true
   def mount(_params, _session, socket) do
@@ -29,14 +30,21 @@ defmodule ManifoldWeb.MailLive.Index do
        query: "",
        unread_only: false,
        after_cursor: nil,
-       subscribed_mailbox_id: nil
+       subscribed_mailbox_id: nil,
+       syncing: false,
+       sync_receive_method_id: nil,
+       subscribed_sync_method_id: nil
      )}
   end
 
   @impl true
   def handle_params(params, _uri, socket) do
     mailbox = select_mailbox(socket.assigns.mailboxes, params["mailbox_id"])
-    socket = subscribe_mailbox(socket, mailbox && mailbox.id)
+
+    socket =
+      socket
+      |> subscribe_mailbox(mailbox && mailbox.id)
+      |> assign_sync_state(mailbox)
 
     case mailbox && load_view(mailbox, socket.assigns.live_action, params) do
       nil ->
@@ -127,14 +135,14 @@ defmodule ManifoldWeb.MailLive.Index do
 
   def handle_event("sync", _params, %{assigns: %{mailbox: mailbox}} = socket)
       when not is_nil(mailbox) do
-    method =
-      mailbox.id
-      |> Connectors.list_receive_methods_for_account()
-      |> Enum.find(&(&1.enabled and &1.sync_enabled))
+    method = sync_receive_method(mailbox)
 
     case method && Connectors.enqueue_sync(method.id) do
       {:ok, _job} ->
-        {:noreply, put_flash(socket, :info, "Synchronization queued.")}
+        {:noreply,
+         socket
+         |> assign(sync_receive_method_id: method.id, syncing: true)
+         |> put_flash(:info, "Synchronization queued.")}
 
       nil ->
         {:noreply,
@@ -255,6 +263,14 @@ defmodule ManifoldWeb.MailLive.Index do
     do: move_and_return(socket, fn -> Mail.restore(socket.assigns.mailbox.id, [entry_id]) end)
 
   @impl true
+  def handle_info({:sync_job_changed, account_id, running?}, socket) do
+    if socket.assigns.sync_receive_method_id == account_id do
+      {:noreply, assign(socket, :syncing, running?)}
+    else
+      {:noreply, socket}
+    end
+  end
+
   def handle_info(
         {:mailbox_changed, mailbox_id},
         %{assigns: %{mailbox: %{id: mailbox_id}}} = socket
@@ -396,6 +412,40 @@ defmodule ManifoldWeb.MailLive.Index do
     end
 
     assign(socket, :subscribed_mailbox_id, mailbox_id)
+  end
+
+  defp sync_receive_method(nil), do: nil
+
+  defp sync_receive_method(mailbox) do
+    mailbox.id
+    |> Connectors.list_receive_methods_for_account()
+    |> Enum.find(&(&1.enabled and &1.sync_enabled))
+  end
+
+  defp assign_sync_state(socket, mailbox) do
+    method = sync_receive_method(mailbox)
+    method_id = method && method.id
+
+    socket
+    |> subscribe_sync_method(method_id)
+    |> assign(
+      sync_receive_method_id: method_id,
+      syncing: method_id != nil and Connectors.sync_job_running?(method_id)
+    )
+  end
+
+  defp subscribe_sync_method(socket, method_id) do
+    if connected?(socket) and socket.assigns.subscribed_sync_method_id != method_id do
+      if current = socket.assigns.subscribed_sync_method_id do
+        Phoenix.PubSub.unsubscribe(Manifold.PubSub, SyncNotifier.topic(current))
+      end
+
+      if method_id do
+        Phoenix.PubSub.subscribe(Manifold.PubSub, SyncNotifier.topic(method_id))
+      end
+    end
+
+    assign(socket, :subscribed_sync_method_id, method_id)
   end
 
   defp mutate(socket, action) do
@@ -644,8 +694,9 @@ defmodule ManifoldWeb.MailLive.Index do
           <button
             id="sync-button"
             type="button"
-            class="sync-button"
+            class={["sync-button", @syncing && "is-syncing"]}
             phx-click="sync"
+            disabled={@syncing}
             title="Sync mail now"
           >
             <.dm_mdi name="sync" class="mail-icon" />
