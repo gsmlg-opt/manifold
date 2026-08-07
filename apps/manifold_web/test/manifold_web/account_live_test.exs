@@ -126,6 +126,19 @@ defmodule ManifoldWeb.AccountLiveTest do
     assert html =~ ~p"/settings/accounts/#{account.id}/edit"
   end
 
+  test "accounts index and show render settings nav with Accounts current", %{conn: conn} do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Nav", address: "nav@example.test"})
+
+    {:ok, _view, html} = live(conn, ~p"/settings/accounts")
+    assert html =~ ~s(id="settings-nav")
+    assert html =~ ~s(data-current="accounts")
+
+    {:ok, _view, html} = live(conn, ~p"/settings/accounts/#{account.id}")
+    assert html =~ ~s(id="settings-nav")
+    assert html =~ ~s(data-current="accounts")
+  end
+
   test "edit account updates name and address", %{conn: conn} do
     {:ok, account} =
       Accounts.create_account(%{name: "Dana", address: "dana@example.test"})

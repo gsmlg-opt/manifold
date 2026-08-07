@@ -23,4 +23,18 @@ defmodule ManifoldWeb.SettingsLiveTest do
     assert html =~ ~p"/settings/appearance"
     assert html =~ ~s(data-current="general")
   end
+
+  test "appearance settings page renders placeholder with Appearance current", %{conn: conn} do
+    {:ok, _view, html} = live(conn, ~p"/settings/appearance")
+
+    assert html =~ "Appearance"
+    assert html =~ "Coming soon"
+    assert html =~ ~s(id="settings-nav")
+    assert html =~ ~s(data-current="appearance")
+  end
+
+  test "appbar Settings menu points at /settings", %{conn: conn} do
+    {:ok, _view, html} = live(conn, ~p"/settings/general")
+    assert html =~ ~s(href="/settings")
+  end
 end
