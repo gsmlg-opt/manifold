@@ -67,6 +67,31 @@ defmodule Manifold.Mail.MailboxTest do
     assert length(both) == 2
   end
 
+  test "entry_ids_for_threads returns folder-scoped entries for selected threads" do
+    mailbox_id = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox_id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    archive = Enum.find(folders, &(&1.kind == "archive"))
+    now = DateTime.utc_now()
+
+    a = thread_fixture(mailbox_id, inbox.id, "A", now, 2)
+    b = thread_fixture(mailbox_id, inbox.id, "B", DateTime.add(now, -10), 1)
+    _c = thread_fixture(mailbox_id, inbox.id, "C", DateTime.add(now, -20), 1)
+
+    archived =
+      projected_message_fixture(mailbox_id, archive.id, a.thread.id, "Archived in A", now)
+
+    assert {:ok, ids} =
+             Mail.entry_ids_for_threads(mailbox_id, inbox.id, [a.thread.id, b.thread.id])
+
+    assert MapSet.new(ids) ==
+             MapSet.new(Enum.map(a.entries ++ b.entries, & &1.id))
+
+    refute archived.entry.id in ids
+
+    assert {:ok, []} = Mail.entry_ids_for_threads(mailbox_id, inbox.id, [])
+  end
+
   test "conversation detail is folder scoped" do
     mailbox_id = mailbox_fixture()
     assert {:ok, folders} = Mail.list_folders(mailbox_id)

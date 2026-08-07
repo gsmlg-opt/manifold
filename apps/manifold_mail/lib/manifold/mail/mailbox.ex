@@ -336,6 +336,33 @@ defmodule Manifold.Mail.Mailbox do
     end
   end
 
+  @spec entry_ids_for_threads(Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
+          {:ok, [Ecto.UUID.t()]} | {:error, Error.t()}
+  def entry_ids_for_threads(mailbox_id, folder_id, thread_ids) when is_list(thread_ids) do
+    ids = [mailbox_id, folder_id | thread_ids]
+
+    if valid_uuids?(ids) do
+      if thread_ids == [] do
+        {:ok, []}
+      else
+        entry_ids =
+          from(entry in MailboxEntry,
+            where:
+              entry.mailbox_id == ^mailbox_id and entry.folder_id == ^folder_id and
+                entry.thread_id in ^thread_ids and not entry.quarantined,
+            select: entry.id
+          )
+          |> Repo.all()
+
+        {:ok, entry_ids}
+      end
+    else
+      {:error, error(:permanent, :not_found, "invalid mailbox, folder, or thread id")}
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
   @spec set_starred(Ecto.UUID.t(), [Ecto.UUID.t()], boolean()) ::
           {:ok, non_neg_integer()} | {:error, Error.t()}
   def set_starred(mailbox_id, entry_ids, starred?) when is_boolean(starred?) do
