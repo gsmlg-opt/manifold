@@ -401,7 +401,7 @@ defmodule Manifold.Mail.Projector do
       sender_name: sender && clean_text(sender.name),
       sender_address: sender && clean_text(sender.address),
       sent_at: parsed.sent_at,
-      received_at: source.received_at,
+      received_at: mailbox_received_at(source),
       text_body: clean_text(parsed.text_body),
       sanitized_html: parsed.html_body |> clean_text() |> HtmlSanitizer.sanitize(),
       parser_version: versions.parser_version,
@@ -410,6 +410,12 @@ defmodule Manifold.Mail.Projector do
       parse_error: parse_error
     }
   end
+
+  # Provider imports often set inbound_delivery.received_at to sync/fetch time when the
+  # connector has not yet supplied mailbox INTERNALDATE/DateReceived. Leave the projected
+  # message blank so UI can fall back to Date/sent_at until Sync calls set_received_at/2.
+  defp mailbox_received_at(%{source_kind: "provider_import"}), do: nil
+  defp mailbox_received_at(source), do: source.received_at
 
   defp insert_headers(message_id, headers) do
     now = DateTime.utc_now()

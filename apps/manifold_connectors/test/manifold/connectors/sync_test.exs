@@ -27,7 +27,7 @@ defmodule Manifold.Connectors.SyncTest do
 
   alias Manifold.Ingest.Schema.{DeliveryRecipient, InboundDelivery}
   alias Manifold.Ingest
-  alias Manifold.Mail.Schema.MailboxEntry
+  alias Manifold.Mail.Schema.{MailboxEntry, Message}
   alias Manifold.Repo
 
   @moduletag :tmp_dir
@@ -206,6 +206,174 @@ defmodule Manifold.Connectors.SyncTest do
 
     assert Repo.get_by!(MailboxEntry, inbound_delivery_id: mapping.inbound_delivery_id).mailbox_id ==
              mailbox.id
+  end
+
+  test "provider mailbox receive time is applied after projection, not sync now", %{
+    account: account,
+    cursor: cursor,
+    mailbox: mailbox
+  } do
+    provider_received_at = ~U[2026-07-29 01:00:00.000000Z]
+    sent_at = ~U[2026-07-28 20:00:00.000000Z]
+
+    Process.put(
+      {:raw_result, "message-received-at"},
+      {:ok,
+       %RawMessage{
+         bytes:
+           "From: sender@example.net\r\n" <>
+             "Date: Tue, 28 Jul 2026 20:00:00 +0000\r\n" <>
+             "Subject: receive-time\r\n\r\nBody\r\n",
+         received_at: provider_received_at,
+         labels: ["INBOX"],
+         read?: false,
+         starred?: false
+       }}
+    )
+
+    Process.put(
+      :sync_page_result,
+      {:ok,
+       %Page{
+         messages: [
+           %ProviderRemoteMessage{
+             id: "message-received-at",
+             received_at: provider_received_at,
+             folder_kind: "inbox",
+             labels: ["INBOX"],
+             read?: false,
+             starred?: false
+           }
+         ],
+         cursor: %{provider_cursor(cursor) | committed_cursor: "101"}
+       }}
+    )
+
+    assert :ok = Connectors.sync_account(account.id)
+    mapping = Repo.get_by!(RemoteMessage, provider_message_id: "message-received-at")
+    assert mapping.provider_received_at == provider_received_at
+
+    assert :ok = Ingest.archive_delivery(mapping.inbound_delivery_id)
+    assert :ok = Ingest.project_delivery(mapping.inbound_delivery_id)
+
+    job = Repo.get_by!(Oban.Job, worker: inspect(ApplyRemoteState))
+    assert :ok = ApplyRemoteState.perform(job)
+
+    message = Repo.get_by!(Message, inbound_delivery_id: mapping.inbound_delivery_id)
+    assert message.received_at == provider_received_at
+    assert message.sent_at == sent_at
+
+    entry = Repo.get_by!(MailboxEntry, inbound_delivery_id: mapping.inbound_delivery_id)
+    assert entry.folder_id == Manifold.Mail.Folders.get_system(mailbox.id, "inbox").id
+  end
+
+  test "missing provider receive time leaves message.received_at nil so UI uses Date header",
+       %{
+         account: account,
+         cursor: cursor,
+         mailbox: mailbox
+       } do
+    sync_now = ~U[2026-08-06 10:20:00.000000Z]
+    sent_at = ~U[2026-08-05 08:00:00.000000Z]
+
+    Process.put(
+      {:raw_result, "message-no-provider-time"},
+      {:ok,
+       %RawMessage{
+         bytes:
+           "From: sender@example.net\r\n" <>
+             "Date: Wed, 05 Aug 2026 08:00:00 +0000\r\n" <>
+             "Subject: no-provider-time\r\n\r\nBody\r\n",
+         received_at: nil,
+         labels: ["INBOX"],
+         read?: false,
+         starred?: false
+       }}
+    )
+
+    Process.put(
+      :sync_page_result,
+      {:ok,
+       %Page{
+         messages: [
+           %ProviderRemoteMessage{
+             id: "message-no-provider-time",
+             received_at: nil,
+             folder_kind: "inbox",
+             labels: ["INBOX"],
+             read?: false,
+             starred?: false
+           }
+         ],
+         cursor: %{provider_cursor(cursor) | committed_cursor: "101"}
+       }}
+    )
+
+    assert :ok = Connectors.sync_account(account.id, now: sync_now)
+    mapping = Repo.get_by!(RemoteMessage, provider_message_id: "message-no-provider-time")
+    assert is_nil(mapping.provider_received_at)
+
+    delivery = Repo.get!(InboundDelivery, mapping.inbound_delivery_id)
+    assert delivery.received_at == sync_now
+
+    assert :ok = Ingest.archive_delivery(mapping.inbound_delivery_id)
+    assert :ok = Ingest.project_delivery(mapping.inbound_delivery_id)
+
+    job = Repo.get_by!(Oban.Job, worker: inspect(ApplyRemoteState))
+    assert :ok = ApplyRemoteState.perform(job)
+
+    message = Repo.get_by!(Message, inbound_delivery_id: mapping.inbound_delivery_id)
+    assert is_nil(message.received_at)
+    assert message.sent_at == sent_at
+
+    entry = Repo.get_by!(MailboxEntry, inbound_delivery_id: mapping.inbound_delivery_id)
+    assert entry.folder_id == Manifold.Mail.Folders.get_system(mailbox.id, "inbox").id
+  end
+
+  test "sync repairs historical fetch-time placeholders using provider_received_at", %{
+    account: account,
+    cursor: cursor
+  } do
+    provider_received_at = ~U[2026-07-29 01:00:00.000000Z]
+    fetch_time = ~U[2026-08-06 10:20:00.000000Z]
+
+    Process.put(
+      :sync_page_result,
+      {:ok,
+       %Page{
+         messages: [remote_message("message-repair")],
+         cursor: %{provider_cursor(cursor) | committed_cursor: "101"}
+       }}
+    )
+
+    assert :ok = Connectors.sync_account(account.id)
+    mapping = Repo.get_by!(RemoteMessage, provider_message_id: "message-repair")
+
+    assert :ok = Ingest.archive_delivery(mapping.inbound_delivery_id)
+    assert :ok = Ingest.project_delivery(mapping.inbound_delivery_id)
+
+    message = Repo.get_by!(Message, inbound_delivery_id: mapping.inbound_delivery_id)
+
+    message
+    |> Message.changeset(%{received_at: fetch_time})
+    |> Repo.update!()
+
+    mapping
+    |> RemoteMessage.changeset(%{provider_received_at: provider_received_at})
+    |> Repo.update!()
+
+    Process.put(
+      :sync_page_result,
+      {:ok,
+       %Page{
+         messages: [],
+         cursor: %{provider_cursor(Repo.get!(SyncCursor, cursor.id)) | committed_cursor: "102"}
+       }}
+    )
+
+    assert :ok = Connectors.sync_account(account.id)
+
+    assert Repo.get!(Message, message.id).received_at == provider_received_at
   end
 
   test "acceptance before connector mapping retries without another delivery", %{

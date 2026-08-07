@@ -955,7 +955,8 @@ defmodule Manifold.Ingest do
       raw_object_key: delivery.raw_object_key,
       raw_size: delivery.raw_size,
       raw_sha256: delivery.raw_sha256,
-      received_at: delivery.received_at
+      received_at: delivery.received_at,
+      source_kind: delivery.source_kind
     }
   end
 

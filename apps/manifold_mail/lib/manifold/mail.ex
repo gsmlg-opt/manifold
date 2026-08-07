@@ -72,6 +72,9 @@ defmodule Manifold.Mail do
   @spec set_received_at(Ecto.UUID.t(), DateTime.t()) :: :ok
   defdelegate set_received_at(inbound_delivery_id, received_at), to: ReceivedAt, as: :set
 
+  @spec clear_received_at(Ecto.UUID.t()) :: :ok
+  defdelegate clear_received_at(inbound_delivery_id), to: ReceivedAt, as: :clear
+
   @spec stale_projection_delivery_ids(pos_integer(), pos_integer(), Keyword.t()) ::
           [Ecto.UUID.t()]
   def stale_projection_delivery_ids(parser_version, sanitizer_version, opts \\ []) do

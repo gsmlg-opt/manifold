@@ -654,6 +654,11 @@ defmodule Manifold.Connectors do
         :ok
 
       {%RemoteMessage{} = remote, %ReceiveMethod{} = account} ->
+        if match?(%DateTime{}, remote.provider_received_at) and
+             is_binary(remote.inbound_delivery_id) do
+          Mail.set_received_at(remote.inbound_delivery_id, remote.provider_received_at)
+        end
+
         account.account_id
         |> Mail.apply_external_state(remote.inbound_delivery_id, %{
           folder_kind: normalize_folder_kind(remote.remote_folder_kind),

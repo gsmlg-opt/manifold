@@ -136,6 +136,17 @@ defmodule Manifold.Mail.ProjectorTest do
              Mail.open_attachment(other_mailbox_id, attachment_view.id)
   end
 
+  test "provider_import projection leaves received_at nil for connector repair",
+       %{tmp_dir: tmp_dir} do
+    mailbox_id = mailbox_fixture()
+    raw = plain_message("<provider-import-1@example.net>", "Provider import", "body")
+    source = source_fixture(tmp_dir, mailbox_id, raw, source_kind: "provider_import")
+
+    assert {:ok, result} = Mail.project_inbound(source)
+    message = Repo.get!(Message, result.message_id)
+    assert is_nil(message.received_at)
+  end
+
   test "failure after blob storage but before projection commit is safe to retry", %{
     tmp_dir: tmp_dir
   } do
@@ -548,7 +559,7 @@ defmodule Manifold.Mail.ProjectorTest do
     mailbox_id
   end
 
-  defp source_fixture(tmp_dir, mailbox_id, raw) do
+  defp source_fixture(tmp_dir, mailbox_id, raw, opts \\ []) do
     now = DateTime.utc_now()
     delivery_id = Ecto.UUID.generate()
     ingest_id = Ecto.UUID.generate()
@@ -558,6 +569,7 @@ defmodule Manifold.Mail.ProjectorTest do
     source_path = Path.join(tmp_dir, delivery_id <> ".eml")
     File.write!(source_path, raw)
     assert {:ok, _stat} = RawStore.put_from_path(raw_key, source_path)
+    source_kind = Keyword.get(opts, :source_kind)
 
     Repo.insert_all("inbound_deliveries", [
       %{
@@ -592,7 +604,8 @@ defmodule Manifold.Mail.ProjectorTest do
       raw_object_key: raw_key,
       raw_size: byte_size(raw),
       raw_sha256: sha256,
-      received_at: now
+      received_at: now,
+      source_kind: source_kind
     }
   end
 

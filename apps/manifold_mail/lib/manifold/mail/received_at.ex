@@ -37,6 +37,30 @@ defmodule Manifold.Mail.ReceivedAt do
     end
   end
 
+  @doc """
+  Clears projected mailbox receive time so UI can fall back to Date/sent_at.
+
+  Used for provider imports that only had sync/fetch time, not INTERNALDATE.
+  """
+  @spec clear(Ecto.UUID.t()) :: :ok
+  def clear(inbound_delivery_id) when is_binary(inbound_delivery_id) do
+    case Repo.get_by(Message, inbound_delivery_id: inbound_delivery_id) do
+      %Message{received_at: nil} ->
+        :ok
+
+      %Message{} = message ->
+        message
+        |> Message.changeset(%{received_at: nil})
+        |> Repo.update!()
+
+        refresh_threads(inbound_delivery_id)
+        :ok
+
+      nil ->
+        :ok
+    end
+  end
+
   defp refresh_threads(inbound_delivery_id) do
     thread_ids =
       MailboxEntry

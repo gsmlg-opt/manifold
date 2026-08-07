@@ -105,6 +105,7 @@ defmodule Manifold.Connectors.Sync do
 
   defp do_run(account_id, now, opts) do
     with {:ok, account, cursor} <- begin_sync(account_id, now),
+         :ok <- repair_received_at(account),
          {:ok, adapter, config} <- runtime(account.kind),
          {:ok, config} <- enrich_runtime_config(account, config),
          {:ok, auth} <-
@@ -693,9 +694,30 @@ defmodule Manifold.Connectors.Sync do
       mailbox_id: account.account_id,
       storage_domain_id: storage_domain_id,
       recipient_address: account.email_address,
+      # Ingest requires a timestamp; prefer mailbox receive time, else sync time.
+      # messages.received_at is filled later only from provider_received_at.
       received_at: message.received_at || raw.received_at || now,
       ingest_id: deterministic_ingest_id(account, message.id)
     }
+  end
+
+  defp repair_received_at(account) do
+    remotes =
+      RemoteMessage
+      |> where([remote], remote.external_account_id == ^account.id)
+      |> where([remote], not is_nil(remote.inbound_delivery_id))
+      |> select([remote], {remote.inbound_delivery_id, remote.provider_received_at})
+      |> Repo.all()
+
+    Enum.each(remotes, fn
+      {delivery_id, %DateTime{} = provider_received_at} ->
+        Mail.set_received_at(delivery_id, provider_received_at)
+
+      {delivery_id, nil} ->
+        Mail.clear_received_at(delivery_id)
+    end)
+
+    :ok
   end
 
   defp deterministic_ingest_id(account, message_id) do
