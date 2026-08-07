@@ -272,6 +272,30 @@ defmodule Manifold.ConnectorsTest do
     assert Repo.aggregate(query, :count) == 0
   end
 
+  test "sync_job_running? reflects incomplete SyncAccount jobs", %{mailbox: mailbox} do
+    assert {:ok, account} =
+             Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
+
+    # OAuth completion enqueues SyncAccount; clear so we assert from a known empty state
+    Repo.delete_all(Oban.Job)
+    refute Connectors.sync_job_running?(account.id)
+
+    assert {:ok, _job} = Connectors.enqueue_sync(account.id)
+    assert Connectors.sync_job_running?(account.id)
+
+    {count, _} =
+      Oban.Job
+      |> where([job], job.worker == ^inspect(Manifold.Connectors.Jobs.SyncAccount))
+      |> where(
+        [job],
+        fragment("?->>'external_account_id' = ?", job.args, ^account.id)
+      )
+      |> Repo.update_all(set: [state: "completed"])
+
+    assert count >= 1
+    refute Connectors.sync_job_running?(account.id)
+  end
+
   defp consumed(mailbox_id) do
     %Consumed{
       provider: "gmail",

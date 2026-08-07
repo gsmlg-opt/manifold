@@ -479,6 +479,11 @@ defmodule Manifold.Connectors do
   def read_activity(account_id, date, limit \\ 200),
     do: ActivityLog.read(account_id, date, limit)
 
+  @spec sync_job_running?(Ecto.UUID.t()) :: boolean()
+  def sync_job_running?(account_id) when is_binary(account_id) do
+    match?(%Oban.Job{}, incomplete_sync_job(Repo, account_id))
+  end
+
   @spec enqueue_sync(Ecto.UUID.t()) :: {:ok, Oban.Job.t()} | {:error, Error.t() | term()}
   def enqueue_sync(account_id) do
     Repo.transaction(fn ->
@@ -904,22 +909,23 @@ defmodule Manifold.Connectors do
   end
 
   defp ensure_sync_job(repo, account_id) do
-    existing =
-      Oban.Job
-      |> where([job], job.worker == ^inspect(SyncAccount))
-      |> where([job], job.state in ~w(available scheduled executing retryable suspended))
-      |> where(
-        [job],
-        fragment("?->>'external_account_id' = ?", job.args, ^account_id)
-      )
-      |> order_by([job], asc: job.id)
-      |> limit(1)
-      |> repo.one()
-
-    existing ||
+    incomplete_sync_job(repo, account_id) ||
       account_id
       |> then(&SyncAccount.new(%{"external_account_id" => &1}))
       |> repo.insert!()
+  end
+
+  defp incomplete_sync_job(repo, account_id) do
+    Oban.Job
+    |> where([job], job.worker == ^inspect(SyncAccount))
+    |> where([job], job.state in ~w(available scheduled executing retryable suspended))
+    |> where(
+      [job],
+      fragment("?->>'external_account_id' = ?", job.args, ^account_id)
+    )
+    |> order_by([job], asc: job.id)
+    |> limit(1)
+    |> repo.one()
   end
 
   defp validate_consumed(provider, %Consumed{provider: provider}), do: :ok
