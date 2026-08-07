@@ -11,9 +11,7 @@ const UpstreamThemeSwitcher = DuskmoonHooks.ThemeSwitcher;
 const THEME_STORAGE_KEY = "theme";
 
 function resolveAutoTheme() {
-  return window.matchMedia("(prefers-color-scheme: dark)").matches
-    ? "moonlight"
-    : "sunshine";
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "moonlight" : "sunshine";
 }
 
 function applyTheme(theme) {

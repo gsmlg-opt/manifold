@@ -33,10 +33,11 @@ defmodule ManifoldAPI.RestTest do
 
   test "well-known discovery document", %{conn: conn} do
     base = ManifoldAPI.Endpoint.url()
+    expected_version = :manifold_api |> Application.spec(:vsn) |> List.to_string()
 
     assert %{
              "product" => "manifold",
-             "version" => "0.1.0",
+             "version" => ^expected_version,
              "auth" => "deployment_boundary",
              "api" => %{
                "rest" => %{

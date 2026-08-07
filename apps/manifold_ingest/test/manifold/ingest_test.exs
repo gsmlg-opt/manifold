@@ -429,6 +429,10 @@ defmodule Manifold.IngestTest do
   end
 
   test "archival commits projection and security jobs before projection completes" do
+    parser_version = Application.fetch_env!(:manifold_mail, :parser_version)
+    sanitizer_version = Application.fetch_env!(:manifold_mail, :sanitizer_version)
+    evaluation_version = Application.fetch_env!(:manifold_security, :evaluation_version)
+
     %{route: route} = route_fixture()
     assert {:ok, delivery} = accept_delivery([route])
 
@@ -439,8 +443,8 @@ defmodule Manifold.IngestTest do
                worker: inspect(ProjectInboundMail),
                args: %{
                  "inbound_delivery_id" => delivery.id,
-                 "parser_version" => 1,
-                 "sanitizer_version" => 1
+                 "parser_version" => parser_version,
+                 "sanitizer_version" => sanitizer_version
                }
              )
 
@@ -449,7 +453,7 @@ defmodule Manifold.IngestTest do
                worker: inspect(EvaluateInboundSecurity),
                args: %{
                  "inbound_delivery_id" => delivery.id,
-                 "evaluation_version" => 1
+                 "evaluation_version" => evaluation_version
                }
              )
 
@@ -457,8 +461,8 @@ defmodule Manifold.IngestTest do
              ProjectInboundMail.perform(%Oban.Job{
                args: %{
                  "inbound_delivery_id" => delivery.id,
-                 "parser_version" => 1,
-                 "sanitizer_version" => 1
+                 "parser_version" => parser_version,
+                 "sanitizer_version" => sanitizer_version
                }
              })
 
@@ -680,6 +684,9 @@ defmodule Manifold.IngestTest do
       Application.put_env(:manifold_mail, :parser_version, old_parser_version)
       Application.put_env(:manifold_mail, :sanitizer_version, old_sanitizer_version)
     end)
+
+    Application.put_env(:manifold_mail, :parser_version, 1)
+    Application.put_env(:manifold_mail, :sanitizer_version, 1)
 
     %{route: route} = route_fixture()
     assert {:ok, delivery} = accept_delivery([route])

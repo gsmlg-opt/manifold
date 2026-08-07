@@ -200,7 +200,7 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
           message_id: message_id,
           kind: kind,
           position: position,
-          name: display_name,
+          display_name: display_name,
           address: address,
           canonical_address: String.downcase(address, :ascii),
           inserted_at: now,

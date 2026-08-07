@@ -70,8 +70,7 @@ defmodule ManifoldWeb.AccountLive.Edit do
 
       <.form for={@form} id="account-form" phx-change="validate" phx-submit="save">
         <label>
-          Name
-          <input type="text" name={@form[:name].name} value={@form[:name].value} required />
+          Name <input type="text" name={@form[:name].name} value={@form[:name].value} required />
         </label>
         <label>
           Address
