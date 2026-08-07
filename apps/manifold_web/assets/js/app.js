@@ -3,6 +3,7 @@ import { Socket } from "phoenix";
 import { LiveSocket } from "phoenix_live_view";
 import * as DuskmoonHooks from "phoenix_duskmoon/hooks";
 import "./datetime.js";
+import { ConversationRow } from "./conversation_row.js";
 
 // Prefer localStorage over an empty/default server theme so LiveView remounts
 // do not clobber an explicit sunshine/moonlight choice with OS auto.
@@ -90,7 +91,7 @@ let csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("
 
 let liveSocket = new LiveSocket("/live", Socket, {
   params: { _csrf_token: csrfToken },
-  hooks: { ...DuskmoonHooks, ThemeSwitcher },
+  hooks: { ...DuskmoonHooks, ThemeSwitcher, ConversationRow },
 });
 
 liveSocket.connect();
