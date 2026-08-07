@@ -1,6 +1,8 @@
 defmodule ManifoldWeb.MailLive.Index do
   use ManifoldWeb, :live_view
 
+  require Logger
+
   import ManifoldWeb.MailComponents
 
   alias Manifold.Accounts
@@ -9,6 +11,8 @@ defmodule ManifoldWeb.MailLive.Index do
   alias Manifold.Outbound
   alias ManifoldWeb.MailNotifier
   alias ManifoldWeb.SyncNotifier
+
+  @auto_mark_read_ms 3_000
 
   @impl true
   def mount(_params, _session, socket) do
@@ -33,7 +37,11 @@ defmodule ManifoldWeb.MailLive.Index do
        subscribed_mailbox_id: nil,
        syncing: false,
        sync_receive_method_id: nil,
-       subscribed_sync_method_id: nil
+       subscribed_sync_method_id: nil,
+       selected_thread_ids: MapSet.new(),
+       confirm_mark_all_read?: false,
+       auto_mark_timer: nil,
+       auto_mark_thread_id: nil
      )}
   end
 
@@ -68,24 +76,44 @@ defmodule ManifoldWeb.MailLive.Index do
          )}
 
       {:ok, loaded} ->
-        {:noreply,
-         assign(socket,
-           page_title: loaded.page_title,
-           mailbox: mailbox,
-           folders: loaded.folders,
-           folder: loaded.folder,
-           page: loaded.page,
-           conversation: loaded.conversation,
-           mail_view: loaded.mail_view,
-           drafts: loaded.drafts,
-           sent_items: loaded.sent_items,
-           draft: loaded.draft,
-           draft_params: draft_form_params(loaded.draft),
-           sent_detail: loaded.sent_detail,
-           query: loaded.query,
-           unread_only: loaded.unread_only,
-           after_cursor: loaded.after_cursor
-         )}
+        prev_folder_id = socket.assigns.folder && socket.assigns.folder.id
+        prev_after = socket.assigns.after_cursor
+
+        selection_reset? =
+          loaded.mail_view == :folder and
+            (prev_folder_id != (loaded.folder && loaded.folder.id) or
+               prev_after != loaded.after_cursor)
+
+        socket =
+          socket
+          |> assign(
+            page_title: loaded.page_title,
+            mailbox: mailbox,
+            folders: loaded.folders,
+            folder: loaded.folder,
+            page: loaded.page,
+            conversation: loaded.conversation,
+            mail_view: loaded.mail_view,
+            drafts: loaded.drafts,
+            sent_items: loaded.sent_items,
+            draft: loaded.draft,
+            draft_params: draft_form_params(loaded.draft),
+            sent_detail: loaded.sent_detail,
+            query: loaded.query,
+            unread_only: loaded.unread_only,
+            after_cursor: loaded.after_cursor,
+            confirm_mark_all_read?: false
+          )
+          |> then(fn socket ->
+            if selection_reset? do
+              assign(socket, :selected_thread_ids, MapSet.new())
+            else
+              socket
+            end
+          end)
+          |> schedule_auto_mark_read()
+
+        {:noreply, socket}
 
       {:error, _reason} ->
         {:noreply,
@@ -244,8 +272,10 @@ defmodule ManifoldWeb.MailLive.Index do
   def handle_event("mark-read", %{"entry-id" => entry_id}, socket),
     do: mutate(socket, fn -> Mail.mark_read(socket.assigns.mailbox.id, [entry_id], true) end)
 
-  def handle_event("mark-unread", %{"entry-id" => entry_id}, socket),
-    do: mutate(socket, fn -> Mail.mark_read(socket.assigns.mailbox.id, [entry_id], false) end)
+  def handle_event("mark-unread", %{"entry-id" => entry_id}, socket) do
+    socket = cancel_auto_mark_read(socket)
+    mutate(socket, fn -> Mail.mark_read(socket.assigns.mailbox.id, [entry_id], false) end)
+  end
 
   def handle_event("star", %{"entry-id" => entry_id}, socket),
     do: mutate(socket, fn -> Mail.set_starred(socket.assigns.mailbox.id, [entry_id], true) end)
@@ -262,6 +292,78 @@ defmodule ManifoldWeb.MailLive.Index do
   def handle_event("restore", %{"entry-id" => entry_id}, socket),
     do: move_and_return(socket, fn -> Mail.restore(socket.assigns.mailbox.id, [entry_id]) end)
 
+  def handle_event("select-conversation", %{"thread-id" => thread_id} = params, socket) do
+    modifier? = params["modifier"] in [true, "true", "1"]
+
+    if modifier? do
+      selected =
+        if MapSet.member?(socket.assigns.selected_thread_ids, thread_id) do
+          MapSet.delete(socket.assigns.selected_thread_ids, thread_id)
+        else
+          MapSet.put(socket.assigns.selected_thread_ids, thread_id)
+        end
+
+      {:noreply, assign(socket, :selected_thread_ids, selected)}
+    else
+      path =
+        folder_thread_path(socket.assigns.mailbox.id, socket.assigns.folder.id, thread_id,
+          q: socket.assigns.query,
+          unread: unread_param(socket.assigns.unread_only),
+          after: socket.assigns.after_cursor
+        )
+
+      {:noreply,
+       socket
+       |> assign(:selected_thread_ids, MapSet.new([thread_id]))
+       |> push_patch(to: path)}
+    end
+  end
+
+  def handle_event("bulk-mark-read", _params, socket),
+    do: bulk_entries(socket, &Mail.mark_read(socket.assigns.mailbox.id, &1, true), :stay)
+
+  def handle_event("bulk-mark-unread", _params, socket) do
+    socket = cancel_auto_mark_read(socket)
+    bulk_entries(socket, &Mail.mark_read(socket.assigns.mailbox.id, &1, false), :stay)
+  end
+
+  def handle_event("bulk-archive", _params, socket),
+    do: bulk_entries(socket, &Mail.archive(socket.assigns.mailbox.id, &1), :leave_if_open)
+
+  def handle_event("bulk-trash", _params, socket),
+    do: bulk_entries(socket, &Mail.trash(socket.assigns.mailbox.id, &1), :leave_if_open)
+
+  def handle_event("open-mark-all-read", _params, socket) do
+    if socket.assigns.folder.unread_count == 0 do
+      {:noreply, put_flash(socket, :info, "Nothing to mark.")}
+    else
+      {:noreply, assign(socket, :confirm_mark_all_read?, true)}
+    end
+  end
+
+  def handle_event("cancel-mark-all-read", _params, socket),
+    do: {:noreply, assign(socket, :confirm_mark_all_read?, false)}
+
+  def handle_event("confirm-mark-all-read", _params, socket) do
+    case Mail.mark_folder_read(socket.assigns.mailbox.id, socket.assigns.folder.id) do
+      {:ok, 0} ->
+        {:noreply,
+         socket
+         |> assign(:confirm_mark_all_read?, false)
+         |> put_flash(:info, "Nothing to mark.")}
+
+      {:ok, _count} ->
+        {:noreply,
+         socket
+         |> assign(:confirm_mark_all_read?, false)
+         |> reload()
+         |> schedule_auto_mark_read()}
+
+      {:error, _} ->
+        {:noreply, put_flash(socket, :error, "Mailbox action failed.")}
+    end
+  end
+
   @impl true
   def handle_info({:sync_job_changed, account_id, running?}, socket) do
     if socket.assigns.sync_receive_method_id == account_id do
@@ -271,11 +373,38 @@ defmodule ManifoldWeb.MailLive.Index do
     end
   end
 
+  def handle_info({:auto_mark_read, thread_id}, socket) do
+    open? =
+      socket.assigns.conversation &&
+        socket.assigns.conversation.thread_id == thread_id &&
+        socket.assigns.auto_mark_thread_id == thread_id
+
+    socket = assign(socket, auto_mark_timer: nil, auto_mark_thread_id: nil)
+
+    if open? do
+      unread_ids =
+        socket.assigns.conversation.messages
+        |> Enum.reject(& &1.read)
+        |> Enum.map(& &1.entry_id)
+
+      case Mail.mark_read(socket.assigns.mailbox.id, unread_ids, true) do
+        {:ok, _} ->
+          {:noreply, reload(socket)}
+
+        {:error, reason} ->
+          Logger.warning("auto mark read failed: #{inspect(reason)}")
+          {:noreply, socket}
+      end
+    else
+      {:noreply, socket}
+    end
+  end
+
   def handle_info(
         {:mailbox_changed, mailbox_id},
         %{assigns: %{mailbox: %{id: mailbox_id}}} = socket
       ) do
-    {:noreply, reload(socket)}
+    {:noreply, socket |> reload() |> schedule_auto_mark_read()}
   end
 
   def handle_info({:mailbox_changed, _mailbox_id}, socket), do: {:noreply, socket}
@@ -450,7 +579,7 @@ defmodule ManifoldWeb.MailLive.Index do
 
   defp mutate(socket, action) do
     case action.() do
-      {:ok, _count} -> {:noreply, reload(socket)}
+      {:ok, _count} -> {:noreply, socket |> reload() |> schedule_auto_mark_read()}
       {:error, _reason} -> {:noreply, put_flash(socket, :error, "Mailbox action failed.")}
     end
   end
@@ -471,6 +600,76 @@ defmodule ManifoldWeb.MailLive.Index do
       {:error, _reason} ->
         {:noreply, put_flash(socket, :error, "Mailbox action failed.")}
     end
+  end
+
+  defp bulk_entries(socket, fun, mode) do
+    thread_ids = MapSet.to_list(socket.assigns.selected_thread_ids)
+
+    with {:ok, entry_ids} <-
+           Mail.entry_ids_for_threads(
+             socket.assigns.mailbox.id,
+             socket.assigns.folder.id,
+             thread_ids
+           ),
+         {:ok, _count} <- fun.(entry_ids) do
+      open_id = socket.assigns.conversation && socket.assigns.conversation.thread_id
+      leave? = mode == :leave_if_open and open_id in thread_ids
+
+      socket =
+        socket
+        |> assign(:selected_thread_ids, MapSet.new())
+        |> cancel_auto_mark_read()
+
+      socket =
+        if leave? do
+          push_patch(socket,
+            to:
+              folder_path(socket.assigns.mailbox.id, socket.assigns.folder.id,
+                q: socket.assigns.query,
+                unread: unread_param(socket.assigns.unread_only),
+                after: socket.assigns.after_cursor
+              )
+          )
+        else
+          socket |> reload() |> schedule_auto_mark_read()
+        end
+
+      {:noreply, socket}
+    else
+      {:error, _} ->
+        {:noreply, put_flash(socket, :error, "Mailbox action failed.")}
+    end
+  end
+
+  defp schedule_auto_mark_read(socket) do
+    socket = cancel_auto_mark_read(socket)
+    conversation = socket.assigns.conversation
+
+    cond do
+      is_nil(conversation) ->
+        socket
+
+      Enum.any?(conversation.messages, &(not &1.read)) ->
+        ref =
+          Process.send_after(
+            self(),
+            {:auto_mark_read, conversation.thread_id},
+            @auto_mark_read_ms
+          )
+
+        assign(socket, auto_mark_timer: ref, auto_mark_thread_id: conversation.thread_id)
+
+      true ->
+        socket
+    end
+  end
+
+  defp cancel_auto_mark_read(socket) do
+    if ref = socket.assigns[:auto_mark_timer] do
+      Process.cancel_timer(ref)
+    end
+
+    assign(socket, auto_mark_timer: nil, auto_mark_thread_id: nil)
   end
 
   defp reload(socket) do
@@ -786,6 +985,16 @@ defmodule ManifoldWeb.MailLive.Index do
                   {@folder.unread_count}
                 </span>
               </button>
+              <button
+                id="mark-all-read"
+                type="button"
+                class="mark-all-read"
+                phx-click="open-mark-all-read"
+                title="Mark all messages in this folder as read"
+              >
+                <.dm_mdi name="email-check-outline" class="mail-icon" />
+                <span>Mark all read</span>
+              </button>
             </div>
             <span class="mailbox-address">{mailbox_label(@mailbox)}</span>
           </div>
@@ -814,18 +1023,16 @@ defmodule ManifoldWeb.MailLive.Index do
         </div>
 
         <nav class="conversation-items">
-          <.link
+          <button
             :for={item <- @page.items}
-            navigate={
-              folder_thread_path(@mailbox.id, @folder.id, item.thread_id,
-                q: @query,
-                unread: unread_param(@unread_only),
-                after: @after_cursor
-              )
-            }
+            type="button"
+            id={"conversation-row-#{item.thread_id}"}
+            phx-hook="ConversationRow"
+            data-thread-id={item.thread_id}
             class={[
               "conversation-row",
               item.unread && "is-unread",
+              MapSet.member?(@selected_thread_ids, item.thread_id) && "is-checked",
               @conversation && item.thread_id == @conversation.thread_id && "is-selected"
             ]}
           >
@@ -847,7 +1054,7 @@ defmodule ManifoldWeb.MailLive.Index do
               name="paperclip"
               class="row-state-icon attached"
             />
-          </.link>
+          </button>
         </nav>
 
         <nav
@@ -1210,6 +1417,45 @@ defmodule ManifoldWeb.MailLive.Index do
           end}
         </p>
       </aside>
+
+      <div
+        :if={@mailbox && @mail_view == :folder && MapSet.size(@selected_thread_ids) > 0}
+        id="bulk-selection-bar"
+        class="bulk-selection-bar"
+        role="toolbar"
+        aria-label="Bulk conversation actions"
+      >
+        <span class="bulk-selection-count">{MapSet.size(@selected_thread_ids)} selected</span>
+        <button type="button" id="bulk-mark-read" phx-click="bulk-mark-read">Mark read</button>
+        <button type="button" id="bulk-mark-unread" phx-click="bulk-mark-unread">
+          Mark unread
+        </button>
+        <button type="button" id="bulk-archive" phx-click="bulk-archive">Archive</button>
+        <button type="button" id="bulk-trash" phx-click="bulk-trash">Delete</button>
+      </div>
+
+      <div
+        :if={@confirm_mark_all_read?}
+        id="mark-all-read-modal"
+        class="mark-all-read-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="mark-all-read-title"
+      >
+        <div class="mark-all-read-backdrop" phx-click="cancel-mark-all-read"></div>
+        <div class="mark-all-read-dialog">
+          <h2 id="mark-all-read-title">Mark all as read?</h2>
+          <p>
+            Mark all {@folder.unread_count} unread messages in {@folder.name} as read.
+          </p>
+          <div class="mark-all-read-actions">
+            <button type="button" phx-click="cancel-mark-all-read">Cancel</button>
+            <button type="button" id="confirm-mark-all-read" phx-click="confirm-mark-all-read">
+              Mark all read
+            </button>
+          </div>
+        </div>
+      </div>
     </section>
     """
   end

@@ -146,6 +146,172 @@ defmodule ManifoldWeb.MailLiveTest do
     assert has_element?(view, "#sync-button[disabled]")
   end
 
+  test "clicking a conversation selects and opens it", %{conn: conn} do
+    mailbox = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox.id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    thread = projected_thread(mailbox, inbox.id, "Open me", DateTime.utc_now())
+
+    assert {:ok, view, _html} = live(conn, ~p"/mail/#{mailbox.id}/folders/#{inbox.id}")
+
+    render_click(view, "select-conversation", %{
+      "thread-id" => thread.thread.id,
+      "modifier" => "false"
+    })
+
+    assert_patch(
+      view,
+      ~p"/mail/#{mailbox.id}/folders/#{inbox.id}/threads/#{thread.thread.id}"
+    )
+
+    assert has_element?(view, "#conversation-row-#{thread.thread.id}.is-checked")
+    assert has_element?(view, "#conversation-row-#{thread.thread.id}.is-selected")
+  end
+
+  test "modifier select toggles without opening", %{conn: conn} do
+    mailbox = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox.id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    a = projected_thread(mailbox, inbox.id, "A", DateTime.utc_now())
+    b = projected_thread(mailbox, inbox.id, "B", DateTime.add(DateTime.utc_now(), -10))
+
+    assert {:ok, view, _html} = live(conn, ~p"/mail/#{mailbox.id}/folders/#{inbox.id}")
+
+    render_click(view, "select-conversation", %{
+      "thread-id" => a.thread.id,
+      "modifier" => "false"
+    })
+
+    render_click(view, "select-conversation", %{
+      "thread-id" => b.thread.id,
+      "modifier" => "true"
+    })
+
+    assert has_element?(view, "#conversation-row-#{a.thread.id}.is-checked")
+    assert has_element?(view, "#conversation-row-#{b.thread.id}.is-checked")
+
+    assert_patch(
+      view,
+      ~p"/mail/#{mailbox.id}/folders/#{inbox.id}/threads/#{a.thread.id}"
+    )
+
+    refute has_element?(view, ".mail-reader h2", "B")
+  end
+
+  test "bulk toolbar marks selected conversations read", %{conn: conn} do
+    mailbox = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox.id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    a = projected_thread(mailbox, inbox.id, "Bulk A", DateTime.utc_now())
+    b = projected_thread(mailbox, inbox.id, "Bulk B", DateTime.add(DateTime.utc_now(), -10))
+
+    assert {:ok, view, _html} = live(conn, ~p"/mail/#{mailbox.id}/folders/#{inbox.id}")
+
+    render_click(view, "select-conversation", %{
+      "thread-id" => a.thread.id,
+      "modifier" => "false"
+    })
+
+    render_click(view, "select-conversation", %{
+      "thread-id" => b.thread.id,
+      "modifier" => "true"
+    })
+
+    assert has_element?(view, "#bulk-selection-bar")
+
+    view
+    |> element("#bulk-mark-read")
+    |> render_click()
+
+    refute has_element?(view, "#conversation-row-#{a.thread.id}.is-unread")
+    refute has_element?(view, "#conversation-row-#{b.thread.id}.is-unread")
+    refute has_element?(view, "#bulk-selection-bar")
+  end
+
+  test "bulk trash moves selected conversations and clears open reader", %{conn: conn} do
+    mailbox = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox.id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    a = projected_thread(mailbox, inbox.id, "Trash me", DateTime.utc_now())
+
+    assert {:ok, view, _html} = live(conn, ~p"/mail/#{mailbox.id}/folders/#{inbox.id}")
+
+    render_click(view, "select-conversation", %{
+      "thread-id" => a.thread.id,
+      "modifier" => "false"
+    })
+
+    view
+    |> element("#bulk-trash")
+    |> render_click()
+
+    refute has_element?(view, "#conversation-row-#{a.thread.id}")
+    refute has_element?(view, ".mail-reader")
+    assert_patch(view, ~p"/mail/#{mailbox.id}/folders/#{inbox.id}")
+  end
+
+  test "mark all read requires modal confirm", %{conn: conn} do
+    mailbox = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox.id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    projected_thread(mailbox, inbox.id, "Unread all", DateTime.utc_now())
+
+    assert {:ok, view, _html} = live(conn, ~p"/mail/#{mailbox.id}/folders/#{inbox.id}")
+    assert has_element?(view, "#mark-all-read")
+    refute has_element?(view, "#mark-all-read-modal")
+
+    view |> element("#mark-all-read") |> render_click()
+    assert has_element?(view, "#mark-all-read-modal")
+
+    view |> element("#confirm-mark-all-read") |> render_click()
+
+    refute has_element?(view, "#mark-all-read-modal")
+    refute has_element?(view, ".conversation-row.is-unread")
+  end
+
+  test "opening a conversation auto-marks read after timer message", %{conn: conn} do
+    mailbox = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox.id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    thread = projected_thread(mailbox, inbox.id, "Auto read", DateTime.utc_now())
+
+    assert {:ok, view, _html} =
+             live(
+               conn,
+               ~p"/mail/#{mailbox.id}/folders/#{inbox.id}/threads/#{thread.thread.id}"
+             )
+
+    assert has_element?(view, "#conversation-row-#{thread.thread.id}.is-unread")
+
+    send(view.pid, {:auto_mark_read, thread.thread.id})
+    _ = render(view)
+
+    refute has_element?(view, "#conversation-row-#{thread.thread.id}.is-unread")
+    assert Repo.get!(MailboxEntry, thread.entry.id).read_at
+  end
+
+  test "leaving a conversation before auto-mark keeps it unread", %{conn: conn} do
+    mailbox = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox.id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    thread = projected_thread(mailbox, inbox.id, "Stay unread", DateTime.utc_now())
+
+    assert {:ok, view, _html} =
+             live(
+               conn,
+               ~p"/mail/#{mailbox.id}/folders/#{inbox.id}/threads/#{thread.thread.id}"
+             )
+
+    view
+    |> element(".reader-back")
+    |> render_click()
+
+    send(view.pid, {:auto_mark_read, thread.thread.id})
+    _ = render(view)
+
+    assert is_nil(Repo.get!(MailboxEntry, thread.entry.id).read_at)
+  end
+
   defp mailbox_fixture do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "mailui#{suffix}.test"})
