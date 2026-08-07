@@ -117,6 +117,10 @@ defmodule Manifold.Mail do
           {:ok, [Ecto.UUID.t()]} | {:error, Error.t()}
   defdelegate entry_ids_for_threads(mailbox_id, folder_id, thread_ids), to: Mailbox
 
+  @spec mark_folder_read(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, non_neg_integer()} | {:error, Error.t()}
+  defdelegate mark_folder_read(mailbox_id, folder_id), to: Mailbox
+
   @spec set_starred(Ecto.UUID.t(), [Ecto.UUID.t()], boolean()) ::
           {:ok, non_neg_integer()} | {:error, Error.t()}
   defdelegate set_starred(mailbox_id, entry_ids, starred?), to: Mailbox

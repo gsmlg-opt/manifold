@@ -363,6 +363,31 @@ defmodule Manifold.Mail.Mailbox do
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
+  @spec mark_folder_read(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, non_neg_integer()} | {:error, Error.t()}
+  def mark_folder_read(mailbox_id, folder_id) do
+    if valid_uuids?([mailbox_id, folder_id]) and
+         Folders.belongs_to_mailbox?(folder_id, mailbox_id) do
+      entry_ids =
+        from(entry in MailboxEntry,
+          where:
+            entry.mailbox_id == ^mailbox_id and entry.folder_id == ^folder_id and
+              is_nil(entry.read_at) and not entry.quarantined,
+          select: entry.id
+        )
+        |> Repo.all()
+
+      case mark_read(mailbox_id, entry_ids, true) do
+        {:ok, _count} -> {:ok, length(entry_ids)}
+        error -> error
+      end
+    else
+      {:error, error(:permanent, :not_found, "folder not found in mailbox")}
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
   @spec set_starred(Ecto.UUID.t(), [Ecto.UUID.t()], boolean()) ::
           {:ok, non_neg_integer()} | {:error, Error.t()}
   def set_starred(mailbox_id, entry_ids, starred?) when is_boolean(starred?) do
