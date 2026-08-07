@@ -11,8 +11,13 @@ defmodule Manifold.Umbrella.MixProject do
       elixir: "~> 1.18",
       elixirc_options: [warnings_as_errors: Mix.env() in [:dev, :test]],
       listeners: [Phoenix.CodeReloader],
-      releases: releases(),
-      preferred_cli_env: [
+      releases: releases()
+    ]
+  end
+
+  def cli do
+    [
+      preferred_envs: [
         format: :dev,
         "format --check-formatted": :dev,
         test: :test,
