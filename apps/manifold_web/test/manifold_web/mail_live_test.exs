@@ -63,6 +63,13 @@ defmodule ManifoldWeb.MailLiveTest do
     assert html =~ ~s(id="compose-button")
     assert has_element?(view, ".folder-total-count", "2")
     assert has_element?(view, "#unread-filter")
+    assert has_element?(view, "#folder-more-actions")
+    assert has_element?(view, "#mark-all-read")
+    assert has_element?(view, "#unread-filter.folder-header-icon-button")
+    assert has_element?(view, "#folder-more-actions .folder-header-icon-button")
+    assert has_element?(view, "#unread-filter[aria-label='Show unread only']")
+    assert has_element?(view, "#folder-more-actions", "More actions")
+    assert has_element?(view, "#mark-all-read", "Mark all read")
 
     html =
       view

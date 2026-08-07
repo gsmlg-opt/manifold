@@ -971,30 +971,44 @@ defmodule ManifoldWeb.MailLive.Index do
               <span class="folder-total-count" title="Messages in this folder">
                 {@folder.total_count}
               </span>
-              <button
-                id="unread-filter"
-                type="button"
-                class={["unread-filter", @unread_only && "is-active"]}
-                phx-click="toggle-unread-filter"
-                aria-pressed={to_string(@unread_only)}
-                title={if @unread_only, do: "Show all messages", else: "Show unread only"}
-              >
-                <.dm_mdi name="email-outline" class="mail-icon" />
-                <span>Unread</span>
-                <span :if={@folder.unread_count > 0} class="unread-filter-count">
-                  {@folder.unread_count}
-                </span>
-              </button>
-              <button
-                id="mark-all-read"
-                type="button"
-                class="mark-all-read"
-                phx-click="open-mark-all-read"
-                title="Mark all messages in this folder as read"
-              >
-                <.dm_mdi name="email-check-outline" class="mail-icon" />
-                <span>Mark all read</span>
-              </button>
+              <div class="folder-header-actions">
+                <.dm_tooltip
+                  content={if @unread_only, do: "Show all messages", else: "Show unread only"}
+                  position="bottom"
+                >
+                  <button
+                    id="unread-filter"
+                    type="button"
+                    class={["folder-header-icon-button", @unread_only && "is-active"]}
+                    phx-click="toggle-unread-filter"
+                    aria-pressed={to_string(@unread_only)}
+                    aria-label={if @unread_only, do: "Show all messages", else: "Show unread only"}
+                  >
+                    <.dm_mdi name="filter-variant" class="mail-icon" />
+                  </button>
+                </.dm_tooltip>
+
+                <div id="folder-more-actions" class="folder-more-actions">
+                  <.dm_dropdown id="folder-more-menu" position="bottom">
+                    <:trigger>
+                      <span class="folder-header-icon-button" aria-hidden="true">
+                        <.dm_mdi name="dots-horizontal" class="mail-icon" />
+                      </span>
+                      <span class="sr-only">More actions</span>
+                    </:trigger>
+                    <:content>
+                      <button
+                        type="button"
+                        id="mark-all-read"
+                        class="popover-menu-item"
+                        phx-click="open-mark-all-read"
+                      >
+                        Mark all read
+                      </button>
+                    </:content>
+                  </.dm_dropdown>
+                </div>
+              </div>
             </div>
             <span class="mailbox-address">{mailbox_label(@mailbox)}</span>
           </div>
