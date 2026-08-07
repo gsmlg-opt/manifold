@@ -1,6 +1,8 @@
 defmodule ManifoldWeb.DeliveryLive.Index do
   use ManifoldWeb, :live_view
 
+  import ManifoldWeb.OperationsComponents
+
   alias Manifold.Ingest
   alias Manifold.Security
   alias ManifoldWeb.IngestNotifier
@@ -17,7 +19,7 @@ defmodule ManifoldWeb.DeliveryLive.Index do
 
   def render(assigns) do
     ~H"""
-    <section>
+    <.ops_shell current={:deliveries}>
       <h1>Inbound Deliveries</h1>
       <dl class="ops-summary" aria-label="Inbound operations summary">
         <div>
@@ -66,7 +68,7 @@ defmodule ManifoldWeb.DeliveryLive.Index do
           </tbody>
         </table>
       </div>
-    </section>
+    </.ops_shell>
     """
   end
 

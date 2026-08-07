@@ -1,6 +1,8 @@
 defmodule ManifoldWeb.DeliveryLive.Show do
   use ManifoldWeb, :live_view
 
+  import ManifoldWeb.OperationsComponents
+
   alias Manifold.Ingest
   alias Manifold.Security
   alias ManifoldWeb.IngestNotifier
@@ -36,7 +38,7 @@ defmodule ManifoldWeb.DeliveryLive.Show do
 
   def render(assigns) do
     ~H"""
-    <section>
+    <.ops_shell current={:deliveries}>
       <h1>Inbound Delivery</h1>
       <dl class="detail-grid">
         <dt>Source</dt><dd>{source_label(@detail.delivery.source_kind)}</dd>
@@ -146,7 +148,7 @@ defmodule ManifoldWeb.DeliveryLive.Show do
           </tbody>
         </table>
       </div>
-    </section>
+    </.ops_shell>
     """
   end
 
