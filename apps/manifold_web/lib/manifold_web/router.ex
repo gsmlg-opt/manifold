@@ -19,6 +19,7 @@ defmodule ManifoldWeb.Router do
 
     get("/connectors/:provider/start", ConnectorOAuthController, :start)
     get("/connectors/:provider/callback", ConnectorOAuthController, :callback)
+    get("/settings", SettingsRedirectController, :redirect_general)
 
     live_session :local_instance do
       live("/", MailLive.Index, :home)
@@ -39,6 +40,7 @@ defmodule ManifoldWeb.Router do
       live("/deliveries/:id", DeliveryLive.Show, :show)
       live("/jobs", JobLive.Index, :index)
       live("/cloud", CloudLive.Index, :index)
+      live("/settings/general", SettingsLive.General, :index)
       live("/settings/accounts", AccountLive.Index, :index)
       live("/settings/accounts/new", AccountLive.New, :new)
       live("/settings/accounts/:id/edit", AccountLive.Edit, :edit)
