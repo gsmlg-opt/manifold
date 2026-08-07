@@ -19,6 +19,11 @@
   </.dm_appbar>
   <main class="content">
     <.flash_group flash={@flash} />
-    {@inner_content}
+    <section class="settings-layout">
+      <.settings_nav current={@settings_section} />
+      <div class="settings-main">
+        {@inner_content}
+      </div>
+    </section>
   </main>
 </div>

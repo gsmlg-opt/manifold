@@ -13,4 +13,14 @@ defmodule ManifoldWeb.SettingsLiveTest do
     assert html =~ "General"
     assert html =~ "Coming soon"
   end
+
+  test "general settings page renders left nav with General current", %{conn: conn} do
+    {:ok, _view, html} = live(conn, ~p"/settings/general")
+
+    assert html =~ ~s(id="settings-nav")
+    assert html =~ ~p"/settings/general"
+    assert html =~ ~p"/settings/accounts"
+    assert html =~ ~p"/settings/appearance"
+    assert html =~ ~s(data-current="general")
+  end
 end

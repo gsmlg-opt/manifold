@@ -135,7 +135,7 @@ a {
   color: var(--color-on-surface);
 }
 
-.content > section:not(.webmail):not(.ops-layout) {
+.content > section:not(.webmail):not(.ops-layout):not(.settings-layout) {
   max-width: 1180px;
   margin: 0 auto;
   padding: 28px;
@@ -504,26 +504,74 @@ code {
   gap: 14px;
 }
 
-.settings-nav {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
+.settings-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  min-height: calc(100vh - 64px);
+  background: var(--color-surface);
+  color: var(--color-on-surface);
 }
 
-.settings-nav a {
-  padding: 7px 9px;
-  border-bottom: 2px solid transparent;
-  color: var(--color-on-surface-variant);
-  font-size: 13px;
+.settings-nav-aside {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px 12px;
+  border-right: 1px solid var(--color-outline-variant);
+  background: var(--color-secondary);
+  color: var(--color-secondary-content);
+}
+
+.settings-nav-title {
+  margin: 0 9px 4px;
+  color: color-mix(in oklch, var(--color-secondary-content) 72%, transparent);
+  font-size: 12px;
   font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.settings-nav-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-nav-link {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  min-height: 38px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border-radius: var(--radius-field, 0.375rem);
+  color: color-mix(in oklch, var(--color-secondary-content) 82%, transparent);
+  font-size: 14px;
   text-decoration: none;
 }
 
-.settings-nav a:hover,
-.settings-nav a:focus-visible {
-  border-bottom-color: var(--color-primary);
-  color: var(--color-primary);
-  outline: none;
+.settings-nav-link:hover {
+  background: color-mix(in oklch, var(--color-secondary-content) 12%, transparent);
+  color: var(--color-secondary-content);
+}
+
+.settings-nav-link.is-current {
+  background: var(--color-primary-container);
+  color: var(--color-on-primary-container);
+  font-weight: 700;
+}
+
+.settings-nav-icon {
+  width: 19px;
+  height: 19px;
+  color: currentColor;
+}
+
+.settings-main {
+  min-width: 0;
+  max-width: 1180px;
+  padding: 28px;
 }
 
 .settings-secondary,
@@ -2072,6 +2120,25 @@ code {
   }
 
   .ops-main {
+    max-width: none;
+    padding: 20px 16px;
+  }
+
+  .settings-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-nav-aside {
+    border-right: 0;
+    border-bottom: 1px solid var(--color-outline-variant);
+  }
+
+  .settings-nav-list {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .settings-main {
     max-width: none;
     padding: 20px 16px;
   }

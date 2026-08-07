@@ -40,7 +40,14 @@ defmodule ManifoldWeb.Router do
       live("/deliveries/:id", DeliveryLive.Show, :show)
       live("/jobs", JobLive.Index, :index)
       live("/cloud", CloudLive.Index, :index)
+    end
+
+    live_session :settings,
+      on_mount: [ManifoldWeb.Hooks.SettingsPath],
+      layout: {ManifoldWeb.Layouts, :settings} do
       live("/settings/general", SettingsLive.General, :index)
+      live("/settings/appearance", SettingsLive.Appearance, :index)
+
       live("/settings/accounts", AccountLive.Index, :index)
       live("/settings/accounts/new", AccountLive.New, :new)
       live("/settings/accounts/:id/edit", AccountLive.Edit, :edit)
