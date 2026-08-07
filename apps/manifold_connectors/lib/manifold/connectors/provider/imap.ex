@@ -273,7 +273,7 @@ defmodule Manifold.Connectors.Provider.IMAP do
   defp build_boost_uid_page(
          transport,
          conn,
-         cursor,
+         %SyncCursor{} = cursor,
          metadata,
          sorted_uids,
          page_uids,
@@ -313,7 +313,7 @@ defmodule Manifold.Connectors.Provider.IMAP do
   defp build_recent_uid_page(
          transport,
          conn,
-         cursor,
+         %SyncCursor{} = cursor,
          _metadata,
          sorted_uids,
          page_uids,
@@ -353,7 +353,7 @@ defmodule Manifold.Connectors.Provider.IMAP do
   defp build_new_uid_page(
          transport,
          conn,
-         cursor,
+         %SyncCursor{} = cursor,
          metadata,
          sorted_uids,
          page_uids,
@@ -399,7 +399,7 @@ defmodule Manifold.Connectors.Provider.IMAP do
   defp build_flags_scan_page(
          transport,
          conn,
-         cursor,
+         %SyncCursor{} = cursor,
          metadata,
          sorted_uids,
          uidvalidity,

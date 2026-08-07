@@ -114,8 +114,6 @@ defmodule Manifold.Edge.Router do
     end
   end
 
-  defp authenticate(%Plug.Conn{halted: true} = conn, _opts), do: conn
-
   defp authenticate(conn, _opts) do
     now = DateTime.utc_now()
     max_skew_seconds = api_config(:max_clock_skew_seconds)

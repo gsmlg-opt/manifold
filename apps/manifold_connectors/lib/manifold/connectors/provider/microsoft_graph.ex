@@ -217,14 +217,14 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   defp normalize_sync_response(%Req.Response{} = response, _cursor, _base_url),
     do: {:error, classify_response(response)}
 
-  defp advance_cursor(cursor, %{"@odata.nextLink" => next_link}, base_url)
+  defp advance_cursor(%SyncCursor{} = cursor, %{"@odata.nextLink" => next_link}, base_url)
        when is_binary(next_link) do
     with :ok <- validate_graph_url(next_link, base_url) do
       {:ok, %SyncCursor{cursor | page_cursor: next_link}}
     end
   end
 
-  defp advance_cursor(cursor, %{"@odata.deltaLink" => delta_link}, base_url)
+  defp advance_cursor(%SyncCursor{} = cursor, %{"@odata.deltaLink" => delta_link}, base_url)
        when is_binary(delta_link) do
     with :ok <- validate_graph_url(delta_link, base_url) do
       {:ok,

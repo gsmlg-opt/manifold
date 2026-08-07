@@ -193,7 +193,7 @@ defmodule Manifold.Connectors.EAS.WBXML do
          {:ok, _charset, rest} <- decode_mb_u_int32(rest),
          {:ok, string_table_len, rest} <- decode_mb_u_int32(rest),
          true <- byte_size(rest) >= string_table_len,
-         <<_string_table::binary-size(string_table_len), body::binary>> <- rest,
+         <<_string_table::binary-size(^string_table_len), body::binary>> <- rest,
          {:ok, [root | _], _rest, _page} <- decode_nodes(body, 0, []) do
       {:ok, root}
     else
@@ -312,7 +312,7 @@ defmodule Manifold.Connectors.EAS.WBXML do
   defp decode_nodes(<<@opaque_token, rest::binary>>, page, acc) do
     case decode_mb_u_int32(rest) do
       {:ok, len, rest} when is_integer(len) and len >= 0 and byte_size(rest) >= len ->
-        <<data::binary-size(len), rest::binary>> = rest
+        <<data::binary-size(^len), rest::binary>> = rest
         decode_nodes(rest, page, [data | acc])
 
       _ ->

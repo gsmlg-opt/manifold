@@ -229,8 +229,6 @@ defmodule Manifold.Connectors.Provider.Gmail do
     end
   end
 
-  defp initial_messages(_body), do: invalid_response()
-
   defp history_messages(body) when is_map(body) do
     case Map.get(body, "history", []) do
       history when is_list(history) ->
@@ -245,8 +243,6 @@ defmodule Manifold.Connectors.Provider.Gmail do
         invalid_response()
     end
   end
-
-  defp history_messages(_body), do: invalid_response()
 
   defp normalize_history_record(record, {:ok, messages}) when is_map(record) do
     history_groups = [

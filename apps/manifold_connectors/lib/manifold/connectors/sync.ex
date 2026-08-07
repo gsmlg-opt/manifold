@@ -659,7 +659,7 @@ defmodule Manifold.Connectors.Sync do
     end
   end
 
-  defp merge_remote_state(message, raw) do
+  defp merge_remote_state(%ProviderMessage{} = message, raw) do
     labels = if message.labels == [], do: raw.labels, else: message.labels
 
     %ProviderMessage{

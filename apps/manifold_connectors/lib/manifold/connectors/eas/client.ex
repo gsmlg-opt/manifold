@@ -454,13 +454,10 @@ defmodule Manifold.Connectors.EAS.Client do
 
         {:ok, conn}
 
-      {:error, %Error{code: :connect_failed} = error} ->
-        # DNS / TLS / connect failures must surface — do not treat as "OPTIONS optional".
+      {:error, %Error{} = error} ->
+        # http_request/2 wraps all transport failures as Error; surface them so
+        # DNS / TLS / connect problems are not treated as "OPTIONS optional".
         {:error, error}
-
-      {:error, _error} ->
-        # Other OPTIONS failures (timeouts, odd gateways) remain best-effort.
-        {:ok, conn}
     end
   end
 
@@ -595,7 +592,7 @@ defmodule Manifold.Connectors.EAS.Client do
   @doc false
   def format_transport_reason(reason) do
     message =
-      if Exception.exception?(reason), do: Exception.message(reason), else: inspect(reason)
+      if is_exception(reason), do: Exception.message(reason), else: inspect(reason)
 
     cond do
       transport_reason(reason) == :nxdomain or message == "non-existing domain" ->
@@ -702,7 +699,7 @@ defmodule Manifold.Connectors.EAS.Client do
     %Error{class: :temporary, code: :invalid_response, message: message}
   end
 
-  defp http_error(cmd, status, body, host \\ nil) do
+  defp http_error(cmd, status, body, host) do
     detail =
       cond do
         gateway_html_400?(body) and status == 400 and qq_exmail_host?(host) ->
@@ -979,8 +976,6 @@ defmodule Manifold.Connectors.EAS.Client do
       %{conn | cookies: Map.to_list(merged)}
     end
   end
-
-  defp store_cookies(conn, _), do: conn
 
   defp parse_set_cookie(value) when is_binary(value) do
     case String.split(value, ";", parts: 2) do
