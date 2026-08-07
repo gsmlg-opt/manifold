@@ -67,6 +67,58 @@ defmodule Manifold.Mail.MailboxTest do
     assert length(both) == 2
   end
 
+  test "entry_ids_for_threads returns folder-scoped entries for selected threads" do
+    mailbox_id = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox_id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    archive = Enum.find(folders, &(&1.kind == "archive"))
+    now = DateTime.utc_now()
+
+    a = thread_fixture(mailbox_id, inbox.id, "A", now, 2)
+    b = thread_fixture(mailbox_id, inbox.id, "B", DateTime.add(now, -10), 1)
+    _c = thread_fixture(mailbox_id, inbox.id, "C", DateTime.add(now, -20), 1)
+
+    archived =
+      projected_message_fixture(mailbox_id, archive.id, a.thread.id, "Archived in A", now)
+
+    assert {:ok, ids} =
+             Mail.entry_ids_for_threads(mailbox_id, inbox.id, [a.thread.id, b.thread.id])
+
+    assert MapSet.new(ids) ==
+             MapSet.new(Enum.map(a.entries ++ b.entries, & &1.id))
+
+    refute archived.entry.id in ids
+
+    assert {:ok, []} = Mail.entry_ids_for_threads(mailbox_id, inbox.id, [])
+  end
+
+  test "mark_folder_read marks only unread entries in the folder" do
+    mailbox_id = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox_id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    archive = Enum.find(folders, &(&1.kind == "archive"))
+    now = DateTime.utc_now()
+
+    inbox_unread = thread_fixture(mailbox_id, inbox.id, "Inbox unread", now, 1)
+    inbox_read = thread_fixture(mailbox_id, inbox.id, "Inbox read", DateTime.add(now, -10), 1)
+    archive_unread = thread_fixture(mailbox_id, archive.id, "Archive unread", now, 1)
+
+    assert {:ok, 1} =
+             Mail.mark_read(mailbox_id, Enum.map(inbox_read.entries, & &1.id), true)
+
+    assert {:ok, 1} = Mail.mark_folder_read(mailbox_id, inbox.id)
+
+    assert Repo.get!(MailboxEntry, hd(inbox_unread.entries).id).read_at
+    assert Repo.get!(MailboxEntry, hd(inbox_read.entries).id).read_at
+    assert is_nil(Repo.get!(MailboxEntry, hd(archive_unread.entries).id).read_at)
+
+    assert {:ok, folders_after} = Mail.list_folders(mailbox_id)
+    inbox_after = Enum.find(folders_after, &(&1.id == inbox.id))
+    assert inbox_after.unread_count == 0
+
+    assert {:ok, 0} = Mail.mark_folder_read(mailbox_id, inbox.id)
+  end
+
   test "conversation detail is folder scoped" do
     mailbox_id = mailbox_fixture()
     assert {:ok, folders} = Mail.list_folders(mailbox_id)

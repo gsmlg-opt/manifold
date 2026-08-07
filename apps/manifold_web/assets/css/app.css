@@ -923,6 +923,7 @@ code {
 }
 
 .webmail {
+  position: relative;
   display: grid;
   grid-template-columns: 230px 390px minmax(420px, 1fr);
   width: 100%;
@@ -1319,23 +1320,164 @@ code {
 .conversation-row {
   position: relative;
   display: grid;
+  width: 100%;
   grid-template-columns: 8px minmax(0, 1fr) 18px;
   min-height: 105px;
   gap: 8px;
+  margin: 0;
   padding: 13px 13px 12px 10px;
+  border: 0;
   border-bottom: 1px solid var(--color-outline-variant);
+  background: transparent;
   color: var(--color-on-surface);
+  text-align: left;
   text-decoration: none;
+  cursor: pointer;
+  font: inherit;
 }
 
 .conversation-row:hover {
   background: var(--color-surface-container-high);
 }
 
+.conversation-row.is-checked {
+  background: color-mix(in oklch, var(--color-primary) 12%, transparent);
+  box-shadow: inset 3px 0 color-mix(in oklch, var(--color-primary) 55%, transparent);
+}
+
 .conversation-row.is-selected {
   background: var(--color-primary-container);
   color: var(--color-on-primary-container);
   box-shadow: inset 3px 0 var(--color-primary);
+}
+
+.conversation-row.is-checked.is-selected {
+  background: var(--color-primary-container);
+  box-shadow: inset 3px 0 var(--color-primary);
+}
+
+.mark-all-read {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 4px;
+  padding: 4px 8px;
+  border: 1px solid var(--color-outline-variant);
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--color-on-surface) 6%, transparent);
+  color: var(--color-on-surface);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.mark-all-read:hover,
+.mark-all-read:focus-visible {
+  border-color: var(--color-primary);
+  outline: 2px solid color-mix(in oklch, var(--color-primary) 55%, transparent);
+}
+
+.mark-all-read .mail-icon {
+  width: 16px;
+  height: 16px;
+}
+
+.bulk-selection-bar {
+  position: absolute;
+  z-index: 20;
+  left: 50%;
+  bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100% - 32px);
+  padding: 10px 16px;
+  border: 1px solid var(--color-outline-variant);
+  border-radius: 999px;
+  background: var(--color-surface-container-highest);
+  color: var(--color-on-surface);
+  box-shadow: 0 8px 24px color-mix(in oklch, var(--color-on-surface) 24%, transparent);
+  transform: translateX(-50%);
+}
+
+.bulk-selection-bar button {
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--color-on-surface) 10%, transparent);
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.bulk-selection-bar button:hover,
+.bulk-selection-bar button:focus-visible {
+  background: color-mix(in oklch, var(--color-primary) 18%, transparent);
+}
+
+.bulk-selection-count {
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.mark-all-read-modal {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+}
+
+.mark-all-read-backdrop {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in oklch, var(--color-on-surface) 45%, transparent);
+}
+
+.mark-all-read-dialog {
+  position: relative;
+  z-index: 1;
+  width: min(360px, calc(100% - 32px));
+  padding: 20px;
+  border: 1px solid var(--color-outline-variant);
+  border-radius: 12px;
+  background: var(--color-surface-container-high);
+  color: var(--color-on-surface);
+  box-shadow: 0 16px 40px color-mix(in oklch, var(--color-on-surface) 28%, transparent);
+}
+
+.mark-all-read-dialog h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+
+.mark-all-read-dialog p {
+  margin: 0 0 16px;
+  color: var(--color-on-surface-variant);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.mark-all-read-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.mark-all-read-actions button {
+  padding: 8px 12px;
+  border: 1px solid var(--color-outline-variant);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-on-surface);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.mark-all-read-actions #confirm-mark-all-read {
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+  color: var(--color-primary-content);
 }
 
 .unread-dot {
