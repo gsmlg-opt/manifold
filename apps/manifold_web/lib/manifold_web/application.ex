@@ -11,6 +11,7 @@ defmodule ManifoldWeb.Application do
       {Phoenix.PubSub, name: Manifold.PubSub},
       ManifoldWeb.IngestNotifier,
       ManifoldWeb.MailNotifier,
+      ManifoldWeb.SyncNotifier,
       ManifoldWeb.Endpoint
     ]
 
