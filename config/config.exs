@@ -92,7 +92,7 @@ config :manifold_security,
   adapter_config: []
 
 config :manifold_smtp,
-  enabled: config_env() != :test,
+  enabled: false,
   hostname: "localhost",
   bind: "127.0.0.1",
   port: 2525,

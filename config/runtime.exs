@@ -169,6 +169,7 @@ if edge_release? do
     ]
 
   config :manifold_smtp,
+    enabled: true,
     resolver: Manifold.Edge.SMTP,
     ingest: Manifold.Edge.SMTP
 end

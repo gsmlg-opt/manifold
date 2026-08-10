@@ -66,6 +66,26 @@ defmodule Manifold.ConfigTest do
     assert edge_apps[:manifold_smtp] == :permanent
   end
 
+  test "default runtime disables the inbound SMTP listener" do
+    smtp = read_config(:dev)[:manifold_smtp]
+
+    refute smtp[:enabled]
+  end
+
+  test "edge runtime enables the inbound SMTP listener" do
+    put_runtime_env(%{
+      "RELEASE_NAME" => "manifold_edge",
+      "MANIFOLD_EDGE_DATABASE_URL" => "ecto://localhost/manifold_edge",
+      "MANIFOLD_EDGE_API_URL" => "https://edge.example",
+      "MANIFOLD_EDGE_SHARED_SECRET" => String.duplicate("e", 32),
+      "MANIFOLD_EDGE_INSTALLATION_ID" => "edge-1"
+    })
+
+    smtp = read_runtime(:prod)[:manifold_smtp]
+
+    assert smtp[:enabled]
+  end
+
   test "test connector defaults use a valid non-production key and inert endpoints" do
     connectors = read_config(:test)[:manifold_connectors]
 
