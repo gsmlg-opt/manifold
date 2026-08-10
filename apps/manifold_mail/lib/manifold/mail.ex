@@ -155,12 +155,65 @@ defmodule Manifold.Mail do
     |> repo.all()
   end
 
+  @doc false
+  @spec attachment_object_keys_batch(
+          module(),
+          Ecto.UUID.t(),
+          Ecto.UUID.t() | nil,
+          pos_integer()
+        ) :: %{keys: [String.t()], next: Ecto.UUID.t() | nil, done?: boolean()}
+  def attachment_object_keys_batch(repo, delivery_id, after_id, limit)
+      when (is_nil(after_id) or is_binary(after_id)) and is_integer(limit) and limit > 0 do
+    query =
+      Attachment
+      |> join(:inner, [attachment], message in Message, on: message.id == attachment.message_id)
+      |> where([_attachment, message], message.inbound_delivery_id == ^delivery_id)
+      |> where([attachment, _message], not is_nil(attachment.object_key))
+      |> order_by([attachment, _message], asc: attachment.id)
+      |> limit(^limit)
+
+    query =
+      if after_id do
+        where(query, [attachment, _message], attachment.id > ^after_id)
+      else
+        query
+      end
+
+    rows =
+      repo.all(
+        from([attachment, _message] in query, select: {attachment.id, attachment.object_key})
+      )
+
+    %{
+      keys: rows |> Enum.map(&elem(&1, 1)) |> Enum.uniq(),
+      next: rows |> List.last() |> then(&(&1 && elem(&1, 0))),
+      done?: length(rows) < limit
+    }
+  end
+
   @spec blob_referenced?(String.t() | nil) :: boolean()
   def blob_referenced?(object_key) when is_binary(object_key) do
     Repo.exists?(where(Attachment, [attachment], attachment.object_key == ^object_key))
   end
 
   def blob_referenced?(nil), do: false
+
+  @doc false
+  @spec lock_blob_object_keys(module(), [String.t()]) :: :ok
+  def lock_blob_object_keys(repo, object_keys) when is_list(object_keys) do
+    object_keys
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.each(fn object_key ->
+      Ecto.Adapters.SQL.query!(
+        repo,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        ["manifold:mail:blob:" <> object_key]
+      )
+    end)
+
+    :ok
+  end
 
   @spec account_data_remaining?(Ecto.UUID.t()) :: boolean()
   def account_data_remaining?(mailbox_id) do

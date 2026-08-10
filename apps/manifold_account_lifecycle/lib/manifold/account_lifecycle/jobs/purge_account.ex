@@ -11,8 +11,11 @@ defmodule Manifold.AccountLifecycle.Jobs.PurgeAccount do
       states: :incomplete
     ]
 
+  alias Manifold.AccountLifecycle.Purge
+
   @impl Oban.Worker
+  @spec perform(Oban.Job.t()) :: Purge.result()
   def perform(%Oban.Job{args: %{"purge_id" => purge_id}} = job) do
-    Manifold.AccountLifecycle.Purge.run(purge_id, job)
+    Purge.run(purge_id, job)
   end
 end

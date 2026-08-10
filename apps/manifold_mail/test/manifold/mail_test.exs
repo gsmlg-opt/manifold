@@ -141,6 +141,32 @@ defmodule Manifold.MailTest do
     assert Repo.get!(InboundDelivery, second_delivery.id)
   end
 
+  test "attachment object-key discovery is cursor bounded without storing an object key cursor" do
+    %{domain_id: domain_id} = mailbox_fixtures(1)
+    delivery = delivery_fixture(domain_id)
+    message = message_fixture(delivery.id)
+
+    keys =
+      for index <- 1..251 do
+        digest = :crypto.hash(:sha256, Integer.to_string(index)) |> Base.encode16(case: :lower)
+        key = object_key(digest)
+        attachment_fixture(message.id, Integer.to_string(index), key)
+        key
+      end
+
+    assert %{keys: first, next: cursor, done?: false} =
+             Mail.attachment_object_keys_batch(Repo, delivery.id, nil, 250)
+
+    assert length(first) == 250
+    assert is_binary(cursor)
+    refute cursor in keys
+
+    assert %{keys: second, next: _last_cursor, done?: true} =
+             Mail.attachment_object_keys_batch(Repo, delivery.id, cursor, 250)
+
+    assert Enum.sort(first ++ second) == Enum.sort(keys)
+  end
+
   test "mail cleanup indexes are valid, ready, ordered, and retry-aware" do
     attachment_migration_path =
       Path.expand(
@@ -369,6 +395,237 @@ defmodule Manifold.MailTest do
   end
 
   defp object_key(sha256), do: "blobs/sha256/#{String.slice(sha256, 0, 2)}/#{sha256}"
+end
+
+defmodule Manifold.MailBlobPublicationConcurrencyTest do
+  use ExUnit.Case, async: false
+
+  alias Ecto.Adapters.SQL.Sandbox
+  alias Manifold.Mail
+  alias Manifold.Mail.InboundSource
+  alias Manifold.Mail.Schema.{Attachment, MailboxEntry}
+  alias Manifold.Repo
+  alias Manifold.Storage.{BlobStore, RawStore}
+
+  @moduletag :tmp_dir
+
+  setup %{tmp_dir: tmp_dir} do
+    :ok = Sandbox.checkout(Repo, sandbox: false)
+
+    old_raw = Application.fetch_env!(:manifold_storage, :raw_store_dir)
+    old_blob = Application.fetch_env!(:manifold_storage, :blob_store_dir)
+    Application.put_env(:manifold_storage, :raw_store_dir, Path.join(tmp_dir, "raw"))
+    Application.put_env(:manifold_storage, :blob_store_dir, Path.join(tmp_dir, "blobs"))
+
+    fixture = publication_fixture(tmp_dir)
+
+    on_exit(fn ->
+      Application.put_env(:manifold_storage, :raw_store_dir, old_raw)
+      Application.put_env(:manifold_storage, :blob_store_dir, old_blob)
+      :ok = Sandbox.checkout(Repo, sandbox: false)
+
+      try do
+        Repo.query!("DELETE FROM inbound_deliveries WHERE id = $1::uuid", [
+          Ecto.UUID.dump!(fixture.delivery_id)
+        ])
+
+        Repo.query!("DELETE FROM mailboxes WHERE id = $1::uuid", [
+          Ecto.UUID.dump!(fixture.mailbox_id)
+        ])
+
+        Repo.query!("DELETE FROM domains WHERE id = $1::uuid", [
+          Ecto.UUID.dump!(fixture.domain_id)
+        ])
+      after
+        Sandbox.checkin(Repo)
+      end
+    end)
+
+    {:ok, fixture: fixture}
+  end
+
+  test "blob cleanup waits for publication commit and then retains the referenced blob", %{
+    fixture: fixture
+  } do
+    test_pid = self()
+    barrier_ref = make_ref()
+
+    publisher =
+      Task.async(fn ->
+        :ok = Sandbox.checkout(Repo, sandbox: false)
+
+        try do
+          Mail.project_inbound(fixture.source,
+            after_blob_storage_before_commit: fn ->
+              send(test_pid, {:blob_stored, self(), barrier_ref})
+
+              receive do
+                {:commit_projection, ^barrier_ref} -> :ok
+              after
+                5_000 -> raise "timed out waiting to commit blob publication"
+              end
+            end
+          )
+        after
+          Sandbox.checkin(Repo)
+        end
+      end)
+
+    publisher_pid = publisher.pid
+    assert_receive {:blob_stored, ^publisher_pid, ^barrier_ref}, 5_000
+    assert {:ok, _stat} = BlobStore.stat(fixture.blob_key)
+    refute Mail.blob_referenced?(fixture.blob_key)
+
+    cleanup =
+      Task.async(fn ->
+        :ok = Sandbox.checkout(Repo, sandbox: false)
+
+        try do
+          Repo.transaction(fn ->
+            [[backend_pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+            send(test_pid, {:cleanup_started, self(), backend_pid, barrier_ref})
+            :ok = Mail.lock_blob_object_keys(Repo, [fixture.blob_key])
+            referenced? = Mail.blob_referenced?(fixture.blob_key)
+            if not referenced?, do: :ok = BlobStore.delete(fixture.blob_key)
+            referenced?
+          end)
+        after
+          Sandbox.checkin(Repo)
+        end
+      end)
+
+    cleanup_pid = cleanup.pid
+    assert_receive {:cleanup_started, ^cleanup_pid, cleanup_backend_pid, ^barrier_ref}, 5_000
+    assert_advisory_wait(cleanup_backend_pid, 5_000)
+
+    send(publisher_pid, {:commit_projection, barrier_ref})
+    assert {:ok, %{state: :parsed}} = Task.await(publisher, 5_000)
+    assert {:ok, true} = Task.await(cleanup, 5_000)
+
+    assert Repo.get_by!(Attachment, object_key: fixture.blob_key)
+    assert {:ok, _stat} = BlobStore.stat(fixture.blob_key)
+  end
+
+  defp assert_advisory_wait(backend_pid, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    Stream.repeatedly(fn ->
+      Repo.query!(
+        "SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1",
+        [backend_pid]
+      ).rows
+    end)
+    |> Enum.reduce_while(nil, fn
+      [["Lock", "advisory"]], _state ->
+        {:halt, :ok}
+
+      _rows, _state ->
+        if System.monotonic_time(:millisecond) < deadline do
+          {:cont, nil}
+        else
+          flunk("cleanup did not block on the blob advisory lock")
+        end
+    end)
+  end
+
+  defp publication_fixture(tmp_dir) do
+    now = DateTime.utc_now()
+    domain_id = Ecto.UUID.generate()
+    mailbox_id = Ecto.UUID.generate()
+    delivery_id = Ecto.UUID.generate()
+    domain = "blob-race-#{domain_id}.test"
+    attachment = "serialized publication #{delivery_id}"
+    digest = :crypto.hash(:sha256, attachment) |> Base.encode16(case: :lower)
+    {:ok, blob_key} = BlobStore.build_key(digest)
+
+    raw = multipart_message(attachment)
+    raw_sha256 = :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
+    raw_key = RawStore.build_key(domain_id, now, delivery_id)
+    raw_path = Path.join(tmp_dir, delivery_id <> ".eml")
+    File.write!(raw_path, raw)
+    {:ok, _stat} = RawStore.put_from_path(raw_key, raw_path)
+
+    Repo.insert_all("domains", [
+      %{
+        id: Ecto.UUID.dump!(domain_id),
+        name: domain,
+        normalized_domain: domain,
+        active: true,
+        plus_addressing_enabled: true,
+        inserted_at: now,
+        updated_at: now
+      }
+    ])
+
+    Repo.insert_all("mailboxes", [
+      %{
+        id: Ecto.UUID.dump!(mailbox_id),
+        domain_id: Ecto.UUID.dump!(domain_id),
+        local_part: "inbox",
+        canonical_local_part: "inbox",
+        active: true,
+        plus_addressing_enabled: true,
+        inserted_at: now,
+        updated_at: now
+      }
+    ])
+
+    Repo.insert_all("inbound_deliveries", [
+      %{
+        id: Ecto.UUID.dump!(delivery_id),
+        ingest_id: Ecto.UUID.generate(),
+        source_kind: "provider_import",
+        storage_domain_id: Ecto.UUID.dump!(domain_id),
+        received_at: now,
+        raw_size: byte_size(raw),
+        raw_sha256: raw_sha256,
+        raw_object_key: raw_key,
+        spool_bundle_path: Path.join(tmp_dir, "removed-spool"),
+        raw_storage_state: "archived",
+        processing_state: "archived",
+        inserted_at: now,
+        updated_at: now
+      }
+    ])
+
+    Repo.insert!(
+      MailboxEntry.changeset(%MailboxEntry{}, %{
+        mailbox_id: mailbox_id,
+        inbound_delivery_id: delivery_id,
+        original_recipient: "inbox@#{domain}",
+        quarantined: false
+      })
+    )
+
+    %{
+      domain_id: domain_id,
+      mailbox_id: mailbox_id,
+      delivery_id: delivery_id,
+      blob_key: blob_key,
+      source: %InboundSource{
+        inbound_delivery_id: delivery_id,
+        raw_object_key: raw_key,
+        raw_size: byte_size(raw),
+        raw_sha256: raw_sha256,
+        received_at: now,
+        source_kind: "provider_import"
+      }
+    }
+  end
+
+  defp multipart_message(attachment) do
+    "From: Sender <sender@example.net>\r\n" <>
+      "To: inbox@example.test\r\n" <>
+      "Subject: Blob race\r\n" <>
+      "Message-ID: <blob-race@example.test>\r\n" <>
+      "Content-Type: multipart/mixed; boundary=race\r\n\r\n" <>
+      "--race\r\nContent-Type: text/plain\r\n\r\nBody\r\n" <>
+      "--race\r\nContent-Type: application/octet-stream; name=blob.bin\r\n" <>
+      "Content-Disposition: attachment; filename=blob.bin\r\n" <>
+      "Content-Transfer-Encoding: base64\r\n\r\n" <>
+      Base.encode64(attachment) <>
+      "\r\n--race--\r\n"
+  end
 end
 
 defmodule Manifold.MailConcurrencyTest do
