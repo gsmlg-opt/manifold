@@ -37,22 +37,24 @@ defmodule Manifold.Outbound do
   @spec create_draft(Ecto.UUID.t(), map(), Keyword.t()) ::
           {:ok, OutboundMessage.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def create_draft(mailbox_id, attrs, opts) do
-    with {:ok, identity} <- Accounts.get_sender_identity(mailbox_id),
+    with {:ok, _identity} <- Accounts.get_sender_identity(mailbox_id),
          {:ok, recipients} <- normalize_recipients(Map.get(attrs, :recipients, [])) do
       run_before_persist(opts)
       now = DateTime.utc_now()
 
       Repo.transaction(fn ->
         case lock_active_sender(Repo, mailbox_id) do
-          {:ok, _mailbox} ->
+          {:ok, mailbox} ->
+            sender_address = Accounts.account_address(mailbox)
+
             message_attrs = %{
               mailbox_id: mailbox_id,
               state: "draft",
               composition_kind: Map.get(attrs, :composition_kind, "new"),
               source_message_id: Map.get(attrs, :source_message_id),
-              sender_name: identity.display_name,
-              sender_address: identity.address,
-              canonical_sender_address: identity.canonical_address,
+              sender_name: mailbox.name,
+              sender_address: sender_address,
+              canonical_sender_address: String.downcase(sender_address, :ascii),
               subject: Map.get(attrs, :subject),
               text_body: Map.get(attrs, :text_body),
               in_reply_to: Map.get(attrs, :in_reply_to),
@@ -347,28 +349,45 @@ defmodule Manifold.Outbound do
           {:snooze, 5} | %{cancelled: non_neg_integer(), done?: boolean()}
   def cancel_account_jobs(mailbox_id, limit) when is_integer(limit) and limit > 0 do
     matching = account_job_query(mailbox_id)
-    executing? = matching |> where([job, _message], job.state == "executing") |> Repo.exists?()
 
-    selected_ids =
+    selected =
       matching
-      |> order_by([job, _message], asc: job.id)
+      |> order_by([job], asc: job.id)
       |> limit(^limit)
-      |> select([job, _message], job.id)
+      |> select([job], {job.id, job.state})
+      |> Repo.all()
 
-    {:ok, cancelled} =
-      Oban.Job
-      |> where([job], job.id in subquery(selected_ids))
-      |> Oban.cancel_all_jobs()
+    selected_ids = Enum.map(selected, &elem(&1, 0))
+    selected_executing? = Enum.any?(selected, &(elem(&1, 1) == "executing"))
+
+    cancelled =
+      case selected_ids do
+        [] ->
+          0
+
+        ids ->
+          {:ok, count} =
+            Oban.Job
+            |> where([job], job.id in ^ids)
+            |> Oban.cancel_all_jobs()
+
+          count
+      end
 
     matching_executing? =
       matching
-      |> where([job, _message], job.state == "executing")
+      |> where([job], job.state == "executing")
       |> Repo.exists?()
 
-    if cancelled > 0 or executing? or matching_executing? do
-      {:snooze, 5}
-    else
-      %{cancelled: 0, done?: not Repo.exists?(matching)}
+    cond do
+      selected_executing? or matching_executing? ->
+        {:snooze, 5}
+
+      cancelled > 0 ->
+        %{cancelled: cancelled, done?: false}
+
+      true ->
+        %{cancelled: 0, done?: not Repo.exists?(matching)}
     end
   end
 
@@ -378,32 +397,30 @@ defmodule Manifold.Outbound do
           done?: boolean()
         }
   def purge_account_batch(mailbox_id, limit) when is_integer(limit) and limit > 0 do
-    case Repo.transaction(fn ->
-           message_ids =
-             OutboundMessage
-             |> where([message], message.mailbox_id == ^mailbox_id)
-             |> order_by([message], asc: message.id)
-             |> limit(^limit)
-             |> lock("FOR UPDATE SKIP LOCKED")
-             |> select([message], message.id)
-             |> Repo.all()
+    {:ok, result} =
+      Repo.transaction(fn ->
+        message_ids =
+          OutboundMessage
+          |> where([message], message.mailbox_id == ^mailbox_id)
+          |> order_by([message], asc: message.id)
+          |> limit(^limit)
+          |> lock("FOR UPDATE SKIP LOCKED")
+          |> select([message], message.id)
+          |> Repo.all()
 
-           ProviderEvent
-           |> where([event], event.outbound_message_id in ^message_ids)
-           |> Repo.delete_all()
+        ProviderEvent
+        |> where([event], event.outbound_message_id in ^message_ids)
+        |> Repo.delete_all()
 
-           {deleted, _rows} =
-             OutboundMessage
-             |> where([message], message.id in ^message_ids and message.mailbox_id == ^mailbox_id)
-             |> Repo.delete_all()
+        {deleted, _rows} =
+          OutboundMessage
+          |> where([message], message.id in ^message_ids and message.mailbox_id == ^mailbox_id)
+          |> Repo.delete_all()
 
-           %{deleted: deleted, done?: not account_data_remaining?(Repo, mailbox_id)}
-         end) do
-      {:ok, result} -> result
-      {:error, reason} -> {:error, reason}
-    end
-  rescue
-    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+        %{deleted: deleted, done?: not account_data_remaining?(Repo, mailbox_id)}
+      end)
+
+    result
   end
 
   @spec account_data_remaining?(Ecto.UUID.t()) :: boolean()
@@ -702,13 +719,31 @@ defmodule Manifold.Outbound do
 
   defp account_job_query(mailbox_id) do
     Oban.Job
-    |> join(:inner, [job], message in OutboundMessage,
-      on: fragment("?->>'outbound_message_id' = ?::text", job.args, message.id)
+    |> where(
+      [job],
+      job.worker == ^inspect(SubmitOutbound) and
+        job.state in ~w(available scheduled executing retryable suspended)
     )
     |> where(
-      [job, message],
-      job.worker == ^inspect(SubmitOutbound) and message.mailbox_id == ^mailbox_id and
-        job.state in ~w(available scheduled executing retryable suspended)
+      [job],
+      fragment(
+        """
+        EXISTS (
+          SELECT 1
+          FROM "outbound_messages" AS outbound_message
+          WHERE outbound_message.mailbox_id = ?
+            AND outbound_message.id = CASE
+              WHEN (?->>'outbound_message_id') ~*
+                '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+              THEN (?->>'outbound_message_id')::uuid
+              ELSE NULL
+            END
+        )
+        """,
+        type(^mailbox_id, :binary_id),
+        job.args,
+        job.args
+      )
     )
   end
 

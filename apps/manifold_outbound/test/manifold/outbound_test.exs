@@ -175,6 +175,36 @@ defmodule Manifold.OutboundTest do
     assert Repo.aggregate(OutboundEvent, :count) == 0
   end
 
+  test "draft creation freezes sender fields from the locked current account" do
+    %{mailbox: mailbox, address: original_address} = mailbox_fixture()
+    [_local_part, domain] = String.split(original_address, "@", parts: 2)
+
+    before_persist = fn ->
+      assert {:ok, updated} =
+               Accounts.update_account(mailbox, %{
+                 name: "Current Sender",
+                 address: "current@#{domain}"
+               })
+
+      assert updated.local_part == "current"
+    end
+
+    assert {:ok, draft} =
+             Outbound.create_draft(
+               mailbox.id,
+               %{
+                 subject: "Current identity",
+                 text_body: "Body",
+                 recipients: [%{kind: "to", address: "person@example.net"}]
+               },
+               before_persist: before_persist
+             )
+
+    assert draft.sender_name == "Current Sender"
+    assert draft.sender_address == "current@#{domain}"
+    assert draft.canonical_sender_address == "current@#{domain}"
+  end
+
   test "draft update rechecks sender activity immediately before persistence" do
     %{mailbox: mailbox} = mailbox_fixture()
     draft = draft_fixture(mailbox.id)
@@ -225,11 +255,7 @@ defmodule Manifold.OutboundTest do
       |> order_by([job], asc: job.id)
       |> Repo.all()
 
-    [executing, suspended, _available, completed] = target_jobs
-
-    Oban.Job
-    |> where([job], job.id == ^executing.id)
-    |> Repo.update_all(set: [state: "executing"])
+    [suspended, _available, pending_execution, completed] = target_jobs
 
     Oban.Job
     |> where([job], job.id == ^suspended.id)
@@ -251,9 +277,13 @@ defmodule Manifold.OutboundTest do
 
     assert target_incomplete_job_count(mailbox.id) == 3
 
-    assert {:snooze, 5} = Outbound.cancel_account_jobs(mailbox.id, 2)
+    assert %{cancelled: 2, done?: false} = Outbound.cancel_account_jobs(mailbox.id, 2)
     assert target_incomplete_job_count(mailbox.id) == 1
     assert target_cancelled_job_count(mailbox.id) == 2
+
+    Oban.Job
+    |> where([job], job.id == ^pending_execution.id)
+    |> Repo.update_all(set: [state: "executing"])
 
     assert {:snooze, 5} = Outbound.cancel_account_jobs(mailbox.id, 2)
     assert target_incomplete_job_count(mailbox.id) == 0
@@ -275,20 +305,93 @@ defmodule Manifold.OutboundTest do
     start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
 
     %{mailbox: mailbox} = mailbox_fixture()
-    draft = draft_fixture(mailbox.id)
-    assert {:ok, _queued} = Outbound.queue_draft(mailbox.id, draft.id)
 
-    {result, queries} =
+    for _index <- 1..25 do
+      draft = draft_fixture(mailbox.id)
+      assert {:ok, _queued} = Outbound.queue_draft(mailbox.id, draft.id)
+    end
+
+    %{"outbound_message_id" => "not-a-uuid"}
+    |> SubmitOutbound.new()
+    |> Repo.insert!()
+
+    {_result, queries} =
       capture_repo_queries(fn -> Outbound.cancel_account_jobs(mailbox.id, 1) end)
 
-    assert {:snooze, 5} = result
+    ownership_query =
+      Enum.find(queries, fn query ->
+        String.starts_with?(query, "SELECT ") and
+          String.contains?(query, ~s("oban_jobs")) and
+          String.contains?(query, ~s("outbound_messages")) and
+          String.contains?(query, "ORDER BY") and
+          String.contains?(query, "LIMIT $")
+      end)
 
-    assert Enum.any?(queries, fn query ->
-             String.starts_with?(query, "UPDATE ") and
-               String.contains?(query, ~s("oban_jobs")) and
-               String.contains?(query, ~s("outbound_messages")) and
-               String.contains?(query, "LIMIT $")
-           end)
+    assert is_binary(ownership_query)
+    assert String.contains?(ownership_query, "EXISTS")
+    assert String.contains?(ownership_query, "CASE")
+    assert String.contains?(ownership_query, "~*")
+    assert String.contains?(ownership_query, "::uuid")
+    refute String.contains?(ownership_query, ~s("id"::text))
+  end
+
+  test "outbound purge index supports bounded mailbox ID scans" do
+    %{mailbox: mailbox} = mailbox_fixture()
+    _draft = draft_fixture(mailbox.id)
+
+    index_name = "outbound_messages_mailbox_id_id_index"
+
+    assert [[^index_name, index_definition]] =
+             Repo.query!(
+               """
+               SELECT indexname, indexdef
+               FROM pg_indexes
+               WHERE schemaname = current_schema()
+                 AND tablename = 'outbound_messages'
+                 AND indexname = $1
+               """,
+               [index_name]
+             ).rows
+
+    assert index_definition =~ "(mailbox_id, id)"
+
+    Repo.query!("SET LOCAL enable_seqscan = off")
+
+    plan =
+      Repo.query!(
+        """
+        EXPLAIN (COSTS OFF)
+        SELECT id
+        FROM outbound_messages
+        WHERE mailbox_id = $1
+        ORDER BY id
+        LIMIT 250
+        """,
+        [Ecto.UUID.dump!(mailbox.id)]
+      ).rows
+      |> List.flatten()
+      |> Enum.join("\n")
+
+    assert plan =~ index_name
+  end
+
+  test "outbound purge index is built concurrently outside migration locks" do
+    migration_path =
+      Path.expand(
+        "../../../manifold_data/priv/repo/migrations/20260811000200_add_outbound_purge_index.exs",
+        __DIR__
+      )
+
+    assert File.exists?(migration_path)
+    migration = Manifold.Repo.Migrations.AddOutboundPurgeIndex
+    unless Code.ensure_loaded?(migration), do: Code.require_file(migration_path)
+
+    assert [disable_ddl_transaction: true, disable_migration_lock: true] =
+             apply(migration, :__migration__, [])
+
+    source = File.read!(migration_path)
+    assert source =~ "index(:outbound_messages, [:mailbox_id, :id], concurrently: true)"
+    assert length(Regex.scan(~r/concurrently:\s*true/, source)) == 1
   end
 
   test "account purge deletes bounded messages and provider events before cascades" do
