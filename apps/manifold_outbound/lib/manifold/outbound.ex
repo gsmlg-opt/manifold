@@ -18,6 +18,7 @@ defmodule Manifold.Outbound do
     OutboundEvent,
     OutboundMessage,
     OutboundRecipient,
+    ProviderEvent,
     ProviderSubmission
   }
 
@@ -30,36 +31,48 @@ defmodule Manifold.Outbound do
 
   @spec create_draft(Ecto.UUID.t(), map()) ::
           {:ok, OutboundMessage.t()} | {:error, Error.t() | Ecto.Changeset.t()}
-  def create_draft(mailbox_id, attrs) do
+  def create_draft(mailbox_id, attrs), do: create_draft(mailbox_id, attrs, [])
+
+  @doc false
+  @spec create_draft(Ecto.UUID.t(), map(), Keyword.t()) ::
+          {:ok, OutboundMessage.t()} | {:error, Error.t() | Ecto.Changeset.t()}
+  def create_draft(mailbox_id, attrs, opts) do
     with {:ok, identity} <- Accounts.get_sender_identity(mailbox_id),
          {:ok, recipients} <- normalize_recipients(Map.get(attrs, :recipients, [])) do
+      run_before_persist(opts)
       now = DateTime.utc_now()
 
       Repo.transaction(fn ->
-        message_attrs = %{
-          mailbox_id: mailbox_id,
-          state: "draft",
-          composition_kind: Map.get(attrs, :composition_kind, "new"),
-          source_message_id: Map.get(attrs, :source_message_id),
-          sender_name: identity.display_name,
-          sender_address: identity.address,
-          canonical_sender_address: identity.canonical_address,
-          subject: Map.get(attrs, :subject),
-          text_body: Map.get(attrs, :text_body),
-          in_reply_to: Map.get(attrs, :in_reply_to),
-          references: Map.get(attrs, :references, [])
-        }
+        case lock_active_sender(Repo, mailbox_id) do
+          {:ok, _mailbox} ->
+            message_attrs = %{
+              mailbox_id: mailbox_id,
+              state: "draft",
+              composition_kind: Map.get(attrs, :composition_kind, "new"),
+              source_message_id: Map.get(attrs, :source_message_id),
+              sender_name: identity.display_name,
+              sender_address: identity.address,
+              canonical_sender_address: identity.canonical_address,
+              subject: Map.get(attrs, :subject),
+              text_body: Map.get(attrs, :text_body),
+              in_reply_to: Map.get(attrs, :in_reply_to),
+              references: Map.get(attrs, :references, [])
+            }
 
-        case %OutboundMessage{}
-             |> OutboundMessage.create_changeset(message_attrs)
-             |> Repo.insert() do
-          {:ok, message} ->
-            insert_recipients!(message.id, recipients, now)
-            insert_event!(message.id, "draft_created", now)
-            message
+            case %OutboundMessage{}
+                 |> OutboundMessage.create_changeset(message_attrs)
+                 |> Repo.insert() do
+              {:ok, message} ->
+                insert_recipients!(message.id, recipients, now)
+                insert_event!(message.id, "draft_created", now)
+                message
 
-          {:error, changeset} ->
-            Repo.rollback(changeset)
+              {:error, changeset} ->
+                Repo.rollback(changeset)
+            end
+
+          {:error, reason} ->
+            Repo.rollback(reason)
         end
       end)
       |> normalize_transaction()
@@ -97,7 +110,14 @@ defmodule Manifold.Outbound do
 
         %OutboundMessage{} = draft ->
           with :ok <- expected_revision(draft, opts) do
-            update_draft_transaction(draft, Map.delete(attrs, :recipients), recipients)
+            run_before_persist(opts)
+
+            update_draft_transaction(
+              mailbox_id,
+              draft,
+              Map.delete(attrs, :recipients),
+              recipients
+            )
           end
       end
     end
@@ -235,6 +255,9 @@ defmodule Manifold.Outbound do
 
     multi =
       Multi.new()
+      |> Multi.run(:sender, fn repo, _changes ->
+        lock_active_sender(repo, mailbox_id)
+      end)
       |> Multi.run(:draft, fn repo, _changes ->
         draft =
           OutboundMessage
@@ -318,6 +341,73 @@ defmodule Manifold.Outbound do
   def record_provider_event(provider, event, opts \\ []) do
     ProviderEvents.record(provider, event, opts)
   end
+
+  @doc false
+  @spec cancel_account_jobs(Ecto.UUID.t(), pos_integer()) ::
+          {:snooze, 5} | %{cancelled: non_neg_integer(), done?: boolean()}
+  def cancel_account_jobs(mailbox_id, limit) when is_integer(limit) and limit > 0 do
+    matching = account_job_query(mailbox_id)
+    executing? = matching |> where([job, _message], job.state == "executing") |> Repo.exists?()
+
+    selected_ids =
+      matching
+      |> order_by([job, _message], asc: job.id)
+      |> limit(^limit)
+      |> select([job, _message], job.id)
+
+    {:ok, cancelled} =
+      Oban.Job
+      |> where([job], job.id in subquery(selected_ids))
+      |> Oban.cancel_all_jobs()
+
+    matching_executing? =
+      matching
+      |> where([job, _message], job.state == "executing")
+      |> Repo.exists?()
+
+    if cancelled > 0 or executing? or matching_executing? do
+      {:snooze, 5}
+    else
+      %{cancelled: 0, done?: not Repo.exists?(matching)}
+    end
+  end
+
+  @doc false
+  @spec purge_account_batch(Ecto.UUID.t(), pos_integer()) :: %{
+          deleted: non_neg_integer(),
+          done?: boolean()
+        }
+  def purge_account_batch(mailbox_id, limit) when is_integer(limit) and limit > 0 do
+    case Repo.transaction(fn ->
+           message_ids =
+             OutboundMessage
+             |> where([message], message.mailbox_id == ^mailbox_id)
+             |> order_by([message], asc: message.id)
+             |> limit(^limit)
+             |> lock("FOR UPDATE SKIP LOCKED")
+             |> select([message], message.id)
+             |> Repo.all()
+
+           ProviderEvent
+           |> where([event], event.outbound_message_id in ^message_ids)
+           |> Repo.delete_all()
+
+           {deleted, _rows} =
+             OutboundMessage
+             |> where([message], message.id in ^message_ids and message.mailbox_id == ^mailbox_id)
+             |> Repo.delete_all()
+
+           %{deleted: deleted, done?: not account_data_remaining?(Repo, mailbox_id)}
+         end) do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  @spec account_data_remaining?(Ecto.UUID.t()) :: boolean()
+  def account_data_remaining?(mailbox_id), do: account_data_remaining?(Repo, mailbox_id)
 
   defp normalize_recipients(recipients)
        when is_list(recipients) and length(recipients) <= @max_recipients do
@@ -502,24 +592,30 @@ defmodule Manifold.Outbound do
     |> Map.put(:recipients, recipients)
   end
 
-  defp update_draft_transaction(draft, attrs, recipients) do
+  defp update_draft_transaction(mailbox_id, draft, attrs, recipients) do
     Repo.transaction(fn ->
-      case draft
-           |> OutboundMessage.draft_changeset(attrs)
-           |> Repo.update(stale_error_field: :lock_version) do
-        {:ok, updated} ->
-          if is_list(recipients) do
-            OutboundRecipient
-            |> where([recipient], recipient.outbound_message_id == ^updated.id)
-            |> Repo.delete_all()
+      case lock_active_sender(Repo, mailbox_id) do
+        {:ok, _mailbox} ->
+          case draft
+               |> OutboundMessage.draft_changeset(attrs)
+               |> Repo.update(stale_error_field: :lock_version) do
+            {:ok, updated} ->
+              if is_list(recipients) do
+                OutboundRecipient
+                |> where([recipient], recipient.outbound_message_id == ^updated.id)
+                |> Repo.delete_all()
 
-            insert_recipients!(updated.id, recipients, DateTime.utc_now())
+                insert_recipients!(updated.id, recipients, DateTime.utc_now())
+              end
+
+              updated
+
+            {:error, changeset} ->
+              Repo.rollback(changeset)
           end
 
-          updated
-
-        {:error, changeset} ->
-          Repo.rollback(changeset)
+        {:error, reason} ->
+          Repo.rollback(reason)
       end
     end)
     |> normalize_transaction()
@@ -602,6 +698,44 @@ defmodule Manifold.Outbound do
       true ->
         State.validate_transition(draft.state, "queued")
     end
+  end
+
+  defp account_job_query(mailbox_id) do
+    Oban.Job
+    |> join(:inner, [job], message in OutboundMessage,
+      on: fragment("?->>'outbound_message_id' = ?::text", job.args, message.id)
+    )
+    |> where(
+      [job, message],
+      job.worker == ^inspect(SubmitOutbound) and message.mailbox_id == ^mailbox_id and
+        job.state in ~w(available scheduled executing retryable suspended)
+    )
+  end
+
+  defp lock_active_sender(repo, mailbox_id) do
+    case Accounts.active_account_for_update(repo, mailbox_id) do
+      {:ok, %{domain: %{active: true}} = mailbox} -> {:ok, mailbox}
+      {:ok, _mailbox} -> {:error, sender_not_active_error()}
+      {:error, %Error{reason: :mailbox_not_active}} -> {:error, sender_not_active_error()}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  defp sender_not_active_error do
+    error(:permanent, :sender_not_active, "sender account is not active")
+  end
+
+  defp account_data_remaining?(repo, mailbox_id) do
+    repo.exists?(where(OutboundMessage, [message], message.mailbox_id == ^mailbox_id))
+  end
+
+  defp run_before_persist(opts) do
+    case Keyword.get(opts, :before_persist) do
+      callback when is_function(callback, 0) -> callback.()
+      nil -> :ok
+    end
+
+    :ok
   end
 
   defp normalize_transaction({:ok, value}), do: {:ok, value}

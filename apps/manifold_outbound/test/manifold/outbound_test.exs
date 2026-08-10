@@ -1,5 +1,5 @@
 defmodule Manifold.OutboundTest do
-  use Manifold.DataCase, async: true
+  use Manifold.DataCase, async: false
 
   alias Manifold.Accounts
   alias Manifold.Outbound
@@ -9,6 +9,7 @@ defmodule Manifold.OutboundTest do
     OutboundEvent,
     OutboundMessage,
     OutboundRecipient,
+    ProviderEvent,
     ProviderSubmission
   }
 
@@ -114,6 +115,255 @@ defmodule Manifold.OutboundTest do
     assert Repo.get!(OutboundMessage, draft.id).state == "draft"
     assert Repo.aggregate(Oban.Job, :count) == 0
     assert Repo.aggregate(ProviderSubmission, :count) == 0
+  end
+
+  test "queueing rechecks and locks the active sender before the draft" do
+    %{mailbox: mailbox} = mailbox_fixture()
+    draft = draft_fixture(mailbox.id)
+
+    {result, queries} =
+      capture_repo_queries(fn ->
+        Outbound.queue_draft(mailbox.id, draft.id, expected_revision: draft.lock_version)
+      end)
+
+    assert {:ok, %OutboundMessage{state: "queued"}} = result
+
+    lock_queries = Enum.filter(queries, &String.contains?(&1, "FOR UPDATE"))
+    assert [sender_lock, draft_lock] = lock_queries
+    assert String.contains?(sender_lock, ~s(FROM "mailboxes"))
+    assert String.contains?(draft_lock, ~s(FROM "outbound_messages"))
+  end
+
+  test "inactive sender cannot queue an existing draft" do
+    %{mailbox: mailbox} = mailbox_fixture()
+    draft = draft_fixture(mailbox.id)
+
+    assert {:ok, _mailbox} = Accounts.disable_account(mailbox.id)
+
+    assert {:error, %{class: :permanent, reason: :sender_not_active}} =
+             Outbound.queue_draft(mailbox.id, draft.id, expected_revision: draft.lock_version)
+
+    assert Repo.get!(OutboundMessage, draft.id).state == "draft"
+    refute Repo.get_by(ProviderSubmission, outbound_message_id: draft.id)
+
+    refute Repo.get_by(Oban.Job,
+             worker: inspect(SubmitOutbound),
+             args: %{"outbound_message_id" => draft.id}
+           )
+  end
+
+  test "draft creation rechecks sender activity immediately before persistence" do
+    %{mailbox: mailbox} = mailbox_fixture()
+
+    before_persist = fn ->
+      assert {:ok, _mailbox} = Accounts.disable_account(mailbox.id)
+    end
+
+    assert {:error, %{class: :permanent, reason: :sender_not_active}} =
+             Outbound.create_draft(
+               mailbox.id,
+               %{
+                 subject: "Stale create",
+                 text_body: "Body",
+                 recipients: [%{kind: "to", address: "person@example.net"}]
+               },
+               before_persist: before_persist
+             )
+
+    assert Repo.aggregate(OutboundMessage, :count) == 0
+    assert Repo.aggregate(OutboundRecipient, :count) == 0
+    assert Repo.aggregate(OutboundEvent, :count) == 0
+  end
+
+  test "draft update rechecks sender activity immediately before persistence" do
+    %{mailbox: mailbox} = mailbox_fixture()
+    draft = draft_fixture(mailbox.id)
+
+    before_persist = fn ->
+      assert {:ok, _mailbox} = Accounts.disable_account(mailbox.id)
+    end
+
+    assert {:error, %{class: :permanent, reason: :sender_not_active}} =
+             Outbound.update_draft(
+               mailbox.id,
+               draft.id,
+               %{
+                 subject: "Stale update",
+                 recipients: [%{kind: "to", address: "changed@example.net"}]
+               },
+               expected_revision: draft.lock_version,
+               before_persist: before_persist
+             )
+
+    assert Repo.get!(OutboundMessage, draft.id).subject == "Ready"
+    assert [%{address: "person@example.net"}] = Outbound.list_recipients(draft.id)
+  end
+
+  test "account job cancellation is bounded and preserves unrelated jobs" do
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+
+    %{mailbox: mailbox} = mailbox_fixture()
+    %{mailbox: other_mailbox} = mailbox_fixture()
+
+    target_messages =
+      for _index <- 1..4 do
+        draft = draft_fixture(mailbox.id)
+        assert {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
+        queued
+      end
+
+    other_draft = draft_fixture(other_mailbox.id)
+    assert {:ok, other_message} = Outbound.queue_draft(other_mailbox.id, other_draft.id)
+
+    target_jobs =
+      Oban.Job
+      |> where([job], job.worker == ^inspect(SubmitOutbound))
+      |> where(
+        [job],
+        fragment("?->>'outbound_message_id'", job.args) in ^Enum.map(target_messages, & &1.id)
+      )
+      |> order_by([job], asc: job.id)
+      |> Repo.all()
+
+    [executing, suspended, _available, completed] = target_jobs
+
+    Oban.Job
+    |> where([job], job.id == ^executing.id)
+    |> Repo.update_all(set: [state: "executing"])
+
+    Oban.Job
+    |> where([job], job.id == ^suspended.id)
+    |> Repo.update_all(set: [state: "suspended"])
+
+    Oban.Job
+    |> where([job], job.id == ^completed.id)
+    |> Repo.update_all(set: [state: "completed"])
+
+    unrelated =
+      %{outbound_message_id: hd(target_messages).id}
+      |> Oban.Job.new(worker: "Manifold.UnrelatedWorker", queue: :outbound)
+      |> Repo.insert!()
+
+    malformed =
+      %{"outbound_message_id" => "not-a-uuid"}
+      |> SubmitOutbound.new()
+      |> Repo.insert!()
+
+    assert target_incomplete_job_count(mailbox.id) == 3
+
+    assert {:snooze, 5} = Outbound.cancel_account_jobs(mailbox.id, 2)
+    assert target_incomplete_job_count(mailbox.id) == 1
+    assert target_cancelled_job_count(mailbox.id) == 2
+
+    assert {:snooze, 5} = Outbound.cancel_account_jobs(mailbox.id, 2)
+    assert target_incomplete_job_count(mailbox.id) == 0
+    assert target_cancelled_job_count(mailbox.id) == 3
+
+    assert %{cancelled: 0, done?: true} = Outbound.cancel_account_jobs(mailbox.id, 2)
+
+    assert Repo.get!(Oban.Job, completed.id).state == "completed"
+    assert Repo.get!(Oban.Job, unrelated.id).state == "available"
+    assert Repo.get!(Oban.Job, malformed.id).state == "available"
+
+    assert Repo.get_by!(Oban.Job,
+             worker: inspect(SubmitOutbound),
+             args: %{"outbound_message_id" => other_message.id}
+           ).state == "available"
+  end
+
+  test "account job cancellation keeps bounded ownership selection in SQL" do
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+
+    %{mailbox: mailbox} = mailbox_fixture()
+    draft = draft_fixture(mailbox.id)
+    assert {:ok, _queued} = Outbound.queue_draft(mailbox.id, draft.id)
+
+    {result, queries} =
+      capture_repo_queries(fn -> Outbound.cancel_account_jobs(mailbox.id, 1) end)
+
+    assert {:snooze, 5} = result
+
+    assert Enum.any?(queries, fn query ->
+             String.starts_with?(query, "UPDATE ") and
+               String.contains?(query, ~s("oban_jobs")) and
+               String.contains?(query, ~s("outbound_messages")) and
+               String.contains?(query, "LIMIT $")
+           end)
+  end
+
+  test "account purge deletes bounded messages and provider events before cascades" do
+    %{mailbox: mailbox} = mailbox_fixture()
+    %{mailbox: other_mailbox} = mailbox_fixture()
+
+    target_messages =
+      for _index <- 1..3 do
+        draft = draft_fixture(mailbox.id)
+        assert {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
+        insert_provider_event(queued.id)
+        queued
+      end
+
+    other_draft = draft_fixture(other_mailbox.id)
+    assert {:ok, other_message} = Outbound.queue_draft(other_mailbox.id, other_draft.id)
+    other_provider_event = insert_provider_event(other_message.id)
+
+    assert Outbound.account_data_remaining?(mailbox.id)
+
+    selected_ids =
+      target_messages
+      |> Enum.map(& &1.id)
+      |> Enum.sort()
+      |> Enum.take(2)
+
+    {first_result, queries} =
+      capture_repo_queries(fn -> Outbound.purge_account_batch(mailbox.id, 2) end)
+
+    assert %{deleted: 2, done?: false} = first_result
+
+    provider_delete_index =
+      Enum.find_index(queries, &String.contains?(&1, ~s(DELETE FROM "provider_events")))
+
+    message_delete_index =
+      Enum.find_index(queries, &String.contains?(&1, ~s(DELETE FROM "outbound_messages")))
+
+    assert is_integer(provider_delete_index)
+    assert is_integer(message_delete_index)
+    assert provider_delete_index < message_delete_index
+
+    Enum.each(selected_ids, fn message_id ->
+      refute Repo.get(OutboundMessage, message_id)
+      refute Repo.get_by(ProviderEvent, outbound_message_id: message_id)
+      refute Repo.get_by(ProviderSubmission, outbound_message_id: message_id)
+
+      assert Repo.aggregate(
+               from(recipient in OutboundRecipient,
+                 where: recipient.outbound_message_id == ^message_id
+               ),
+               :count
+             ) == 0
+
+      assert Repo.aggregate(
+               from(event in OutboundEvent, where: event.outbound_message_id == ^message_id),
+               :count
+             ) == 0
+    end)
+
+    assert Repo.aggregate(
+             from(message in OutboundMessage, where: message.mailbox_id == ^mailbox.id),
+             :count
+           ) == 1
+
+    assert %{deleted: 1, done?: true} = Outbound.purge_account_batch(mailbox.id, 2)
+    assert %{deleted: 0, done?: true} = Outbound.purge_account_batch(mailbox.id, 2)
+    refute Outbound.account_data_remaining?(mailbox.id)
+
+    assert Repo.get!(OutboundMessage, other_message.id)
+
+    assert Repo.get!(ProviderEvent, other_provider_event.id).outbound_message_id ==
+             other_message.id
+
+    assert Repo.get_by!(ProviderSubmission, outbound_message_id: other_message.id)
+    assert Outbound.account_data_remaining?(other_mailbox.id)
   end
 
   test "rejects invalid or duplicate recipient addresses" do
@@ -264,5 +514,77 @@ defmodule Manifold.OutboundTest do
       Accounts.create_account(domain, %{local_part: "inbox", name: "Local Inbox"})
 
     %{mailbox: mailbox, address: "inbox@#{domain.normalized_domain}"}
+  end
+
+  defp target_incomplete_job_count(mailbox_id) do
+    mailbox_id
+    |> account_job_query()
+    |> where([job, _message], job.state in ~w(available scheduled executing retryable suspended))
+    |> Repo.aggregate(:count)
+  end
+
+  defp target_cancelled_job_count(mailbox_id) do
+    mailbox_id
+    |> account_job_query()
+    |> where([job, _message], job.state == "cancelled")
+    |> Repo.aggregate(:count)
+  end
+
+  defp account_job_query(mailbox_id) do
+    Oban.Job
+    |> join(:inner, [job], message in OutboundMessage,
+      on: fragment("?->>'outbound_message_id' = ?::text", job.args, message.id)
+    )
+    |> where(
+      [job, message],
+      job.worker == ^inspect(SubmitOutbound) and message.mailbox_id == ^mailbox_id
+    )
+  end
+
+  defp insert_provider_event(outbound_message_id) do
+    now = DateTime.utc_now()
+
+    %ProviderEvent{}
+    |> ProviderEvent.changeset(%{
+      outbound_message_id: outbound_message_id,
+      provider: "resend",
+      provider_event_id: "purge-#{outbound_message_id}",
+      provider_message_id: "provider-#{outbound_message_id}",
+      event_type: "delivered",
+      normalized_state: "delivered",
+      occurred_at: now,
+      received_at: now,
+      processing_state: "processed",
+      processed_at: now
+    })
+    |> Repo.insert!()
+  end
+
+  defp capture_repo_queries(fun) do
+    handler_id = {__MODULE__, self(), make_ref()}
+    event = Keyword.fetch!(Repo.config(), :telemetry_prefix) ++ [:query]
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn _event, _measurements, metadata, pid -> send(pid, {:repo_query, metadata.query}) end,
+        self()
+      )
+
+    try do
+      result = fun.()
+      {result, collect_repo_queries([])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp collect_repo_queries(queries) do
+    receive do
+      {:repo_query, query} -> collect_repo_queries([query | queries])
+    after
+      0 -> Enum.reverse(queries)
+    end
   end
 end
