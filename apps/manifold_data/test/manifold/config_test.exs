@@ -57,6 +57,15 @@ defmodule Manifold.ConfigTest do
     refute Keyword.has_key?(edge_apps, :manifold_connectors)
   end
 
+  test "inbound SMTP ships only in the edge release" do
+    releases = Manifold.Umbrella.MixProject.project()[:releases]
+    local_apps = releases[:manifold][:applications]
+    edge_apps = releases[:manifold_edge][:applications]
+
+    refute Keyword.has_key?(local_apps, :manifold_smtp)
+    assert edge_apps[:manifold_smtp] == :permanent
+  end
+
   test "test connector defaults use a valid non-production key and inert endpoints" do
     connectors = read_config(:test)[:manifold_connectors]
 
