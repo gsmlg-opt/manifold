@@ -1,5 +1,5 @@
 defmodule Manifold.AccountLifecycleTest do
-  use Manifold.DataCase, async: true
+  use Manifold.DataCase, async: false
   use Oban.Testing, repo: Manifold.Repo
 
   alias Manifold.AccountLifecycle
@@ -9,6 +9,25 @@ defmodule Manifold.AccountLifecycleTest do
   alias Manifold.Accounts
   alias Manifold.Accounts.Schema.{Account, RouteRevision}
   alias Manifold.Connectors.Schema.{ReceiveMethod, SendMethod}
+
+  setup context do
+    opts = Application.fetch_env!(:manifold_data, Oban)
+
+    opts =
+      if context[:oban_testing] == :disabled do
+        opts
+        |> Keyword.put(:testing, :disabled)
+        |> Keyword.put(:queues, [])
+        |> Keyword.put(:plugins, [])
+        |> Keyword.put(:peer, {Oban.Peers.Isolated, leader?: false})
+        |> Keyword.put(:stage_interval, :infinity)
+      else
+        opts
+      end
+
+    start_supervised!({Oban, opts})
+    :ok
+  end
 
   test "request deletion rejects a confirmation mismatch without changing state" do
     account = account_fixture("mismatch@example.test")
@@ -80,6 +99,114 @@ defmodule Manifold.AccountLifecycleTest do
     assert same_purge.discovered_deliveries == 7
     assert same_purge.purged_deliveries == 3
     assert incomplete_purge_job_count(purge.id) == 1
+  end
+
+  test "a suspended purge job remains unique across duplicate deletion requests" do
+    account = account_fixture("suspended@example.test")
+
+    assert {:ok, purge} =
+             AccountLifecycle.request_deletion(account.id, "suspended@example.test")
+
+    {1, nil} =
+      PurgeAccount
+      |> purge_job_query(purge.id)
+      |> Repo.update_all(set: [state: "suspended"])
+
+    assert {:ok, same_purge} =
+             AccountLifecycle.request_deletion(account.id, "suspended@example.test")
+
+    assert same_purge.id == purge.id
+    assert incomplete_purge_job_count(purge.id) == 1
+    assert [%Oban.Job{state: "suspended"}] = purge_jobs(purge.id)
+  end
+
+  @tag oban_testing: :disabled
+  test "concurrent deletion request and retry use Oban uniqueness to persist one job" do
+    {:ok, race_repo} =
+      Repo.start_link(name: nil, pool: DBConnection.ConnectionPool, pool_size: 4)
+
+    Process.unlink(race_repo)
+
+    fixture =
+      on_repo(race_repo, fn ->
+        account = account_fixture("race@#{Ecto.UUID.generate()}.example.test")
+
+        {:ok, purge} =
+          AccountLifecycle.request_deletion(account.id, Accounts.account_address(account))
+
+        discard_purge_jobs(purge.id)
+
+        failed =
+          purge
+          |> AccountPurge.changeset(%{status: "failed", error_message: "retry me"})
+          |> Repo.update!()
+
+        %{account: account, domain_id: account.domain_id, purge: failed}
+      end)
+
+    on_exit(fn -> cleanup_race_fixture(race_repo, fixture) end)
+
+    barrier_ref = make_ref()
+    test_pid = self()
+
+    request_task =
+      Task.async(fn ->
+        receive do
+          {:start_request, ^barrier_ref} ->
+            on_repo(race_repo, fn ->
+              AccountLifecycle.request_deletion(
+                fixture.account.id,
+                Accounts.account_address(fixture.account)
+              )
+            end)
+        end
+      end)
+
+    handler_id = {__MODULE__, self(), barrier_ref}
+    event = Keyword.fetch!(Repo.config(), :telemetry_prefix) ++ [:query]
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn _event, _measurements, %{query: query}, {owner, ref, request_pid} ->
+          if self() == request_pid and String.contains?(query, "pg_try_advisory_xact_lock") do
+            send(owner, {:request_holds_oban_lock, self(), ref})
+
+            receive do
+              {:release_oban_lock, ^ref} -> :ok
+            after
+              5_000 -> :ok
+            end
+          end
+        end,
+        {test_pid, barrier_ref, request_task.pid}
+      )
+
+    send(request_task.pid, {:start_request, barrier_ref})
+
+    {request_result, retry_result} =
+      try do
+        assert_receive {:request_holds_oban_lock, request_pid, ^barrier_ref}, 2_000
+
+        retry_task =
+          Task.async(fn ->
+            on_repo(race_repo, fn -> AccountLifecycle.retry_deletion(fixture.purge.id) end)
+          end)
+
+        retry_result = Task.await(retry_task, 5_000)
+        send(request_pid, {:release_oban_lock, barrier_ref})
+        request_result = Task.await(request_task, 5_000)
+        {request_result, retry_result}
+      after
+        send(request_task.pid, {:release_oban_lock, barrier_ref})
+        :telemetry.detach(handler_id)
+      end
+
+    assert {:ok, %AccountPurge{id: purge_id}} = request_result
+    assert {:ok, %AccountPurge{id: ^purge_id, status: "requested"}} = retry_result
+
+    assert on_repo(race_repo, fn -> incomplete_purge_job_count(purge_id) end) == 1
   end
 
   test "request deletion rolls every state change back before job insertion" do
@@ -276,8 +403,11 @@ defmodule Manifold.AccountLifecycleTest do
              period: :infinity,
              fields: [:worker, :args],
              keys: [:purge_id],
-             states: [:available, :scheduled, :executing, :retryable]
+             states: :incomplete
            ]
+
+    assert Oban.Job.unique_states(opts[:unique][:states]) ==
+             [:suspended, :available, :scheduled, :executing, :retryable]
 
     account = account_fixture("worker@example.test")
     requested = purge_fixture(account.id, %{status: "requested"})
@@ -337,10 +467,16 @@ defmodule Manifold.AccountLifecycleTest do
   end
 
   defp incomplete_purge_job_count(purge_id) do
+    purge_id
+    |> purge_jobs()
+    |> Enum.count(&(&1.state in ~w(suspended available scheduled executing retryable)))
+  end
+
+  defp purge_jobs(purge_id) do
     PurgeAccount
     |> purge_job_query(purge_id)
-    |> where([job], job.state in ~w(available scheduled executing retryable))
-    |> Repo.aggregate(:count)
+    |> order_by([job], asc: job.id)
+    |> Repo.all()
   end
 
   defp discard_purge_jobs(purge_id) do
@@ -355,6 +491,37 @@ defmodule Manifold.AccountLifecycleTest do
         job.worker == ^inspect(worker) and
           fragment("?->>'purge_id'", job.args) == ^purge_id
     )
+  end
+
+  defp on_repo(repo, fun) do
+    previous_repo = Repo.put_dynamic_repo(repo)
+
+    try do
+      fun.()
+    after
+      Repo.put_dynamic_repo(previous_repo)
+    end
+  end
+
+  defp cleanup_race_fixture(race_repo, fixture) do
+    if Process.alive?(race_repo) do
+      try do
+        on_repo(race_repo, fn ->
+          PurgeAccount
+          |> purge_job_query(fixture.purge.id)
+          |> Repo.delete_all()
+
+          Repo.delete_all(from(purge in AccountPurge, where: purge.id == ^fixture.purge.id))
+          Repo.delete_all(from(account in Account, where: account.id == ^fixture.account.id))
+
+          Repo.query!("DELETE FROM domains WHERE id = $1", [
+            Ecto.UUID.dump!(fixture.domain_id)
+          ])
+        end)
+      after
+        if Process.alive?(race_repo), do: Supervisor.stop(race_repo)
+      end
+    end
   end
 
   defp capture_repo_queries(fun) do

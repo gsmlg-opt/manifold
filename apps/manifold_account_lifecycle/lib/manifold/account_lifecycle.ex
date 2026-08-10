@@ -39,9 +39,11 @@ defmodule Manifold.AccountLifecycle do
       |> Multi.run(:before_job_insert, fn _repo, _changes ->
         maybe_fail_before_job_insert(opts)
       end)
-      |> Multi.run(:job, fn repo, %{purge: purge} ->
-        insert_or_load_purge_job(repo, purge.id)
-      end)
+      |> Oban.insert(
+        :job,
+        fn %{purge: purge} -> PurgeAccount.new(%{"purge_id" => purge.id}) end,
+        retry: false
+      )
 
     case Repo.transaction(multi) do
       {:ok, %{purge: purge}} -> {:ok, purge}
@@ -82,9 +84,11 @@ defmodule Manifold.AccountLifecycle do
           error_message: nil
         })
       end)
-      |> Multi.run(:job, fn repo, %{reset: purge} ->
-        insert_or_load_purge_job(repo, purge.id)
-      end)
+      |> Oban.insert(
+        :job,
+        fn %{reset: purge} -> PurgeAccount.new(%{"purge_id" => purge.id}) end,
+        retry: false
+      )
 
     case Repo.transaction(multi) do
       {:ok, %{reset: purge}} -> {:ok, purge}
@@ -142,20 +146,6 @@ defmodule Manifold.AccountLifecycle do
        Error.new(:temporary, :before_job_insert, "injected failure before purge job insertion")}
     else
       {:ok, :ok}
-    end
-  end
-
-  defp insert_or_load_purge_job(repo, purge_id) do
-    query =
-      Oban.Job
-      |> where([job], job.worker == ^inspect(PurgeAccount))
-      |> where([job], job.state in ~w(available scheduled executing retryable))
-      |> where([job], fragment("?->>'purge_id'", job.args) == ^purge_id)
-      |> limit(1)
-
-    case repo.one(query) do
-      %Oban.Job{} = job -> {:ok, job}
-      nil -> purge_id |> then(&PurgeAccount.new(%{"purge_id" => &1})) |> repo.insert()
     end
   end
 
