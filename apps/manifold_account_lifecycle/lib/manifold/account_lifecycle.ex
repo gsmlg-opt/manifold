@@ -176,6 +176,15 @@ defmodule Manifold.AccountLifecycle do
      )}
   end
 
+  defp validate_retry_job(%Oban.Job{conflict?: true, state: "suspended"}) do
+    {:error,
+     Error.new(
+       :temporary,
+       :purge_job_suspended,
+       "the previous account purge job is suspended and requires operator action"
+     )}
+  end
+
   defp validate_retry_job(%Oban.Job{} = job), do: validate_persisted_job(job)
 
   defp validate_persisted_job(%Oban.Job{conflict?: true, id: nil}) do

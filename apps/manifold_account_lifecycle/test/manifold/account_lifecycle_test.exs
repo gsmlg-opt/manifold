@@ -443,6 +443,58 @@ defmodule Manifold.AccountLifecycleTest do
     assert Enum.sort(Enum.map(purge_jobs(failed.id), & &1.state)) == ["available", "completed"]
   end
 
+  test "retry deletion preserves failed state while the prior job is suspended" do
+    account = account_fixture("suspended-retry@example.test")
+
+    assert {:ok, purge} =
+             AccountLifecycle.request_deletion(account.id, "suspended-retry@example.test")
+
+    {1, nil} =
+      PurgeAccount
+      |> purge_job_query(purge.id)
+      |> Repo.update_all(set: [state: "suspended"])
+
+    progress = %{"cursor" => "keep-me"}
+
+    failed =
+      purge
+      |> AccountPurge.changeset(%{
+        status: "failed",
+        stage: "objects",
+        progress: progress,
+        error_class: "temporary",
+        error_code: "operator_suspended",
+        error_message: "awaiting operator action"
+      })
+      |> Repo.update!()
+
+    assert {:error, %{class: :temporary, reason: :purge_job_suspended}} =
+             AccountLifecycle.retry_deletion(failed.id)
+
+    assert %AccountPurge{
+             status: "failed",
+             stage: "objects",
+             progress: ^progress,
+             error_class: "temporary",
+             error_code: "operator_suspended",
+             error_message: "awaiting operator action"
+           } = Repo.get!(AccountPurge, failed.id)
+
+    assert [%Oban.Job{state: "suspended"} = old_job] = purge_jobs(failed.id)
+
+    {1, nil} =
+      Oban.Job
+      |> where([job], job.id == ^old_job.id)
+      |> Repo.update_all(set: [state: "cancelled"])
+
+    assert {:ok, %AccountPurge{id: purge_id, status: "requested"}} =
+             AccountLifecycle.retry_deletion(failed.id)
+
+    assert purge_id == failed.id
+    assert incomplete_purge_job_count(failed.id) == 1
+    assert Enum.sort(Enum.map(purge_jobs(failed.id), & &1.state)) == ["available", "cancelled"]
+  end
+
   test "retry deletion rejects missing, nonfailed, and no-longer-purging requests" do
     assert {:error, %{class: :permanent, reason: :account_purge_not_found}} =
              AccountLifecycle.retry_deletion(Ecto.UUID.generate())
