@@ -11,6 +11,7 @@ defmodule Manifold.ConnectorsTest do
   alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
   alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
   alias Manifold.Ingest.Schema.InboundDelivery
+  alias Manifold.Mail.Schema.MailboxEntry
 
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
@@ -289,6 +290,64 @@ defmodule Manifold.ConnectorsTest do
     assert Repo.aggregate(query, :count) == 0
   end
 
+  test "polling rechecks mailbox activity after candidate discovery", %{mailbox: mailbox} do
+    assert {:ok, account} =
+             Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
+
+    Repo.delete_all(Oban.Job)
+
+    assert {:ok, 0} =
+             Connectors.enqueue_due_syncs(
+               before_locked_recheck: fn ->
+                 assert {:ok, _disabled} = Accounts.disable_account(mailbox.id)
+               end
+             )
+
+    refute Repo.exists?(
+             from(job in Oban.Job,
+               where:
+                 job.worker == ^inspect(SyncAccount) and
+                   fragment("?->>'external_account_id' = ?", job.args, ^account.id)
+             )
+           )
+  end
+
+  test "read push rejects disabled and purging mailboxes without local changes", %{
+    domain: domain,
+    mailbox: mailbox
+  } do
+    {:ok, purging_mailbox} = Accounts.create_account(domain, %{local_part: "read-purge"})
+
+    fixtures = [
+      {:disabled, mailbox, insert_read_push_fixture(mailbox, domain.id, "disabled")},
+      {:purging, purging_mailbox, insert_read_push_fixture(purging_mailbox, domain.id, "purging")}
+    ]
+
+    Enum.each(fixtures, fn
+      {:disabled, target, _fixture} ->
+        assert {:ok, _disabled} = Accounts.disable_account(target.id)
+
+      {:purging, target, _fixture} ->
+        {1, nil} =
+          Account
+          |> where([account], account.id == ^target.id)
+          |> Repo.update_all(set: [active: true, purge_requested_at: DateTime.utc_now()])
+    end)
+
+    Enum.each(fixtures, fn {_state, _target, %{entry: entry, remote: remote}} ->
+      assert_mailbox_not_active(fn -> Connectors.enqueue_read_push([entry.id], true) end)
+      refute Repo.get!(RemoteMessage, remote.id).remote_read
+
+      refute Repo.exists?(
+               from(job in Oban.Job,
+                 where:
+                   job.worker == ^inspect(PushRemoteRead) and
+                     fragment("?->>'remote_message_id' = ?", job.args, ^remote.id)
+               )
+             )
+    end)
+  end
+
   test "sync_job_running? reflects incomplete SyncAccount jobs", %{mailbox: mailbox} do
     assert {:ok, account} =
              Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
@@ -530,6 +589,26 @@ defmodule Manifold.ConnectorsTest do
     assert Repo.get!(Oban.Job, job.id).state == "cancelled"
   end
 
+  test "cancel_account_jobs keeps account ownership matching inside the job query", %{
+    mailbox: mailbox
+  } do
+    for index <- 1..25 do
+      method = insert_receive_method(mailbox.id, "query-shape-#{index}")
+      insert_remote_message(method.id, "query-shape-#{index}")
+    end
+
+    {result, queries} =
+      capture_repo_queries(fn -> Connectors.cancel_account_jobs(mailbox.id, 10) end)
+
+    assert %{cancelled: 0, done?: true} = result
+    assert Enum.any?(queries, &String.contains?(&1, "connector_accounts"))
+
+    refute Enum.any?(queries, fn query ->
+             String.contains?(query, "connector_accounts") and
+               not String.contains?(query, "oban_jobs")
+           end)
+  end
+
   test "delivery discovery is distinct, UUID ordered, account scoped, and ownership aware", %{
     domain: domain,
     mailbox: mailbox
@@ -674,7 +753,7 @@ defmodule Manifold.ConnectorsTest do
     Repo.insert!(
       ReceiveMethod.changeset(%ReceiveMethod{}, %{
         account_id: mailbox_id,
-        kind: "gmail",
+        kind: Keyword.get(opts, :kind, "gmail"),
         provider_account_id: "#{suffix}:#{Ecto.UUID.generate()}",
         email_address: "#{suffix}@example.test",
         status: "connected",
@@ -739,6 +818,53 @@ defmodule Manifold.ConnectorsTest do
           updated_at: now
         }
       ])
+  end
+
+  defp insert_read_push_fixture(mailbox, domain_id, suffix) do
+    delivery_id = Ecto.UUID.generate()
+    insert_delivery(delivery_id, domain_id)
+    method = insert_receive_method(mailbox.id, "read-push-#{suffix}", kind: "imap")
+    remote = insert_remote_message(method.id, "read-push-#{suffix}", delivery_id)
+
+    entry =
+      Repo.insert!(
+        MailboxEntry.changeset(%MailboxEntry{}, %{
+          mailbox_id: mailbox.id,
+          inbound_delivery_id: delivery_id,
+          original_recipient: "#{suffix}@example.test",
+          quarantined: false
+        })
+      )
+
+    %{entry: entry, remote: remote}
+  end
+
+  defp capture_repo_queries(fun) do
+    event = Keyword.fetch!(Repo.config(), :telemetry_prefix) ++ [:query]
+    handler_id = {__MODULE__, self(), make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn _event, _measurements, metadata, pid -> send(pid, {:repo_query, metadata.query}) end,
+        self()
+      )
+
+    try do
+      result = fun.()
+      {result, collect_repo_queries([])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp collect_repo_queries(queries) do
+    receive do
+      {:repo_query, query} -> collect_repo_queries([query | queries])
+    after
+      0 -> Enum.reverse(queries)
+    end
   end
 
   defp assert_mailbox_not_active(fun) do

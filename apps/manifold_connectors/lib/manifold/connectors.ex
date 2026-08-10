@@ -38,6 +38,7 @@ defmodule Manifold.Connectors do
   alias Manifold.Connectors.View
   alias Manifold.Core.{Address, Error}
   alias Manifold.Mail
+  alias Manifold.Mail.Schema.MailboxEntry
   alias Manifold.Repo
 
   @required_scopes %{
@@ -534,21 +535,15 @@ defmodule Manifold.Connectors do
 
   @doc false
   @spec enqueue_due_syncs() :: {:ok, non_neg_integer()} | {:error, Error.t() | term()}
-  def enqueue_due_syncs do
+  @spec enqueue_due_syncs(Keyword.t()) ::
+          {:ok, non_neg_integer()} | {:error, Error.t() | term()}
+  def enqueue_due_syncs(opts \\ []) do
     Repo.transaction(fn ->
-      account_ids =
-        ReceiveMethod
-        |> join(:inner, [account], mailbox in Account, on: mailbox.id == account.account_id)
-        |> where(
-          [account, mailbox],
-          account.enabled and account.sync_enabled and
-            account.status in ["connected", "syncing", "failed"] and
-            account.kind in ^ReceiveMethod.implemented_kinds() and mailbox.active and
-            is_nil(mailbox.purge_requested_at)
-        )
-        |> order_by([account, _mailbox], asc: account.id)
-        |> select([account, _mailbox], account.id)
-        |> Repo.all()
+      candidate_mailbox_ids = due_mailbox_ids(Repo)
+      maybe_before_locked_recheck(opts)
+
+      active_mailbox_ids = lock_active_mailboxes(Repo, candidate_mailbox_ids, :skip_inactive)
+      account_ids = due_receive_method_ids(Repo, active_mailbox_ids)
 
       Enum.each(account_ids, &ensure_sync_job(Repo, &1))
       length(account_ids)
@@ -580,22 +575,7 @@ defmodule Manifold.Connectors do
   @spec cancel_account_jobs(Ecto.UUID.t(), pos_integer()) ::
           {:snooze, 5} | %{cancelled: non_neg_integer(), done?: boolean()}
   def cancel_account_jobs(mailbox_id, limit) when is_integer(limit) and limit > 0 do
-    receive_method_ids =
-      ReceiveMethod
-      |> where([method], method.account_id == ^mailbox_id)
-      |> select([method], method.id)
-      |> Repo.all()
-
-    remote_message_ids =
-      RemoteMessage
-      |> join(:inner, [remote], method in ReceiveMethod,
-        on: method.id == remote.external_account_id
-      )
-      |> where([_remote, method], method.account_id == ^mailbox_id)
-      |> select([remote, _method], remote.id)
-      |> Repo.all()
-
-    matching = account_job_query(receive_method_ids, remote_message_ids)
+    matching = account_job_query(mailbox_id)
 
     selected =
       matching
@@ -869,38 +849,41 @@ defmodule Manifold.Connectors do
   @doc """
   Enqueues remote read write-back jobs for local mailbox entries (IMAP and EAS).
   """
-  @spec enqueue_read_push([Ecto.UUID.t()], boolean()) :: :ok
+  @spec enqueue_read_push([Ecto.UUID.t()], boolean()) :: :ok | {:error, Error.t() | term()}
   def enqueue_read_push(entry_ids, read?)
       when is_list(entry_ids) and is_boolean(read?) do
-    alias Manifold.Connectors.Jobs.PushRemoteRead
-    alias Manifold.Mail.Schema.MailboxEntry
+    Repo.transaction(fn ->
+      mailbox_ids = read_push_mailbox_ids(Repo, entry_ids)
+      lock_active_mailboxes(Repo, mailbox_ids, :rollback_on_inactive)
 
-    remotes =
-      from(entry in MailboxEntry,
-        join: remote in RemoteMessage,
-        on: remote.inbound_delivery_id == entry.inbound_delivery_id,
-        join: method in ReceiveMethod,
-        on: method.id == remote.external_account_id,
-        where:
-          entry.id in ^entry_ids and method.kind in ["imap", "eas"] and
-            method.status != "disconnected",
-        select: remote
-      )
-      |> Repo.all()
+      entry_ids
+      |> read_push_remote_ids(Repo, mailbox_ids)
+      |> lock_remote_messages(Repo)
+      |> Enum.each(fn remote ->
+        with {:ok, _remote} <-
+               remote
+               |> RemoteMessage.changeset(%{remote_read: read?})
+               |> Repo.update(),
+             {:ok, _job} <- replace_push_read_job(Repo, remote.id, read?) do
+          :ok
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
 
-    Enum.each(remotes, fn remote ->
-      remote
-      |> RemoteMessage.changeset(%{remote_read: read?})
-      |> Repo.update!()
-
-      replace_push_read_job(remote.id, read?)
+      :ok
     end)
-
-    :ok
+    |> case do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
   @doc false
-  @spec enqueue_imap_read_push([Ecto.UUID.t()], boolean()) :: :ok
+  @spec enqueue_imap_read_push([Ecto.UUID.t()], boolean()) ::
+          :ok | {:error, Error.t() | term()}
   def enqueue_imap_read_push(entry_ids, read?), do: enqueue_read_push(entry_ids, read?)
 
   @doc false
@@ -915,9 +898,7 @@ defmodule Manifold.Connectors do
           :ok | {:error, Error.t() | ProviderError.t()}
   def push_imap_read(remote_message_id, read?), do: push_remote_read(remote_message_id, read?)
 
-  defp replace_push_read_job(remote_message_id, read?) do
-    alias Manifold.Connectors.Jobs.PushRemoteRead
-
+  defp replace_push_read_job(repo, remote_message_id, read?) do
     Oban.Job
     |> where([job], job.worker == ^inspect(PushRemoteRead))
     |> where([job], job.state in ~w(available scheduled retryable))
@@ -925,11 +906,11 @@ defmodule Manifold.Connectors do
       [job],
       fragment("?->>'remote_message_id' = ?", job.args, ^remote_message_id)
     )
-    |> Repo.delete_all()
+    |> repo.delete_all()
 
     %{"remote_message_id" => remote_message_id, "read" => read?}
     |> PushRemoteRead.new()
-    |> Repo.insert!()
+    |> repo.insert()
   end
 
   defp persist_authorization(provider, consumed, token, identity, cursors, now, opts) do
@@ -2009,16 +1990,141 @@ defmodule Manifold.Connectors do
     repo.rollback(Error.new(:permanent, :sync_disabled, "connector synchronization is disabled"))
   end
 
-  defp account_job_query(receive_method_ids, remote_message_ids) do
+  defp account_job_query(mailbox_id) do
     Oban.Job
     |> where([job], job.state in ~w(available scheduled executing retryable suspended))
     |> where(
       [job],
       (job.worker == ^inspect(SyncAccount) and
-         fragment("?->>'external_account_id'", job.args) in ^receive_method_ids) or
+         fragment(
+           """
+           EXISTS (
+             SELECT 1
+             FROM connector_accounts AS receive_method
+             WHERE receive_method.mailbox_id = ?
+               AND receive_method.id::text = (?->>'external_account_id')
+           )
+           """,
+           type(^mailbox_id, :binary_id),
+           job.args
+         )) or
         (job.worker in ^[inspect(ApplyRemoteState), inspect(PushRemoteRead)] and
-           fragment("?->>'remote_message_id'", job.args) in ^remote_message_ids)
+           fragment(
+             """
+             EXISTS (
+               SELECT 1
+               FROM connector_remote_messages AS remote_message
+               INNER JOIN connector_accounts AS receive_method
+                 ON receive_method.id = remote_message.external_account_id
+               WHERE receive_method.mailbox_id = ?
+                 AND remote_message.id::text = (?->>'remote_message_id')
+             )
+             """,
+             type(^mailbox_id, :binary_id),
+             job.args
+           ))
     )
+  end
+
+  defp due_mailbox_ids(repo) do
+    ReceiveMethod
+    |> join(:inner, [method], mailbox in Account, on: mailbox.id == method.account_id)
+    |> due_receive_methods()
+    |> distinct([_method, mailbox], mailbox.id)
+    |> order_by([_method, mailbox], asc: mailbox.id)
+    |> select([_method, mailbox], mailbox.id)
+    |> repo.all()
+  end
+
+  defp due_receive_method_ids(_repo, []), do: []
+
+  defp due_receive_method_ids(repo, mailbox_ids) do
+    ReceiveMethod
+    |> join(:inner, [method], mailbox in Account, on: mailbox.id == method.account_id)
+    |> due_receive_methods()
+    |> where([_method, mailbox], mailbox.id in ^mailbox_ids)
+    |> order_by([method, _mailbox], asc: method.id)
+    |> select([method, _mailbox], method.id)
+    |> repo.all()
+  end
+
+  defp due_receive_methods(query) do
+    where(
+      query,
+      [method, mailbox],
+      method.enabled and method.sync_enabled and
+        method.status in ["connected", "syncing", "failed"] and
+        method.kind in ^ReceiveMethod.implemented_kinds() and mailbox.active and
+        is_nil(mailbox.purge_requested_at)
+    )
+  end
+
+  defp maybe_before_locked_recheck(opts) do
+    case Keyword.get(opts, :before_locked_recheck) do
+      callback when is_function(callback, 0) -> callback.()
+      nil -> :ok
+    end
+  end
+
+  defp lock_active_mailboxes(repo, mailbox_ids, inactive_mode) do
+    mailbox_ids
+    |> Enum.reduce([], fn mailbox_id, active_ids ->
+      case ensure_active_mailbox(repo, mailbox_id) do
+        {:ok, _mailbox} ->
+          [mailbox_id | active_ids]
+
+        {:error, %Error{reason: :mailbox_not_active} = error} ->
+          case inactive_mode do
+            :skip_inactive -> active_ids
+            :rollback_on_inactive -> repo.rollback(error)
+          end
+
+        {:error, reason} ->
+          repo.rollback(reason)
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  defp read_push_query(entry_ids) do
+    from(entry in MailboxEntry,
+      join: remote in RemoteMessage,
+      on: remote.inbound_delivery_id == entry.inbound_delivery_id,
+      join: method in ReceiveMethod,
+      on: method.id == remote.external_account_id,
+      where:
+        entry.id in ^entry_ids and method.kind in ["imap", "eas"] and
+          method.status != "disconnected"
+    )
+  end
+
+  defp read_push_mailbox_ids(repo, entry_ids) do
+    entry_ids
+    |> read_push_query()
+    |> distinct([_entry, _remote, method], method.account_id)
+    |> order_by([_entry, _remote, method], asc: method.account_id)
+    |> select([_entry, _remote, method], method.account_id)
+    |> repo.all()
+  end
+
+  defp read_push_remote_ids(entry_ids, repo, mailbox_ids) do
+    entry_ids
+    |> read_push_query()
+    |> where([_entry, _remote, method], method.account_id in ^mailbox_ids)
+    |> distinct([_entry, remote, _method], remote.id)
+    |> order_by([_entry, remote, _method], asc: remote.id)
+    |> select([_entry, remote, _method], remote.id)
+    |> repo.all()
+  end
+
+  defp lock_remote_messages([], _repo), do: []
+
+  defp lock_remote_messages(remote_ids, repo) do
+    RemoteMessage
+    |> where([remote], remote.id in ^remote_ids)
+    |> order_by([remote], asc: remote.id)
+    |> lock("FOR UPDATE")
+    |> repo.all()
   end
 
   defp next_purge_batch(repo, mailbox_id, limit) do
