@@ -691,6 +691,7 @@ code {
 
 .mailbox-setup-form,
 #account-form,
+#smtp-send-method-form,
 #imap-account-form,
 #eas-account-form {
   display: grid;
@@ -701,6 +702,7 @@ code {
 
 .mailbox-setup-form label,
 #account-form label,
+#smtp-send-method-form label,
 #imap-account-form label,
 #eas-account-form label {
   display: grid;
@@ -711,6 +713,7 @@ code {
 }
 
 .mailbox-setup-form label span,
+#smtp-send-method-form label span,
 #imap-account-form label span,
 #eas-account-form label span {
   color: var(--color-on-surface-variant);
@@ -720,6 +723,8 @@ code {
 .mailbox-setup-form input,
 .mailbox-setup-form select,
 #account-form input,
+#smtp-send-method-form input,
+#smtp-send-method-form select,
 #imap-account-form input,
 #imap-account-form select,
 #eas-account-form input {
@@ -736,6 +741,8 @@ code {
 .mailbox-setup-form input:focus,
 .mailbox-setup-form select:focus,
 #account-form input:focus,
+#smtp-send-method-form input:focus,
+#smtp-send-method-form select:focus,
 #imap-account-form input:focus,
 #imap-account-form select:focus,
 #eas-account-form input:focus {
@@ -746,6 +753,7 @@ code {
 
 .mailbox-setup-form .settings-action,
 #account-form .settings-action,
+#smtp-send-method-form .settings-action,
 #imap-account-form .settings-action,
 #eas-account-form .settings-action {
   width: fit-content;
