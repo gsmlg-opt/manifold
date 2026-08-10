@@ -512,6 +512,24 @@ defmodule Manifold.ConnectorsTest do
     assert %{cancelled: 0, done?: true} = Connectors.cancel_account_jobs(mailbox.id, 2)
   end
 
+  test "cancel_account_jobs treats suspended matching jobs as incomplete", %{mailbox: mailbox} do
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    method = insert_receive_method(mailbox.id, "suspended")
+
+    job =
+      method.id
+      |> then(&SyncAccount.new(%{"external_account_id" => &1}))
+      |> Repo.insert!()
+
+    {1, nil} =
+      Oban.Job
+      |> where([candidate], candidate.id == ^job.id)
+      |> Repo.update_all(set: [state: "suspended"])
+
+    assert %{cancelled: 1, done?: true} = Connectors.cancel_account_jobs(mailbox.id, 10)
+    assert Repo.get!(Oban.Job, job.id).state == "cancelled"
+  end
+
   test "delivery discovery is distinct, UUID ordered, account scoped, and ownership aware", %{
     domain: domain,
     mailbox: mailbox

@@ -2011,7 +2011,7 @@ defmodule Manifold.Connectors do
 
   defp account_job_query(receive_method_ids, remote_message_ids) do
     Oban.Job
-    |> where([job], job.state in ~w(available scheduled executing retryable))
+    |> where([job], job.state in ~w(available scheduled executing retryable suspended))
     |> where(
       [job],
       (job.worker == ^inspect(SyncAccount) and
