@@ -78,7 +78,11 @@ defmodule Manifold.OutboundTest do
     assert %Oban.Job{
              worker: worker,
              args: %{"outbound_message_id" => outbound_message_id}
-           } = Repo.one!(Oban.Job)
+           } =
+             Repo.get_by!(Oban.Job,
+               worker: inspect(SubmitOutbound),
+               args: %{"outbound_message_id" => draft.id}
+             )
 
     assert worker == inspect(SubmitOutbound)
     assert outbound_message_id == draft.id
@@ -90,7 +94,7 @@ defmodule Manifold.OutboundTest do
              idempotency_key: idempotency_key,
              request_sha256: request_sha256,
              idempotency_expires_at: %DateTime{}
-           } = Repo.one!(ProviderSubmission)
+           } = Repo.get_by!(ProviderSubmission, outbound_message_id: draft.id)
 
     assert byte_size(idempotency_key) > 0
     assert byte_size(request_sha256) == 64
@@ -98,8 +102,22 @@ defmodule Manifold.OutboundTest do
 
     assert {:ok, repeated} = Outbound.queue_draft(mailbox.id, draft.id)
     assert repeated.id == draft.id
-    assert Repo.aggregate(Oban.Job, :count) == 1
-    assert Repo.aggregate(ProviderSubmission, :count) == 1
+
+    assert Repo.aggregate(
+             from(job in Oban.Job,
+               where:
+                 job.worker == ^inspect(SubmitOutbound) and
+                   fragment("?->>'outbound_message_id'", job.args) == ^draft.id
+             ),
+             :count
+           ) == 1
+
+    assert Repo.aggregate(
+             from(submission in ProviderSubmission,
+               where: submission.outbound_message_id == ^draft.id
+             ),
+             :count
+           ) == 1
 
     assert {:error, %{reason: :message_not_editable}} =
              Outbound.update_draft(mailbox.id, draft.id, %{subject: "Too late"})
@@ -113,8 +131,13 @@ defmodule Manifold.OutboundTest do
              Outbound.queue_draft(mailbox.id, draft.id, fail_at: :after_queue_before_job)
 
     assert Repo.get!(OutboundMessage, draft.id).state == "draft"
-    assert Repo.aggregate(Oban.Job, :count) == 0
-    assert Repo.aggregate(ProviderSubmission, :count) == 0
+
+    refute Repo.get_by(Oban.Job,
+             worker: inspect(SubmitOutbound),
+             args: %{"outbound_message_id" => draft.id}
+           )
+
+    refute Repo.get_by(ProviderSubmission, outbound_message_id: draft.id)
   end
 
   test "queueing rechecks and locks the active sender before the draft" do
@@ -170,9 +193,28 @@ defmodule Manifold.OutboundTest do
                before_persist: before_persist
              )
 
-    assert Repo.aggregate(OutboundMessage, :count) == 0
-    assert Repo.aggregate(OutboundRecipient, :count) == 0
-    assert Repo.aggregate(OutboundEvent, :count) == 0
+    assert Repo.aggregate(
+             from(message in OutboundMessage, where: message.mailbox_id == ^mailbox.id),
+             :count
+           ) == 0
+
+    assert Repo.aggregate(
+             from(recipient in OutboundRecipient,
+               join: message in OutboundMessage,
+               on: message.id == recipient.outbound_message_id,
+               where: message.mailbox_id == ^mailbox.id
+             ),
+             :count
+           ) == 0
+
+    assert Repo.aggregate(
+             from(event in OutboundEvent,
+               join: message in OutboundMessage,
+               on: message.id == event.outbound_message_id,
+               where: message.mailbox_id == ^mailbox.id
+             ),
+             :count
+           ) == 0
   end
 
   test "draft creation freezes sender fields from the locked current account" do
@@ -335,6 +377,106 @@ defmodule Manifold.OutboundTest do
     refute String.contains?(ownership_query, ~s("id"::text))
   end
 
+  test "account job cancellation locks selected jobs across state transitions" do
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+
+    {:ok, race_repo} =
+      Repo.start_link(name: nil, pool: DBConnection.ConnectionPool, pool_size: 3)
+
+    Process.unlink(race_repo)
+
+    %{domain: domain, mailbox: mailbox, message: message, job: job} =
+      on_repo(race_repo, fn ->
+        {:ok, domain} =
+          Accounts.create_domain(%{name: "outbound-race-#{Ecto.UUID.generate()}.test"})
+
+        {:ok, mailbox} =
+          Accounts.create_account(domain, %{local_part: "inbox", name: "Race Sender"})
+
+        draft = draft_fixture(mailbox.id)
+        assert {:ok, message} = Outbound.queue_draft(mailbox.id, draft.id)
+
+        job =
+          Repo.get_by!(Oban.Job,
+            worker: inspect(SubmitOutbound),
+            args: %{"outbound_message_id" => message.id}
+          )
+
+        %{domain: domain, mailbox: mailbox, message: message, job: job}
+      end)
+
+    on_exit(fn ->
+      cleanup_race_fixture(race_repo, job.id, mailbox.id, domain.id)
+    end)
+
+    event = Keyword.fetch!(Repo.config(), :telemetry_prefix) ++ [:query]
+    handler_id = {__MODULE__, self(), make_ref()}
+    barrier_ref = make_ref()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn _event, _measurements, %{query: query}, {test_pid, ref} ->
+          if selected_job_query?(query) do
+            send(test_pid, {:selected_jobs, self(), ref, query})
+
+            receive do
+              {:resume_cancellation, ^ref} -> :ok
+            after
+              5_000 -> :ok
+            end
+          end
+        end,
+        {self(), barrier_ref}
+      )
+
+    cancel_task =
+      Task.async(fn ->
+        on_repo(race_repo, fn -> Outbound.cancel_account_jobs(mailbox.id, 1) end)
+      end)
+
+    {transition_yield, cancel_result, transition_result} =
+      try do
+        assert_receive {:selected_jobs, cancel_pid, ^barrier_ref, selected_query}, 2_000
+        assert String.contains?(selected_query, "LIMIT $")
+
+        transition_task =
+          Task.async(fn ->
+            on_repo(race_repo, fn ->
+              Oban.Job
+              |> where([candidate], candidate.id == ^job.id and candidate.state == "available")
+              |> Repo.update_all(set: [state: "executing"])
+            end)
+          end)
+
+        transition_yield = Task.yield(transition_task, 200)
+        send(cancel_pid, {:resume_cancellation, barrier_ref})
+
+        cancel_result = Task.await(cancel_task, 5_000)
+
+        transition_result =
+          case transition_yield do
+            nil -> Task.await(transition_task, 5_000)
+            {:ok, result} -> result
+          end
+
+        {transition_yield, cancel_result, transition_result}
+      after
+        send(cancel_task.pid, {:resume_cancellation, barrier_ref})
+        :telemetry.detach(handler_id)
+      end
+
+    assert is_nil(transition_yield)
+    assert %{cancelled: 1, done?: true} = cancel_result
+    assert {0, nil} = transition_result
+
+    assert on_repo(race_repo, fn -> Repo.get!(Oban.Job, job.id).state end) == "cancelled"
+    assert on_repo(race_repo, fn -> Repo.get!(OutboundMessage, message.id).id end) == message.id
+
+    cleanup_race_fixture(race_repo, job.id, mailbox.id, domain.id)
+  end
+
   test "outbound purge index supports bounded mailbox ID scans" do
     %{mailbox: mailbox} = mailbox_fixture()
     _draft = draft_fixture(mailbox.id)
@@ -489,8 +631,19 @@ defmodule Manifold.OutboundTest do
                ]
              })
 
-    assert Repo.aggregate(OutboundMessage, :count) == 0
-    assert Repo.aggregate(OutboundRecipient, :count) == 0
+    assert Repo.aggregate(
+             from(message in OutboundMessage, where: message.mailbox_id == ^mailbox.id),
+             :count
+           ) == 0
+
+    assert Repo.aggregate(
+             from(recipient in OutboundRecipient,
+               join: message in OutboundMessage,
+               on: message.id == recipient.outbound_message_id,
+               where: message.mailbox_id == ^mailbox.id
+             ),
+             :count
+           ) == 0
   end
 
   test "inactive mailbox cannot create an outbound draft" do
@@ -616,7 +769,48 @@ defmodule Manifold.OutboundTest do
     {:ok, mailbox} =
       Accounts.create_account(domain, %{local_part: "inbox", name: "Local Inbox"})
 
-    %{mailbox: mailbox, address: "inbox@#{domain.normalized_domain}"}
+    %{domain: domain, mailbox: mailbox, address: "inbox@#{domain.normalized_domain}"}
+  end
+
+  defp on_repo(repo, fun) do
+    previous_repo = Repo.put_dynamic_repo(repo)
+
+    try do
+      fun.()
+    after
+      Repo.put_dynamic_repo(previous_repo)
+    end
+  end
+
+  defp cleanup_race_fixture(repo, job_id, mailbox_id, domain_id) do
+    if Process.alive?(repo) do
+      try do
+        on_repo(repo, fn ->
+          Oban.Job
+          |> where([candidate], candidate.id == ^job_id)
+          |> Repo.delete_all()
+
+          Repo.query!("DELETE FROM mailboxes WHERE id = $1", [Ecto.UUID.dump!(mailbox_id)])
+          Repo.query!("DELETE FROM domains WHERE id = $1", [Ecto.UUID.dump!(domain_id)])
+        end)
+      after
+        if Process.alive?(repo) do
+          try do
+            Supervisor.stop(repo)
+          catch
+            :exit, _reason -> :ok
+          end
+        end
+      end
+    end
+  end
+
+  defp selected_job_query?(query) do
+    String.starts_with?(query, "SELECT ") and
+      String.contains?(query, ~s("oban_jobs")) and
+      String.contains?(query, ~s("state")) and
+      String.contains?(query, "ORDER BY") and
+      String.contains?(query, "LIMIT $")
   end
 
   defp target_incomplete_job_count(mailbox_id) do

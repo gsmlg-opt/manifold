@@ -348,47 +348,48 @@ defmodule Manifold.Outbound do
   @spec cancel_account_jobs(Ecto.UUID.t(), pos_integer()) ::
           {:snooze, 5} | %{cancelled: non_neg_integer(), done?: boolean()}
   def cancel_account_jobs(mailbox_id, limit) when is_integer(limit) and limit > 0 do
-    matching = account_job_query(mailbox_id)
+    {:ok, result} =
+      Repo.transaction(fn ->
+        matching = account_job_query(mailbox_id)
 
-    selected =
-      matching
-      |> order_by([job], asc: job.id)
-      |> limit(^limit)
-      |> select([job], {job.id, job.state})
-      |> Repo.all()
+        selected =
+          matching
+          |> order_by([job], asc: job.id)
+          |> limit(^limit)
+          |> lock("FOR UPDATE SKIP LOCKED")
+          |> select([job], {job.id, job.state})
+          |> Repo.all()
 
-    selected_ids = Enum.map(selected, &elem(&1, 0))
-    selected_executing? = Enum.any?(selected, &(elem(&1, 1) == "executing"))
+        selected_ids = Enum.map(selected, &elem(&1, 0))
+        selected_executing? = Enum.any?(selected, &(elem(&1, 1) == "executing"))
 
-    cancelled =
-      case selected_ids do
-        [] ->
-          0
+        cancelled =
+          case selected_ids do
+            [] ->
+              0
 
-        ids ->
-          {:ok, count} =
-            Oban.Job
-            |> where([job], job.id in ^ids)
-            |> Oban.cancel_all_jobs()
+            ids ->
+              {:ok, count} =
+                Oban.Job
+                |> where([job], job.id in ^ids)
+                |> Oban.cancel_all_jobs()
 
-          count
-      end
+              count
+          end
 
-    matching_executing? =
-      matching
-      |> where([job], job.state == "executing")
-      |> Repo.exists?()
+        matching_executing? =
+          matching
+          |> where([job], job.state == "executing")
+          |> Repo.exists?()
 
-    cond do
-      selected_executing? or matching_executing? ->
-        {:snooze, 5}
+        if selected_executing? or matching_executing? do
+          {:snooze, 5}
+        else
+          %{cancelled: cancelled, done?: not Repo.exists?(matching)}
+        end
+      end)
 
-      cancelled > 0 ->
-        %{cancelled: cancelled, done?: false}
-
-      true ->
-        %{cancelled: 0, done?: not Repo.exists?(matching)}
-    end
+    result
   end
 
   @doc false
