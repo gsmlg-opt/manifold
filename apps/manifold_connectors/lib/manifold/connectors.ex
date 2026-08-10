@@ -7,12 +7,13 @@ defmodule Manifold.Connectors do
 
   alias Ecto.Multi
   alias Manifold.Accounts
+  alias Manifold.Accounts.Schema.Account
   alias Manifold.Connectors.ActivityLog
   alias Manifold.Connectors.Crypto
   alias Manifold.Connectors.IMAP.Client
   alias Manifold.Connectors.EAS.Client, as: EASClient
   alias Manifold.Connectors.SMTP.Client, as: SmtpClient
-  alias Manifold.Connectors.Jobs.SyncAccount
+  alias Manifold.Connectors.Jobs.{ApplyRemoteState, PushRemoteRead, SyncAccount}
   alias Manifold.Connectors.OAuth.Consumed
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.IMAP, as: ProviderIMAP
@@ -26,6 +27,7 @@ defmodule Manifold.Connectors do
     ReceiveMethod,
     EasSettings,
     ImapSettings,
+    OAuthTransaction,
     RemoteMessage,
     SendCredential,
     SendMethod,
@@ -98,33 +100,31 @@ defmodule Manifold.Connectors do
           {:ok, ReceiveMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def enable_receive_method(receive_method_id) do
     Repo.transaction(fn ->
-      method =
+      mailbox_id =
         ReceiveMethod
         |> where([m], m.id == ^receive_method_id)
-        |> lock("FOR UPDATE")
+        |> select([m], m.account_id)
         |> Repo.one()
 
-      case method do
+      case mailbox_id do
         nil ->
           Repo.rollback(Error.new(:permanent, :account_not_found, "receive method not found"))
 
-        %ReceiveMethod{status: "disconnected"} ->
-          Repo.rollback(
-            Error.new(:permanent, :account_disconnected, "receive method is disconnected")
-          )
+        mailbox_id ->
+          case ensure_active_mailbox(Repo, mailbox_id) do
+            {:ok, _mailbox} ->
+              case lock_receive_method(Repo, receive_method_id) do
+                nil ->
+                  Repo.rollback(
+                    Error.new(:permanent, :account_not_found, "receive method not found")
+                  )
 
-        %ReceiveMethod{status: "not_implemented"} ->
-          Repo.rollback(
-            Error.new(:permanent, :not_implemented, "receive method is not implemented yet")
-          )
+                method ->
+                  enable_receive_method(Repo, method)
+              end
 
-        %ReceiveMethod{} = method ->
-          disable_other_methods(Repo, method.account_id, except_id: method.id)
-
-          case ReceiveMethod.changeset(method, %{enabled: true, sync_enabled: true})
-               |> Repo.update() do
-            {:ok, updated} -> updated
-            {:error, changeset} -> Repo.rollback(changeset)
+            {:error, reason} ->
+              Repo.rollback(reason)
           end
       end
     end)
@@ -146,17 +146,26 @@ defmodule Manifold.Connectors do
     if is_nil(email) do
       {:error, Error.new(:permanent, :account_not_found, "account not found")}
     else
-      ReceiveMethod.changeset(%ReceiveMethod{}, %{
-        account_id: account_id,
-        kind: kind,
-        provider_account_id: "#{kind}:#{email}:#{Ecto.UUID.generate()}",
-        email_address: email,
-        status: "not_implemented",
-        enabled: false,
-        sync_enabled: false,
-        granted_scopes: []
-      })
-      |> Repo.insert()
+      changeset =
+        ReceiveMethod.changeset(%ReceiveMethod{}, %{
+          account_id: account_id,
+          kind: kind,
+          provider_account_id: "#{kind}:#{email}:#{Ecto.UUID.generate()}",
+          email_address: email,
+          status: "not_implemented",
+          enabled: false,
+          sync_enabled: false,
+          granted_scopes: []
+        })
+
+      Repo.transaction(fn ->
+        with {:ok, _mailbox} <- ensure_active_mailbox(Repo, account_id),
+             {:ok, method} <- Repo.insert(changeset) do
+          method
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
     end
   end
 
@@ -374,27 +383,31 @@ defmodule Manifold.Connectors do
           {:ok, SendMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def enable_send_method(send_method_id) do
     Repo.transaction(fn ->
-      method =
+      mailbox_id =
         SendMethod
         |> where([m], m.id == ^send_method_id)
-        |> lock("FOR UPDATE")
+        |> select([m], m.account_id)
         |> Repo.one()
 
-      case method do
+      case mailbox_id do
         nil ->
           Repo.rollback(Error.new(:permanent, :account_not_found, "send method not found"))
 
-        %SendMethod{status: "disconnected"} ->
-          Repo.rollback(
-            Error.new(:permanent, :account_disconnected, "send method is disconnected")
-          )
+        mailbox_id ->
+          case ensure_active_mailbox(Repo, mailbox_id) do
+            {:ok, _mailbox} ->
+              case lock_send_method(Repo, send_method_id) do
+                nil ->
+                  Repo.rollback(
+                    Error.new(:permanent, :account_not_found, "send method not found")
+                  )
 
-        %SendMethod{} = method ->
-          disable_other_send_methods(Repo, method.account_id, except_id: method.id)
+                method ->
+                  enable_send_method(Repo, method)
+              end
 
-          case SendMethod.changeset(method, %{enabled: true}) |> Repo.update() do
-            {:ok, updated} -> updated
-            {:error, changeset} -> Repo.rollback(changeset)
+            {:error, reason} ->
+              Repo.rollback(reason)
           end
       end
     end)
@@ -487,31 +500,32 @@ defmodule Manifold.Connectors do
   @spec enqueue_sync(Ecto.UUID.t()) :: {:ok, Oban.Job.t()} | {:error, Error.t() | term()}
   def enqueue_sync(account_id) do
     Repo.transaction(fn ->
-      account =
+      mailbox_id =
         ReceiveMethod
         |> where([account], account.id == ^account_id)
-        |> lock("FOR UPDATE")
+        |> select([account], account.account_id)
         |> Repo.one()
 
-      case account do
-        %ReceiveMethod{status: "disconnected"} ->
-          Repo.rollback(
-            Error.new(:permanent, :account_disconnected, "receive method is disconnected")
-          )
-
-        %ReceiveMethod{enabled: false} ->
-          Repo.rollback(Error.new(:permanent, :sync_disabled, "receive method is not enabled"))
-
-        %ReceiveMethod{sync_enabled: true} ->
-          ensure_sync_job(Repo, account_id)
-
-        %ReceiveMethod{} ->
-          Repo.rollback(
-            Error.new(:permanent, :sync_disabled, "connector synchronization is disabled")
-          )
-
+      case mailbox_id do
         nil ->
           Repo.rollback(Error.new(:permanent, :account_not_found, "connector account not found"))
+
+        mailbox_id ->
+          case ensure_active_mailbox(Repo, mailbox_id) do
+            {:ok, _mailbox} ->
+              case lock_receive_method(Repo, account_id) do
+                nil ->
+                  Repo.rollback(
+                    Error.new(:permanent, :account_not_found, "connector account not found")
+                  )
+
+                account ->
+                  enqueue_sync(Repo, account)
+              end
+
+            {:error, reason} ->
+              Repo.rollback(reason)
+          end
       end
     end)
   rescue
@@ -524,14 +538,16 @@ defmodule Manifold.Connectors do
     Repo.transaction(fn ->
       account_ids =
         ReceiveMethod
+        |> join(:inner, [account], mailbox in Account, on: mailbox.id == account.account_id)
         |> where(
-          [account],
+          [account, mailbox],
           account.enabled and account.sync_enabled and
             account.status in ["connected", "syncing", "failed"] and
-            account.kind in ^ReceiveMethod.implemented_kinds()
+            account.kind in ^ReceiveMethod.implemented_kinds() and mailbox.active and
+            is_nil(mailbox.purge_requested_at)
         )
-        |> order_by([account], asc: account.id)
-        |> select([account], account.id)
+        |> order_by([account, _mailbox], asc: account.id)
+        |> select([account, _mailbox], account.id)
         |> Repo.all()
 
       Enum.each(account_ids, &ensure_sync_job(Repo, &1))
@@ -540,6 +556,172 @@ defmodule Manifold.Connectors do
   rescue
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
+
+  @doc false
+  @spec quiesce_account(module(), Ecto.UUID.t()) ::
+          {:ok, %{receive_methods: non_neg_integer(), send_methods: non_neg_integer()}}
+  def quiesce_account(repo, mailbox_id) do
+    now = DateTime.utc_now()
+
+    {receive_count, _} =
+      ReceiveMethod
+      |> where([method], method.account_id == ^mailbox_id)
+      |> repo.update_all(set: [enabled: false, sync_enabled: false, updated_at: now])
+
+    {send_count, _} =
+      SendMethod
+      |> where([method], method.account_id == ^mailbox_id)
+      |> repo.update_all(set: [enabled: false, updated_at: now])
+
+    {:ok, %{receive_methods: receive_count, send_methods: send_count}}
+  end
+
+  @doc false
+  @spec cancel_account_jobs(Ecto.UUID.t(), pos_integer()) ::
+          {:snooze, 5} | %{cancelled: non_neg_integer(), done?: boolean()}
+  def cancel_account_jobs(mailbox_id, limit) when is_integer(limit) and limit > 0 do
+    receive_method_ids =
+      ReceiveMethod
+      |> where([method], method.account_id == ^mailbox_id)
+      |> select([method], method.id)
+      |> Repo.all()
+
+    remote_message_ids =
+      RemoteMessage
+      |> join(:inner, [remote], method in ReceiveMethod,
+        on: method.id == remote.external_account_id
+      )
+      |> where([_remote, method], method.account_id == ^mailbox_id)
+      |> select([remote, _method], remote.id)
+      |> Repo.all()
+
+    matching = account_job_query(receive_method_ids, remote_message_ids)
+
+    selected =
+      matching
+      |> order_by([job], asc: job.id)
+      |> limit(^limit)
+      |> select([job], {job.id, job.state})
+      |> Repo.all()
+
+    selected_ids = Enum.map(selected, &elem(&1, 0))
+    selected_executing? = Enum.any?(selected, &(elem(&1, 1) == "executing"))
+
+    cancelled =
+      case selected_ids do
+        [] ->
+          0
+
+        ids ->
+          {:ok, count} =
+            Oban.Job
+            |> where([job], job.id in ^ids)
+            |> Oban.cancel_all_jobs()
+
+          count
+      end
+
+    matching_executing? =
+      matching
+      |> where([job], job.state == "executing")
+      |> Repo.exists?()
+
+    if selected_executing? or matching_executing? do
+      {:snooze, 5}
+    else
+      %{cancelled: cancelled, done?: not Repo.exists?(matching)}
+    end
+  end
+
+  @spec list_account_delivery_ids(Ecto.UUID.t(), Ecto.UUID.t() | nil, pos_integer()) :: %{
+          ids: [Ecto.UUID.t()],
+          next: Ecto.UUID.t() | nil,
+          done?: boolean()
+        }
+  def list_account_delivery_ids(mailbox_id, after_id, limit)
+      when is_integer(limit) and limit > 0 do
+    query =
+      RemoteMessage
+      |> join(:inner, [remote], method in ReceiveMethod,
+        on: method.id == remote.external_account_id
+      )
+      |> where(
+        [remote, method],
+        method.account_id == ^mailbox_id and not is_nil(remote.inbound_delivery_id)
+      )
+
+    query =
+      if is_binary(after_id) do
+        where(query, [remote, _method], remote.inbound_delivery_id > ^after_id)
+      else
+        query
+      end
+
+    ids =
+      query
+      |> distinct([remote, _method], remote.inbound_delivery_id)
+      |> order_by([remote, _method], asc: remote.inbound_delivery_id)
+      |> limit(^limit)
+      |> select([remote, _method], remote.inbound_delivery_id)
+      |> Repo.all()
+
+    %{ids: ids, next: List.last(ids), done?: length(ids) < limit}
+  end
+
+  @spec delivery_owned?(Ecto.UUID.t()) :: boolean()
+  def delivery_owned?(delivery_id) do
+    RemoteMessage
+    |> where([remote], remote.inbound_delivery_id == ^delivery_id)
+    |> Repo.exists?()
+  end
+
+  @doc false
+  @spec purge_account_batch(module(), Ecto.UUID.t(), pos_integer()) :: %{
+          deleted: non_neg_integer(),
+          done?: boolean(),
+          activity_log_ids: [Ecto.UUID.t()]
+        }
+  def purge_account_batch(repo, mailbox_id, limit) when is_integer(limit) and limit > 0 do
+    case next_purge_batch(repo, mailbox_id, limit) do
+      {:remote_messages, ids} ->
+        {deleted, _} =
+          RemoteMessage
+          |> where([remote], remote.id in ^ids)
+          |> repo.delete_all()
+
+        purge_result(repo, mailbox_id, deleted, [])
+
+      {:receive_methods, ids} ->
+        {deleted, _} =
+          ReceiveMethod
+          |> where([method], method.id in ^ids)
+          |> repo.delete_all()
+
+        purge_result(repo, mailbox_id, deleted, ids)
+
+      {:send_methods, ids} ->
+        {deleted, _} =
+          SendMethod
+          |> where([method], method.id in ^ids)
+          |> repo.delete_all()
+
+        purge_result(repo, mailbox_id, deleted, [])
+
+      {:oauth_transactions, ids} ->
+        {deleted, _} =
+          OAuthTransaction
+          |> where([transaction], transaction.id in ^ids)
+          |> repo.delete_all()
+
+        purge_result(repo, mailbox_id, deleted, [])
+
+      :empty ->
+        %{deleted: 0, done?: true, activity_log_ids: []}
+    end
+  end
+
+  @spec account_data_remaining?(Ecto.UUID.t()) :: boolean()
+  def account_data_remaining?(mailbox_id), do: account_data_remaining?(Repo, mailbox_id)
 
   @spec disconnect(Ecto.UUID.t()) ::
           {:ok, ReceiveMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
@@ -752,6 +934,9 @@ defmodule Manifold.Connectors do
 
   defp persist_authorization(provider, consumed, token, identity, cursors, now, opts) do
     Multi.new()
+    |> Multi.run(:mailbox_fence, fn repo, _changes ->
+      ensure_active_mailbox(repo, consumed.mailbox_id)
+    end)
     |> Multi.run(:account, fn repo, _changes ->
       upsert_account(repo, provider, consumed.mailbox_id, identity, token.scopes)
     end)
@@ -1300,6 +1485,9 @@ defmodule Manifold.Connectors do
         EasSettings.default_protocol_version()
 
     Multi.new()
+    |> Multi.run(:mailbox_fence, fn repo, _changes ->
+      ensure_active_mailbox(repo, mailbox.id)
+    end)
     |> Multi.run(:disable_others, fn repo, _changes ->
       disable_other_methods(repo, mailbox.id)
       {:ok, :ok}
@@ -1544,6 +1732,9 @@ defmodule Manifold.Connectors do
     mailbox_path = attr(attrs, :mailbox_path) || "INBOX"
 
     Multi.new()
+    |> Multi.run(:mailbox_fence, fn repo, _changes ->
+      ensure_active_mailbox(repo, mailbox.id)
+    end)
     |> Multi.run(:disable_others, fn repo, _changes ->
       disable_other_methods(repo, mailbox.id)
       {:ok, :ok}
@@ -1700,6 +1891,9 @@ defmodule Manifold.Connectors do
     tls_mode = attr(attrs, :tls_mode) || "tls"
 
     Multi.new()
+    |> Multi.run(:mailbox_fence, fn repo, _changes ->
+      ensure_active_mailbox(repo, mailbox.id)
+    end)
     |> Multi.run(:disable_others, fn repo, _changes ->
       disable_other_send_methods(repo, mailbox.id)
       {:ok, :ok}
@@ -1747,6 +1941,142 @@ defmodule Manifold.Connectors do
     else
       {:ok, :ok}
     end
+  end
+
+  defp ensure_active_mailbox(repo, mailbox_id) do
+    Accounts.active_account_for_update(repo, mailbox_id)
+  end
+
+  defp lock_receive_method(repo, receive_method_id) do
+    ReceiveMethod
+    |> where([method], method.id == ^receive_method_id)
+    |> lock("FOR UPDATE")
+    |> repo.one()
+  end
+
+  defp lock_send_method(repo, send_method_id) do
+    SendMethod
+    |> where([method], method.id == ^send_method_id)
+    |> lock("FOR UPDATE")
+    |> repo.one()
+  end
+
+  defp enable_receive_method(repo, %ReceiveMethod{status: "disconnected"}) do
+    repo.rollback(Error.new(:permanent, :account_disconnected, "receive method is disconnected"))
+  end
+
+  defp enable_receive_method(repo, %ReceiveMethod{status: "not_implemented"}) do
+    repo.rollback(
+      Error.new(:permanent, :not_implemented, "receive method is not implemented yet")
+    )
+  end
+
+  defp enable_receive_method(repo, %ReceiveMethod{} = method) do
+    disable_other_methods(repo, method.account_id, except_id: method.id)
+
+    case ReceiveMethod.changeset(method, %{enabled: true, sync_enabled: true}) |> repo.update() do
+      {:ok, updated} -> updated
+      {:error, changeset} -> repo.rollback(changeset)
+    end
+  end
+
+  defp enable_send_method(repo, %SendMethod{status: "disconnected"}) do
+    repo.rollback(Error.new(:permanent, :account_disconnected, "send method is disconnected"))
+  end
+
+  defp enable_send_method(repo, %SendMethod{} = method) do
+    disable_other_send_methods(repo, method.account_id, except_id: method.id)
+
+    case SendMethod.changeset(method, %{enabled: true}) |> repo.update() do
+      {:ok, updated} -> updated
+      {:error, changeset} -> repo.rollback(changeset)
+    end
+  end
+
+  defp enqueue_sync(repo, %ReceiveMethod{status: "disconnected"}) do
+    repo.rollback(Error.new(:permanent, :account_disconnected, "receive method is disconnected"))
+  end
+
+  defp enqueue_sync(repo, %ReceiveMethod{enabled: false}) do
+    repo.rollback(Error.new(:permanent, :sync_disabled, "receive method is not enabled"))
+  end
+
+  defp enqueue_sync(repo, %ReceiveMethod{sync_enabled: true} = account) do
+    ensure_sync_job(repo, account.id)
+  end
+
+  defp enqueue_sync(repo, %ReceiveMethod{}) do
+    repo.rollback(Error.new(:permanent, :sync_disabled, "connector synchronization is disabled"))
+  end
+
+  defp account_job_query(receive_method_ids, remote_message_ids) do
+    Oban.Job
+    |> where([job], job.state in ~w(available scheduled executing retryable))
+    |> where(
+      [job],
+      (job.worker == ^inspect(SyncAccount) and
+         fragment("?->>'external_account_id'", job.args) in ^receive_method_ids) or
+        (job.worker in ^[inspect(ApplyRemoteState), inspect(PushRemoteRead)] and
+           fragment("?->>'remote_message_id'", job.args) in ^remote_message_ids)
+    )
+  end
+
+  defp next_purge_batch(repo, mailbox_id, limit) do
+    remote_ids =
+      RemoteMessage
+      |> join(:inner, [remote], method in ReceiveMethod,
+        on: method.id == remote.external_account_id
+      )
+      |> where([_remote, method], method.account_id == ^mailbox_id)
+      |> order_by([remote, _method], asc: remote.id)
+      |> limit(^limit)
+      |> lock("FOR UPDATE")
+      |> select([remote, _method], remote.id)
+      |> repo.all()
+
+    cond do
+      remote_ids != [] ->
+        {:remote_messages, remote_ids}
+
+      receive_ids = purge_ids(repo, ReceiveMethod, :account_id, mailbox_id, limit) ->
+        {:receive_methods, receive_ids}
+
+      send_ids = purge_ids(repo, SendMethod, :account_id, mailbox_id, limit) ->
+        {:send_methods, send_ids}
+
+      oauth_ids = purge_ids(repo, OAuthTransaction, :mailbox_id, mailbox_id, limit) ->
+        {:oauth_transactions, oauth_ids}
+
+      true ->
+        :empty
+    end
+  end
+
+  defp purge_ids(repo, schema, field, mailbox_id, limit) do
+    ids =
+      schema
+      |> where([row], field(row, ^field) == ^mailbox_id)
+      |> order_by([row], asc: row.id)
+      |> limit(^limit)
+      |> lock("FOR UPDATE")
+      |> select([row], row.id)
+      |> repo.all()
+
+    if ids == [], do: nil, else: ids
+  end
+
+  defp purge_result(repo, mailbox_id, deleted, activity_log_ids) do
+    %{
+      deleted: deleted,
+      done?: not account_data_remaining?(repo, mailbox_id),
+      activity_log_ids: activity_log_ids
+    }
+  end
+
+  defp account_data_remaining?(repo, mailbox_id) do
+    repo.exists?(where(ReceiveMethod, [method], method.account_id == ^mailbox_id)) or
+      repo.exists?(where(SendMethod, [method], method.account_id == ^mailbox_id)) or
+      repo.exists?(where(OAuthTransaction, [transaction], transaction.mailbox_id == ^mailbox_id))
   end
 
   defp database_error(reason) do

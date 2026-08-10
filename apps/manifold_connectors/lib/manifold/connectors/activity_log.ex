@@ -102,6 +102,17 @@ defmodule Manifold.Connectors.ActivityLog do
     end
   end
 
+  @spec delete_account(String.t()) :: :ok | {:error, :invalid_account_id | term()}
+  def delete_account(account_id) do
+    with {:ok, account_id} <- validate_account_id(account_id) do
+      case File.rm_rf(account_dir(account_id)) do
+        {:ok, _paths} -> :ok
+        {:error, :enoent, _path} -> :ok
+        {:error, reason, _path} -> {:error, reason}
+      end
+    end
+  end
+
   @doc false
   def day_path!(account_id, date) do
     {:ok, account_id} = validate_account_id(account_id)

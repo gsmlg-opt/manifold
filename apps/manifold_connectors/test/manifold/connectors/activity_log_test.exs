@@ -108,6 +108,26 @@ defmodule Manifold.Connectors.ActivityLogTest do
     assert {:ok, [^keep]} = ActivityLog.list_dates(account_id)
   end
 
+  test "delete_account removes only the validated account directory and is idempotent", %{
+    account_id: account_id,
+    log_dir: log_dir
+  } do
+    other_account_id = Ecto.UUID.generate()
+    assert :ok = ActivityLog.append(account_id, sample_entry())
+    assert :ok = ActivityLog.append(other_account_id, sample_entry())
+
+    assert :ok = ActivityLog.delete_account(account_id)
+    refute File.exists?(Path.join(log_dir, account_id))
+    assert File.exists?(Path.join(log_dir, other_account_id))
+    assert :ok = ActivityLog.delete_account(account_id)
+
+    for invalid <- ["../etc", account_id <> "/../x", account_id <> "\\x", "not-a-uuid"] do
+      assert {:error, :invalid_account_id} = ActivityLog.delete_account(invalid)
+    end
+
+    assert File.exists?(Path.join(log_dir, other_account_id))
+  end
+
   defp sample_entry do
     %{
       "event" => ["manifold", "connectors", "sync", "stop"],
