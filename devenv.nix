@@ -9,9 +9,6 @@ in
   env.PGHOST = "${config.env.DEVENV_RUNTIME}/postgres";
   env.POSTGRES_SOCKET_DIR = "${config.env.DEVENV_RUNTIME}/postgres";
 
-  env.MANIFOLD_SMTP_HOSTNAME = "localhost";
-  env.MANIFOLD_SMTP_BIND = "127.0.0.1";
-  env.MANIFOLD_SMTP_PORT = "2525";
   env.MANIFOLD_SPOOL_DIR = "${root}/priv/spool/dev";
   env.MANIFOLD_RAW_STORE_BACKEND = "local";
   env.MANIFOLD_RAW_STORE_DIR = "${root}/priv/raw_store/dev";

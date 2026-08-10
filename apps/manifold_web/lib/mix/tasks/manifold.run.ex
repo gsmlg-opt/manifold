@@ -3,13 +3,12 @@ defmodule Mix.Tasks.Manifold.Run do
   Starts the Manifold development server.
 
   Always runs `mix compile --force` first, then delegates to `mix phx.server`,
-  which starts the Phoenix endpoint and the umbrella supervision tree,
-  including the SMTP listener when it is enabled.
+  which starts the Phoenix endpoint and the mail-client umbrella applications.
   """
 
   use Mix.Task
 
-  @shortdoc "Force-compiles, then starts Phoenix and the Manifold SMTP listener"
+  @shortdoc "Force-compiles and starts the Manifold mail-client runtime"
 
   @impl Mix.Task
   def run(args) do

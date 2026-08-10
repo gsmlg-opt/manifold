@@ -1,8 +1,9 @@
 # Manifold
 
 Manifold is a self-hosted Phoenix webmail application backed by an Elixir-native
-mail platform. It is designed to replace a desktop email client for locally
-hosted mailboxes while preserving durable SMTP acceptance and raw message data.
+mail platform. The main runtime acts as a mail client for provider-hosted
+accounts; the optional `manifold_edge` release provides durable inbound SMTP for
+installations that deploy it.
 
 ## Milestones 0-6
 
@@ -16,7 +17,8 @@ read-only Gmail and Microsoft 365 synchronization:
 - Optional `manifold_edge` release and local `manifold_cloud` pull client.
 - PostgreSQL/Ecto migrations and Oban jobs.
 - Domain, mailbox, alias, alias target, and recipient resolution.
-- `gen_smtp` development listener on port `2525`.
+- Edge-only `gen_smtp` listener, using port `2525` in development and port `25`
+  in the edge release by default.
 - Durable spool bundles under `tmp/`, `ready/`, `failed/`, and `quarantine/`.
 - Local filesystem raw-message store.
 - Bounded asynchronous MIME projection with ordered headers, addresses, selected
@@ -229,7 +231,7 @@ Run migrations only:
 mix ecto.migrate
 ```
 
-Start Phoenix and the SMTP listener:
+Start the mail-client runtime:
 
 ```sh
 devenv processes start
@@ -238,7 +240,8 @@ devenv processes start
 The managed Manifold process runs pending Ecto migrations after PostgreSQL is
 ready and before starting the application.
 
-Open Phoenix at `http://localhost:4290`. Submit SMTP mail to `127.0.0.1:2525`.
+Open Phoenix at `http://localhost:4290`; the API listens at
+`http://localhost:4292`. The separate `manifold_edge` release owns inbound SMTP.
 The root page is the mailbox inbox; transport lifecycle details remain under
 `/deliveries`.
 
