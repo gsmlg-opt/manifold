@@ -141,24 +141,49 @@ defmodule Manifold.MailTest do
     assert Repo.get!(InboundDelivery, second_delivery.id)
   end
 
-  test "mail cleanup probes have concurrent supporting indexes" do
-    migration_path =
+  test "mail cleanup indexes are valid, ready, ordered, and retry-aware" do
+    attachment_migration_path =
       Path.expand(
         "../../../manifold_data/priv/repo/migrations/20260811000300_add_attachment_object_key_index.exs",
         __DIR__
       )
 
-    assert File.exists?(migration_path)
-    migration = Manifold.Repo.Migrations.AddAttachmentObjectKeyIndex
-    unless Code.ensure_loaded?(migration), do: Code.require_file(migration_path)
+    mailbox_migration_path =
+      Path.expand(
+        "../../../manifold_data/priv/repo/migrations/20260811000400_add_mailbox_entry_cleanup_index.exs",
+        __DIR__
+      )
+
+    assert File.exists?(attachment_migration_path)
+    assert File.exists?(mailbox_migration_path)
+
+    attachment_migration = Manifold.Repo.Migrations.AddAttachmentObjectKeyIndex
+
+    unless Code.ensure_loaded?(attachment_migration),
+      do: Code.require_file(attachment_migration_path)
+
+    mailbox_migration = Manifold.Repo.Migrations.AddMailboxEntryCleanupIndex
+
+    unless Code.ensure_loaded?(mailbox_migration),
+      do: Code.require_file(mailbox_migration_path)
 
     assert [disable_ddl_transaction: true, disable_migration_lock: true] =
-             apply(migration, :__migration__, [])
+             apply(attachment_migration, :__migration__, [])
 
-    source = File.read!(migration_path)
-    assert source =~ "index(:attachments, [:object_key], concurrently: true)"
-    assert source =~ "index(:mailbox_entries, [:mailbox_id, :id], concurrently: true)"
-    assert length(Regex.scan(~r/concurrently:\s*true/, source)) == 2
+    assert [disable_ddl_transaction: true, disable_migration_lock: true] =
+             apply(mailbox_migration, :__migration__, [])
+
+    attachment_source = File.read!(attachment_migration_path)
+    assert attachment_source =~ "index(:attachments, [:object_key], concurrently: true)"
+    refute attachment_source =~ "mailbox_entries"
+    assert length(Regex.scan(~r/concurrently:\s*true/, attachment_source)) == 1
+
+    mailbox_source = File.read!(mailbox_migration_path)
+    assert mailbox_source =~ "create_if_not_exists("
+    assert mailbox_source =~ "index(:mailbox_entries, [:mailbox_id, :id], concurrently: true)"
+    assert mailbox_source =~ "drop_if_exists("
+    assert mailbox_source =~ "def up"
+    assert mailbox_source =~ "def down"
 
     expected_indexes = [
       "attachments_object_key_index",
@@ -168,52 +193,35 @@ defmodule Manifold.MailTest do
     assert indexes =
              Repo.query!(
                """
-               SELECT indexname, indexdef
-               FROM pg_indexes
-               WHERE schemaname = current_schema()
-                 AND indexname = ANY($1)
-               ORDER BY indexname
+               SELECT index_class.relname,
+                      index_meta.indisvalid,
+                      index_meta.indisready,
+                      ARRAY(
+                        SELECT attribute.attname
+                        FROM unnest(index_meta.indkey)
+                             WITH ORDINALITY AS key(attnum, position)
+                        JOIN pg_attribute AS attribute
+                          ON attribute.attrelid = table_class.oid
+                         AND attribute.attnum = key.attnum
+                        WHERE key.position <= index_meta.indnkeyatts
+                        ORDER BY key.position
+                      ),
+                      pg_get_expr(index_meta.indpred, index_meta.indrelid)
+               FROM pg_index AS index_meta
+               JOIN pg_class AS index_class ON index_class.oid = index_meta.indexrelid
+               JOIN pg_class AS table_class ON table_class.oid = index_meta.indrelid
+               JOIN pg_namespace AS namespace ON namespace.oid = table_class.relnamespace
+               WHERE namespace.nspname = current_schema()
+                 AND index_class.relname = ANY($1)
+               ORDER BY index_class.relname
                """,
                [expected_indexes]
              ).rows
 
-    assert Enum.map(indexes, &hd/1) == expected_indexes
-    assert Enum.at(indexes, 0) |> Enum.at(1) =~ "(object_key)"
-    assert Enum.at(indexes, 1) |> Enum.at(1) =~ "(mailbox_id, id)"
-
-    Repo.query!("SET LOCAL enable_seqscan = off")
-
-    blob_plan =
-      Repo.query!(
-        """
-        EXPLAIN (COSTS OFF)
-        SELECT 1
-        FROM attachments
-        WHERE object_key = $1
-        LIMIT 1
-        """,
-        [object_key(String.duplicate("f", 64))]
-      ).rows
-      |> List.flatten()
-      |> Enum.join("\n")
-
-    mailbox_plan =
-      Repo.query!(
-        """
-        EXPLAIN (COSTS OFF)
-        SELECT id
-        FROM mailbox_entries
-        WHERE mailbox_id = $1
-        ORDER BY id
-        LIMIT 250
-        """,
-        [Ecto.UUID.dump!(Ecto.UUID.generate())]
-      ).rows
-      |> List.flatten()
-      |> Enum.join("\n")
-
-    assert blob_plan =~ "attachments_object_key_index"
-    assert mailbox_plan =~ "mailbox_entries_mailbox_id_id_index"
+    assert indexes == [
+             ["attachments_object_key_index", true, true, ["object_key"], nil],
+             ["mailbox_entries_mailbox_id_id_index", true, true, ["mailbox_id", "id"], nil]
+           ]
   end
 
   defp mailbox_fixtures(count) do
@@ -366,7 +374,7 @@ defmodule Manifold.MailConcurrencyTest do
 
   setup do
     :ok = Sandbox.checkout(Repo, sandbox: false)
-    fixture = concurrency_fixture()
+    fixture = concurrency_fixture_ids()
 
     on_exit(fn ->
       :ok = Sandbox.checkout(Repo, sandbox: false)
@@ -377,6 +385,8 @@ defmodule Manifold.MailConcurrencyTest do
         Sandbox.checkin(Repo)
       end
     end)
+
+    insert_concurrency_fixture(fixture)
 
     {:ok, fixture: fixture}
   end
@@ -473,63 +483,80 @@ defmodule Manifold.MailConcurrencyTest do
     end
   end
 
-  defp concurrency_fixture do
-    now = DateTime.utc_now()
+  test "committed fixture cleanup tolerates a partial setup" do
+    partial_fixture = concurrency_fixture_ids()
+
+    Repo.insert_all("domains", [domain_row(partial_fixture, DateTime.utc_now())])
+    cleanup_concurrency_fixture(partial_fixture)
+
+    assert [] =
+             Repo.query!("SELECT id FROM domains WHERE id = $1", [
+               Ecto.UUID.dump!(partial_fixture.domain_id)
+             ]).rows
+  end
+
+  defp concurrency_fixture_ids do
     domain_id = Ecto.UUID.generate()
     mailbox_id = Ecto.UUID.generate()
     other_mailbox_id = Ecto.UUID.generate()
-    domain = "mail-cleanup-race-#{Ecto.UUID.generate()}.test"
-
-    Repo.insert_all("domains", [
-      %{
-        id: Ecto.UUID.dump!(domain_id),
-        name: domain,
-        normalized_domain: domain,
-        active: true,
-        plus_addressing_enabled: true,
-        inserted_at: now,
-        updated_at: now
-      }
-    ])
-
-    Repo.insert_all("mailboxes", [
-      mailbox_row(mailbox_id, domain_id, "target", now),
-      mailbox_row(other_mailbox_id, domain_id, "other", now)
-    ])
-
     delivery_ids = Enum.map(1..7, fn _index -> Ecto.UUID.generate() end)
-
-    Repo.insert_all(
-      "inbound_deliveries",
-      Enum.map(delivery_ids, &delivery_row(&1, domain_id, now))
-    )
-
-    target_rows =
-      delivery_ids
-      |> Enum.take(6)
-      |> Enum.map(&mailbox_entry_row(Ecto.UUID.generate(), mailbox_id, &1, now))
-
-    other_row =
-      mailbox_entry_row(
-        Ecto.UUID.generate(),
-        other_mailbox_id,
-        List.last(delivery_ids),
-        now
-      )
-
-    Repo.insert_all("mailbox_entries", target_rows ++ [other_row])
-
-    entry_ids = target_rows |> Enum.map(&Ecto.UUID.load!(&1.id)) |> Enum.sort()
-    other_entry_id = Ecto.UUID.load!(other_row.id)
+    entry_ids = Enum.map(1..6, fn _index -> Ecto.UUID.generate() end) |> Enum.sort()
+    other_entry_id = Ecto.UUID.generate()
 
     %{
       domain_id: domain_id,
+      domain: "mail-cleanup-race-#{Ecto.UUID.generate()}.test",
       mailbox_id: mailbox_id,
       other_mailbox_id: other_mailbox_id,
       delivery_ids: delivery_ids,
       entry_ids: entry_ids,
       other_entry_id: other_entry_id,
       all_entry_ids: entry_ids ++ [other_entry_id]
+    }
+  end
+
+  defp insert_concurrency_fixture(fixture) do
+    now = DateTime.utc_now()
+
+    Repo.insert_all("domains", [domain_row(fixture, now)])
+
+    Repo.insert_all("mailboxes", [
+      mailbox_row(fixture.mailbox_id, fixture.domain_id, "target", now),
+      mailbox_row(fixture.other_mailbox_id, fixture.domain_id, "other", now)
+    ])
+
+    Repo.insert_all(
+      "inbound_deliveries",
+      Enum.map(fixture.delivery_ids, &delivery_row(&1, fixture.domain_id, now))
+    )
+
+    target_rows =
+      Enum.zip_with(
+        fixture.entry_ids,
+        Enum.take(fixture.delivery_ids, 6),
+        &mailbox_entry_row(&1, fixture.mailbox_id, &2, now)
+      )
+
+    other_row =
+      mailbox_entry_row(
+        fixture.other_entry_id,
+        fixture.other_mailbox_id,
+        List.last(fixture.delivery_ids),
+        now
+      )
+
+    Repo.insert_all("mailbox_entries", target_rows ++ [other_row])
+  end
+
+  defp domain_row(fixture, now) do
+    %{
+      id: Ecto.UUID.dump!(fixture.domain_id),
+      name: fixture.domain,
+      normalized_domain: fixture.domain,
+      active: true,
+      plus_addressing_enabled: true,
+      inserted_at: now,
+      updated_at: now
     }
   end
 
