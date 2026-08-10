@@ -1,6 +1,16 @@
 defmodule Manifold.AccountLifecycle.Purge do
   @moduledoc false
 
+  defmodule DeleteSavepointRepo do
+    @moduledoc false
+
+    alias Manifold.Repo
+
+    def one(query), do: Repo.one(query)
+    def preload(struct, associations), do: Repo.preload(struct, associations)
+    def delete(struct), do: Repo.delete(struct, mode: :savepoint)
+  end
+
   import Ecto.Query
 
   alias Manifold.AccountLifecycle.Schema.{AccountPurge, PurgeDelivery, PurgeObject}
@@ -78,7 +88,7 @@ defmodule Manifold.AccountLifecycle.Purge do
 
   defp dispatch(purge_id, "discover", _job), do: discover(purge_id)
   defp dispatch(purge_id, "drain", _job), do: drain(purge_id)
-  defp dispatch(purge_id, "connectors", _job), do: connectors(purge_id)
+  defp dispatch(purge_id, "connectors", job), do: connectors(purge_id, job)
   defp dispatch(purge_id, "outbound", _job), do: outbound(purge_id)
   defp dispatch(purge_id, "mailbox_copy", _job), do: mailbox_copy(purge_id)
   defp dispatch(purge_id, "orphan_payloads", job), do: orphan_payloads(purge_id, job)
@@ -153,9 +163,14 @@ defmodule Manifold.AccountLifecycle.Purge do
     end)
   end
 
-  defp connectors(purge_id) do
+  defp connectors(purge_id, job) do
     with_stage(purge_id, "connectors", fn repo, purge ->
       result = Connectors.purge_account_batch(repo, purge.mailbox_id, @batch_size)
+
+      if injected_after_connector_delete_before_object_outbox?(job) do
+        repo.rollback(:injected_after_connector_delete_before_object_outbox)
+      end
+
       _inserted = insert_object_work(repo, purge.id, "activity_log", result.activity_log_ids)
 
       if result.done? do
@@ -346,7 +361,7 @@ defmodule Manifold.AccountLifecycle.Purge do
   end
 
   defp complete_purge(repo, purge) do
-    case Accounts.delete_purging_account(repo, purge.mailbox_id) do
+    case delete_account_with_savepoint(repo, purge.mailbox_id) do
       {:ok, _account} ->
         repo.delete_all(where(PurgeDelivery, [work], work.purge_id == ^purge.id))
         repo.delete_all(where(PurgeObject, [work], work.purge_id == ^purge.id))
@@ -374,6 +389,34 @@ defmodule Manifold.AccountLifecycle.Purge do
 
       {:error, reason} ->
         {:error, reason}
+
+      {:constraint, constraint} ->
+        case owning_stage(constraint) do
+          nil ->
+            {:error, {:unrouted_local_constraint, constraint}}
+
+          stage ->
+            advance_result(repo, purge, stage)
+        end
+    end
+  end
+
+  defp delete_account_with_savepoint(repo, mailbox_id) do
+    case repo.transaction(
+           fn ->
+             try do
+               case Accounts.delete_purging_account(DeleteSavepointRepo, mailbox_id) do
+                 {:ok, account} -> {:ok, account}
+                 {:error, reason} -> {:error, reason}
+               end
+             rescue
+               error in Ecto.ConstraintError -> {:constraint, error.constraint}
+             end
+           end,
+           mode: :savepoint
+         ) do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -782,6 +825,10 @@ defmodule Manifold.AccountLifecycle.Purge do
     %{class: :permanent, code: :local_invariant_failed, message: generic_message(:permanent)}
   end
 
+  defp safe_error({:unrouted_local_constraint, _constraint}) do
+    %{class: :permanent, code: :local_invariant_failed, message: generic_message(:permanent)}
+  end
+
   defp safe_error(error) when is_struct(error, DBConnection.ConnectionError) do
     %{class: :temporary, code: :database_unavailable, message: generic_message(:temporary)}
   end
@@ -823,17 +870,24 @@ defmodule Manifold.AccountLifecycle.Purge do
       Map.get(meta || %{}, :fail_at) == :after_orphan_payload_commit
   end
 
-  defp owning_stage(%Ecto.Changeset{} = changeset) do
-    constraints = Enum.map(changeset.constraints, & &1.constraint)
+  defp injected_after_connector_delete_before_object_outbox?(%Oban.Job{meta: meta}) do
+    Map.get(meta || %{}, "fail_at") == "after_connector_delete_before_object_outbox" or
+      Map.get(meta || %{}, :fail_at) == :after_connector_delete_before_object_outbox
+  end
 
+  defp owning_stage(%Ecto.Changeset{} = changeset) do
+    Enum.find_value(changeset.constraints, &owning_stage(&1.constraint))
+  end
+
+  defp owning_stage(constraint) when is_binary(constraint) do
     cond do
-      Enum.any?(constraints, &String.contains?(&1, "connector")) ->
+      String.contains?(constraint, "connector") ->
         "connectors"
 
-      Enum.any?(constraints, &String.contains?(&1, "outbound")) ->
+      String.contains?(constraint, "outbound") ->
         "outbound"
 
-      Enum.any?(constraints, &String.contains?(&1, ["delivery", "ingress", "mailbox"])) ->
+      String.contains?(constraint, ["delivery", "ingress", "mailbox"]) ->
         "mailbox_copy"
 
       true ->
