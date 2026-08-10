@@ -7,7 +7,7 @@ defmodule Manifold.AccountLifecycleTest do
   alias Manifold.AccountLifecycle.Purge
   alias Manifold.AccountLifecycle.Schema.{AccountPurge, PurgeDelivery}
   alias Manifold.Accounts
-  alias Manifold.Accounts.Schema.{Account, RouteRevision}
+  alias Manifold.Accounts.Schema.{Account, Domain, RouteRevision}
   alias Manifold.Connectors.Schema.{ReceiveMethod, SendMethod}
 
   setup context do
@@ -120,16 +120,77 @@ defmodule Manifold.AccountLifecycleTest do
     assert [%Oban.Job{state: "suspended"}] = purge_jobs(purge.id)
   end
 
+  test "request deletion rejects a failed purge until the explicit retry path is used" do
+    account = account_fixture("failed-request@example.test")
+
+    assert {:ok, purge} =
+             AccountLifecycle.request_deletion(account.id, "failed-request@example.test")
+
+    discard_purge_jobs(purge.id)
+
+    failed =
+      purge
+      |> AccountPurge.changeset(%{
+        status: "failed",
+        stage: "outbound",
+        progress: %{"cursor" => "preserved"},
+        error_message: "retry explicitly"
+      })
+      |> Repo.update!()
+
+    assert {:error, %{class: :permanent, reason: :purge_retry_required}} =
+             AccountLifecycle.request_deletion(account.id, "failed-request@example.test")
+
+    assert %AccountPurge{
+             status: "failed",
+             stage: "outbound",
+             progress: %{"cursor" => "preserved"},
+             error_message: "retry explicitly"
+           } = Repo.get!(AccountPurge, failed.id)
+
+    assert incomplete_purge_job_count(failed.id) == 0
+  end
+
+  test "request deletion rejects an already completed purge without enqueueing" do
+    account = account_fixture("completed-request@example.test")
+
+    assert {:ok, purge} =
+             AccountLifecycle.request_deletion(account.id, "completed-request@example.test")
+
+    {1, nil} =
+      PurgeAccount
+      |> purge_job_query(purge.id)
+      |> Repo.update_all(set: [state: "completed"])
+
+    completed =
+      purge
+      |> AccountPurge.changeset(%{status: "completed", stage: "completed"})
+      |> Repo.update!()
+
+    assert {:error, %{class: :permanent, reason: :account_purge_completed}} =
+             AccountLifecycle.request_deletion(account.id, "completed-request@example.test")
+
+    assert %AccountPurge{status: "completed", stage: "completed"} =
+             Repo.get!(AccountPurge, completed.id)
+
+    assert [%Oban.Job{state: "completed"}] = purge_jobs(completed.id)
+  end
+
   @tag oban_testing: :disabled
-  test "concurrent deletion request and retry use Oban uniqueness to persist one job" do
+  test "retry rejects a synthetic conflict while the lock holder later rolls back" do
     {:ok, race_repo} =
       Repo.start_link(name: nil, pool: DBConnection.ConnectionPool, pool_size: 4)
 
     Process.unlink(race_repo)
 
+    race_domain = "#{Ecto.UUID.generate()}.example.test"
+    route_snapshot = on_repo(race_repo, &route_revision_snapshot/0)
+
+    on_exit(fn -> cleanup_race_fixture(race_repo, race_domain, route_snapshot) end)
+
     fixture =
       on_repo(race_repo, fn ->
-        account = account_fixture("race@#{Ecto.UUID.generate()}.example.test")
+        account = account_fixture("race@#{race_domain}")
 
         {:ok, purge} =
           AccountLifecycle.request_deletion(account.id, Accounts.account_address(account))
@@ -141,23 +202,27 @@ defmodule Manifold.AccountLifecycleTest do
           |> AccountPurge.changeset(%{status: "failed", error_message: "retry me"})
           |> Repo.update!()
 
-        %{account: account, domain_id: account.domain_id, purge: failed}
+        %{account: account, purge: failed}
       end)
-
-    on_exit(fn -> cleanup_race_fixture(race_repo, fixture) end)
 
     barrier_ref = make_ref()
     test_pid = self()
 
-    request_task =
+    holder_task =
       Task.async(fn ->
         receive do
-          {:start_request, ^barrier_ref} ->
+          {:start_holder, ^barrier_ref} ->
             on_repo(race_repo, fn ->
-              AccountLifecycle.request_deletion(
-                fixture.account.id,
-                Accounts.account_address(fixture.account)
+              Ecto.Multi.new()
+              |> Oban.insert(
+                :holder_job,
+                PurgeAccount.new(%{"purge_id" => fixture.purge.id}),
+                retry: false
               )
+              |> Ecto.Multi.run(:force_rollback, fn _repo, _changes ->
+                {:error, :holder_rollback}
+              end)
+              |> Repo.transaction()
             end)
         end
       end)
@@ -169,44 +234,72 @@ defmodule Manifold.AccountLifecycleTest do
       :telemetry.attach(
         handler_id,
         event,
-        fn _event, _measurements, %{query: query}, {owner, ref, request_pid} ->
-          if self() == request_pid and String.contains?(query, "pg_try_advisory_xact_lock") do
-            send(owner, {:request_holds_oban_lock, self(), ref})
+        fn _event, _measurements, %{query: query}, {owner, ref, holder_pid} ->
+          if self() == holder_pid and oban_insert_query?(query) do
+            send(owner, {:holder_inserted_uncommitted, self(), ref})
 
             receive do
-              {:release_oban_lock, ^ref} -> :ok
+              {:release_holder, ^ref} -> :ok
             after
-              5_000 -> :ok
+              10_000 -> :ok
             end
           end
         end,
-        {test_pid, barrier_ref, request_task.pid}
+        {test_pid, barrier_ref, holder_task.pid}
       )
 
-    send(request_task.pid, {:start_request, barrier_ref})
+    send(holder_task.pid, {:start_holder, barrier_ref})
 
-    {request_result, retry_result} =
+    {holder_result, contender_result} =
       try do
-        assert_receive {:request_holds_oban_lock, request_pid, ^barrier_ref}, 2_000
+        assert_receive {:holder_inserted_uncommitted, holder_pid, ^barrier_ref}, 10_000
 
-        retry_task =
+        contender_task =
           Task.async(fn ->
             on_repo(race_repo, fn -> AccountLifecycle.retry_deletion(fixture.purge.id) end)
           end)
 
-        retry_result = Task.await(retry_task, 5_000)
-        send(request_pid, {:release_oban_lock, barrier_ref})
-        request_result = Task.await(request_task, 5_000)
-        {request_result, retry_result}
+        contender_result = Task.await(contender_task, 10_000)
+
+        assert {:error, %{class: :temporary, reason: :purge_job_concurrency}} =
+                 contender_result
+
+        assert on_repo(race_repo, fn -> Repo.get!(AccountPurge, fixture.purge.id).status end) ==
+                 "failed"
+
+        assert on_repo(race_repo, fn -> incomplete_purge_job_count(fixture.purge.id) end) == 0
+
+        send(holder_pid, {:release_holder, barrier_ref})
+        holder_result = Task.await(holder_task, 10_000)
+        {holder_result, contender_result}
       after
-        send(request_task.pid, {:release_oban_lock, barrier_ref})
+        send(holder_task.pid, {:release_holder, barrier_ref})
         :telemetry.detach(handler_id)
       end
 
-    assert {:ok, %AccountPurge{id: purge_id}} = request_result
-    assert {:ok, %AccountPurge{id: ^purge_id, status: "requested"}} = retry_result
+    assert {:error, :force_rollback, :holder_rollback, %{holder_job: %Oban.Job{}}} = holder_result
 
+    assert {:error, %{class: :temporary, reason: :purge_job_concurrency}} =
+             contender_result
+
+    assert on_repo(race_repo, fn -> incomplete_purge_job_count(fixture.purge.id) end) == 0
+
+    assert {:ok, %AccountPurge{id: purge_id, status: "requested"}} =
+             on_repo(race_repo, fn -> AccountLifecycle.retry_deletion(fixture.purge.id) end)
+
+    assert purge_id == fixture.purge.id
     assert on_repo(race_repo, fn -> incomplete_purge_job_count(purge_id) end) == 1
+
+    cleanup_race_data(race_repo, race_domain, route_snapshot)
+
+    assert on_repo(race_repo, fn -> race_fixture_counts(race_domain, purge_id) end) == %{
+             domains: 0,
+             jobs: 0,
+             mailboxes: 0,
+             purges: 0
+           }
+
+    assert on_repo(race_repo, &route_revision_snapshot/0) == route_snapshot
   end
 
   test "request deletion rolls every state change back before job insertion" do
@@ -300,6 +393,54 @@ defmodule Manifold.AccountLifecycleTest do
     assert is_nil(retried.error_message)
     assert Repo.get!(PurgeDelivery, work.id).purge_id == failed.id
     assert incomplete_purge_job_count(failed.id) == 1
+  end
+
+  test "retry deletion waits for an executing prior job before resetting failed state" do
+    account = account_fixture("executing-retry@example.test")
+
+    assert {:ok, purge} =
+             AccountLifecycle.request_deletion(account.id, "executing-retry@example.test")
+
+    {1, nil} =
+      PurgeAccount
+      |> purge_job_query(purge.id)
+      |> Repo.update_all(set: [state: "executing"])
+
+    failed =
+      purge
+      |> AccountPurge.changeset(%{
+        status: "failed",
+        stage: "objects",
+        error_class: "temporary",
+        error_code: "worker_exit",
+        error_message: "old worker is finishing"
+      })
+      |> Repo.update!()
+
+    assert {:error, %{class: :temporary, reason: :purge_job_still_finishing}} =
+             AccountLifecycle.retry_deletion(failed.id)
+
+    assert %AccountPurge{
+             status: "failed",
+             stage: "objects",
+             error_class: "temporary",
+             error_code: "worker_exit",
+             error_message: "old worker is finishing"
+           } = Repo.get!(AccountPurge, failed.id)
+
+    assert [%Oban.Job{state: "executing"} = old_job] = purge_jobs(failed.id)
+
+    {1, nil} =
+      Oban.Job
+      |> where([job], job.id == ^old_job.id)
+      |> Repo.update_all(set: [state: "completed"])
+
+    assert {:ok, %AccountPurge{id: purge_id, status: "requested"}} =
+             AccountLifecycle.retry_deletion(failed.id)
+
+    assert purge_id == failed.id
+    assert incomplete_purge_job_count(failed.id) == 1
+    assert Enum.sort(Enum.map(purge_jobs(failed.id), & &1.state)) == ["available", "completed"]
   end
 
   test "retry deletion rejects missing, nonfailed, and no-longer-purging requests" do
@@ -503,25 +644,91 @@ defmodule Manifold.AccountLifecycleTest do
     end
   end
 
-  defp cleanup_race_fixture(race_repo, fixture) do
-    if Process.alive?(race_repo) do
-      try do
-        on_repo(race_repo, fn ->
-          PurgeAccount
-          |> purge_job_query(fixture.purge.id)
-          |> Repo.delete_all()
+  defp cleanup_race_fixture(race_repo, race_domain, route_snapshot) do
+    cleanup_race_data(race_repo, race_domain, route_snapshot)
+  rescue
+    _error in [DBConnection.ConnectionError, ArgumentError] -> :ok
+  catch
+    :exit, _reason -> :ok
+  after
+    stop_repo(race_repo)
+  end
 
-          Repo.delete_all(from(purge in AccountPurge, where: purge.id == ^fixture.purge.id))
-          Repo.delete_all(from(account in Account, where: account.id == ^fixture.account.id))
+  defp cleanup_race_data(race_repo, race_domain, route_snapshot) do
+    on_repo(race_repo, fn ->
+      domain_ids =
+        Domain
+        |> where([domain], domain.normalized_domain == ^race_domain)
+        |> select([domain], domain.id)
+        |> Repo.all()
 
-          Repo.query!("DELETE FROM domains WHERE id = $1", [
-            Ecto.UUID.dump!(fixture.domain_id)
-          ])
-        end)
-      after
-        if Process.alive?(race_repo), do: Supervisor.stop(race_repo)
-      end
-    end
+      mailbox_ids =
+        Account
+        |> where([account], account.domain_id in ^domain_ids)
+        |> select([account], account.id)
+        |> Repo.all()
+
+      purge_ids =
+        AccountPurge
+        |> where([purge], purge.mailbox_id in ^mailbox_ids)
+        |> select([purge], purge.id)
+        |> Repo.all()
+
+      Oban.Job
+      |> where([job], job.worker == ^inspect(PurgeAccount))
+      |> where([job], fragment("?->>'purge_id'", job.args) in ^purge_ids)
+      |> Repo.delete_all()
+
+      Repo.delete_all(from(purge in AccountPurge, where: purge.id in ^purge_ids))
+      Repo.delete_all(from(account in Account, where: account.id in ^mailbox_ids))
+      Repo.delete_all(from(domain in Domain, where: domain.id in ^domain_ids))
+
+      RouteRevision
+      |> where([revision], revision.id == ^route_snapshot.id)
+      |> Repo.update_all(
+        set: [revision: route_snapshot.revision, updated_at: route_snapshot.updated_at]
+      )
+    end)
+  end
+
+  defp race_fixture_counts(race_domain, purge_id) do
+    domain_query = from(domain in Domain, where: domain.normalized_domain == ^race_domain)
+
+    mailbox_query =
+      from(account in Account,
+        join: domain in Domain,
+        on: domain.id == account.domain_id,
+        where: domain.normalized_domain == ^race_domain
+      )
+
+    %{
+      domains: Repo.aggregate(domain_query, :count),
+      jobs: Repo.aggregate(purge_job_query(PurgeAccount, purge_id), :count),
+      mailboxes: Repo.aggregate(mailbox_query, :count),
+      purges: Repo.aggregate(from(purge in AccountPurge, where: purge.id == ^purge_id), :count)
+    }
+  end
+
+  defp route_revision_snapshot do
+    Repo.one!(
+      from(revision in RouteRevision,
+        select: %{
+          id: revision.id,
+          revision: revision.revision,
+          updated_at: revision.updated_at
+        }
+      )
+    )
+  end
+
+  defp oban_insert_query?(query) do
+    String.starts_with?(query, "INSERT INTO") and String.contains?(query, ~s("oban_jobs"))
+  end
+
+  defp stop_repo(race_repo) do
+    Supervisor.stop(race_repo, :normal, 10_000)
+  catch
+    :exit, _reason -> :ok
   end
 
   defp capture_repo_queries(fun) do

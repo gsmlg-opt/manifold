@@ -44,6 +44,9 @@ defmodule Manifold.AccountLifecycle do
         fn %{purge: purge} -> PurgeAccount.new(%{"purge_id" => purge.id}) end,
         retry: false
       )
+      |> Multi.run(:job_validation, fn _repo, %{job: job} ->
+        validate_persisted_job(job)
+      end)
 
     case Repo.transaction(multi) do
       {:ok, %{purge: purge}} -> {:ok, purge}
@@ -89,6 +92,9 @@ defmodule Manifold.AccountLifecycle do
         fn %{reset: purge} -> PurgeAccount.new(%{"purge_id" => purge.id}) end,
         retry: false
       )
+      |> Multi.run(:job_validation, fn _repo, %{job: job} ->
+        validate_retry_job(job)
+      end)
 
     case Repo.transaction(multi) do
       {:ok, %{reset: purge}} -> {:ok, purge}
@@ -130,8 +136,20 @@ defmodule Manifold.AccountLifecycle do
 
   defp insert_or_load_purge(repo, mailbox_id, now) do
     case repo.get_by(AccountPurge, mailbox_id: mailbox_id) do
-      %AccountPurge{} = purge ->
+      %AccountPurge{status: status} = purge when status in ["requested", "running"] ->
         {:ok, purge}
+
+      %AccountPurge{status: "failed"} ->
+        {:error,
+         Error.new(
+           :permanent,
+           :purge_retry_required,
+           "failed account purges must use the retry operation"
+         )}
+
+      %AccountPurge{status: "completed"} ->
+        {:error,
+         Error.new(:permanent, :account_purge_completed, "account purge is already completed")}
 
       nil ->
         %AccountPurge{inserted_at: now, updated_at: now}
@@ -147,6 +165,37 @@ defmodule Manifold.AccountLifecycle do
     else
       {:ok, :ok}
     end
+  end
+
+  defp validate_retry_job(%Oban.Job{conflict?: true, state: "executing"}) do
+    {:error,
+     Error.new(
+       :temporary,
+       :purge_job_still_finishing,
+       "the previous account purge job is still finishing"
+     )}
+  end
+
+  defp validate_retry_job(%Oban.Job{} = job), do: validate_persisted_job(job)
+
+  defp validate_persisted_job(%Oban.Job{conflict?: true, id: nil}) do
+    {:error,
+     Error.new(
+       :temporary,
+       :purge_job_concurrency,
+       "account purge job insertion is contended; retry the operation"
+     )}
+  end
+
+  defp validate_persisted_job(%Oban.Job{id: id} = job) when is_integer(id), do: {:ok, job}
+
+  defp validate_persisted_job(%Oban.Job{}) do
+    {:error,
+     Error.new(
+       :temporary,
+       :purge_job_concurrency,
+       "account purge job was not durably persisted; retry the operation"
+     )}
   end
 
   defp lock_failed_purge(repo, purge_id) do
