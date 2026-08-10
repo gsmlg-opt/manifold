@@ -50,7 +50,7 @@ defmodule Manifold.Accounts do
   def list_active_accounts do
     Account
     |> join(:inner, [a], d in Domain, on: d.id == a.domain_id)
-    |> where([a, d], a.active and d.active)
+    |> where([a, d], a.active and is_nil(a.purge_requested_at) and d.active)
     |> order_by([a, d], asc: d.normalized_domain, asc: a.canonical_local_part)
     |> preload([a, d], domain: d)
     |> Repo.all()
@@ -75,6 +75,70 @@ defmodule Manifold.Accounts do
     end
   end
 
+  @spec disable_account(Ecto.UUID.t()) ::
+          {:ok, Account.t()} | {:error, Error.t() | term()}
+  def disable_account(account_id) do
+    Repo.transaction(fn ->
+      case disable_account(Repo, account_id) do
+        {:ok, account} -> account
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
+  @doc false
+  @spec disable_account(module(), Ecto.UUID.t()) ::
+          {:ok, Account.t()} | {:error, Error.t() | Ecto.Changeset.t()}
+  def disable_account(repo, account_id) do
+    with {:ok, account} <- account_for_update(repo, account_id) do
+      transition_lifecycle(repo, account, %{active: false})
+    end
+  end
+
+  @doc false
+  @spec active_account_for_update(module(), Ecto.UUID.t()) ::
+          {:ok, Account.t()} | {:error, Error.t()}
+  def active_account_for_update(repo, account_id) do
+    query =
+      Account
+      |> joined_domain_query(account_id)
+      |> where([account, _domain], account.active and is_nil(account.purge_requested_at))
+      |> lock("FOR UPDATE")
+
+    case repo.one(query) do
+      %Account{} = account -> {:ok, account}
+      nil -> {:error, mailbox_not_active_error()}
+    end
+  end
+
+  @doc false
+  @spec begin_purge(module(), Ecto.UUID.t(), String.t(), DateTime.t()) ::
+          {:ok, Account.t()}
+          | {:error, :confirmation_mismatch | Error.t() | Ecto.Changeset.t()}
+  def begin_purge(repo, account_id, confirmation, %DateTime{} = now) do
+    with {:ok, account} <- account_for_update(repo, account_id),
+         :ok <- confirm_account_address(account, confirmation) do
+      attrs =
+        if is_nil(account.purge_requested_at) do
+          %{active: false, purge_requested_at: now}
+        else
+          %{active: false}
+        end
+
+      transition_lifecycle(repo, account, attrs)
+    end
+  end
+
+  @doc false
+  @spec delete_purging_account(module(), Ecto.UUID.t()) ::
+          {:ok, Account.t()} | {:error, Error.t() | Ecto.Changeset.t()}
+  def delete_purging_account(repo, account_id) do
+    with {:ok, account} <- account_for_update(repo, account_id),
+         :ok <- ensure_purging(account) do
+      repo.delete(account)
+    end
+  end
+
   @spec account_address(Account.t()) :: String.t()
   def account_address(%Account{} = account) do
     domain = account.domain || Repo.get!(Domain, account.domain_id)
@@ -87,7 +151,9 @@ defmodule Manifold.Accounts do
       from(account in Account,
         join: domain in Domain,
         on: domain.id == account.domain_id,
-        where: account.id == ^account_id and account.active and domain.active,
+        where:
+          account.id == ^account_id and account.active and
+            is_nil(account.purge_requested_at) and domain.active,
         select: {account, domain}
       )
 
@@ -132,7 +198,9 @@ defmodule Manifold.Accounts do
       from(account in Account,
         join: domain in Domain,
         on: domain.id == account.domain_id,
-        where: account.id == ^account_id and account.active and domain.active,
+        where:
+          account.id == ^account_id and account.active and
+            is_nil(account.purge_requested_at) and domain.active,
         select: domain.id
       )
 
@@ -369,6 +437,79 @@ defmodule Manifold.Accounts do
     end)
   end
 
+  defp account_for_update(repo, account_id) do
+    query =
+      Account
+      |> joined_domain_query(account_id)
+      |> lock("FOR UPDATE")
+
+    case repo.one(query) do
+      %Account{} = account -> {:ok, account}
+      nil -> {:error, account_not_found_error()}
+    end
+  end
+
+  defp joined_domain_query(query, account_id) do
+    query
+    |> join(:inner, [account], domain in Domain, on: domain.id == account.domain_id)
+    |> where([account, _domain], account.id == ^account_id)
+    |> preload([_account, domain], domain: domain)
+  end
+
+  defp confirm_account_address(%Account{} = account, confirmation) do
+    expected = account.local_part <> "@" <> account.domain.normalized_domain
+
+    if String.trim(confirmation) == expected do
+      :ok
+    else
+      {:error, :confirmation_mismatch}
+    end
+  end
+
+  defp ensure_purging(%Account{purge_requested_at: nil}) do
+    {:error,
+     Error.new(:permanent, :account_not_purging, "account deletion has not been requested")}
+  end
+
+  defp ensure_purging(%Account{}), do: :ok
+
+  defp transition_lifecycle(repo, %Account{} = account, attrs) do
+    with {:ok, updated} <- account |> lifecycle_changeset(attrs) |> repo.update(),
+         :ok <- maybe_advance_route_revision(repo, account.active and not updated.active) do
+      {:ok, updated}
+    end
+  end
+
+  defp lifecycle_changeset(%Account{} = account, attrs) do
+    Ecto.Changeset.cast(account, attrs, [:active, :purge_requested_at])
+  end
+
+  defp maybe_advance_route_revision(repo, true) do
+    {:ok, _updated_count} = advance_route_revision(repo)
+    :ok
+  end
+
+  defp maybe_advance_route_revision(_repo, false), do: :ok
+
+  defp advance_route_revision(repo) do
+    {updated_count, nil} =
+      repo.update_all(
+        RouteRevision,
+        inc: [revision: 1],
+        set: [updated_at: DateTime.utc_now()]
+      )
+
+    {:ok, updated_count}
+  end
+
+  defp account_not_found_error do
+    Error.new(:permanent, :account_not_found, "account not found")
+  end
+
+  defp mailbox_not_active_error do
+    Error.new(:permanent, :mailbox_not_active, "account destination is not active")
+  end
+
   defp resolve_parsed(%Address{} = parsed, repo) do
     case repo.get_by(Domain, normalized_domain: parsed.domain, active: true) do
       %Domain{} = domain ->
@@ -385,7 +526,7 @@ defmodule Manifold.Accounts do
     Account
     |> where([a], a.domain_id == ^domain.id)
     |> where([a], a.canonical_local_part == ^parsed.canonical_local_part)
-    |> where([a], a.active)
+    |> where([a], a.active and is_nil(a.purge_requested_at))
     |> repo.one()
     |> case do
       %Account{} = account ->
@@ -412,7 +553,7 @@ defmodule Manifold.Accounts do
     Account
     |> where([a], a.domain_id == ^domain.id)
     |> where([a], a.canonical_local_part == ^base)
-    |> where([a], a.active and a.plus_addressing_enabled)
+    |> where([a], a.active and is_nil(a.purge_requested_at) and a.plus_addressing_enabled)
     |> repo.one()
     |> case do
       %Account{} = account -> route(parsed, domain, base, plus_tag, [account.id])
@@ -455,12 +596,9 @@ defmodule Manifold.Accounts do
           :update -> Ecto.Multi.update(multi, :resource, changeset)
         end
       end)
-      |> Ecto.Multi.update_all(
-        :route_revision,
-        RouteRevision,
-        inc: [revision: 1],
-        set: [updated_at: DateTime.utc_now()]
-      )
+      |> Ecto.Multi.run(:route_revision, fn repo, _changes ->
+        advance_route_revision(repo)
+      end)
 
     multi
     |> Repo.transaction()
@@ -492,7 +630,10 @@ defmodule Manifold.Accounts do
   defp snapshot_routes do
     Account
     |> join(:inner, [account], domain in Domain, on: domain.id == account.domain_id)
-    |> where([account, domain], account.active and domain.active)
+    |> where(
+      [account, domain],
+      account.active and is_nil(account.purge_requested_at) and domain.active
+    )
     |> order_by(
       [account, domain],
       asc: domain.normalized_domain,

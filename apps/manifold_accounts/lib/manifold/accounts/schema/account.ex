@@ -9,6 +9,7 @@ defmodule Manifold.Accounts.Schema.Account do
     field(:canonical_local_part, :string)
     field(:name, :string, source: :display_name)
     field(:active, :boolean, default: true)
+    field(:purge_requested_at, :utc_datetime_usec)
     field(:plus_addressing_enabled, :boolean, default: true)
 
     belongs_to(:domain, Manifold.Accounts.Schema.Domain)
