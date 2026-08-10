@@ -23,6 +23,7 @@ defmodule ManifoldWeb.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:manifold_account_lifecycle, in_umbrella: true},
       {:manifold_accounts, in_umbrella: true},
       {:manifold_connectors, in_umbrella: true},
       {:manifold_ingest, in_umbrella: true},
