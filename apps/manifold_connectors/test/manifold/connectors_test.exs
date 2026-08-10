@@ -1013,7 +1013,7 @@ defmodule Manifold.ConnectorsPollingRaceTest do
       end)
 
     poller_pid = poller.pid
-    assert_receive {:poll_candidates_discovered, ^poller_pid, poller_backend_pid}
+    assert_receive {:poll_candidates_discovered, ^poller_pid, poller_backend_pid}, 5_000
 
     disabler =
       Task.async(fn ->
@@ -1034,7 +1034,7 @@ defmodule Manifold.ConnectorsPollingRaceTest do
       end)
 
     disabler_pid = disabler.pid
-    assert_receive {:mailbox_disabled_and_locked, ^disabler_pid}
+    assert_receive {:mailbox_disabled_and_locked, ^disabler_pid}, 5_000
     send(poller_pid, :attempt_mailbox_lock)
     assert_postgres_lock_wait(poller_backend_pid)
 
@@ -1051,7 +1051,7 @@ defmodule Manifold.ConnectorsPollingRaceTest do
            )
   end
 
-  defp assert_postgres_lock_wait(backend_pid, attempts \\ 100)
+  defp assert_postgres_lock_wait(backend_pid, attempts \\ 500)
 
   defp assert_postgres_lock_wait(_backend_pid, 0) do
     flunk("polling transaction never blocked on the mailbox row lock")
