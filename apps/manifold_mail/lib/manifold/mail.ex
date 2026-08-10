@@ -3,8 +3,12 @@ defmodule Manifold.Mail do
   Public mailbox projection and webmail context.
   """
 
+  import Ecto.Query
+
   alias Ecto.Multi
   alias Manifold.Core.Error
+  alias Manifold.Mail.Schema.{Attachment, MailboxEntry, Message}
+  alias Manifold.Repo
 
   alias Manifold.Mail.{
     Acceptance,
@@ -79,6 +83,88 @@ defmodule Manifold.Mail do
           [Ecto.UUID.t()]
   def stale_projection_delivery_ids(parser_version, sanitizer_version, opts \\ []) do
     Projector.stale_delivery_ids(parser_version, sanitizer_version, opts)
+  end
+
+  @spec list_account_delivery_ids(Ecto.UUID.t(), Ecto.UUID.t() | nil, pos_integer()) :: %{
+          ids: [Ecto.UUID.t()],
+          done?: boolean()
+        }
+  def list_account_delivery_ids(mailbox_id, after_id, limit)
+      when (is_nil(after_id) or is_binary(after_id)) and is_integer(limit) and limit > 0 do
+    owned_deliveries =
+      MailboxEntry
+      |> where([entry], entry.mailbox_id == ^mailbox_id)
+      |> select([entry], %{id: entry.inbound_delivery_id})
+      |> distinct(true)
+
+    query =
+      owned_deliveries
+      |> subquery()
+      |> order_by([delivery], asc: delivery.id)
+      |> limit(^(limit + 1))
+
+    query =
+      if is_binary(after_id) do
+        where(query, [delivery], delivery.id > ^after_id)
+      else
+        query
+      end
+
+    ids = Repo.all(from(delivery in query, select: delivery.id))
+    %{ids: Enum.take(ids, limit), done?: length(ids) <= limit}
+  end
+
+  @spec delete_mailbox_entries_batch(Ecto.UUID.t(), pos_integer()) :: %{
+          deleted: non_neg_integer(),
+          done?: boolean()
+        }
+  def delete_mailbox_entries_batch(mailbox_id, limit)
+      when is_integer(limit) and limit > 0 do
+    target_ids =
+      MailboxEntry
+      |> where([entry], entry.mailbox_id == ^mailbox_id)
+      |> order_by([entry], asc: entry.id)
+      |> limit(^limit)
+      |> lock("FOR UPDATE SKIP LOCKED")
+      |> select([entry], %{id: entry.id})
+
+    {deleted, _rows} =
+      MailboxEntry
+      |> with_cte("target_mailbox_entries", as: ^target_ids, materialized: true)
+      |> join(:inner, [entry], target in "target_mailbox_entries", on: target.id == entry.id)
+      |> where([entry, _target], entry.mailbox_id == ^mailbox_id)
+      |> Repo.delete_all()
+
+    %{deleted: deleted, done?: not account_data_remaining?(mailbox_id)}
+  end
+
+  @spec delivery_owned?(Ecto.UUID.t()) :: boolean()
+  def delivery_owned?(delivery_id) do
+    Repo.exists?(where(MailboxEntry, [entry], entry.inbound_delivery_id == ^delivery_id))
+  end
+
+  @spec attachment_object_keys(module(), Ecto.UUID.t()) :: [String.t()]
+  def attachment_object_keys(repo, delivery_id) do
+    Attachment
+    |> join(:inner, [attachment], message in Message, on: message.id == attachment.message_id)
+    |> where([_attachment, message], message.inbound_delivery_id == ^delivery_id)
+    |> where([attachment, _message], not is_nil(attachment.object_key))
+    |> distinct(true)
+    |> order_by([attachment, _message], asc: attachment.object_key)
+    |> select([attachment, _message], attachment.object_key)
+    |> repo.all()
+  end
+
+  @spec blob_referenced?(String.t() | nil) :: boolean()
+  def blob_referenced?(object_key) when is_binary(object_key) do
+    Repo.exists?(where(Attachment, [attachment], attachment.object_key == ^object_key))
+  end
+
+  def blob_referenced?(nil), do: false
+
+  @spec account_data_remaining?(Ecto.UUID.t()) :: boolean()
+  def account_data_remaining?(mailbox_id) do
+    Repo.exists?(where(MailboxEntry, [entry], entry.mailbox_id == ^mailbox_id))
   end
 
   @spec list_folders(Ecto.UUID.t()) ::
