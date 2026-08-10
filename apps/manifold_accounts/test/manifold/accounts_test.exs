@@ -229,11 +229,16 @@ defmodule Manifold.AccountsTest do
   test "active_account_for_update returns only active non-purging accounts with domain loaded" do
     assert {:ok, account} = Accounts.create_account(%{address: "locked@example.test"})
 
-    assert {:ok, locked} =
-             Repo.transaction(fn ->
-               {:ok, locked} = Accounts.active_account_for_update(Repo, account.id)
-               locked
-             end)
+    {result, queries} =
+      capture_repo_queries(fn ->
+        Repo.transaction(fn ->
+          {:ok, locked} = Accounts.active_account_for_update(Repo, account.id)
+          locked
+        end)
+      end)
+
+    assert {:ok, locked} = result
+    assert_mailbox_only_lock_query(queries)
 
     assert locked.id == account.id
     assert Ecto.assoc_loaded?(locked.domain)
@@ -258,6 +263,17 @@ defmodule Manifold.AccountsTest do
              Repo.transaction(fn ->
                Accounts.active_account_for_update(Repo, Ecto.UUID.generate())
              end)
+  end
+
+  test "account lifecycle transitions lock only the mailbox row" do
+    assert {:ok, account} = Accounts.create_account(%{address: "lifecycle-lock@example.test"})
+
+    {result, queries} = capture_repo_queries(fn -> Accounts.disable_account(account.id) end)
+
+    assert {:ok, disabled} = result
+    assert disabled.id == account.id
+    assert Ecto.assoc_loaded?(disabled.domain)
+    assert_mailbox_only_lock_query(queries)
   end
 
   test "delete_purging_account refuses non-purging accounts and deletes purging accounts" do
@@ -412,5 +428,40 @@ defmodule Manifold.AccountsTest do
 
   defp route_revision do
     Repo.one!(from(revision in RouteRevision, select: revision.revision))
+  end
+
+  defp capture_repo_queries(fun) do
+    event = Keyword.fetch!(Repo.config(), :telemetry_prefix) ++ [:query]
+    handler_id = {__MODULE__, self(), make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn _event, _measurements, metadata, pid -> send(pid, {:repo_query, metadata.query}) end,
+        self()
+      )
+
+    try do
+      result = fun.()
+      {result, collect_repo_queries([])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp collect_repo_queries(queries) do
+    receive do
+      {:repo_query, query} -> collect_repo_queries([query | queries])
+    after
+      0 -> Enum.reverse(queries)
+    end
+  end
+
+  defp assert_mailbox_only_lock_query(queries) do
+    assert [lock_query] = Enum.filter(queries, &String.contains?(&1, "FOR UPDATE"))
+    assert lock_query =~ ~r/FROM "mailboxes" AS [a-z]\d/
+    refute lock_query =~ "JOIN"
+    refute lock_query =~ ~s/"domains"/
   end
 end

@@ -101,14 +101,11 @@ defmodule Manifold.Accounts do
   def active_account_for_update(repo, account_id) do
     query =
       Account
-      |> joined_domain_query(account_id)
-      |> where([account, _domain], account.active and is_nil(account.purge_requested_at))
+      |> where([account], account.id == ^account_id)
+      |> where([account], account.active and is_nil(account.purge_requested_at))
       |> lock("FOR UPDATE")
 
-    case repo.one(query) do
-      %Account{} = account -> {:ok, account}
-      nil -> {:error, mailbox_not_active_error()}
-    end
+    locked_account(repo, query, mailbox_not_active_error())
   end
 
   @doc false
@@ -440,20 +437,17 @@ defmodule Manifold.Accounts do
   defp account_for_update(repo, account_id) do
     query =
       Account
-      |> joined_domain_query(account_id)
+      |> where([account], account.id == ^account_id)
       |> lock("FOR UPDATE")
 
-    case repo.one(query) do
-      %Account{} = account -> {:ok, account}
-      nil -> {:error, account_not_found_error()}
-    end
+    locked_account(repo, query, account_not_found_error())
   end
 
-  defp joined_domain_query(query, account_id) do
-    query
-    |> join(:inner, [account], domain in Domain, on: domain.id == account.domain_id)
-    |> where([account, _domain], account.id == ^account_id)
-    |> preload([_account, domain], domain: domain)
+  defp locked_account(repo, query, not_found_error) do
+    case repo.one(query) do
+      %Account{} = account -> {:ok, repo.preload(account, :domain)}
+      nil -> {:error, not_found_error}
+    end
   end
 
   defp confirm_account_address(%Account{} = account, confirmation) do
