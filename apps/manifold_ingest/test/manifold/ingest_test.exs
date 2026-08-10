@@ -624,6 +624,23 @@ defmodule Manifold.IngestTest do
     assert spool_plan =~ "inbound_deliveries_spool_bundle_path_index"
   end
 
+  test "cleanup indexes are built concurrently outside migration locks" do
+    migration_path =
+      Path.expand(
+        "../../../manifold_data/priv/repo/migrations/20260811000100_add_ingest_cleanup_indexes.exs",
+        __DIR__
+      )
+
+    Code.require_file(migration_path)
+    migration = Manifold.Repo.Migrations.AddIngestCleanupIndexes
+
+    assert [disable_ddl_transaction: true, disable_migration_lock: true] =
+             apply(migration, :__migration__, [])
+
+    source = File.read!(migration_path)
+    assert length(Regex.scan(~r/concurrently:\s*true/, source)) == 2
+  end
+
   test "delivery job cancellation is bounded and preserves unrelated work" do
     start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
 
@@ -657,17 +674,37 @@ defmodule Manifold.IngestTest do
 
     assert Repo.get!(Oban.Job, unrelated.id).state == "available"
     assert Repo.get!(Oban.Job, malformed.id).state == "available"
+  end
 
-    executing = ArchiveRawEmail.new(%{"inbound_delivery_id" => delivery.id}) |> Repo.insert!()
+  test "executing delivery jobs require follow-up drain checks" do
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
 
-    {1, nil} =
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+
+    first =
       Oban.Job
-      |> where([job], job.id == ^executing.id)
+      |> where([job], job.worker == ^inspect(ArchiveRawEmail))
+      |> where(
+        [job],
+        fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery.id)
+      )
+      |> Repo.one!()
+
+    second = ProjectInboundMail.new(%{"inbound_delivery_id" => delivery.id}) |> Repo.insert!()
+
+    {2, nil} =
+      Oban.Job
+      |> where([job], job.id in [^first.id, ^second.id])
       |> Repo.update_all(set: [state: "executing"])
 
-    assert {:snooze, 5} = Ingest.cancel_delivery_jobs([delivery.id], 2)
-    assert Repo.get!(Oban.Job, executing.id).state == "cancelled"
-    assert %{cancelled: 0, done?: true} = Ingest.cancel_delivery_jobs([delivery.id], 2)
+    assert {:snooze, 5} = Ingest.cancel_delivery_jobs([delivery.id], 1)
+    assert target_job_state_counts(delivery.id) == %{"cancelled" => 1, "executing" => 1}
+
+    assert {:snooze, 5} = Ingest.cancel_delivery_jobs([delivery.id], 1)
+    assert target_job_state_counts(delivery.id) == %{"cancelled" => 2}
+
+    assert %{cancelled: 0, done?: true} = Ingest.cancel_delivery_jobs([delivery.id], 1)
   end
 
   test "acceptance rejects empty frozen routes before writing database state" do
