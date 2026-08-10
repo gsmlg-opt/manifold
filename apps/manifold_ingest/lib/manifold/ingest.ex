@@ -188,7 +188,10 @@ defmodule Manifold.Ingest do
   end
 
   defp persist_acceptance(bundle, routes, opts) do
-    case Repo.transaction(acceptance_multi(bundle, routes, opts)) do
+    multi = acceptance_multi(bundle, routes, opts)
+    run_before_persist(opts)
+
+    case Repo.transaction(multi) do
       {:ok, %{delivery: delivery}} ->
         emit_acceptance_telemetry(delivery)
         {:ok, delivery}
@@ -222,6 +225,8 @@ defmodule Manifold.Ingest do
         })
       end)
 
+    run_before_persist(opts)
+
     case Repo.transaction(multi) do
       {:ok, %{delivery: delivery, cloud_ingress_identity: identity}} ->
         emit_acceptance_telemetry(delivery)
@@ -243,6 +248,9 @@ defmodule Manifold.Ingest do
 
     multi =
       Multi.new()
+      |> Multi.run(:active_mailboxes, fn repo, _changes ->
+        lock_active_mailboxes(repo, [source.mailbox_id])
+      end)
       |> Multi.insert(
         :delivery,
         InboundDelivery.acceptance_changeset(%InboundDelivery{}, bundle, %{
@@ -292,6 +300,8 @@ defmodule Manifold.Ingest do
         })
       end)
 
+    run_before_persist(opts)
+
     case Repo.transaction(multi) do
       {:ok, %{delivery: delivery, external_ingress_identity: identity}} ->
         emit_acceptance_telemetry(delivery)
@@ -314,7 +324,16 @@ defmodule Manifold.Ingest do
     source_kind = Keyword.get(opts, :source_kind, "smtp")
     storage_domain_id = Keyword.get(opts, :storage_domain_id, first_route_domain_id(routes))
 
+    mailbox_ids =
+      routes
+      |> Enum.flat_map(& &1.mailbox_ids)
+      |> Enum.uniq()
+      |> Enum.sort()
+
     Multi.new()
+    |> Multi.run(:active_mailboxes, fn repo, _changes ->
+      lock_active_mailboxes(repo, mailbox_ids)
+    end)
     |> Multi.insert(
       :delivery,
       InboundDelivery.acceptance_changeset(%InboundDelivery{}, bundle, %{
@@ -344,6 +363,144 @@ defmodule Manifold.Ingest do
       ArchiveRawEmail.new(%{"inbound_delivery_id" => delivery.id})
     end)
   end
+
+  @spec list_account_delivery_ids(Ecto.UUID.t(), Ecto.UUID.t() | nil, pos_integer()) :: %{
+          ids: [Ecto.UUID.t()],
+          done?: boolean()
+        }
+  def list_account_delivery_ids(mailbox_id, after_id, limit)
+      when (is_nil(after_id) or is_binary(after_id)) and is_integer(limit) and limit > 0 do
+    page_limit = limit + 1
+
+    recipients =
+      DeliveryRecipient
+      |> where([recipient], recipient.mailbox_id == ^mailbox_id)
+      |> select([recipient], %{id: recipient.inbound_delivery_id})
+
+    identities =
+      ExternalIngressIdentity
+      |> where([identity], identity.mailbox_id == ^mailbox_id)
+      |> select([identity], %{id: identity.inbound_delivery_id})
+
+    query =
+      recipients
+      |> union(^identities)
+      |> subquery()
+      |> order_by([owner], asc: owner.id)
+      |> limit(^page_limit)
+
+    query =
+      if is_binary(after_id) do
+        where(query, [owner], owner.id > ^after_id)
+      else
+        query
+      end
+
+    ids = Repo.all(from(owner in query, select: owner.id))
+    %{ids: Enum.take(ids, limit), done?: length(ids) <= limit}
+  end
+
+  @spec delivery_owned?(Ecto.UUID.t()) :: boolean()
+  def delivery_owned?(delivery_id), do: delivery_owned?(Repo, delivery_id)
+
+  @spec delete_mailbox_links_batch(Ecto.UUID.t(), pos_integer()) :: %{
+          deleted: non_neg_integer(),
+          done?: boolean()
+        }
+  def delete_mailbox_links_batch(mailbox_id, limit) when is_integer(limit) and limit > 0 do
+    case mailbox_link_ids(Repo, ExternalIngressIdentity, mailbox_id, limit) do
+      [] ->
+        mailbox_id
+        |> then(&mailbox_link_ids(Repo, DeliveryRecipient, &1, limit))
+        |> delete_mailbox_links(Repo, DeliveryRecipient, mailbox_id)
+
+      ids ->
+        delete_mailbox_links(ids, Repo, ExternalIngressIdentity, mailbox_id)
+    end
+  end
+
+  @spec delete_orphan_delivery(module(), Ecto.UUID.t()) ::
+          {:ok, %{raw_object_key: String.t() | nil, spool_bundle_path: String.t()}}
+          | {:error, Error.t() | Ecto.Changeset.t()}
+  def delete_orphan_delivery(repo, delivery_id) do
+    delivery =
+      InboundDelivery
+      |> where([delivery], delivery.id == ^delivery_id)
+      |> lock("FOR UPDATE")
+      |> repo.one()
+
+    cond do
+      is_nil(delivery) ->
+        {:error, Error.new(:permanent, :not_found, "delivery not found")}
+
+      delivery_owned?(repo, delivery.id) ->
+        {:error,
+         Error.new(
+           :permanent,
+           :delivery_still_owned,
+           "delivery still has mailbox ownership links"
+         )}
+
+      true ->
+        CloudIngressIdentity
+        |> where([identity], identity.inbound_delivery_id == ^delivery.id)
+        |> repo.delete_all()
+
+        case repo.delete(delivery) do
+          {:ok, _delivery} ->
+            {:ok,
+             %{
+               raw_object_key: delivery.raw_object_key,
+               spool_bundle_path: delivery.spool_bundle_path
+             }}
+
+          {:error, changeset} ->
+            {:error, changeset}
+        end
+    end
+  end
+
+  @spec raw_object_referenced?(String.t() | nil) :: boolean()
+  def raw_object_referenced?(key) when is_binary(key) do
+    Repo.exists?(where(InboundDelivery, [delivery], delivery.raw_object_key == ^key))
+  end
+
+  def raw_object_referenced?(nil), do: false
+
+  @spec spool_path_referenced?(String.t() | nil) :: boolean()
+  def spool_path_referenced?(path) when is_binary(path) do
+    Repo.exists?(where(InboundDelivery, [delivery], delivery.spool_bundle_path == ^path))
+  end
+
+  def spool_path_referenced?(nil), do: false
+
+  @spec cancel_delivery_jobs([Ecto.UUID.t()], pos_integer()) ::
+          {:snooze, 5} | %{cancelled: non_neg_integer(), done?: boolean()}
+  def cancel_delivery_jobs(delivery_ids, limit)
+      when is_list(delivery_ids) and is_integer(limit) and limit > 0 do
+    matching = delivery_job_query(delivery_ids)
+    executing? = matching |> where([job], job.state == "executing") |> Repo.exists?()
+
+    selected_ids =
+      matching
+      |> order_by([job], asc: job.id)
+      |> limit(^limit)
+      |> select([job], job.id)
+
+    {:ok, cancelled} =
+      Oban.Job
+      |> where([job], job.id in subquery(selected_ids))
+      |> Oban.cancel_all_jobs()
+
+    if executing? do
+      {:snooze, 5}
+    else
+      %{cancelled: cancelled, done?: not Repo.exists?(matching)}
+    end
+  end
+
+  @spec account_data_remaining?(Ecto.UUID.t()) :: boolean()
+  def account_data_remaining?(mailbox_id), do: account_data_remaining?(Repo, mailbox_id)
 
   @spec list_inbound_deliveries() :: [InboundDelivery.t()]
   def list_inbound_deliveries do
@@ -1152,6 +1309,67 @@ defmodule Manifold.Ingest do
      })}
   end
 
+  defp lock_active_mailboxes(repo, mailbox_ids) do
+    Enum.reduce_while(Enum.sort(mailbox_ids), {:ok, :ok}, fn mailbox_id, {:ok, :ok} ->
+      case Accounts.active_account_for_update(repo, mailbox_id) do
+        {:ok, _mailbox} -> {:cont, {:ok, :ok}}
+        {:error, %Error{} = error} -> {:halt, {:error, error}}
+      end
+    end)
+  end
+
+  defp mailbox_link_ids(repo, schema, mailbox_id, limit) do
+    schema
+    |> where([link], link.mailbox_id == ^mailbox_id)
+    |> order_by([link], asc: link.id)
+    |> limit(^limit)
+    |> select([link], link.id)
+    |> repo.all()
+  end
+
+  defp delete_mailbox_links(ids, repo, schema, mailbox_id) do
+    {deleted, _rows} =
+      schema
+      |> where([link], link.id in ^ids)
+      |> repo.delete_all()
+
+    %{deleted: deleted, done?: not account_data_remaining?(repo, mailbox_id)}
+  end
+
+  defp delivery_owned?(repo, delivery_id) do
+    repo.exists?(
+      where(DeliveryRecipient, [recipient], recipient.inbound_delivery_id == ^delivery_id)
+    ) or
+      repo.exists?(
+        where(
+          ExternalIngressIdentity,
+          [identity],
+          identity.inbound_delivery_id == ^delivery_id
+        )
+      )
+  end
+
+  defp delivery_job_query(delivery_ids) do
+    workers =
+      Enum.map(
+        [ArchiveRawEmail, ProjectInboundMail, EvaluateInboundSecurity],
+        &inspect/1
+      )
+
+    Oban.Job
+    |> where([job], job.worker in ^workers)
+    |> where([job], job.state in ~w(available scheduled executing retryable suspended))
+    |> where(
+      [job],
+      fragment("?->>'inbound_delivery_id'", job.args) in ^delivery_ids
+    )
+  end
+
+  defp account_data_remaining?(repo, mailbox_id) do
+    repo.exists?(where(DeliveryRecipient, [recipient], recipient.mailbox_id == ^mailbox_id)) or
+      repo.exists?(where(ExternalIngressIdentity, [identity], identity.mailbox_id == ^mailbox_id))
+  end
+
   defp build_recipient_rows(routes, now) do
     Enum.flat_map(routes, fn route ->
       Enum.map(route.mailbox_ids, fn mailbox_id ->
@@ -1435,5 +1653,14 @@ defmodule Manifold.Ingest do
     else
       :ok
     end
+  end
+
+  defp run_before_persist(opts) do
+    case Keyword.get(opts, :before_persist) do
+      callback when is_function(callback, 0) -> callback.()
+      nil -> :ok
+    end
+
+    :ok
   end
 end

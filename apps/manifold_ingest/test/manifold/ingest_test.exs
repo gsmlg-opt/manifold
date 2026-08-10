@@ -106,6 +106,24 @@ defmodule Manifold.IngestTest do
     assert Repo.aggregate(Oban.Job, :count) == 0
   end
 
+  test "frozen routes cannot accept mail after their mailbox is disabled" do
+    %{mailbox: mailbox, route: route} = route_fixture()
+    bundle = edge_bundle!("stale-route", [route])
+    edge_bundle = edge_bundle!("stale-edge-route", [route])
+
+    assert {:ok, _mailbox} = Accounts.disable_account(mailbox.id)
+
+    assert {:error, %{class: :permanent, reason: :mailbox_not_active}} =
+             Ingest.accept(bundle, [route])
+
+    assert {:error, %{class: :permanent, reason: :mailbox_not_active}} =
+             Ingest.accept_edge("edge-primary", "stale-edge", edge_bundle, [route])
+
+    assert Repo.aggregate(InboundDelivery, :count) == 0
+    assert Repo.aggregate(DeliveryRecipient, :count) == 0
+    assert Repo.aggregate(CloudIngressIdentity, :count) == 0
+  end
+
   test "edge acceptance records provenance in the acceptance transaction" do
     %{route: route} = route_fixture()
     bundle = edge_bundle!("edge-first", [route])
@@ -327,6 +345,21 @@ defmodule Manifold.IngestTest do
     assert Repo.aggregate(InboundDelivery, :count) == 0
   end
 
+  test "external import rechecks mailbox activity immediately before persistence" do
+    %{domain: domain, mailbox: mailbox} = route_fixture()
+    source = external_source(domain, mailbox, "gmail-message-stale")
+
+    before_persist = fn ->
+      assert {:ok, _mailbox} = Accounts.disable_account(mailbox.id)
+    end
+
+    assert {:error, %{class: :permanent, reason: :mailbox_not_active}} =
+             Ingest.import_external(raw_message(), source, before_persist: before_persist)
+
+    assert Repo.aggregate(InboundDelivery, :count) == 0
+    assert Repo.aggregate(ExternalIngressIdentity, :count) == 0
+  end
+
   test "external acceptance failure leaves a ready orphan and no logical acceptance" do
     %{domain: domain, mailbox: mailbox} = route_fixture()
     source = external_source(domain, mailbox, "gmail-message-rollback")
@@ -380,6 +413,188 @@ defmodule Manifold.IngestTest do
     assert delivery.raw_storage_state == "archived"
     assert String.starts_with?(delivery.raw_object_key, "raw/#{domain.id}/")
     assert Repo.aggregate(DeliveryRecipient, :count) == 0
+  end
+
+  test "account delivery ownership APIs include external imports and delete their links" do
+    %{domain: domain, mailbox: mailbox} = route_fixture()
+    source = external_source(domain, mailbox, "gmail-message-cleanup")
+
+    assert {:ok, receipt} = Ingest.import_external(raw_message(), source)
+    delivery_id = receipt.inbound_delivery_id
+
+    assert %{ids: [^delivery_id], done?: true} =
+             Ingest.list_account_delivery_ids(mailbox.id, nil, 250)
+
+    assert Ingest.delivery_owned?(delivery_id)
+    assert Ingest.account_data_remaining?(mailbox.id)
+
+    assert %{deleted: 1, done?: true} =
+             Ingest.delete_mailbox_links_batch(mailbox.id, 250)
+
+    refute Ingest.delivery_owned?(delivery_id)
+    refute Ingest.account_data_remaining?(mailbox.id)
+  end
+
+  test "account delivery listing unions, deduplicates, orders, and pages ownership sources" do
+    %{domain: domain, mailbox: mailbox, route: route} = route_fixture()
+    assert {:ok, smtp_delivery} = accept_delivery([route])
+
+    ExternalIngressIdentity.changeset(%ExternalIngressIdentity{}, %{
+      provider: "gmail",
+      source_id: Ecto.UUID.generate(),
+      external_message_id: "duplicate-owner",
+      inbound_delivery_id: smtp_delivery.id,
+      mailbox_id: mailbox.id,
+      raw_size: smtp_delivery.raw_size,
+      raw_sha256: smtp_delivery.raw_sha256,
+      target_sha256: String.duplicate("0", 64)
+    })
+    |> Repo.insert!()
+
+    source = external_source(domain, mailbox, "gmail-message-page")
+    assert {:ok, external_receipt} = Ingest.import_external(raw_message(), source)
+
+    expected_ids = Enum.sort([smtp_delivery.id, external_receipt.inbound_delivery_id])
+
+    assert %{ids: ^expected_ids, done?: true} =
+             Ingest.list_account_delivery_ids(mailbox.id, nil, 10)
+
+    assert [first_id, second_id] = expected_ids
+
+    assert %{ids: [^first_id], done?: false} =
+             Ingest.list_account_delivery_ids(mailbox.id, nil, 1)
+
+    assert %{ids: [^second_id], done?: true} =
+             Ingest.list_account_delivery_ids(mailbox.id, first_id, 1)
+  end
+
+  test "mailbox link deletion drains one ownership table per call" do
+    %{domain: domain, mailbox: mailbox, route: route} = route_fixture()
+    assert {:ok, _smtp_delivery} = accept_delivery([route])
+
+    assert {:ok, _external_receipt} =
+             Ingest.import_external(
+               raw_message(),
+               external_source(domain, mailbox, "gmail-message-drain")
+             )
+
+    assert %{deleted: 1, done?: false} =
+             Ingest.delete_mailbox_links_batch(mailbox.id, 250)
+
+    assert Repo.aggregate(ExternalIngressIdentity, :count) == 0
+    assert Repo.aggregate(DeliveryRecipient, :count) == 1
+
+    assert %{deleted: 1, done?: true} =
+             Ingest.delete_mailbox_links_batch(mailbox.id, 250)
+
+    assert Repo.aggregate(DeliveryRecipient, :count) == 0
+  end
+
+  test "mailbox link deletion preserves shared delivery ownership" do
+    %{domain: domain, mailbox: first_mailbox, route: first_route} = route_fixture()
+    {:ok, second_mailbox} = Accounts.create_account(domain, %{local_part: "shared"})
+
+    second_route = %{
+      first_route
+      | original_recipient: "shared@#{domain.normalized_domain}",
+        canonical_recipient: "shared@#{domain.normalized_domain}",
+        mailbox_ids: [second_mailbox.id]
+    }
+
+    assert {:ok, delivery} = accept_delivery([first_route, second_route])
+
+    assert %{deleted: 1, done?: true} =
+             Ingest.delete_mailbox_links_batch(first_mailbox.id, 250)
+
+    assert Ingest.delivery_owned?(delivery.id)
+    refute Ingest.account_data_remaining?(first_mailbox.id)
+
+    assert %{ids: [delivery_id], done?: true} =
+             Ingest.list_account_delivery_ids(second_mailbox.id, nil, 250)
+
+    assert delivery_id == delivery.id
+  end
+
+  test "orphan delivery deletion returns object candidates and removes cloud provenance" do
+    %{mailbox: mailbox, route: route} = route_fixture()
+    bundle = edge_bundle!("orphan-edge", [route])
+
+    assert {:ok, receipt} =
+             Ingest.accept_edge("edge-primary", "orphan-edge", bundle, [route])
+
+    delivery = Repo.get!(InboundDelivery, receipt.inbound_delivery_id)
+    raw_object_key = "raw/orphan/#{delivery.id}.eml"
+
+    delivery
+    |> Ecto.Changeset.change(raw_object_key: raw_object_key)
+    |> Repo.update!()
+
+    assert Ingest.raw_object_referenced?(raw_object_key)
+    assert Ingest.spool_path_referenced?(delivery.spool_bundle_path)
+    assert %{deleted: 1, done?: true} = Ingest.delete_mailbox_links_batch(mailbox.id, 250)
+
+    assert {:ok,
+            %{
+              raw_object_key: ^raw_object_key,
+              spool_bundle_path: spool_bundle_path
+            }} = Ingest.delete_orphan_delivery(Repo, delivery.id)
+
+    assert spool_bundle_path == delivery.spool_bundle_path
+    refute Repo.get(InboundDelivery, delivery.id)
+    refute Repo.get_by(CloudIngressIdentity, inbound_delivery_id: delivery.id)
+    refute Ingest.raw_object_referenced?(raw_object_key)
+    refute Ingest.spool_path_referenced?(delivery.spool_bundle_path)
+  end
+
+  test "orphan delivery deletion rejects deliveries with any mailbox owner" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+
+    assert {:error, %{class: :permanent, reason: :delivery_still_owned}} =
+             Ingest.delete_orphan_delivery(Repo, delivery.id)
+
+    assert Repo.get!(InboundDelivery, delivery.id)
+  end
+
+  test "delivery job cancellation is bounded and preserves unrelated work" do
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+    %{route: other_route} = route_fixture()
+    assert {:ok, other_delivery} = accept_delivery([other_route])
+
+    ProjectInboundMail.new(%{"inbound_delivery_id" => delivery.id}) |> Repo.insert!()
+
+    suspended =
+      EvaluateInboundSecurity.new(%{"inbound_delivery_id" => delivery.id}) |> Repo.insert!()
+
+    {1, nil} =
+      Oban.Job
+      |> where([job], job.id == ^suspended.id)
+      |> Repo.update_all(set: [state: "suspended"])
+
+    unrelated =
+      ProjectInboundMail.new(%{"inbound_delivery_id" => other_delivery.id}) |> Repo.insert!()
+
+    malformed = ArchiveRawEmail.new(%{"delivery_id" => delivery.id}) |> Repo.insert!()
+
+    assert %{cancelled: 2, done?: false} = Ingest.cancel_delivery_jobs([delivery.id], 2)
+    assert %{cancelled: 1, done?: true} = Ingest.cancel_delivery_jobs([delivery.id], 2)
+
+    assert Repo.get!(Oban.Job, unrelated.id).state == "available"
+    assert Repo.get!(Oban.Job, malformed.id).state == "available"
+
+    executing = ArchiveRawEmail.new(%{"inbound_delivery_id" => delivery.id}) |> Repo.insert!()
+
+    {1, nil} =
+      Oban.Job
+      |> where([job], job.id == ^executing.id)
+      |> Repo.update_all(set: [state: "executing"])
+
+    assert {:snooze, 5} = Ingest.cancel_delivery_jobs([delivery.id], 2)
+    assert Repo.get!(Oban.Job, executing.id).state == "cancelled"
+    assert %{cancelled: 0, done?: true} = Ingest.cancel_delivery_jobs([delivery.id], 2)
   end
 
   test "acceptance rejects empty frozen routes before writing database state" do
