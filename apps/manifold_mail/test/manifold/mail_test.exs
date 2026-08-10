@@ -179,11 +179,20 @@ defmodule Manifold.MailTest do
     assert length(Regex.scan(~r/concurrently:\s*true/, attachment_source)) == 1
 
     mailbox_source = File.read!(mailbox_migration_path)
-    assert mailbox_source =~ "create_if_not_exists("
-    assert mailbox_source =~ "index(:mailbox_entries, [:mailbox_id, :id], concurrently: true)"
+    create_source = "create(index(:mailbox_entries, [:mailbox_id, :id], concurrently: true))"
+
+    drop_source =
+      "drop_if_exists(index(:mailbox_entries, [:mailbox_id, :id], concurrently: true))"
+
+    assert mailbox_source =~ create_source
+    refute mailbox_source =~ "create_if_not_exists("
     assert mailbox_source =~ "drop_if_exists("
     assert mailbox_source =~ "def up"
     assert mailbox_source =~ "def down"
+
+    {drop_position, _length} = :binary.match(mailbox_source, drop_source)
+    {create_position, _length} = :binary.match(mailbox_source, create_source)
+    assert drop_position < create_position
 
     expected_indexes = [
       "attachments_object_key_index",

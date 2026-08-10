@@ -5,7 +5,8 @@ defmodule Manifold.Repo.Migrations.AddMailboxEntryCleanupIndex do
   @disable_migration_lock true
 
   def up do
-    create_if_not_exists(index(:mailbox_entries, [:mailbox_id, :id], concurrently: true))
+    drop_if_exists(index(:mailbox_entries, [:mailbox_id, :id], concurrently: true))
+    create(index(:mailbox_entries, [:mailbox_id, :id], concurrently: true))
   end
 
   def down do
