@@ -423,6 +423,15 @@ defmodule Manifold.Ingest do
           {:ok, %{raw_object_key: String.t() | nil, spool_bundle_path: String.t()}}
           | {:error, Error.t() | Ecto.Changeset.t()}
   def delete_orphan_delivery(repo, delivery_id) do
+    repo.transaction(fn ->
+      case delete_orphan_delivery_transaction(repo, delivery_id) do
+        {:ok, candidates} -> candidates
+        {:error, reason} -> repo.rollback(reason)
+      end
+    end)
+  end
+
+  defp delete_orphan_delivery_transaction(repo, delivery_id) do
     delivery =
       InboundDelivery
       |> where([delivery], delivery.id == ^delivery_id)
@@ -446,16 +455,26 @@ defmodule Manifold.Ingest do
         |> where([identity], identity.inbound_delivery_id == ^delivery.id)
         |> repo.delete_all()
 
-        case repo.delete(delivery) do
-          {:ok, _delivery} ->
-            {:ok,
-             %{
-               raw_object_key: delivery.raw_object_key,
-               spool_bundle_path: delivery.spool_bundle_path
-             }}
+        try do
+          case repo.delete(delivery) do
+            {:ok, _delivery} ->
+              {:ok,
+               %{
+                 raw_object_key: delivery.raw_object_key,
+                 spool_bundle_path: delivery.spool_bundle_path
+               }}
 
-          {:error, changeset} ->
-            {:error, changeset}
+            {:error, changeset} ->
+              {:error, changeset}
+          end
+        rescue
+          Ecto.ConstraintError ->
+            {:error,
+             Error.new(
+               :temporary,
+               :delivery_delete_failed,
+               "delivery could not be deleted"
+             )}
         end
     end
   end
@@ -492,7 +511,12 @@ defmodule Manifold.Ingest do
       |> where([job], job.id in subquery(selected_ids))
       |> Oban.cancel_all_jobs()
 
-    if executing? do
+    matching_executing? =
+      matching
+      |> where([job], job.state == "executing")
+      |> Repo.exists?()
+
+    if cancelled > 0 or executing? or matching_executing? do
       {:snooze, 5}
     else
       %{cancelled: cancelled, done?: not Repo.exists?(matching)}

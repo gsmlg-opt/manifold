@@ -468,25 +468,35 @@ defmodule Manifold.IngestTest do
              Ingest.list_account_delivery_ids(mailbox.id, first_id, 1)
   end
 
-  test "mailbox link deletion drains one ownership table per call" do
+  test "mailbox link deletion is bounded and drains one ownership table per call" do
     %{domain: domain, mailbox: mailbox, route: route} = route_fixture()
-    assert {:ok, _smtp_delivery} = accept_delivery([route])
 
-    assert {:ok, _external_receipt} =
-             Ingest.import_external(
-               raw_message(),
-               external_source(domain, mailbox, "gmail-message-drain")
-             )
+    for _index <- 1..3 do
+      assert {:ok, _smtp_delivery} = accept_delivery([route])
+    end
 
-    assert %{deleted: 1, done?: false} =
-             Ingest.delete_mailbox_links_batch(mailbox.id, 250)
+    for index <- 1..3 do
+      assert {:ok, _external_receipt} =
+               Ingest.import_external(
+                 raw_message(),
+                 external_source(domain, mailbox, "gmail-message-drain-#{index}")
+               )
+    end
+
+    assert %{deleted: 2, done?: false} = Ingest.delete_mailbox_links_batch(mailbox.id, 2)
+
+    assert Repo.aggregate(ExternalIngressIdentity, :count) == 1
+    assert Repo.aggregate(DeliveryRecipient, :count) == 3
+
+    assert %{deleted: 1, done?: false} = Ingest.delete_mailbox_links_batch(mailbox.id, 2)
 
     assert Repo.aggregate(ExternalIngressIdentity, :count) == 0
+    assert Repo.aggregate(DeliveryRecipient, :count) == 3
+
+    assert %{deleted: 2, done?: false} = Ingest.delete_mailbox_links_batch(mailbox.id, 2)
     assert Repo.aggregate(DeliveryRecipient, :count) == 1
 
-    assert %{deleted: 1, done?: true} =
-             Ingest.delete_mailbox_links_batch(mailbox.id, 250)
-
+    assert %{deleted: 1, done?: true} = Ingest.delete_mailbox_links_batch(mailbox.id, 2)
     assert Repo.aggregate(DeliveryRecipient, :count) == 0
   end
 
@@ -533,11 +543,16 @@ defmodule Manifold.IngestTest do
     assert Ingest.spool_path_referenced?(delivery.spool_bundle_path)
     assert %{deleted: 1, done?: true} = Ingest.delete_mailbox_links_batch(mailbox.id, 250)
 
+    {result, queries} =
+      capture_repo_queries(fn -> Ingest.delete_orphan_delivery(Repo, delivery.id) end)
+
     assert {:ok,
             %{
               raw_object_key: ^raw_object_key,
               spool_bundle_path: spool_bundle_path
-            }} = Ingest.delete_orphan_delivery(Repo, delivery.id)
+            }} = result
+
+    assert Enum.any?(queries, &transaction_boundary_query?/1)
 
     assert spool_bundle_path == delivery.spool_bundle_path
     refute Repo.get(InboundDelivery, delivery.id)
@@ -554,6 +569,59 @@ defmodule Manifold.IngestTest do
              Ingest.delete_orphan_delivery(Repo, delivery.id)
 
     assert Repo.get!(InboundDelivery, delivery.id)
+  end
+
+  test "orphan delivery deletion rolls back cloud provenance when delivery deletion fails" do
+    %{mailbox: mailbox, route: route} = route_fixture()
+    bundle = edge_bundle!("orphan-rollback", [route])
+
+    assert {:ok, receipt} =
+             Ingest.accept_edge("edge-primary", "orphan-rollback", bundle, [route])
+
+    assert %{deleted: 1, done?: true} = Ingest.delete_mailbox_links_batch(mailbox.id, 250)
+    insert_restricting_remote_message(mailbox.id, receipt.inbound_delivery_id)
+
+    result =
+      try do
+        Ingest.delete_orphan_delivery(Repo, receipt.inbound_delivery_id)
+      rescue
+        Ecto.ConstraintError -> :raised_constraint_error
+      end
+
+    assert {:error, %{class: :temporary, reason: :delivery_delete_failed}} = result
+    assert Repo.get_by!(CloudIngressIdentity, inbound_delivery_id: receipt.inbound_delivery_id)
+    assert Repo.get!(InboundDelivery, receipt.inbound_delivery_id)
+  end
+
+  test "cleanup reference probes use dedicated inbound delivery indexes" do
+    expected_indexes = [
+      "inbound_deliveries_raw_object_key_index",
+      "inbound_deliveries_spool_bundle_path_index"
+    ]
+
+    indexes =
+      Repo.query!(
+        """
+        SELECT indexname, indexdef
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND tablename = 'inbound_deliveries'
+          AND indexname = ANY($1)
+        ORDER BY indexname
+        """,
+        [expected_indexes]
+      ).rows
+
+    assert Enum.map(indexes, &hd/1) == expected_indexes
+    assert Enum.at(indexes, 0) |> Enum.at(1) =~ "WHERE (raw_object_key IS NOT NULL)"
+
+    Repo.query!("SET LOCAL enable_seqscan = off")
+
+    raw_plan = reference_query_plan("raw_object_key", "raw/missing.eml")
+    spool_plan = reference_query_plan("spool_bundle_path", "/spool/missing")
+
+    assert raw_plan =~ "inbound_deliveries_raw_object_key_index"
+    assert spool_plan =~ "inbound_deliveries_spool_bundle_path_index"
   end
 
   test "delivery job cancellation is bounded and preserves unrelated work" do
@@ -579,8 +647,13 @@ defmodule Manifold.IngestTest do
 
     malformed = ArchiveRawEmail.new(%{"delivery_id" => delivery.id}) |> Repo.insert!()
 
-    assert %{cancelled: 2, done?: false} = Ingest.cancel_delivery_jobs([delivery.id], 2)
-    assert %{cancelled: 1, done?: true} = Ingest.cancel_delivery_jobs([delivery.id], 2)
+    assert {:snooze, 5} = Ingest.cancel_delivery_jobs([delivery.id], 2)
+    assert target_job_state_counts(delivery.id) == %{"cancelled" => 2, "suspended" => 1}
+
+    assert {:snooze, 5} = Ingest.cancel_delivery_jobs([delivery.id], 2)
+    assert target_job_state_counts(delivery.id) == %{"cancelled" => 3}
+
+    assert %{cancelled: 0, done?: true} = Ingest.cancel_delivery_jobs([delivery.id], 2)
 
     assert Repo.get!(Oban.Job, unrelated.id).state == "available"
     assert Repo.get!(Oban.Job, malformed.id).state == "available"
@@ -1194,4 +1267,101 @@ defmodule Manifold.IngestTest do
   end
 
   defp raw_message, do: "Subject: hello\r\n\r\nBody\r\n"
+
+  defp capture_repo_queries(fun) do
+    event = Keyword.fetch!(Repo.config(), :telemetry_prefix) ++ [:query]
+    handler_id = {__MODULE__, self(), make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn _event, _measurements, metadata, pid -> send(pid, {:repo_query, metadata.query}) end,
+        self()
+      )
+
+    try do
+      result = fun.()
+      {result, collect_repo_queries([])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp collect_repo_queries(queries) do
+    receive do
+      {:repo_query, query} -> collect_repo_queries([query | queries])
+    after
+      0 -> Enum.reverse(queries)
+    end
+  end
+
+  defp transaction_boundary_query?(query) do
+    query in ["begin", "commit"] or String.starts_with?(query, "SAVEPOINT") or
+      String.starts_with?(query, "RELEASE SAVEPOINT")
+  end
+
+  defp insert_restricting_remote_message(mailbox_id, delivery_id) do
+    account_id = Ecto.UUID.generate()
+    now = DateTime.utc_now()
+
+    Repo.query!(
+      """
+      INSERT INTO connector_accounts (
+        id, mailbox_id, provider, provider_account_id, email_address, status,
+        enabled, sync_enabled, granted_scopes, lock_version, inserted_at, updated_at
+      ) VALUES ($1, $2, 'gmail', $3, 'cleanup@example.test', 'connected',
+                false, true, ARRAY[]::text[], 1, $4, $4)
+      """,
+      [
+        Ecto.UUID.dump!(account_id),
+        Ecto.UUID.dump!(mailbox_id),
+        "cleanup:#{account_id}",
+        now
+      ]
+    )
+
+    Repo.query!(
+      """
+      INSERT INTO connector_remote_messages (
+        id, external_account_id, provider_message_id, inbound_delivery_id,
+        remote_labels, remote_read, remote_starred, remote_deleted, state,
+        lock_version, inserted_at, updated_at
+      ) VALUES ($1, $2, $3, $4, ARRAY[]::text[], false, false, false,
+                'imported', 1, $5, $5)
+      """,
+      [
+        Ecto.UUID.dump!(Ecto.UUID.generate()),
+        Ecto.UUID.dump!(account_id),
+        "cleanup:#{delivery_id}",
+        Ecto.UUID.dump!(delivery_id),
+        now
+      ]
+    )
+  end
+
+  defp reference_query_plan(column, value) do
+    %{rows: rows} =
+      Repo.query!(
+        "EXPLAIN SELECT 1 FROM inbound_deliveries WHERE #{column} = $1 LIMIT 1",
+        [value]
+      )
+
+    rows |> List.flatten() |> Enum.join("\n")
+  end
+
+  defp target_job_state_counts(delivery_id) do
+    workers = Enum.map([ArchiveRawEmail, ProjectInboundMail, EvaluateInboundSecurity], &inspect/1)
+
+    Oban.Job
+    |> where([job], job.worker in ^workers)
+    |> where(
+      [job],
+      fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery_id)
+    )
+    |> group_by([job], job.state)
+    |> select([job], {job.state, count(job.id)})
+    |> Repo.all()
+    |> Map.new()
+  end
 end
