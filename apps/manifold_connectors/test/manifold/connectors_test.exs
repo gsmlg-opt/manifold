@@ -290,28 +290,6 @@ defmodule Manifold.ConnectorsTest do
     assert Repo.aggregate(query, :count) == 0
   end
 
-  test "polling rechecks mailbox activity after candidate discovery", %{mailbox: mailbox} do
-    assert {:ok, account} =
-             Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
-
-    Repo.delete_all(Oban.Job)
-
-    assert {:ok, 0} =
-             Connectors.enqueue_due_syncs(
-               before_locked_recheck: fn ->
-                 assert {:ok, _disabled} = Accounts.disable_account(mailbox.id)
-               end
-             )
-
-    refute Repo.exists?(
-             from(job in Oban.Job,
-               where:
-                 job.worker == ^inspect(SyncAccount) and
-                   fragment("?->>'external_account_id' = ?", job.args, ^account.id)
-             )
-           )
-  end
-
   test "read push rejects disabled and purging mailboxes without local changes", %{
     domain: domain,
     mailbox: mailbox
@@ -346,6 +324,61 @@ defmodule Manifold.ConnectorsTest do
                )
              )
     end)
+  end
+
+  test "read push only updates the mailbox entry owner's remote on a shared delivery", %{
+    domain: domain,
+    mailbox: purging_mailbox
+  } do
+    {:ok, active_mailbox} = Accounts.create_account(domain, %{local_part: "read-shared-active"})
+    delivery_id = Ecto.UUID.generate()
+    insert_delivery(delivery_id, domain.id)
+
+    purging_method =
+      insert_receive_method(purging_mailbox.id, "read-shared-purging", kind: "imap")
+
+    active_method = insert_receive_method(active_mailbox.id, "read-shared-active", kind: "imap")
+
+    purging_remote =
+      insert_remote_message(purging_method.id, "read-shared-purging", delivery_id)
+
+    active_remote = insert_remote_message(active_method.id, "read-shared-active", delivery_id)
+
+    entry =
+      Repo.insert!(
+        MailboxEntry.changeset(%MailboxEntry{}, %{
+          mailbox_id: active_mailbox.id,
+          inbound_delivery_id: delivery_id,
+          original_recipient: "read-shared-active@example.test",
+          quarantined: false
+        })
+      )
+
+    {1, nil} =
+      Account
+      |> where([account], account.id == ^purging_mailbox.id)
+      |> Repo.update_all(set: [active: true, purge_requested_at: DateTime.utc_now()])
+
+    assert :ok = Connectors.enqueue_read_push([entry.id], true)
+
+    assert Repo.get!(RemoteMessage, active_remote.id).remote_read
+    refute Repo.get!(RemoteMessage, purging_remote.id).remote_read
+
+    assert Repo.exists?(
+             from(job in Oban.Job,
+               where:
+                 job.worker == ^inspect(PushRemoteRead) and
+                   fragment("?->>'remote_message_id' = ?", job.args, ^active_remote.id)
+             )
+           )
+
+    refute Repo.exists?(
+             from(job in Oban.Job,
+               where:
+                 job.worker == ^inspect(PushRemoteRead) and
+                   fragment("?->>'remote_message_id' = ?", job.args, ^purging_remote.id)
+             )
+           )
   end
 
   test "sync_job_running? reflects incomplete SyncAccount jobs", %{mailbox: mailbox} do
@@ -592,20 +625,44 @@ defmodule Manifold.ConnectorsTest do
   test "cancel_account_jobs keeps account ownership matching inside the job query", %{
     mailbox: mailbox
   } do
-    for index <- 1..25 do
-      method = insert_receive_method(mailbox.id, "query-shape-#{index}")
-      insert_remote_message(method.id, "query-shape-#{index}")
-    end
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+
+    [target_method | _] =
+      for index <- 1..25 do
+        method = insert_receive_method(mailbox.id, "query-shape-#{index}")
+        insert_remote_message(method.id, "query-shape-#{index}")
+        method
+      end
+
+    valid_job =
+      target_method.id
+      |> then(&SyncAccount.new(%{"external_account_id" => &1}))
+      |> Repo.insert!()
+
+    malformed_jobs = [
+      SyncAccount.new(%{"external_account_id" => "not-a-uuid"}) |> Repo.insert!(),
+      ApplyRemoteState.new(%{"remote_message_id" => "also-not-a-uuid"}) |> Repo.insert!(),
+      PushRemoteRead.new(%{"remote_message_id" => "still-not-a-uuid", "read" => true})
+      |> Repo.insert!()
+    ]
 
     {result, queries} =
       capture_repo_queries(fn -> Connectors.cancel_account_jobs(mailbox.id, 10) end)
 
-    assert %{cancelled: 0, done?: true} = result
-    assert Enum.any?(queries, &String.contains?(&1, "connector_accounts"))
+    assert %{cancelled: 1, done?: true} = result
+    assert Repo.get!(Oban.Job, valid_job.id).state == "cancelled"
+    assert Enum.all?(malformed_jobs, &(Repo.get!(Oban.Job, &1.id).state == "available"))
 
-    refute Enum.any?(queries, fn query ->
-             String.contains?(query, "connector_accounts") and
-               not String.contains?(query, "oban_jobs")
+    ownership_queries = Enum.filter(queries, &String.contains?(&1, "connector_accounts"))
+    assert ownership_queries != []
+
+    assert Enum.all?(ownership_queries, &String.contains?(&1, "oban_jobs"))
+    refute Enum.any?(ownership_queries, &String.contains?(&1, "receive_method.id::text"))
+    refute Enum.any?(ownership_queries, &String.contains?(&1, "remote_message.id::text"))
+
+    assert Enum.any?(ownership_queries, fn query ->
+             String.contains?(query, "receive_method.id = CASE") and
+               String.contains?(query, "remote_message.id = CASE")
            end)
   end
 
@@ -873,4 +930,163 @@ defmodule Manifold.ConnectorsTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)
   defp restore_env(key, value), do: Application.put_env(:manifold_connectors, key, value)
+end
+
+defmodule Manifold.ConnectorsPollingRaceTest do
+  use ExUnit.Case, async: false
+
+  import Ecto.Query
+
+  alias Ecto.Adapters.SQL.Sandbox
+  alias Manifold.Accounts
+  alias Manifold.Accounts.Schema.{Account, Domain}
+  alias Manifold.Connectors
+  alias Manifold.Connectors.Jobs.SyncAccount
+  alias Manifold.Connectors.Schema.ReceiveMethod
+  alias Manifold.Repo
+
+  setup do
+    :ok = Sandbox.checkout(Repo, sandbox: false)
+
+    suffix = System.unique_integer([:positive])
+
+    domain =
+      Repo.insert!(
+        Domain.changeset(%Domain{}, %{
+          name: "connector-race-#{suffix}.test",
+          active: true
+        })
+      )
+
+    mailbox =
+      Repo.insert!(
+        Account.changeset(%Account{}, %{
+          domain_id: domain.id,
+          local_part: "poll-race",
+          active: true
+        })
+      )
+
+    method =
+      Repo.insert!(
+        ReceiveMethod.changeset(%ReceiveMethod{}, %{
+          account_id: mailbox.id,
+          kind: "gmail",
+          provider_account_id: "poll-race:#{Ecto.UUID.generate()}",
+          email_address: "poll-race@example.test",
+          status: "connected",
+          enabled: true,
+          sync_enabled: true,
+          granted_scopes: []
+        })
+      )
+
+    on_exit(fn -> cleanup_fixture(domain.id, mailbox.id, method.id) end)
+
+    {:ok, mailbox: mailbox, method: method}
+  end
+
+  test "polling waits for a concurrent mailbox transition and rechecks activity", %{
+    mailbox: mailbox,
+    method: method
+  } do
+    test_process = self()
+
+    poller =
+      Task.async(fn ->
+        :ok = Sandbox.checkout(Repo, sandbox: false)
+
+        try do
+          Connectors.enqueue_due_syncs(
+            before_locked_recheck: fn ->
+              %{rows: [[backend_pid]]} = Repo.query!("SELECT pg_backend_pid()")
+              send(test_process, {:poll_candidates_discovered, self(), backend_pid})
+
+              receive do
+                :attempt_mailbox_lock -> :ok
+              end
+            end
+          )
+        after
+          Sandbox.checkin(Repo)
+        end
+      end)
+
+    poller_pid = poller.pid
+    assert_receive {:poll_candidates_discovered, ^poller_pid, poller_backend_pid}
+
+    disabler =
+      Task.async(fn ->
+        :ok = Sandbox.checkout(Repo, sandbox: false)
+
+        try do
+          Repo.transaction(fn ->
+            assert {:ok, disabled} = Accounts.disable_account(Repo, mailbox.id)
+            send(test_process, {:mailbox_disabled_and_locked, self()})
+
+            receive do
+              :commit_mailbox_disable -> disabled
+            end
+          end)
+        after
+          Sandbox.checkin(Repo)
+        end
+      end)
+
+    disabler_pid = disabler.pid
+    assert_receive {:mailbox_disabled_and_locked, ^disabler_pid}
+    send(poller_pid, :attempt_mailbox_lock)
+    assert_postgres_lock_wait(poller_backend_pid)
+
+    send(disabler_pid, :commit_mailbox_disable)
+    assert {:ok, %Account{active: false}} = Task.await(disabler)
+    assert {:ok, 0} = Task.await(poller)
+
+    refute Repo.exists?(
+             from(job in Oban.Job,
+               where:
+                 job.worker == ^inspect(SyncAccount) and
+                   fragment("?->>'external_account_id' = ?", job.args, ^method.id)
+             )
+           )
+  end
+
+  defp assert_postgres_lock_wait(backend_pid, attempts \\ 100)
+
+  defp assert_postgres_lock_wait(_backend_pid, 0) do
+    flunk("polling transaction never blocked on the mailbox row lock")
+  end
+
+  defp assert_postgres_lock_wait(backend_pid, attempts) do
+    wait_event =
+      Repo.query!("SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1", [backend_pid])
+      |> Map.fetch!(:rows)
+
+    if wait_event == [["Lock"]] do
+      :ok
+    else
+      Process.sleep(10)
+      assert_postgres_lock_wait(backend_pid, attempts - 1)
+    end
+  end
+
+  defp cleanup_fixture(domain_id, mailbox_id, method_id) do
+    :ok = Sandbox.checkout(Repo, sandbox: false)
+
+    try do
+      Repo.delete_all(
+        from(job in Oban.Job,
+          where:
+            job.worker == ^inspect(SyncAccount) and
+              fragment("?->>'external_account_id' = ?", job.args, ^method_id)
+        )
+      )
+
+      Repo.delete_all(from(method in ReceiveMethod, where: method.id == ^method_id))
+      Repo.delete_all(from(mailbox in Account, where: mailbox.id == ^mailbox_id))
+      Repo.delete_all(from(domain in Domain, where: domain.id == ^domain_id))
+    after
+      Sandbox.checkin(Repo)
+    end
+  end
 end

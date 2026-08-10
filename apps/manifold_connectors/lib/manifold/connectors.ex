@@ -2002,10 +2002,16 @@ defmodule Manifold.Connectors do
              SELECT 1
              FROM connector_accounts AS receive_method
              WHERE receive_method.mailbox_id = ?
-               AND receive_method.id::text = (?->>'external_account_id')
+               AND receive_method.id = CASE
+                 WHEN (?->>'external_account_id') ~*
+                   '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                 THEN (?->>'external_account_id')::uuid
+                 ELSE NULL
+               END
            )
            """,
            type(^mailbox_id, :binary_id),
+           job.args,
            job.args
          )) or
         (job.worker in ^[inspect(ApplyRemoteState), inspect(PushRemoteRead)] and
@@ -2017,10 +2023,16 @@ defmodule Manifold.Connectors do
                INNER JOIN connector_accounts AS receive_method
                  ON receive_method.id = remote_message.external_account_id
                WHERE receive_method.mailbox_id = ?
-                 AND remote_message.id::text = (?->>'remote_message_id')
+                 AND remote_message.id = CASE
+                   WHEN (?->>'remote_message_id') ~*
+                     '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                   THEN (?->>'remote_message_id')::uuid
+                   ELSE NULL
+                 END
              )
              """,
              type(^mailbox_id, :binary_id),
+             job.args,
              job.args
            ))
     )
@@ -2091,7 +2103,7 @@ defmodule Manifold.Connectors do
       join: remote in RemoteMessage,
       on: remote.inbound_delivery_id == entry.inbound_delivery_id,
       join: method in ReceiveMethod,
-      on: method.id == remote.external_account_id,
+      on: method.id == remote.external_account_id and method.account_id == entry.mailbox_id,
       where:
         entry.id in ^entry_ids and method.kind in ["imap", "eas"] and
           method.status != "disconnected"
