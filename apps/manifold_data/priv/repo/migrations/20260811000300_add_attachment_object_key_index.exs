@@ -6,5 +6,6 @@ defmodule Manifold.Repo.Migrations.AddAttachmentObjectKeyIndex do
 
   def change do
     create(index(:attachments, [:object_key], concurrently: true))
+    create(index(:mailbox_entries, [:mailbox_id, :id], concurrently: true))
   end
 end
