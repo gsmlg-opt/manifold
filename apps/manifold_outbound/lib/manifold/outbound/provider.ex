@@ -72,7 +72,7 @@ defmodule Manifold.Outbound.Provider.Request do
 
   @type t :: %__MODULE__{
           provider: String.t(),
-          send_method_id: Ecto.UUID.t(),
+          send_method_id: Ecto.UUID.t() | nil,
           envelope: Manifold.Outbound.Provider.Envelope.t(),
           raw_message: binary(),
           request_sha256: String.t()
