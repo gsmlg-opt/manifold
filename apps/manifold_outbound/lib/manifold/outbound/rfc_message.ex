@@ -5,7 +5,8 @@ defmodule Manifold.Outbound.RfcMessage do
   alias Manifold.Outbound.Provider.Envelope
 
   @encoded_word_bytes 39
-  @message_id ~r/\A<[^\s<>@]+@[^\s<>@]+>\z/u
+  @soft_header_line_bytes 78
+  @hard_header_line_bytes 998
 
   @spec render(Envelope.t(), Keyword.t()) :: {:ok, binary()} | {:error, Error.t()}
   def render(%Envelope{} = envelope, opts) when is_list(opts) do
@@ -35,7 +36,11 @@ defmodule Manifold.Outbound.RfcMessage do
         |> add_header("Content-Type", "text/plain; charset=UTF-8")
         |> add_header("Content-Transfer-Encoding", "quoted-printable")
 
-      {:ok, IO.iodata_to_binary([Enum.reverse(headers), "\r\n", body])}
+      headers = headers |> Enum.reverse() |> IO.iodata_to_binary()
+
+      with :ok <- validate_header_lines(headers) do
+        {:ok, IO.iodata_to_binary([headers, "\r\n", body])}
+      end
     end
   end
 
@@ -162,18 +167,59 @@ defmodule Manifold.Outbound.RfcMessage do
   defp optional_message_id(value), do: message_id(value)
 
   defp message_id(value) when is_binary(value) do
-    if safe_header?(value) and ascii?(value) and Regex.match?(@message_id, value),
-      do: {:ok, value},
-      else: invalid()
+    with true <- safe_header?(value),
+         true <- ascii?(value),
+         {:ok, id_left, id_right} <- split_message_id(value),
+         true <- dot_atom?(id_left),
+         true <- dot_atom?(id_right) do
+      {:ok, value}
+    else
+      _invalid -> invalid()
+    end
   end
 
   defp message_id(_value), do: invalid()
 
+  defp split_message_id("<" <> rest) do
+    if String.ends_with?(rest, ">") do
+      inner = binary_part(rest, 0, byte_size(rest) - 1)
+
+      case String.split(inner, "@", parts: 3) do
+        [id_left, id_right] -> {:ok, id_left, id_right}
+        _invalid -> :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp split_message_id(_value), do: :error
+
+  defp dot_atom?(value) do
+    value != "" and
+      value
+      |> String.split(".", trim: false)
+      |> Enum.all?(fn
+        "" -> false
+        atom -> atom |> :binary.bin_to_list() |> Enum.all?(&atext?/1)
+      end)
+  end
+
+  defp atext?(byte) when byte in ?A..?Z or byte in ?a..?z or byte in ?0..?9, do: true
+  defp atext?(byte) when byte in ~c"!#$%&'*+-/=?^_`{|}~", do: true
+  defp atext?(_byte), do: false
+
   defp references(values) when is_list(values) do
     Enum.reduce_while(values, {:ok, []}, fn value, {:ok, ids} ->
       case message_id(value) do
-        {:ok, id} -> {:cont, {:ok, [id | ids]}}
-        {:error, %Error{}} = error -> {:halt, error}
+        {:ok, id} when byte_size(id) < @hard_header_line_bytes ->
+          {:cont, {:ok, [id | ids]}}
+
+        {:ok, _oversized} ->
+          {:halt, invalid()}
+
+        {:error, %Error{}} = error ->
+          {:halt, error}
       end
     end)
     |> case do
@@ -264,9 +310,11 @@ defmodule Manifold.Outbound.RfcMessage do
 
   defp fold_references([first | rest]) do
     {lines, line} =
-      Enum.reduce(rest, {[], "References: " <> first}, fn reference, {lines, line} ->
-        if byte_size(line) + 1 + byte_size(reference) <= 78 do
-          {lines, line <> " " <> reference}
+      Enum.reduce([first | rest], {[], "References:"}, fn reference, {lines, line} ->
+        candidate = line <> " " <> reference
+
+        if byte_size(candidate) <= @soft_header_line_bytes do
+          {lines, candidate}
         else
           {[line | lines], " " <> reference}
         end
@@ -279,6 +327,16 @@ defmodule Manifold.Outbound.RfcMessage do
   end
 
   defp add_header(headers, name, value), do: [[name, ": ", value, "\r\n"] | headers]
+
+  defp validate_header_lines(headers) do
+    if headers
+       |> String.split("\r\n", trim: false)
+       |> Enum.all?(&(byte_size(&1) <= @hard_header_line_bytes)) do
+      :ok
+    else
+      invalid()
+    end
+  end
 
   defp safe_header?(value) do
     String.valid?(value) and
