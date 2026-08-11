@@ -462,8 +462,12 @@ defmodule Manifold.AccountLifecycle.Purge do
     ids = Repo.all(from(work in query, select: work.inbound_delivery_id))
 
     case Ingest.cancel_delivery_jobs(ids, @batch_size) do
-      {:snooze, 5} -> {:snooze, 5}
-      result -> {result, List.last(ids) || cursor, length(ids) < @batch_size}
+      {:snooze, 5} ->
+        {:snooze, 5}
+
+      result ->
+        next_cursor = if result.done?, do: List.last(ids) || cursor, else: cursor
+        {result, next_cursor, length(ids) < @batch_size}
     end
   end
 

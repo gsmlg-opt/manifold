@@ -953,7 +953,7 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Manifold.AccountLifecycle.Jobs.PurgeAccount
-  alias Manifold.AccountLifecycle.Schema.{AccountPurge, PurgeObject}
+  alias Manifold.AccountLifecycle.Schema.{AccountPurge, PurgeDelivery, PurgeObject}
   alias Manifold.Mail
   alias Manifold.Mail.InboundSource
   alias Manifold.Mail.Schema.{Attachment, MailboxEntry}
@@ -964,6 +964,7 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
 
   setup %{tmp_dir: tmp_dir} do
     :ok = Sandbox.checkout(Repo, sandbox: false)
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
 
     old_raw = Application.fetch_env!(:manifold_storage, :raw_store_dir)
     old_blob = Application.fetch_env!(:manifold_storage, :blob_store_dir)
@@ -986,6 +987,10 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
           Ecto.UUID.dump!(fixture.purge_id)
         ])
 
+        Repo.query!("DELETE FROM oban_jobs WHERE args->>'inbound_delivery_id' = $1", [
+          fixture.delivery_id
+        ])
+
         Repo.query!("DELETE FROM inbound_deliveries WHERE id = $1::uuid", [
           Ecto.UUID.dump!(fixture.delivery_id)
         ])
@@ -1003,6 +1008,106 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
     end)
 
     {:ok, fixture: fixture}
+  end
+
+  test "ingest drain retains the current delivery page when a concurrent job makes done false", %{
+    fixture: fixture
+  } do
+    fixture.object_id |> then(&Repo.get!(PurgeObject, &1)) |> Repo.delete!()
+
+    fixture.purge_id
+    |> then(&Repo.get!(AccountPurge, &1))
+    |> AccountPurge.changeset(%{
+      stage: "drain",
+      progress: %{"source" => "ingest", "complete_sources" => ["connectors", "outbound"]}
+    })
+    |> Repo.update!()
+
+    Repo.insert!(%PurgeDelivery{
+      purge_id: fixture.purge_id,
+      inbound_delivery_id: fixture.delivery_id
+    })
+
+    test_pid = self()
+    barrier_ref = make_ref()
+    handler_id = {__MODULE__, self(), barrier_ref}
+    event = Keyword.fetch!(Repo.config(), :telemetry_prefix) ++ [:query]
+
+    first_run =
+      Task.async(fn ->
+        :ok = Sandbox.checkout(Repo, sandbox: false)
+
+        try do
+          receive do
+            {:run_purge, ^barrier_ref} -> perform_purge(fixture.purge_id)
+          after
+            5_000 -> raise "timed out waiting to run ingest drain"
+          end
+        after
+          Sandbox.checkin(Repo)
+        end
+      end)
+
+    first_run_pid = first_run.pid
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn _event, _measurements, metadata, {owner, purge_pid, ref} ->
+          if self() == purge_pid and ingest_cancel_update?(metadata.query) do
+            send(owner, {:cancel_update_finished, self(), ref})
+
+            receive do
+              {:continue_done_check, ^ref} -> :ok
+            after
+              5_000 -> raise "timed out waiting for concurrent ingest job"
+            end
+          end
+        end,
+        {test_pid, first_run_pid, barrier_ref}
+      )
+
+    try do
+      send(first_run_pid, {:run_purge, barrier_ref})
+      assert_receive {:cancel_update_finished, ^first_run_pid, ^barrier_ref}, 5_000
+
+      now = DateTime.utc_now()
+
+      job =
+        Repo.insert!(%Oban.Job{
+          queue: "archive",
+          worker: "Manifold.Ingest.Jobs.ArchiveRawEmail",
+          args: %{"inbound_delivery_id" => fixture.delivery_id},
+          state: "available",
+          attempt: 1,
+          max_attempts: 20,
+          scheduled_at: now
+        })
+
+      send(first_run_pid, {:continue_done_check, barrier_ref})
+      assert {:snooze, 1} = Task.await(first_run, 5_000)
+      assert Repo.get!(Oban.Job, job.id).state == "available"
+
+      retained = Repo.get!(AccountPurge, fixture.purge_id)
+      assert retained.stage == "drain"
+
+      assert retained.progress == %{
+               "source" => "ingest",
+               "complete_sources" => ["connectors", "outbound"]
+             }
+
+      assert {:snooze, 5} = perform_purge(fixture.purge_id)
+      assert Repo.get!(Oban.Job, job.id).state == "cancelled"
+      assert Repo.get!(AccountPurge, fixture.purge_id).progress == retained.progress
+
+      assert {:snooze, 1} = perform_purge(fixture.purge_id)
+      drained = Repo.get!(AccountPurge, fixture.purge_id)
+      assert drained.stage == "connectors"
+      assert drained.progress == %{}
+    after
+      :telemetry.detach(handler_id)
+    end
   end
 
   test "purge object cleanup waits for publication and retains the committed blob", %{
@@ -1068,6 +1173,19 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
     assert Repo.get!(PurgeObject, fixture.object_id).status == "completed"
     assert Repo.get!(AccountPurge, fixture.purge_id).deleted_objects == 0
     assert {:ok, _stat} = BlobStore.stat(fixture.blob_key)
+  end
+
+  defp perform_purge(purge_id) do
+    PurgeAccount.perform(%Oban.Job{
+      args: %{"purge_id" => purge_id},
+      attempt: 1,
+      max_attempts: 20,
+      meta: %{}
+    })
+  end
+
+  defp ingest_cancel_update?(query) do
+    String.starts_with?(query, "UPDATE") and String.contains?(query, ~s("oban_jobs"))
   end
 
   defp assert_advisory_wait(backend_pid, timeout_ms) do
