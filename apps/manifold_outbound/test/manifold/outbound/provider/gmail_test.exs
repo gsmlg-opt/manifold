@@ -52,13 +52,14 @@ defmodule Manifold.Outbound.Provider.GmailTest do
             }} = Gmail.submit(@config, @request)
   end
 
-  test "accepts a nonempty message id when Gmail omits the thread id" do
+  test "treats a missing thread id as acceptance uncertainty" do
     Req.Test.expect(Gmail, fn conn -> Req.Test.json(conn, %{"id" => "gmail-message-2"}) end)
 
-    assert {:ok,
-            %Provider.Submission{
-              provider_message_id: "gmail-message-2",
-              metadata: %{thread_id: nil}
+    assert {:error,
+            %Provider.Error{
+              class: :uncertain,
+              code: "invalid_response",
+              message: "Gmail may have accepted the message"
             }} = Gmail.submit(@config, @request)
   end
 
@@ -189,11 +190,12 @@ defmodule Manifold.Outbound.Provider.GmailTest do
   end
 
   test "treats malformed successful responses as acceptance uncertainty" do
-    Req.Test.expect(Gmail, 4, fn conn ->
+    Req.Test.expect(Gmail, 5, fn conn ->
       body =
         case Process.get(:gmail_invalid_success) do
           :missing_id -> %{"threadId" => "thread-1"}
           :empty_id -> %{"id" => "", "threadId" => "thread-1"}
+          :invalid_id -> %{"id" => 123, "threadId" => "thread-1"}
           :empty_thread -> %{"id" => "message-1", "threadId" => ""}
           :invalid_thread -> %{"id" => "message-1", "threadId" => 123}
         end
@@ -201,7 +203,7 @@ defmodule Manifold.Outbound.Provider.GmailTest do
       Req.Test.json(conn, body)
     end)
 
-    for failure <- [:missing_id, :empty_id, :empty_thread, :invalid_thread] do
+    for failure <- [:missing_id, :empty_id, :invalid_id, :empty_thread, :invalid_thread] do
       Process.put(:gmail_invalid_success, failure)
 
       assert {:error,

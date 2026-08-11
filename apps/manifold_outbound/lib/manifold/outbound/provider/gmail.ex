@@ -54,18 +54,9 @@ defmodule Manifold.Outbound.Provider.Gmail do
     end
   end
 
-  defp accepted(%{"id" => id} = body) when is_binary(id) and id != "" do
-    case Map.fetch(body, "threadId") do
-      :error ->
-        accepted(id, nil)
-
-      {:ok, thread_id} when is_binary(thread_id) and thread_id != "" ->
-        accepted(id, thread_id)
-
-      {:ok, _invalid_thread_id} ->
-        invalid_response()
-    end
-  end
+  defp accepted(%{"id" => id, "threadId" => thread_id})
+       when is_binary(id) and id != "" and is_binary(thread_id) and thread_id != "",
+       do: accepted(id, thread_id)
 
   defp accepted(_body), do: invalid_response()
 
