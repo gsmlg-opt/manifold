@@ -560,6 +560,116 @@ defmodule Manifold.Outbound.SubmissionTest do
     ])
   end
 
+  test "submission telemetry maps arbitrary provider codes to provider_error" do
+    attach_submit_telemetry()
+
+    for {code, expected_code} <- [
+          {"Stable body", "provider_error"},
+          {"smtp-secret", "provider_error"},
+          {String.duplicate("a7", 32), "provider_error"},
+          {"transport_error", "transport_error"}
+        ] do
+      %{message: message} = queued_operational_fixture("smtp")
+
+      error = %Provider.Error{
+        class: :transient,
+        code: code,
+        message: "provider failure"
+      }
+
+      assert {:error, ^error} =
+               Outbound.submit_message(message.id,
+                 provider: TestProvider,
+                 provider_config: [test_pid: self(), result: {:error, error}]
+               )
+
+      assert_receive {:provider_submit, _, _}
+
+      assert_receive {:telemetry, [:manifold, :outbound, :submit, :stop], measurements,
+                      %{error_code: ^expected_code} = metadata}
+
+      assert_secret_free_telemetry(measurements, metadata, [
+        "Stable body",
+        "smtp-secret",
+        String.duplicate("a7", 32)
+      ])
+    end
+  end
+
+  test "submission emits one sanitized stop event when a database failure is rescued" do
+    %{message: message} = queued_operational_fixture("smtp")
+    attach_submit_telemetry()
+
+    database_error = %DBConnection.ConnectionError{
+      message: "database-password-secret after provider I/O"
+    }
+
+    assert {:error, %{class: :temporary, reason: :database_unavailable}} =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [
+                 test_pid: self(),
+                 result:
+                   {:ok,
+                    %Provider.Submission{
+                      provider_message_id: "accepted-before-database-error",
+                      metadata: %{}
+                    }}
+               ],
+               before_result_persist: fn _preparation, _result -> raise database_error end
+             )
+
+    assert_receive {:provider_submit, _, _}
+
+    assert_receive {:telemetry, [:manifold, :outbound, :submit, :stop], measurements,
+                    %{
+                      outbound_message_id: outbound_message_id,
+                      outcome: :error,
+                      error_code: :database_unavailable
+                    } = metadata}
+
+    assert outbound_message_id == message.id
+    assert_secret_free_telemetry(measurements, metadata, ["database-password-secret"])
+    refute_receive {:telemetry, [:manifold, :outbound, :submit, :stop], _, _}
+    assert Repo.get!(OutboundMessage, message.id).state == "submitting"
+  end
+
+  test "submission emits one sanitized stop event before reraising an unexpected exception" do
+    %{message: message} = queued_operational_fixture("smtp")
+    attach_submit_telemetry()
+    exception = RuntimeError.exception("raw_message unexpected-exception-secret")
+
+    assert_raise RuntimeError, "raw_message unexpected-exception-secret", fn ->
+      Outbound.submit_message(message.id,
+        provider: TestProvider,
+        provider_config: [
+          test_pid: self(),
+          result:
+            {:ok,
+             %Provider.Submission{
+               provider_message_id: "accepted-before-unexpected-exception",
+               metadata: %{}
+             }}
+        ],
+        before_result_persist: fn _preparation, _result -> raise exception end
+      )
+    end
+
+    assert_receive {:provider_submit, _, _}
+
+    assert_receive {:telemetry, [:manifold, :outbound, :submit, :stop], measurements,
+                    %{
+                      outbound_message_id: outbound_message_id,
+                      outcome: :error,
+                      error_code: :unexpected_exception
+                    } = metadata}
+
+    assert outbound_message_id == message.id
+    assert_secret_free_telemetry(measurements, metadata, ["unexpected-exception-secret"])
+    refute_receive {:telemetry, [:manifold, :outbound, :submit, :stop], _, _}
+    assert Repo.get!(OutboundMessage, message.id).state == "submitting"
+  end
+
   test "does not reroute a queued submission when its snapshot is disabled" do
     %{message: message, method: snapshot, account: account, address: address} =
       queued_operational_fixture("smtp")
@@ -1024,6 +1134,23 @@ defmodule Manifold.Outbound.SubmissionTest do
     do: tuple |> Tuple.to_list() |> telemetry_terms()
 
   defp telemetry_terms(value), do: [value]
+
+  defp attach_submit_telemetry do
+    handler_id = "submission-stop-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :outbound, :submit, :stop],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:telemetry, event, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
 
   defp expire_authorization!(authorization_id) do
     Repo.get!(OAuthAuthorization, authorization_id)

@@ -82,8 +82,9 @@ The current implementation includes:
 - Purpose-scoped OAuth authorization-code primitives with one-time, hashed state
   and PKCE `S256`; Gmail receive and send grants incrementally share one
   authorization record.
-- AES-256-GCM encryption envelopes for access tokens, refresh tokens, and PKCE
-  verifiers. Encryption binds each secret to its account and purpose.
+- AES-256-GCM encryption envelopes with context-bound associated data. Shared
+  Gmail tokens bind the authorization ID plus access/refresh kind; PKCE verifiers
+  bind the provider plus account ID.
 - Gmail OpenID identity, message-list, history, and `format=RAW` operations
   using the stable subject identifier and `gmail.readonly` scope. The shared
   authorization can also hold `gmail.send` for outbound Gmail API submission.

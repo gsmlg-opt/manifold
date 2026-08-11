@@ -31,7 +31,10 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
         send(test_pid, {:exchange_required_scopes, Keyword.get(opts, :required_scopes)})
       end
 
-      Keyword.fetch!(opts, :token)
+      case Keyword.get(opts, :raise) do
+        nil -> Keyword.fetch!(opts, :token)
+        exception -> raise exception
+      end
     end
 
     @impl true
@@ -311,6 +314,55 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
       "raw-refreshed-access-token",
       "raw-refreshed-refresh-token"
     ])
+  end
+
+  test "OAuth completion emits one sanitized stop event when a database failure is rescued", %{
+    account: account,
+    address: address
+  } do
+    attach_telemetry([[:manifold, :connectors, :oauth, :complete, :stop]])
+
+    database_error = %DBConnection.ConnectionError{
+      message: "database-password-secret during OAuth completion"
+    }
+
+    assert {:error, %CoreError{class: :temporary, reason: :database_unavailable}} =
+             complete(:send, account, address, provider_opts: [raise: database_error])
+
+    assert_receive {:telemetry, [:manifold, :connectors, :oauth, :complete, :stop], measurements,
+                    %{
+                      account_id: account_id,
+                      outcome: :error,
+                      error_code: :database_unavailable
+                    } = metadata}
+
+    assert account_id == account.id
+    assert_secret_free_telemetry(measurements, metadata, ["database-password-secret"])
+    refute_receive {:telemetry, [:manifold, :connectors, :oauth, :complete, :stop], _, _}
+  end
+
+  test "OAuth completion emits one sanitized stop event before reraising an unexpected exception",
+       %{
+         account: account,
+         address: address
+       } do
+    attach_telemetry([[:manifold, :connectors, :oauth, :complete, :stop]])
+    exception = RuntimeError.exception("authorization_code unexpected-complete-secret")
+
+    assert_raise RuntimeError, "authorization_code unexpected-complete-secret", fn ->
+      complete(:send, account, address, provider_opts: [raise: exception])
+    end
+
+    assert_receive {:telemetry, [:manifold, :connectors, :oauth, :complete, :stop], measurements,
+                    %{
+                      account_id: account_id,
+                      outcome: :error,
+                      error_code: :unexpected_exception
+                    } = metadata}
+
+    assert account_id == account.id
+    assert_secret_free_telemetry(measurements, metadata, ["unexpected-complete-secret"])
+    refute_receive {:telemetry, [:manifold, :connectors, :oauth, :complete, :stop], _, _}
   end
 
   test "send-to-receive upgrade preserves send scope and initializes receive only then", %{

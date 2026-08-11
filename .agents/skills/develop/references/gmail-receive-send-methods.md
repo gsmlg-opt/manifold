@@ -64,6 +64,9 @@ submissions exist.
   address; Gmail plus or dot alias normalization is not used.
 - Refresh and reconnect-required transitions serialize on the shared
   authorization and affect both Gmail directions.
+- Encryption uses context-bound associated data: shared Gmail tokens bind the
+  authorization ID plus access/refresh kind, while PKCE verifiers bind provider
+  plus account ID.
 
 ## Queue and uncertainty invariants
 
@@ -87,6 +90,10 @@ submissions exist.
 - OAuth start/complete/refresh use `[:manifold, :connectors, :oauth, ..., :stop]`;
   selection failures use `[:manifold, :outbound, :send_method, :select, :stop]`;
   provider attempts use `[:manifold, :outbound, :submit, :stop]`.
+- Rescued database failures and unexpected exceptions emit one sanitized stop
+  event; unexpected exceptions are then reraised unchanged. Submission telemetry
+  exposes only a bounded set of known error codes and maps all others to
+  `provider_error`.
 
 ## Configuration
 

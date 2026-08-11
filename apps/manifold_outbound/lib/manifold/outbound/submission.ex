@@ -22,33 +22,125 @@ defmodule Manifold.Outbound.Submission do
   alias Manifold.Outbound.State
   alias Manifold.Repo
 
-  @telemetry_forbidden_fragments ~w(token password authorization_code raw_message)
-  @telemetry_code_pattern ~r/\A[a-z0-9_.:-]{1,128}\z/
+  @telemetry_error_codes MapSet.new(~w(
+    acceptance_unknown
+    account_disconnected
+    authentication_expired
+    auth_failed
+    authorization_not_found
+    bad_greeting
+    bad_reply
+    concurrent_idempotent_requests
+    connect_failed
+    credential_authentication_failed
+    data_rejected
+    database_unavailable
+    domain_policy
+    ehlo_failed
+    gmail_reconnect_lifecycle_failed
+    insufficient_scope
+    insufficient_provider_scope
+    interrupted_submission
+    invalid_address
+    invalid_config
+    invalid_credential_envelope
+    invalid_envelope_address
+    invalid_encryption_key
+    invalid_gmail_authorization
+    invalid_grant
+    invalid_idempotent_request
+    invalid_message
+    invalid_message_id
+    invalid_provider_response
+    invalid_response
+    message_rejected
+    not_found
+    outbound_not_found
+    provider_not_configured
+    provider_unavailable
+    rate_limited
+    reconnect_required
+    recv_failed
+    recipient_rejected
+    request_integrity_failed
+    request_rejected
+    reauthorization_required
+    send_failed
+    send_method_provider_mismatch
+    send_method_required
+    sender_rejected
+    sender_address_mismatch
+    smtp_error
+    stale_submission_result
+    starttls_failed
+    submission_not_found
+    submission_not_retryable
+    submission_uncertain
+    timeout
+    tls_failed
+    transport_error
+    unexpected_exception
+    unsupported_provider
+  ))
 
   @spec submit(Ecto.UUID.t(), Keyword.t()) ::
           :ok | {:error, Error.t() | Provider.Error.t()}
   def submit(message_id, opts \\ []) do
     start = System.monotonic_time()
 
-    case prepare_attempt(message_id, start) do
-      {:ok, :already_accepted} ->
-        :ok
+    case capture_submission(fn -> prepare_attempt(message_id, start) end) do
+      {:return, prepared} ->
+        submit_prepared(prepared, opts, start)
 
-      {:ok, preparation} ->
-        result =
-          preparation
-          |> call_provider(opts)
-          |> then(&persist_result(preparation, &1, opts))
+      {:database_error, result} ->
+        emit_submit_stop(%{message_id: message_id, attempt_count: 0}, result, start)
+        result
 
+      {:exception, exception, stacktrace} ->
+        emit_submit_stop(
+          %{message_id: message_id, attempt_count: 0},
+          unexpected_exception_result(),
+          start
+        )
+
+        reraise(exception, stacktrace)
+    end
+  end
+
+  defp submit_prepared({:ok, :already_accepted}, _opts, _start), do: :ok
+
+  defp submit_prepared({:error, reason}, _opts, _start), do: {:error, reason}
+
+  defp submit_prepared({:ok, preparation}, opts, start) do
+    case capture_submission(fn ->
+           preparation
+           |> call_provider(opts)
+           |> then(&persist_result(preparation, &1, opts))
+         end) do
+      {tag, result} when tag in [:return, :database_error] ->
         emit_submit_stop(preparation, result, start)
         result
 
-      {:error, reason} ->
-        {:error, reason}
+      {:exception, exception, stacktrace} ->
+        emit_submit_stop(preparation, unexpected_exception_result(), start)
+        reraise(exception, stacktrace)
     end
+  end
+
+  defp capture_submission(fun) do
+    {:return, fun.()}
   rescue
     DBConnection.ConnectionError ->
-      {:error, Error.new(:temporary, :database_unavailable, "outbound database is unavailable")}
+      {:database_error,
+       {:error, Error.new(:temporary, :database_unavailable, "outbound database is unavailable")}}
+
+    exception ->
+      {:exception, exception, __STACKTRACE__}
+  end
+
+  defp unexpected_exception_result do
+    {:error,
+     Error.new(:temporary, :unexpected_exception, "outbound submission failed unexpectedly")}
   end
 
   defp prepare_attempt(message_id, start) do
@@ -636,16 +728,7 @@ defmodule Manifold.Outbound.Submission do
   defp emit_submit_stop(preparation, result, start) do
     {outcome, error_code} = submit_outcome(result)
 
-    metadata = %{
-      account_id: preparation.message.mailbox_id,
-      outbound_message_id: preparation.message_id,
-      submission_id: preparation.submission_id,
-      send_method_id: preparation.submission.send_method_id,
-      provider: preparation.submission.provider,
-      method_kind: preparation.submission.provider,
-      adapter: preparation.submission.provider,
-      outcome: outcome
-    }
+    metadata = submit_metadata(preparation, outcome)
 
     metadata = if error_code, do: Map.put(metadata, :error_code, error_code), else: metadata
 
@@ -680,20 +763,41 @@ defmodule Manifold.Outbound.Submission do
   defp submit_outcome(_result), do: {:error, :submission_failed}
 
   defp telemetry_error_code(code) when is_atom(code) do
-    if safe_telemetry_code?(Atom.to_string(code)), do: code, else: :provider_error
+    if MapSet.member?(@telemetry_error_codes, Atom.to_string(code)),
+      do: code,
+      else: :provider_error
   end
 
   defp telemetry_error_code(code) when is_binary(code) do
-    if safe_telemetry_code?(code), do: code, else: "provider_error"
+    if MapSet.member?(@telemetry_error_codes, code), do: code, else: "provider_error"
   end
 
   defp telemetry_error_code(_code), do: :provider_error
 
-  defp safe_telemetry_code?(code) do
-    downcased = String.downcase(code)
+  defp submit_metadata(%{message: message, submission: submission} = preparation, outcome) do
+    %{
+      account_id: message.mailbox_id,
+      outbound_message_id: preparation.message_id,
+      submission_id: preparation.submission_id,
+      send_method_id: submission.send_method_id,
+      provider: submission.provider,
+      method_kind: submission.provider,
+      adapter: submission.provider,
+      outcome: outcome
+    }
+  end
 
-    Regex.match?(@telemetry_code_pattern, downcased) and
-      not Enum.any?(@telemetry_forbidden_fragments, &String.contains?(downcased, &1))
+  defp submit_metadata(%{message_id: message_id}, outcome) do
+    %{
+      account_id: nil,
+      outbound_message_id: message_id,
+      submission_id: nil,
+      send_method_id: nil,
+      provider: nil,
+      method_kind: nil,
+      adapter: nil,
+      outcome: outcome
+    }
   end
 
   defp telemetry_context(message, submission) do

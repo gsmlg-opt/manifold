@@ -44,39 +44,64 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     now = Keyword.get(opts, :now, DateTime.utc_now())
     provider_opts = Keyword.get(opts, :provider_opts, [])
 
-    result =
-      with {:ok, purpose} <- normalize_purpose(consumed.purpose),
-           {:ok, %Token{} = token} <-
-             adapter.exchange_code(
-               code,
-               consumed.pkce_verifier,
-               consumed.redirect_uri,
-               config,
-               provider_opts
-             ),
-           {:ok, %Identity{} = identity} <-
-             adapter.identity(token.access_token, config, provider_opts),
-           {:ok, provider_address} <- Address.parse(identity.email_address),
-           {:ok, cursors} <- initial_cursors(purpose, adapter, token, config, provider_opts),
-           :ok <- validate_cursors(purpose, cursors) do
-        persist(consumed, purpose, token, identity, provider_address, cursors, now)
-      else
-        {:error, %ProviderError{} = error} -> {:error, provider_error(error)}
-        {:error, %CoreError{} = error} -> {:error, error}
-      end
+    case capture_complete(fn ->
+           with {:ok, purpose} <- normalize_purpose(consumed.purpose),
+                {:ok, %Token{} = token} <-
+                  adapter.exchange_code(
+                    code,
+                    consumed.pkce_verifier,
+                    consumed.redirect_uri,
+                    config,
+                    provider_opts
+                  ),
+                {:ok, %Identity{} = identity} <-
+                  adapter.identity(token.access_token, config, provider_opts),
+                {:ok, provider_address} <- Address.parse(identity.email_address),
+                {:ok, cursors} <- initial_cursors(purpose, adapter, token, config, provider_opts),
+                :ok <- validate_cursors(purpose, cursors) do
+             persist(consumed, purpose, token, identity, provider_address, cursors, now)
+           else
+             {:error, %ProviderError{} = error} -> {:error, provider_error(error)}
+             {:error, %CoreError{} = error} -> {:error, error}
+           end
+         end) do
+      {:return, result} ->
+        emit_oauth_complete(consumed, result, start)
+        public_complete_result(result)
 
-    emit_oauth_complete(consumed, result, start)
-    public_complete_result(result)
-  rescue
-    DBConnection.ConnectionError ->
-      {:error, database_error()}
-
-    error in Postgrex.Error ->
-      normalize_transaction_error(error, __STACKTRACE__)
+      {:exception, exception, stacktrace} ->
+        emit_oauth_complete(consumed, unexpected_complete_result(), start)
+        reraise(exception, stacktrace)
+    end
   end
 
   def complete(_code, %Consumed{}, _adapter, _config, _opts) do
     {:error, CoreError.new(:permanent, :oauth_provider_mismatch, "OAuth provider does not match")}
+  end
+
+  defp capture_complete(fun) do
+    {:return, fun.()}
+  rescue
+    DBConnection.ConnectionError ->
+      {:return, {:error, database_error()}}
+
+    error in Postgrex.Error ->
+      case error do
+        %Postgrex.Error{postgres: %{code: code}}
+        when code in [:deadlock_detected, :serialization_failure] ->
+          {:return, {:error, database_error()}}
+
+        _unexpected ->
+          {:exception, error, __STACKTRACE__}
+      end
+
+    exception ->
+      {:exception, exception, __STACKTRACE__}
+  end
+
+  defp unexpected_complete_result do
+    {:error,
+     CoreError.new(:temporary, :unexpected_exception, "OAuth completion failed unexpectedly")}
   end
 
   @spec checkout_access_token(Ecto.UUID.t(), module(), keyword(), keyword()) ::
