@@ -114,12 +114,21 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
           | {:error, CoreError.t() | ProviderError.t() | Ecto.Changeset.t()}
   def checkout_access_token(authorization_id, adapter, config, opts \\ []) do
     required_scope = Keyword.get(opts, :required_scope)
+
+    expected_authorization_lock_version =
+      Keyword.get(opts, :expected_authorization_lock_version)
+
     now = Keyword.get(opts, :now, DateTime.utc_now())
     provider_opts = Keyword.get(opts, :provider_opts, [])
     continuation = Keyword.get(opts, :access_token_continuation, &default_continuation/1)
 
     Repo.transaction(fn ->
       with {:ok, authorization} <- lock_authorization(authorization_id),
+           :ok <-
+             validate_expected_authorization_lock_version(
+               authorization,
+               expected_authorization_lock_version
+             ),
            :ok <- validate_required_scope(authorization.provider, required_scope),
            :ok <- validate_checkout_authorization(authorization, required_scope) do
         authorization
@@ -166,6 +175,9 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     now = Keyword.get(opts, :now, DateTime.utc_now())
     provider_opts = Keyword.get(opts, :provider_opts, [])
 
+    after_authorized_method_snapshot =
+      Keyword.get(opts, :after_authorized_method_snapshot)
+
     with {:ok, required_scope} <- method_scope(provider, purpose) do
       case purpose do
         :receive ->
@@ -176,7 +188,8 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
             adapter,
             config,
             now,
-            provider_opts
+            provider_opts,
+            after_authorized_method_snapshot
           )
 
         :send ->
@@ -235,14 +248,16 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
          adapter,
          config,
          now,
-         provider_opts
+         provider_opts,
+         after_authorized_method_snapshot
        ) do
     case authorized_method_snapshot(provider, account_id, required_scope) do
       {:ok, {:unchanged, method}} ->
         {:ok, method}
 
       {:ok, {:setup, snapshot}} ->
-        with {:ok, checkout} <-
+        with :ok <- maybe_after_authorized_method_snapshot(after_authorized_method_snapshot),
+             {:ok, checkout} <-
                checkout_authorized_method_access(
                  snapshot,
                  required_scope,
@@ -286,6 +301,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
                 account_id: account.id,
                 account_address: account_address.canonical,
                 authorization_id: authorization.id,
+                phase_one_authorization_lock_version: authorization.lock_version,
                 provider: authorization.provider,
                 provider_subject_id: authorization.provider_subject_id,
                 email_address: authorization.email_address,
@@ -328,6 +344,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
 
     checkout_access_token(snapshot.authorization_id, adapter, config,
       required_scope: required_scope,
+      expected_authorization_lock_version: snapshot.phase_one_authorization_lock_version,
       now: now,
       provider_opts: provider_opts,
       access_token_continuation: continuation
@@ -413,6 +430,22 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
       authorization.provider_subject_id == snapshot.provider_subject_id and
       authorization.email_address == snapshot.email_address
   end
+
+  defp maybe_after_authorized_method_snapshot(nil), do: :ok
+
+  defp maybe_after_authorized_method_snapshot(hook) when is_function(hook, 0),
+    do: hook.()
+
+  defp validate_expected_authorization_lock_version(_authorization, nil), do: :ok
+
+  defp validate_expected_authorization_lock_version(
+         %OAuthAuthorization{lock_version: lock_version},
+         lock_version
+       ),
+       do: :ok
+
+  defp validate_expected_authorization_lock_version(_authorization, _expected_lock_version),
+    do: {:error, stale_oauth_authorization()}
 
   defp lock_receive_method_lifecycle(account_id, provider, snapshot_ids \\ []) do
     methods =
@@ -526,13 +559,25 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     do: lock_receive_method_cursors(method_id)
 
   defp lock_receive_method_cursors(method_id) do
-    StoredCursor
-    |> where([cursor], cursor.external_account_id == ^method_id)
-    |> order_by([cursor], asc: cursor.id)
-    |> lock("FOR UPDATE")
-    |> Repo.all()
+    try do
+      StoredCursor
+      |> where([cursor], cursor.external_account_id == ^method_id)
+      |> order_by([cursor], asc: cursor.id)
+      |> lock("FOR UPDATE NOWAIT")
+      |> Repo.all()
 
-    :ok
+      :ok
+    rescue
+      error in Postgrex.Error ->
+        case error do
+          %Postgrex.Error{postgres: %{code: code}}
+          when code in [:lock_not_available, "55P03"] ->
+            {:error, oauth_lifecycle_busy()}
+
+          _unexpected ->
+            reraise(error, __STACKTRACE__)
+        end
+    end
   end
 
   defp validate_receive_method_lifecycle(snapshot, lifecycle) do
@@ -552,6 +597,14 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
       :permanent,
       :stale_oauth_authorization,
       "OAuth authorization or receive-method lifecycle changed before setup completed"
+    )
+  end
+
+  defp oauth_lifecycle_busy do
+    CoreError.new(
+      :temporary,
+      :oauth_lifecycle_busy,
+      "OAuth receive lifecycle is changing; retry the operation"
     )
   end
 
@@ -636,11 +689,9 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
         with {:ok, authorization} <- lock_authorization(authorization_id),
              true <- authorization.account_id == account_id,
              {:ok, method} <- lock_method(direction, method_id, authorization),
-             lifecycle_changed? = method.status != "disconnected",
              {:ok, disconnected} <- disconnect_locked_method(direction, method, now),
              :ok <- delete_method_secrets(direction, method.id),
-             {:ok, _authorization} <-
-               maybe_disconnect_authorization(authorization, now, lifecycle_changed?),
+             {:ok, _authorization} <- maybe_disconnect_authorization(authorization, now),
              {:ok, _event} <-
                insert_authorization_event(
                  authorization.id,
@@ -677,7 +728,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
              {:ok, method} <- lock_method(:receive, method_id, authorization),
              :ok <- cancel_receive_jobs(method.id),
              {:ok, deleted} <- Repo.delete(method),
-             {:ok, _authorization} <- maybe_disconnect_authorization(authorization, now, true),
+             {:ok, _authorization} <- maybe_disconnect_authorization(authorization, now),
              {:ok, _event} <-
                insert_authorization_event(
                  authorization.id,
@@ -1860,8 +1911,12 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     end
   end
 
-  defp disconnect_locked_method(:receive, %ReceiveMethod{status: "disconnected"} = method, _now),
-    do: {:ok, method}
+  defp disconnect_locked_method(:receive, %ReceiveMethod{status: "disconnected"} = method, _now) do
+    method
+    |> ReceiveMethod.changeset(%{})
+    |> Ecto.Changeset.force_change(:status, method.status)
+    |> Repo.update()
+  end
 
   defp disconnect_locked_method(:receive, %ReceiveMethod{} = method, now) do
     method
@@ -1877,8 +1932,12 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     |> Repo.update()
   end
 
-  defp disconnect_locked_method(:send, %SendMethod{status: "disconnected"} = method, _now),
-    do: {:ok, method}
+  defp disconnect_locked_method(:send, %SendMethod{status: "disconnected"} = method, _now) do
+    method
+    |> SendMethod.changeset(%{})
+    |> Ecto.Changeset.force_change(:status, method.status)
+    |> Repo.update()
+  end
 
   defp disconnect_locked_method(:send, %SendMethod{} = method, now) do
     method
@@ -1957,7 +2016,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     end
   end
 
-  defp maybe_disconnect_authorization(authorization, now, lifecycle_changed?) do
+  defp maybe_disconnect_authorization(authorization, now) do
     receive_count =
       ReceiveMethod
       |> where(
@@ -1975,6 +2034,12 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
       |> Repo.aggregate(:count)
 
     cond do
+      receive_count + send_count == 0 and authorization.status == "disconnected" ->
+        authorization
+        |> OAuthAuthorization.changeset(%{})
+        |> Ecto.Changeset.force_change(:status, authorization.status)
+        |> Repo.update()
+
       receive_count + send_count == 0 ->
         authorization
         |> OAuthAuthorization.changeset(%{
@@ -1989,14 +2054,11 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
         })
         |> Repo.update()
 
-      lifecycle_changed? ->
+      true ->
         authorization
         |> OAuthAuthorization.changeset(%{})
         |> Ecto.Changeset.force_change(:status, authorization.status)
         |> Repo.update()
-
-      true ->
-        {:ok, authorization}
     end
   end
 

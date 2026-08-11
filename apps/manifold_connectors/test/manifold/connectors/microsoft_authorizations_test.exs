@@ -435,6 +435,50 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
              )
   end
 
+  test "a stale phase-one generation is rejected before refresh provider I/O", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    advanced =
+      authorization
+      |> OAuthAuthorization.changeset(%{})
+      |> Ecto.Changeset.force_change(:status, authorization.status)
+      |> Repo.update!()
+
+    {:ok, refresh_count} = Agent.start_link(fn -> 0 end)
+
+    refreshed = %Token{
+      access_token: "unexpected-refreshed-access",
+      refresh_token: nil,
+      expires_at: ~U[2026-08-12 04:00:00.000000Z],
+      scopes: [MicrosoftScopes.read()]
+    }
+
+    assert {:error, %{class: :permanent, reason: :stale_oauth_authorization}} =
+             OAuthAuthorizations.checkout_access_token(
+               authorization.id,
+               FakeMicrosoft,
+               [],
+               required_scope: MicrosoftScopes.read(),
+               expected_authorization_lock_version: authorization.lock_version,
+               now: @refresh_now,
+               provider_opts: [
+                 refresh_count: refresh_count,
+                 refresh_result: {:ok, refreshed},
+                 test_pid: self()
+               ]
+             )
+
+    assert Agent.get(refresh_count, & &1) == 0
+    refute_receive {:refresh_started, _, _, _}, 100
+
+    assert authorization_snapshot(Repo.get!(OAuthAuthorization, authorization.id)) ==
+             authorization_snapshot(advanced)
+  end
+
   test "disconnecting receive leaves a healthy send reference and token ciphertext", %{
     account: account,
     address: address
@@ -458,6 +502,33 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
     assert persisted_authorization.refresh_token_ciphertext ==
              authorization.refresh_token_ciphertext
+  end
+
+  test "repeated send disconnect advances method and authorization generations", %{
+    account: account,
+    address: address
+  } do
+    {receive, send_method, authorization} = complete_both(account, address)
+
+    assert {:ok, %SendMethod{status: "disconnected"}} =
+             OAuthAuthorizations.disconnect_method(:send, account.id, send_method.id)
+
+    disconnected_send = Repo.get!(SendMethod, send_method.id)
+    generation = Repo.get!(OAuthAuthorization, authorization.id)
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+
+    assert {:ok, %SendMethod{status: "disconnected"} = repeated} =
+             OAuthAuthorizations.disconnect_method(:send, account.id, send_method.id)
+
+    advanced = Repo.get!(OAuthAuthorization, authorization.id)
+
+    assert repeated.lock_version > disconnected_send.lock_version
+    assert advanced.lock_version > generation.lock_version
+    assert advanced.status == "connected"
+    assert advanced.access_token_ciphertext == authorization.access_token_ciphertext
+    assert advanced.refresh_token_ciphertext == authorization.refresh_token_ciphertext
+    assert Repo.get!(ReceiveMethod, receive.id).status == "connected"
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before + 1
   end
 
   test "disconnecting the final method erases ciphertext and disconnects authorization", %{
@@ -582,6 +653,127 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert Repo.aggregate(ConnectorEvent, :count) == events_before
   end
 
+  test "receive setup carries its own refresh generation into final persistence", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, send_method} =
+             complete(:send, account, address, scopes: access_token_scopes(all_scopes()))
+
+    authorization = Repo.get!(OAuthAuthorization, send_method.oauth_authorization_id)
+
+    refreshed = %Token{
+      access_token: "setup-refreshed-access",
+      refresh_token: nil,
+      expires_at: ~U[2026-08-12 04:00:00.000000Z],
+      scopes: access_token_scopes(all_scopes())
+    }
+
+    assert {:ok, %ReceiveMethod{status: "connected"} = receive} =
+             OAuthAuthorizations.add_authorized_method(
+               "microsoft",
+               account.id,
+               :receive,
+               FakeMicrosoft,
+               [],
+               now: @refresh_now,
+               provider_opts: [refresh_result: {:ok, refreshed}]
+             )
+
+    advanced = Repo.get!(OAuthAuthorization, authorization.id)
+    assert advanced.lock_version > authorization.lock_version
+
+    assert {:ok, "setup-refreshed-access"} =
+             Crypto.decrypt(
+               advanced.access_token_ciphertext,
+               "credential:#{authorization.id}:access"
+             )
+
+    assert sync_cursor_ids(receive.id) != []
+    assert sync_job_count(receive.id) == 1
+  end
+
+  test "phase-one receive setup cannot absorb an absent-create-delete ABA", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, send_method} =
+             complete(:send, account, address, scopes: access_token_scopes(all_scopes()))
+
+    authorization = Repo.get!(OAuthAuthorization, send_method.oauth_authorization_id)
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+    gate = make_ref()
+    test_pid = self()
+    {:ok, refresh_count} = Agent.start_link(fn -> 0 end)
+
+    refreshed = %Token{
+      access_token: "unexpected-aba-refresh",
+      refresh_token: nil,
+      expires_at: ~U[2026-08-12 04:00:00.000000Z],
+      scopes: access_token_scopes(all_scopes())
+    }
+
+    add_task =
+      Task.async(fn ->
+        OAuthAuthorizations.add_authorized_method(
+          "microsoft",
+          account.id,
+          :receive,
+          FakeMicrosoft,
+          [],
+          now: @refresh_now,
+          after_authorized_method_snapshot: fn ->
+            send(test_pid, {:authorized_method_snapshotted, self()})
+
+            receive do
+              {:release_authorized_method_snapshot, ^gate} -> :ok
+            end
+          end,
+          provider_opts: [
+            refresh_count: refresh_count,
+            refresh_result: {:ok, refreshed},
+            test_pid: test_pid
+          ]
+        )
+      end)
+
+    assert_receive {:authorized_method_snapshotted, snapshot_process}
+
+    assert {:ok, %ReceiveMethod{} = transient_receive} =
+             OAuthAuthorizations.add_authorized_method(
+               "microsoft",
+               account.id,
+               :receive,
+               FakeMicrosoft,
+               [],
+               now: @now
+             )
+
+    assert {:ok, %ReceiveMethod{id: transient_id}} =
+             OAuthAuthorizations.delete_receive_method(transient_receive.id)
+
+    assert transient_id == transient_receive.id
+    send(snapshot_process, {:release_authorized_method_snapshot, gate})
+
+    assert {:error, %{class: :permanent, reason: :stale_oauth_authorization}} =
+             Task.await(add_task, 5_000)
+
+    assert Agent.get(refresh_count, & &1) == 0
+    refute_receive {:refresh_started, _, _, _}, 100
+    refute_receive :initial_cursors, 100
+
+    advanced = Repo.get!(OAuthAuthorization, authorization.id)
+    assert advanced.lock_version > authorization.lock_version
+    assert advanced.status == "connected"
+    assert advanced.access_token_ciphertext == authorization.access_token_ciphertext
+    assert advanced.refresh_token_ciphertext == authorization.refresh_token_ciphertext
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+    assert Repo.aggregate(ReceiveMethod, :count) == 0
+    assert Repo.aggregate(SyncCursor, :count) == 0
+    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before + 2
+  end
+
   test "blocked cursor revalidation rejects a changed token generation", %{
     account: account,
     address: address
@@ -692,6 +884,46 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
     assert Repo.get!(ReceiveMethod, receive.id).status == "disconnected"
     assert Repo.get!(SendMethod, send_method.id).status == "connected"
+    assert sync_cursor_ids(receive.id) == cursor_ids_before
+    assert sync_job_count(receive.id) == jobs_before
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before + 1
+  end
+
+  test "blocked receive add cannot undo a repeated disconnected receive lifecycle", %{
+    account: account,
+    address: address
+  } do
+    {receive, send_method, authorization} = complete_both(account, address)
+
+    assert {:ok, %ReceiveMethod{status: "disconnected"}} =
+             OAuthAuthorizations.disconnect_method(:receive, account.id, receive.id)
+
+    disconnected_receive = Repo.get!(ReceiveMethod, receive.id)
+    generation = Repo.get!(OAuthAuthorization, authorization.id)
+    cursor_ids_before = sync_cursor_ids(receive.id)
+    jobs_before = sync_job_count(receive.id)
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+    gate = make_ref()
+
+    {add_task, cursor_process} = start_blocked_receive_add(account, gate)
+
+    assert {:ok, %ReceiveMethod{status: "disconnected"} = repeated} =
+             OAuthAuthorizations.disconnect_method(:receive, account.id, receive.id)
+
+    advanced = Repo.get!(OAuthAuthorization, authorization.id)
+    assert repeated.lock_version > disconnected_receive.lock_version
+    assert advanced.lock_version > generation.lock_version
+
+    send(cursor_process, {:release_cursors, gate})
+
+    assert {:error, %{class: :permanent, reason: :stale_oauth_authorization}} =
+             Task.await(add_task, 5_000)
+
+    assert Repo.get!(ReceiveMethod, receive.id).status == "disconnected"
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+    assert advanced.status == "connected"
+    assert advanced.access_token_ciphertext == authorization.access_token_ciphertext
+    assert advanced.refresh_token_ciphertext == authorization.refresh_token_ciphertext
     assert sync_cursor_ids(receive.id) == cursor_ids_before
     assert sync_job_count(receive.id) == jobs_before
     assert Repo.aggregate(ConnectorEvent, :count) == events_before + 1
@@ -1183,4 +1415,322 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)
   defp restore_env(key, value), do: Application.put_env(:manifold_connectors, key, value)
+end
+
+defmodule Manifold.Connectors.MicrosoftAuthorizationCursorFenceTest do
+  use ExUnit.Case, async: false
+
+  import Ecto.Query
+
+  alias Ecto.Adapters.SQL.Sandbox
+  alias Manifold.Accounts
+  alias Manifold.Connectors.{Crypto, MicrosoftScopes, OAuthAuthorizations}
+
+  alias Manifold.Connectors.Schema.{
+    ConnectorEvent,
+    OAuthAuthorization,
+    ReceiveMethod,
+    SendMethod,
+    SyncCursor
+  }
+
+  alias Manifold.Connectors.MicrosoftAuthorizationsTest.FakeMicrosoft
+  alias Manifold.Repo
+
+  @now ~U[2026-08-12 01:00:00.000000Z]
+  @expires_at ~U[2026-08-12 02:00:00.000000Z]
+
+  setup do
+    :ok = Sandbox.checkout(Repo, sandbox: false)
+    old_key = Application.get_env(:manifold_connectors, :encryption_key)
+
+    Application.put_env(
+      :manifold_connectors,
+      :encryption_key,
+      Base.encode64(:crypto.strong_rand_bytes(32))
+    )
+
+    on_exit(fn ->
+      if old_key do
+        Application.put_env(:manifold_connectors, :encryption_key, old_key)
+      else
+        Application.delete_env(:manifold_connectors, :encryption_key)
+      end
+    end)
+
+    :ok
+  end
+
+  for operation <- [:setup, :delete] do
+    test "#{operation} cursor fence fails fast and releases an earlier partial cursor lock" do
+      operation = unquote(operation)
+      fixture = insert_lifecycle_fixture!(operation)
+      supervisor = start_supervised!(Task.Supervisor)
+      test_pid = self()
+      gate = make_ref()
+
+      holder =
+        Task.Supervisor.async_nolink(supervisor, fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              assert %SyncCursor{} =
+                       SyncCursor
+                       |> where([cursor], cursor.id == ^fixture.later_cursor_id)
+                       |> lock("FOR UPDATE")
+                       |> Repo.one!()
+
+              send(test_pid, {:later_cursor_locked, self(), gate})
+
+              receive do
+                {:delete_earlier_cursor, ^gate} -> :ok
+              end
+
+              assert {1, nil} =
+                       SyncCursor
+                       |> where([cursor], cursor.id == ^fixture.earlier_cursor_id)
+                       |> Repo.delete_all()
+
+              send(test_pid, {:earlier_cursor_deleted, self(), gate})
+
+              receive do
+                {:commit_cursor_checkpoint, ^gate} -> :ok
+              end
+            end)
+          end)
+        end)
+
+      try do
+        assert_receive {:later_cursor_locked, holder_pid, ^gate}, 5_000
+
+        lifecycle =
+          Task.Supervisor.async_nolink(supervisor, fn ->
+            Sandbox.unboxed_run(Repo, fn -> run_lifecycle(operation, fixture) end)
+          end)
+
+        try do
+          assert {:ok, {:error, %{class: :temporary, reason: :oauth_lifecycle_busy}}} =
+                   Task.yield(lifecycle, 1_000)
+
+          send(holder_pid, {:delete_earlier_cursor, gate})
+          assert_receive {:earlier_cursor_deleted, ^holder_pid, ^gate}, 1_000
+          send(holder_pid, {:commit_cursor_checkpoint, gate})
+          assert {:ok, :ok} = Task.await(holder, 5_000)
+
+          assert lifecycle_snapshot(fixture) == fixture.lifecycle_snapshot
+          assert cursor_ids(fixture.receive.id) == [fixture.later_cursor_id]
+          assert Repo.get!(SendMethod, fixture.send_method.id).status == "connected"
+          assert scoped_job_count(fixture.receive.id) == 0
+          assert scoped_event_count(fixture.authorization.id) == 0
+        after
+          stop_task(lifecycle)
+        end
+      after
+        stop_task(holder)
+        cleanup_fixture!(fixture)
+      end
+    end
+  end
+
+  defp insert_lifecycle_fixture!(operation) do
+    suffix = System.unique_integer([:positive])
+    {:ok, domain} = Accounts.create_domain(%{name: "microsoft-fence-#{suffix}.test"})
+    {:ok, account} = Accounts.create_account(domain, %{local_part: "person"})
+    account = Repo.preload(account, :domain)
+    address = Accounts.account_address(account)
+    authorization_id = Ecto.UUID.generate()
+    subject = "microsoft-cursor-fence-#{suffix}"
+    scopes = all_scopes()
+    cursor_id_prefix = Ecto.UUID.generate() |> String.slice(0, 35)
+    earlier_cursor_id = cursor_id_prefix <> "1"
+    later_cursor_id = cursor_id_prefix <> "2"
+
+    assert {:ok, access_token_ciphertext} =
+             Crypto.encrypt(
+               "cursor-fence-access",
+               "credential:#{authorization_id}:access"
+             )
+
+    assert {:ok, refresh_token_ciphertext} =
+             Crypto.encrypt(
+               "cursor-fence-refresh",
+               "credential:#{authorization_id}:refresh"
+             )
+
+    authorization =
+      %OAuthAuthorization{id: authorization_id}
+      |> OAuthAuthorization.changeset(%{
+        account_id: account.id,
+        provider: "microsoft",
+        provider_subject_id: subject,
+        email_address: address,
+        granted_scopes: scopes,
+        status: "connected",
+        access_token_ciphertext: access_token_ciphertext,
+        refresh_token_ciphertext: refresh_token_ciphertext,
+        token_expires_at: @expires_at
+      })
+      |> Repo.insert!()
+
+    receive_status = if operation == :setup, do: "failed", else: "connected"
+    receive_enabled = operation == :delete
+
+    receive =
+      %ReceiveMethod{}
+      |> ReceiveMethod.changeset(%{
+        account_id: account.id,
+        oauth_authorization_id: authorization.id,
+        kind: "microsoft",
+        provider_account_id: subject,
+        email_address: address,
+        status: receive_status,
+        enabled: receive_enabled,
+        sync_enabled: receive_enabled,
+        granted_scopes: scopes
+      })
+      |> Repo.insert!()
+
+    send_method =
+      %SendMethod{}
+      |> SendMethod.changeset(%{
+        account_id: account.id,
+        oauth_authorization_id: authorization.id,
+        kind: "microsoft",
+        email_address: address,
+        status: "connected",
+        enabled: true
+      })
+      |> Repo.insert!()
+
+    insert_cursor!(receive.id, earlier_cursor_id, "earlier")
+    insert_cursor!(receive.id, later_cursor_id, "later")
+
+    fixture = %{
+      domain: domain,
+      account: account,
+      authorization: authorization,
+      receive: receive,
+      send_method: send_method,
+      earlier_cursor_id: earlier_cursor_id,
+      later_cursor_id: later_cursor_id
+    }
+
+    Map.put(fixture, :lifecycle_snapshot, lifecycle_snapshot(fixture))
+  end
+
+  defp insert_cursor!(receive_method_id, id, scope) do
+    %SyncCursor{id: id}
+    |> SyncCursor.changeset(%{
+      external_account_id: receive_method_id,
+      scope: scope,
+      phase: "initial",
+      metadata: %{},
+      generation: 1
+    })
+    |> Repo.insert!()
+  end
+
+  defp run_lifecycle(:setup, fixture) do
+    OAuthAuthorizations.add_authorized_method(
+      "microsoft",
+      fixture.account.id,
+      :receive,
+      FakeMicrosoft,
+      [],
+      now: @now
+    )
+  end
+
+  defp run_lifecycle(:delete, fixture) do
+    OAuthAuthorizations.delete_receive_method(fixture.receive.id)
+  end
+
+  defp lifecycle_snapshot(fixture) do
+    %{
+      authorization:
+        fixture.authorization.id
+        |> then(&Repo.get!(OAuthAuthorization, &1))
+        |> Map.take([
+          :status,
+          :access_token_ciphertext,
+          :refresh_token_ciphertext,
+          :token_expires_at,
+          :lock_version
+        ]),
+      receive:
+        fixture.receive.id
+        |> then(&Repo.get!(ReceiveMethod, &1))
+        |> Map.take([:status, :enabled, :sync_enabled, :lock_version])
+    }
+  end
+
+  defp cursor_ids(receive_method_id) do
+    SyncCursor
+    |> where([cursor], cursor.external_account_id == ^receive_method_id)
+    |> order_by([cursor], asc: cursor.id)
+    |> select([cursor], cursor.id)
+    |> Repo.all()
+  end
+
+  defp scoped_job_count(receive_method_id) do
+    Repo.aggregate(
+      from(job in Oban.Job,
+        where: fragment("?->>'external_account_id' = ?", job.args, ^receive_method_id)
+      ),
+      :count
+    )
+  end
+
+  defp scoped_event_count(authorization_id) do
+    Repo.aggregate(
+      from(event in ConnectorEvent,
+        where: event.oauth_authorization_id == ^authorization_id
+      ),
+      :count
+    )
+  end
+
+  defp cleanup_fixture!(fixture) do
+    Oban.Job
+    |> where(
+      [job],
+      fragment("?->>'external_account_id' = ?", job.args, ^fixture.receive.id)
+    )
+    |> Repo.delete_all()
+
+    SyncCursor
+    |> where([cursor], cursor.external_account_id == ^fixture.receive.id)
+    |> Repo.delete_all()
+
+    ReceiveMethod
+    |> where([method], method.account_id == ^fixture.account.id)
+    |> Repo.delete_all()
+
+    SendMethod
+    |> where([method], method.account_id == ^fixture.account.id)
+    |> Repo.delete_all()
+
+    OAuthAuthorization
+    |> where([authorization], authorization.account_id == ^fixture.account.id)
+    |> Repo.delete_all()
+
+    cleanup_account_and_domain!(fixture)
+  end
+
+  defp cleanup_account_and_domain!(fixture) do
+    fixture.account
+    |> then(&Repo.get!(fixture.account.__struct__, &1.id))
+    |> Repo.delete!()
+
+    fixture.domain
+    |> then(&Repo.get!(fixture.domain.__struct__, &1.id))
+    |> Repo.delete!()
+  end
+
+  defp all_scopes do
+    Enum.sort([MicrosoftScopes.read(), MicrosoftScopes.send(), MicrosoftScopes.offline()])
+  end
+
+  defp stop_task(%Task{} = task) do
+    if Process.alive?(task.pid), do: Task.shutdown(task, :brutal_kill), else: :ok
+  end
 end
