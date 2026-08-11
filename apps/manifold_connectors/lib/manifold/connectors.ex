@@ -10,6 +10,7 @@ defmodule Manifold.Connectors do
   alias Manifold.Connectors.ActivityLog
   alias Manifold.Connectors.Crypto
   alias Manifold.Connectors.GmailAuthorizations
+  alias Manifold.Connectors.GmailScopes
   alias Manifold.Connectors.IMAP.Client
   alias Manifold.Connectors.EAS.Client, as: EASClient
   alias Manifold.Connectors.SMTP.Client, as: SmtpClient
@@ -20,6 +21,7 @@ defmodule Manifold.Connectors do
   alias Manifold.Connectors.Provider.EAS, as: ProviderEAS
   alias Manifold.Connectors.Provider.{Identity, Token}
   alias Manifold.Connectors.Sync
+  alias Manifold.Connectors.SubmissionMethod
 
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
@@ -365,6 +367,43 @@ defmodule Manifold.Connectors do
     |> Enum.map(&send_method_view/1)
   end
 
+  @spec enabled_send_method(Ecto.UUID.t()) ::
+          {:ok, SubmissionMethod.t()} | {:error, Error.t()}
+  def enabled_send_method(account_id) do
+    SendMethod
+    |> where([method], method.account_id == ^account_id and method.enabled == true)
+    |> Repo.one()
+    |> case do
+      %SendMethod{} = method -> {:ok, submission_method(method)}
+      nil -> {:error, send_method_required()}
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  @spec checkout_send_method(Ecto.UUID.t(), String.t(), Keyword.t()) ::
+          {:ok, SubmissionMethod.t()}
+          | {:error, Error.t() | ProviderError.t() | Ecto.Changeset.t()}
+  def checkout_send_method(method_id, required_sender, opts \\ []) do
+    with {:ok, parsed_sender} <- Address.parse(required_sender) do
+      Repo.transaction(fn ->
+        with {:ok, method} <- lock_send_method(method_id),
+             :ok <- validate_send_method_checkout(method, parsed_sender),
+             {:ok, credential, config} <- checkout_send_credential(method, opts) do
+          submission_method(method, credential: credential, config: config)
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> case do
+        {:ok, %SubmissionMethod{} = method} -> {:ok, method}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
   @spec test_smtp_connection(map()) :: :ok | {:error, Error.t() | ProviderError.t()}
   def test_smtp_connection(attrs) when is_map(attrs) do
     attrs = normalize_smtp_attrs(attrs)
@@ -401,8 +440,9 @@ defmodule Manifold.Connectors do
     account_id = attr(attrs, :account_id)
 
     with {:ok, parsed} <- Address.parse(attr(attrs, :email_address) || ""),
-         :ok <- maybe_test_smtp(attrs, skip_test?),
-         {:ok, mailbox} <- resolve_send_account(account_id) do
+         {:ok, mailbox} <- resolve_send_account(account_id),
+         :ok <- require_account_sender(parsed, mailbox),
+         :ok <- maybe_test_smtp(attrs, skip_test?) do
       persist_smtp_send_method(attrs, parsed, mailbox, now)
     else
       {:error, %ProviderError{} = error} -> {:error, error}
@@ -1124,6 +1164,17 @@ defmodule Manifold.Connectors do
     }
   end
 
+  defp submission_method(method, opts \\ []) do
+    %SubmissionMethod{
+      id: method.id,
+      account_id: method.account_id,
+      kind: method.kind,
+      email_address: method.email_address,
+      credential: Keyword.get(opts, :credential),
+      config: Keyword.get(opts, :config)
+    }
+  end
+
   defp normalize_folder_kind(folder_kind) when folder_kind in ~w(inbox archive trash),
     do: folder_kind
 
@@ -1708,6 +1759,121 @@ defmodule Manifold.Connectors do
 
   defp resolve_send_account(_) do
     {:error, Error.new(:permanent, :account_not_found, "account not found")}
+  end
+
+  defp lock_send_method(method_id) do
+    SendMethod
+    |> where([method], method.id == ^method_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+    |> case do
+      %SendMethod{} = method -> {:ok, method}
+      nil -> {:error, send_method_required()}
+    end
+  end
+
+  defp validate_send_method_checkout(
+         %SendMethod{status: "disconnected"},
+         _required_sender
+       ) do
+    {:error, Error.new(:permanent, :account_disconnected, "send method is disconnected")}
+  end
+
+  defp validate_send_method_checkout(
+         %SendMethod{status: "reconnect_required"},
+         _required_sender
+       ) do
+    {:error,
+     Error.new(:permanent, :reauthorization_required, "send method requires reauthorization")}
+  end
+
+  defp validate_send_method_checkout(%SendMethod{enabled: false}, _required_sender),
+    do: {:error, send_method_required()}
+
+  defp validate_send_method_checkout(
+         %SendMethod{status: "connected"} = method,
+         required_sender
+       ) do
+    with %{} = account <- Accounts.get_account(method.account_id),
+         {:ok, method_sender} <- Address.parse(method.email_address),
+         {:ok, account_sender} <- Address.parse(Accounts.account_address(account)),
+         true <-
+           required_sender.canonical == method_sender.canonical and
+             method_sender.canonical == account_sender.canonical do
+      :ok
+    else
+      nil -> {:error, send_method_required()}
+      _mismatch -> {:error, sender_address_mismatch()}
+    end
+  end
+
+  defp validate_send_method_checkout(%SendMethod{}, _required_sender),
+    do: {:error, send_method_required()}
+
+  defp checkout_send_credential(
+         %SendMethod{kind: "gmail", oauth_authorization_id: authorization_id},
+         opts
+       )
+       when is_binary(authorization_id) do
+    with {:ok, access_token} <-
+           checkout_oauth_access_token(
+             authorization_id,
+             Keyword.put(opts, :required_scope, GmailScopes.send())
+           ),
+         {:ok, config} <- gmail_submission_config() do
+      {:ok, {:oauth, access_token}, config}
+    end
+  end
+
+  defp checkout_send_credential(%SendMethod{kind: "gmail"}, _opts),
+    do: {:error, send_method_required()}
+
+  defp checkout_send_credential(%SendMethod{kind: "smtp"} = method, _opts) do
+    with %SendCredential{} = credential <-
+           Repo.get_by(SendCredential, send_method_id: method.id),
+         %SmtpSettings{} = settings <- Repo.get_by(SmtpSettings, send_method_id: method.id),
+         {:ok, password} <-
+           Crypto.decrypt(
+             credential.password_ciphertext,
+             credential_context(method.id, :smtp_password)
+           ) do
+      config = Map.take(settings, [:host, :port, :tls_mode, :username])
+      {:ok, {:password, password}, config}
+    else
+      nil -> {:error, send_method_required()}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp gmail_submission_config do
+    case Application.get_env(:manifold_connectors, :providers, [])[:gmail] do
+      config when is_list(config) ->
+        {:ok, Keyword.take(config, [:base_url, :req_options])}
+
+      _missing ->
+        {:error, Error.new(:permanent, :provider_not_configured, "provider is not configured")}
+    end
+  end
+
+  defp require_account_sender(parsed, account) do
+    with {:ok, account_address} <- Address.parse(Accounts.account_address(account)),
+         true <- parsed.canonical == account_address.canonical do
+      :ok
+    else
+      _mismatch -> {:error, sender_address_mismatch()}
+    end
+  end
+
+  defp send_method_required do
+    Error.new(:permanent, :send_method_required, "an enabled send method is required")
+  end
+
+  defp sender_address_mismatch do
+    Error.new(
+      :permanent,
+      :sender_address_mismatch,
+      "send method address does not match the account sender"
+    )
   end
 
   defp maybe_test_smtp(_attrs, true), do: :ok
