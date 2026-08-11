@@ -50,6 +50,13 @@ defmodule Manifold.Connectors do
   def complete_authorization(provider, code, consumed, opts \\ [])
 
   def complete_authorization("gmail", code, %Consumed{} = consumed, opts) do
+    provider_opts =
+      opts
+      |> provider_opts()
+      |> Keyword.put(:required_scopes, consumed.required_scopes)
+
+    opts = Keyword.put(opts, :provider_opts, provider_opts)
+
     with :ok <- validate_consumed("gmail", consumed),
          {:ok, adapter, config} <- adapter_config("gmail") do
       GmailAuthorizations.complete(code, consumed, adapter, config, opts)
@@ -653,6 +660,19 @@ defmodule Manifold.Connectors do
   @spec delete_receive_method(Ecto.UUID.t()) ::
           {:ok, ReceiveMethod.t()} | {:error, Error.t()}
   def delete_receive_method(method_id) do
+    case Repo.get(ReceiveMethod, method_id) do
+      %ReceiveMethod{kind: "gmail", oauth_authorization_id: authorization_id}
+      when is_binary(authorization_id) ->
+        GmailAuthorizations.delete_receive_method(method_id)
+
+      _method ->
+        delete_legacy_receive_method(method_id)
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  defp delete_legacy_receive_method(method_id) do
     Multi.new()
     |> Multi.run(:method, fn repo, _changes ->
       method =
@@ -688,8 +708,6 @@ defmodule Manifold.Connectors do
       {:ok, %{deleted: method}} -> {:ok, method}
       {:error, _step, reason, _changes} -> {:error, reason}
     end
-  rescue
-    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
   @doc false

@@ -25,8 +25,13 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     @behaviour Manifold.Connectors.Provider
 
     @impl true
-    def exchange_code(_code, _verifier, _redirect_uri, _config, opts),
-      do: Keyword.fetch!(opts, :token)
+    def exchange_code(_code, _verifier, _redirect_uri, _config, opts) do
+      if test_pid = Keyword.get(opts, :test_pid) do
+        send(test_pid, {:exchange_required_scopes, Keyword.get(opts, :required_scopes)})
+      end
+
+      Keyword.fetch!(opts, :token)
+    end
 
     @impl true
     def identity(_access_token, _config, opts), do: Keyword.fetch!(opts, :identity)
@@ -530,6 +535,150 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert Repo.get!(SendMethod, alternate.id).enabled
   end
 
+  test "receive reauthorization repairs both Gmail directions", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, send_method} =
+             complete(:send, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    assert {:ok, _authorization} =
+             Manifold.Connectors.GmailAuthorizations.mark_reconnect_required(
+               receive.oauth_authorization_id,
+               reconnect_error()
+             )
+
+    alternate_receive = insert_other_receive!(account.id, address)
+    alternate_send = insert_other_send!(account.id, address)
+
+    assert {:ok, repaired_receive} =
+             complete(:receive, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    assert repaired_receive.id == receive.id
+    assert_gmail_methods_repaired(receive.id, send_method.id)
+    refute Repo.get!(ReceiveMethod, alternate_receive.id).enabled
+    refute Repo.get!(SendMethod, alternate_send.id).enabled
+  end
+
+  test "send reauthorization repairs both Gmail directions", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, send_method} = complete(:send, account, address)
+
+    assert {:ok, receive} =
+             complete(:receive, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    assert {:ok, _authorization} =
+             Manifold.Connectors.GmailAuthorizations.mark_reconnect_required(
+               receive.oauth_authorization_id,
+               reconnect_error()
+             )
+
+    alternate_receive = insert_other_receive!(account.id, address)
+    alternate_send = insert_other_send!(account.id, address)
+
+    assert {:ok, repaired_send} =
+             complete(:send, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    assert repaired_send.id == send_method.id
+    assert_gmail_methods_repaired(receive.id, send_method.id)
+    refute Repo.get!(ReceiveMethod, alternate_receive.id).enabled
+    refute Repo.get!(SendMethod, alternate_send.id).enabled
+  end
+
+  test "deleting a Gmail receive method keeps a live send authorization", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, send_method} =
+             complete(:send, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    before = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    assert sync_job_count(receive.id) == 1
+
+    assert {:ok, deleted} = Connectors.delete_receive_method(receive.id)
+    assert deleted.id == receive.id
+    refute Repo.get(ReceiveMethod, receive.id)
+    assert sync_job_count(receive.id) == 0
+
+    authorization = Repo.get!(OAuthAuthorization, before.id)
+    assert authorization.status == "connected"
+    assert authorization.access_token_ciphertext == before.access_token_ciphertext
+    assert authorization.refresh_token_ciphertext == before.refresh_token_ciphertext
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+  end
+
+  test "deleting the final Gmail receive method disconnects the shared authorization", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    before = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    assert {:ok, deleted} = Connectors.delete_receive_method(receive.id)
+    assert deleted.id == receive.id
+    refute Repo.get(ReceiveMethod, receive.id)
+    assert sync_job_count(receive.id) == 0
+
+    authorization = Repo.get!(OAuthAuthorization, before.id)
+    assert authorization.status == "disconnected"
+    assert authorization.provider_subject_id == before.provider_subject_id
+    assert authorization.email_address == before.email_address
+    assert is_nil(authorization.access_token_ciphertext)
+    assert is_nil(authorization.refresh_token_ciphertext)
+    assert is_nil(authorization.token_expires_at)
+
+    event = Repo.get_by!(ConnectorEvent, event_type: "disconnected")
+    assert event.oauth_authorization_id == before.id
+    assert is_nil(event.external_account_id)
+  end
+
+  test "Gmail disconnect locks the authorization before its receive method", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    queries =
+      repo_queries_during(fn -> assert {:ok, _method} = Connectors.disconnect(receive.id) end)
+
+    assert authorization_lock_index(queries) < receive_method_lock_index(queries)
+  end
+
+  test "Gmail direct delete locks the authorization before its receive method", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    queries =
+      repo_queries_during(fn ->
+        assert {:ok, _method} = Connectors.delete_receive_method(receive.id)
+      end)
+
+    assert authorization_lock_index(queries) < receive_method_lock_index(queries)
+  end
+
   test "connector events require exactly one legacy or Gmail authorization anchor" do
     now = ~U[2026-08-11 01:00:00.000000Z]
 
@@ -664,6 +813,19 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     end
   end
 
+  test "adapter scope fallback comes from the consumed callback transaction", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, %SendMethod{}} =
+             complete(:send, account, address,
+               provider_opts: [test_pid: self(), required_scopes: ["attacker-supplied"]]
+             )
+
+    assert_receive {:exchange_required_scopes, [scope]}
+    assert scope == GmailScopes.send()
+  end
+
   defp complete(purpose, account, address, opts \\ []) do
     purpose_scope = if purpose == :receive, do: GmailScopes.read(), else: GmailScopes.send()
     required_scopes = Keyword.get(opts, :required_scopes, [purpose_scope])
@@ -695,12 +857,18 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
         email_address: address
       })
 
+    provider_opts =
+      Keyword.merge(
+        [token: {:ok, token}, identity: {:ok, identity}],
+        Keyword.get(opts, :provider_opts, [])
+      )
+
     Connectors.complete_authorization(
       "gmail",
       Keyword.get(opts, :code, "authorization-code-secret"),
       consumed,
       now: ~U[2026-08-11 01:00:00.000000Z],
-      provider_opts: [token: {:ok, token}, identity: {:ok, identity}]
+      provider_opts: provider_opts
     )
   end
 
@@ -748,6 +916,74 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
       code: :invalid_grant,
       message: "provider authentication failed"
     }
+  end
+
+  defp assert_gmail_methods_repaired(receive_method_id, send_method_id) do
+    receive = Repo.get!(ReceiveMethod, receive_method_id)
+    assert receive.status == "connected"
+    assert receive.enabled
+    assert receive.sync_enabled
+    assert is_nil(receive.last_error_class)
+    assert is_nil(receive.last_error_code)
+    assert is_nil(receive.last_error_message)
+
+    send_method = Repo.get!(SendMethod, send_method_id)
+    assert send_method.status == "connected"
+    assert send_method.enabled
+    assert is_nil(send_method.last_error_class)
+    assert is_nil(send_method.last_error_code)
+    assert is_nil(send_method.last_error_message)
+
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    assert authorization.status == "connected"
+    assert is_nil(authorization.last_error_class)
+    assert is_nil(authorization.last_error_code)
+    assert is_nil(authorization.last_error_message)
+  end
+
+  defp repo_queries_during(fun) do
+    handler_id = "gmail-lifecycle-query-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :repo, :query],
+        fn _event, _measurements, metadata, pid ->
+          send(pid, {:gmail_lifecycle_query, handler_id, metadata.query})
+        end,
+        test_pid
+      )
+
+    try do
+      fun.()
+      received_repo_queries(handler_id)
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp received_repo_queries(handler_id, queries \\ []) do
+    receive do
+      {:gmail_lifecycle_query, ^handler_id, query} ->
+        received_repo_queries(handler_id, [query | queries])
+    after
+      0 -> Enum.reverse(queries)
+    end
+  end
+
+  defp authorization_lock_index(queries) do
+    Enum.find_index(queries, fn query ->
+      String.contains?(query, ~s(FROM "connector_oauth_authorizations")) and
+        String.contains?(query, "FOR UPDATE")
+    end)
+  end
+
+  defp receive_method_lock_index(queries) do
+    Enum.find_index(queries, fn query ->
+      String.contains?(query, ~s(FROM "connector_accounts")) and
+        String.contains?(query, "FOR UPDATE")
+    end)
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)

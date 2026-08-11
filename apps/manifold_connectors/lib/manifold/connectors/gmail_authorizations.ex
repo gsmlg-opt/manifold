@@ -61,6 +61,9 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   rescue
     DBConnection.ConnectionError ->
       {:error, database_error()}
+
+    error in Postgrex.Error ->
+      normalize_transaction_error(error, __STACKTRACE__)
   end
 
   def complete(_code, %Consumed{}, _adapter, _config, _opts) do
@@ -73,25 +76,57 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   def disconnect_method(direction, method_id) when direction in [:receive, :send] do
     now = DateTime.utc_now()
 
-    Repo.transaction(fn ->
-      with {:ok, method} <- lock_method(direction, method_id),
-           {:ok, disconnected} <- disconnect_locked_method(direction, method, now),
-           :ok <- delete_method_secrets(direction, method.id),
-           {:ok, authorization} <- lock_authorization(method.oauth_authorization_id),
-           {:ok, _authorization} <- maybe_disconnect_authorization(authorization, now),
-           {:ok, _event} <-
-             insert_authorization_event(authorization.id, "disconnected", direction, now) do
-        disconnected
-      else
-        {:error, reason} -> Repo.rollback(reason)
+    with {:ok, authorization_id} <- method_authorization_id(direction, method_id) do
+      Repo.transaction(fn ->
+        with {:ok, authorization} <- lock_authorization(authorization_id),
+             {:ok, method} <- lock_method(direction, method_id, authorization),
+             {:ok, disconnected} <- disconnect_locked_method(direction, method, now),
+             :ok <- delete_method_secrets(direction, method.id),
+             {:ok, _authorization} <- maybe_disconnect_authorization(authorization, now),
+             {:ok, _event} <-
+               insert_authorization_event(authorization.id, "disconnected", direction, now) do
+          disconnected
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> case do
+        {:ok, method} -> {:ok, method}
+        {:error, reason} -> {:error, reason}
       end
-    end)
-    |> case do
-      {:ok, method} -> {:ok, method}
-      {:error, reason} -> {:error, reason}
     end
   rescue
     DBConnection.ConnectionError -> {:error, database_error()}
+    error in Postgrex.Error -> normalize_transaction_error(error, __STACKTRACE__)
+  end
+
+  @spec delete_receive_method(Ecto.UUID.t()) ::
+          {:ok, ReceiveMethod.t()} | {:error, CoreError.t() | Ecto.Changeset.t()}
+  def delete_receive_method(method_id) do
+    now = DateTime.utc_now()
+
+    with {:ok, authorization_id} <- method_authorization_id(:receive, method_id) do
+      Repo.transaction(fn ->
+        with {:ok, authorization} <- lock_authorization(authorization_id),
+             {:ok, method} <- lock_method(:receive, method_id, authorization),
+             :ok <- cancel_receive_jobs(method.id),
+             {:ok, deleted} <- Repo.delete(method),
+             {:ok, _authorization} <- maybe_disconnect_authorization(authorization, now),
+             {:ok, _event} <-
+               insert_authorization_event(authorization.id, "disconnected", :receive, now) do
+          deleted
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> case do
+        {:ok, method} -> {:ok, method}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error()}
+    error in Postgrex.Error -> normalize_transaction_error(error, __STACKTRACE__)
   end
 
   @spec mark_reconnect_required(Ecto.UUID.t(), ProviderError.t(), keyword()) ::
@@ -132,6 +167,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     end
   rescue
     DBConnection.ConnectionError -> {:error, database_error()}
+    error in Postgrex.Error -> normalize_transaction_error(error, __STACKTRACE__)
   end
 
   defp persist(consumed, purpose, token, identity, provider_address, cursors, now) do
@@ -169,6 +205,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
                granted_scopes,
                now
              ),
+           :ok <- repair_dependent_method(purpose, authorization),
            :ok <- persist_receive_state(purpose, method, cursors, now),
            {:ok, _event} <-
              insert_authorization_event(authorization.id, event_type, purpose, now) do
@@ -466,6 +503,77 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     :ok
   end
 
+  defp repair_dependent_method(:receive, authorization) do
+    SendMethod
+    |> where(
+      [method],
+      method.oauth_authorization_id == ^authorization.id and method.kind == @provider and
+        method.status == "reconnect_required"
+    )
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+    |> case do
+      nil ->
+        :ok
+
+      %SendMethod{} = method ->
+        disable_other_send_methods(authorization.account_id, method.id)
+
+        method
+        |> SendMethod.changeset(%{
+          status: "connected",
+          enabled: true,
+          disconnected_at: nil,
+          last_error_class: nil,
+          last_error_code: nil,
+          last_error_message: nil
+        })
+        |> Repo.update()
+        |> ok_result()
+    end
+  end
+
+  defp repair_dependent_method(:send, authorization) do
+    ReceiveMethod
+    |> where(
+      [method],
+      method.oauth_authorization_id == ^authorization.id and method.kind == @provider and
+        method.status == "reconnect_required"
+    )
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+    |> case do
+      nil ->
+        :ok
+
+      %ReceiveMethod{} = method ->
+        disable_other_receive_methods(authorization.account_id, method.id)
+
+        method
+        |> ReceiveMethod.changeset(%{
+          status: "connected",
+          enabled: true,
+          sync_enabled: true,
+          disconnected_at: nil,
+          last_error_class: nil,
+          last_error_code: nil,
+          last_error_message: nil
+        })
+        |> Repo.update()
+        |> case do
+          {:ok, repaired} ->
+            _job = ensure_sync_job(repaired.id)
+            :ok
+
+          {:error, changeset} ->
+            {:error, changeset}
+        end
+    end
+  end
+
+  defp ok_result({:ok, _value}), do: :ok
+  defp ok_result({:error, reason}), do: {:error, reason}
+
   defp maybe_except(query, nil), do: query
   defp maybe_except(query, except_id), do: where(query, [method], method.id != ^except_id)
 
@@ -631,10 +739,41 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   defp purpose_scope(:receive), do: GmailScopes.read()
   defp purpose_scope(:send), do: GmailScopes.send()
 
-  defp lock_method(:receive, method_id), do: do_lock_method(ReceiveMethod, method_id)
-  defp lock_method(:send, method_id), do: do_lock_method(SendMethod, method_id)
+  defp method_authorization_id(:receive, method_id),
+    do: do_method_authorization_id(ReceiveMethod, method_id)
 
-  defp do_lock_method(schema, method_id) do
+  defp method_authorization_id(:send, method_id),
+    do: do_method_authorization_id(SendMethod, method_id)
+
+  defp do_method_authorization_id(schema, method_id) do
+    schema
+    |> where([method], method.id == ^method_id)
+    |> select([method], {method.kind, method.oauth_authorization_id})
+    |> Repo.one()
+    |> case do
+      nil ->
+        {:error, CoreError.new(:permanent, :account_not_found, "connector method not found")}
+
+      {@provider, authorization_id} when is_binary(authorization_id) ->
+        {:ok, authorization_id}
+
+      _method ->
+        {:error,
+         CoreError.new(:permanent, :invalid_gmail_method, "connector method is not Gmail")}
+    end
+  end
+
+  defp lock_method(:receive, method_id, authorization),
+    do: do_lock_method(ReceiveMethod, method_id, authorization)
+
+  defp lock_method(:send, method_id, authorization),
+    do: do_lock_method(SendMethod, method_id, authorization)
+
+  defp do_lock_method(
+         schema,
+         method_id,
+         %OAuthAuthorization{id: authorization_id, account_id: account_id}
+       ) do
     schema
     |> where([method], method.id == ^method_id)
     |> lock("FOR UPDATE")
@@ -643,8 +782,11 @@ defmodule Manifold.Connectors.GmailAuthorizations do
       nil ->
         {:error, CoreError.new(:permanent, :account_not_found, "connector method not found")}
 
-      %{kind: @provider, oauth_authorization_id: authorization_id} = method
-      when is_binary(authorization_id) ->
+      %{
+        kind: @provider,
+        oauth_authorization_id: ^authorization_id,
+        account_id: ^account_id
+      } = method ->
         {:ok, method}
 
       _method ->
@@ -701,6 +843,19 @@ defmodule Manifold.Connectors.GmailAuthorizations do
 
     SmtpSettings
     |> where([settings], settings.send_method_id == ^method_id)
+    |> Repo.delete_all()
+
+    :ok
+  end
+
+  defp cancel_receive_jobs(method_id) do
+    Oban.Job
+    |> where([job], job.worker == ^inspect(SyncAccount))
+    |> where([job], job.state in ~w(available scheduled retryable suspended))
+    |> where(
+      [job],
+      fragment("?->>'external_account_id' = ?", job.args, ^method_id)
+    )
     |> Repo.delete_all()
 
     :ok
@@ -805,4 +960,14 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   defp database_error do
     CoreError.new(:temporary, :database_unavailable, "connector database is unavailable")
   end
+
+  defp normalize_transaction_error(
+         %Postgrex.Error{postgres: %{code: code}},
+         _stacktrace
+       )
+       when code in [:deadlock_detected, :serialization_failure] do
+    {:error, database_error()}
+  end
+
+  defp normalize_transaction_error(error, stacktrace), do: reraise(error, stacktrace)
 end
