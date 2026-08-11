@@ -2,10 +2,11 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
   use Manifold.DataCase, async: false
 
   alias Manifold.Accounts
+  alias Manifold.Connectors.Schema.SendMethod
   alias Manifold.Outbound
   alias Manifold.Outbound.Jobs.SubmitOutbound
   alias Manifold.Outbound.Provider
-  alias Manifold.Outbound.Schema.OutboundMessage
+  alias Manifold.Outbound.Schema.{OutboundMessage, ProviderSubmission}
   alias Manifold.Repo
 
   defmodule ConfiguredProvider do
@@ -108,6 +109,16 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     {:ok, domain} = Accounts.create_domain(%{name: "worker#{suffix}.test"})
     {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "inbox"})
 
+    %SendMethod{}
+    |> SendMethod.changeset(%{
+      account_id: mailbox.id,
+      kind: "smtp",
+      email_address: "inbox@#{domain.normalized_domain}",
+      status: "connected",
+      enabled: true
+    })
+    |> Repo.insert!()
+
     {:ok, draft} =
       Outbound.create_draft(mailbox.id, %{
         subject: "Worker",
@@ -116,6 +127,17 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
       })
 
     {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
+
+    ProviderSubmission
+    |> Repo.get_by!(outbound_message_id: queued.id)
+    |> Ecto.Changeset.change(
+      send_method_id: nil,
+      provider: "resend",
+      provider_rfc_message_id: nil,
+      idempotency_expires_at: DateTime.add(DateTime.utc_now(), 24, :hour)
+    )
+    |> Repo.update!()
+
     queued
   end
 

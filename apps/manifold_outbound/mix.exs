@@ -23,6 +23,7 @@ defmodule Manifold.Outbound.MixProject do
       {:manifold_core, in_umbrella: true},
       {:manifold_data, in_umbrella: true},
       {:manifold_accounts, in_umbrella: true},
+      {:manifold_connectors, in_umbrella: true},
       {:manifold_mail, in_umbrella: true},
       {:oban, "~> 2.20"},
       {:req, "~> 0.5"},
