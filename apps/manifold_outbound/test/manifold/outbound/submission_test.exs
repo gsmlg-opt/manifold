@@ -612,6 +612,65 @@ defmodule Manifold.Outbound.SubmissionTest do
     assert Repo.get!(SendMethod, stale_method.id).status == "connected"
   end
 
+  test "Gmail reconnect lifecycle failure is retryable without resending" do
+    %{message: first_message, method: method} = queued_operational_fixture("gmail")
+
+    {:ok, second_draft} =
+      Outbound.create_draft(method.account_id, %{
+        subject: "Second reconnect",
+        text_body: "Body",
+        recipients: [%{kind: "to", address: "person@example.net"}]
+      })
+
+    {:ok, second_message} = Outbound.queue_draft(method.account_id, second_draft.id)
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      conn |> Plug.Conn.put_status(401) |> Req.Test.json(%{"error" => "invalid_grant"})
+    end)
+
+    result =
+      Outbound.submit_message(first_message.id,
+        provider_config: [
+          base_url: "https://gmail.test",
+          req_options: [plug: {Req.Test, __MODULE__}]
+        ],
+        reconnect_opts: [fail_at: :after_methods_before_event]
+      )
+
+    assert {:error, %{class: :temporary, reason: :gmail_reconnect_lifecycle_failed}} = result
+
+    refute inspect(result) =~ "gmail-access-token"
+    assert Repo.get!(OutboundMessage, first_message.id).state == "submitting"
+    assert Repo.get!(OAuthAuthorization, method.oauth_authorization_id).status == "connected"
+    assert Repo.get!(SendMethod, method.id).status == "connected"
+
+    assert {:error, %{reason: :submission_uncertain}} =
+             Outbound.submit_message(first_message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: :unused]
+             )
+
+    refute_receive {:provider_submit, _, _}
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      conn |> Plug.Conn.put_status(401) |> Req.Test.json(%{"error" => "invalid_grant"})
+    end)
+
+    assert {:error, %Provider.Error{class: :permanent, code: "reconnect_required"}} =
+             Outbound.submit_message(second_message.id,
+               provider_config: [
+                 base_url: "https://gmail.test",
+                 req_options: [plug: {Req.Test, __MODULE__}]
+               ]
+             )
+
+    assert Repo.get!(OAuthAuthorization, method.oauth_authorization_id).status ==
+             "reconnect_required"
+
+    assert Repo.get!(SendMethod, method.id).status == "reconnect_required"
+    assert Repo.get!(OutboundMessage, second_message.id).state == "failed"
+  end
+
   test "disconnected and reconnect-required snapshots block submission" do
     for {status, expected_code} <- [
           {"disconnected", "account_disconnected"},

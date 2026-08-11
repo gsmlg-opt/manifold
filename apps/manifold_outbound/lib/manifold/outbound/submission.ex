@@ -192,7 +192,7 @@ defmodule Manifold.Outbound.Submission do
     result =
       with {:ok, provider, config, request, method} <- dispatch(preparation, opts) do
         provider.submit(config, request)
-        |> maybe_mark_gmail_reconnect(method)
+        |> maybe_mark_gmail_reconnect(method, opts)
       end
 
     maybe_before_persist(opts, preparation, result)
@@ -354,13 +354,28 @@ defmodule Manifold.Outbound.Submission do
 
   defp maybe_mark_gmail_reconnect(
          {:error, %Provider.Error{class: :permanent, code: "reconnect_required"}} = result,
-         %SubmissionMethod{id: method_id, kind: "gmail", credential: {:oauth, access_token}}
+         %SubmissionMethod{id: method_id, kind: "gmail", credential: {:oauth, access_token}},
+         opts
        ) do
-    _ = Connectors.mark_gmail_send_reconnect_required(method_id, access_token)
-    result
+    case Connectors.mark_gmail_send_reconnect_required(
+           method_id,
+           access_token,
+           Keyword.get(opts, :reconnect_opts, [])
+         ) do
+      {:ok, _authorization} -> result
+      {:error, _sanitized_reason} -> {:error, reconnect_lifecycle_error()}
+    end
   end
 
-  defp maybe_mark_gmail_reconnect(result, _method), do: result
+  defp maybe_mark_gmail_reconnect(result, _method, _opts), do: result
+
+  defp reconnect_lifecycle_error do
+    Error.new(
+      :temporary,
+      :gmail_reconnect_lifecycle_failed,
+      "Gmail reconnect state could not be persisted"
+    )
+  end
 
   defp maybe_before_persist(opts, preparation, result) do
     case Keyword.get(opts, :before_result_persist) do
@@ -377,6 +392,8 @@ defmodule Manifold.Outbound.Submission do
 
   defp persist_result(_preparation, {:injected_failure, %Error{} = error}, _opts),
     do: {:error, error}
+
+  defp persist_result(_preparation, {:error, %Error{} = error}, _opts), do: {:error, error}
 
   defp persist_result(preparation, {:error, %Provider.Error{class: :uncertain} = error}, opts) do
     now = DateTime.utc_now()

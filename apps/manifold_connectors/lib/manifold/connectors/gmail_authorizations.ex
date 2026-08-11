@@ -241,9 +241,9 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     error in Postgrex.Error -> normalize_transaction_error(error, __STACKTRACE__)
   end
 
-  @spec mark_send_reconnect_required(Ecto.UUID.t(), String.t()) ::
+  @spec mark_send_reconnect_required(Ecto.UUID.t(), String.t(), Keyword.t()) ::
           {:ok, OAuthAuthorization.t()} | {:error, CoreError.t() | Ecto.Changeset.t()}
-  def mark_send_reconnect_required(method_id, expected_access_token)
+  def mark_send_reconnect_required(method_id, expected_access_token, opts \\ [])
       when is_binary(method_id) and is_binary(expected_access_token) do
     error = %ProviderError{
       class: :reconnect,
@@ -252,9 +252,8 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     }
 
     with {:ok, authorization_id} <- method_authorization_id(:send, method_id) do
-      mark_reconnect_required(authorization_id, error,
-        expected_access_token: expected_access_token
-      )
+      opts = Keyword.put(opts, :expected_access_token, expected_access_token)
+      mark_reconnect_required(authorization_id, error, opts)
     end
   end
 

@@ -36,6 +36,21 @@ defmodule Manifold.Repo.Migrations.EnforceProviderSubmissionMethods do
 
   def down do
     execute("""
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM provider_submissions
+        WHERE provider IN ('gmail', 'smtp')
+      ) THEN
+        RAISE EXCEPTION
+          'cannot rollback provider submission method constraints while Gmail or SMTP submissions exist';
+      END IF;
+    END
+    $$
+    """)
+
+    execute("""
     ALTER TABLE provider_submissions
     DROP CONSTRAINT IF EXISTS provider_submissions_send_method_provider_fkey
     """)
