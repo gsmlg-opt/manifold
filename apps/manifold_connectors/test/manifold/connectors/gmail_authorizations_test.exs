@@ -9,6 +9,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
   alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
+  alias Manifold.Core.Error, as: CoreError
 
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
@@ -971,6 +972,60 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
              )
 
     assert Agent.get(refresh_count, & &1) == 0
+  end
+
+  test "access-token continuation keeps the default API compatible", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, {:continued, "access-secret"}} =
+             Connectors.checkout_oauth_access_token(receive.oauth_authorization_id,
+               required_scope: GmailScopes.read(),
+               now: ~U[2026-08-11 01:00:00.000000Z],
+               access_token_continuation: fn token -> {:ok, {:continued, token}} end
+             )
+
+    assert {:ok, "access-secret"} =
+             Connectors.checkout_oauth_access_token(receive.oauth_authorization_id,
+               required_scope: GmailScopes.read(),
+               now: ~U[2026-08-11 01:00:00.000000Z]
+             )
+  end
+
+  test "continuation errors commit a successful token refresh", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    refreshed = %Token{
+      access_token: "continued-refresh-token",
+      refresh_token: nil,
+      expires_at: ~U[2026-08-11 04:00:00.000000Z],
+      scopes: [GmailScopes.read()]
+    }
+
+    assert {:error, %CoreError{reason: :continuation_rejected}} =
+             Connectors.checkout_oauth_access_token(receive.oauth_authorization_id,
+               required_scope: GmailScopes.read(),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [refresh_result: {:ok, refreshed}],
+               access_token_continuation: fn "continued-refresh-token" ->
+                 {:error,
+                  CoreError.new(:permanent, :continuation_rejected, "continuation rejected")}
+               end
+             )
+
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    assert authorization.token_expires_at == refreshed.expires_at
+
+    assert {:ok, "continued-refresh-token"} =
+             Crypto.decrypt(
+               authorization.access_token_ciphertext,
+               "credential:#{authorization.id}:access"
+             )
   end
 
   test "missing trusted scope fails before provider refresh", %{

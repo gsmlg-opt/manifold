@@ -98,7 +98,7 @@ defmodule Manifold.Connectors do
   end
 
   @spec checkout_oauth_access_token(Ecto.UUID.t(), Keyword.t()) ::
-          {:ok, String.t()} | {:error, Error.t() | ProviderError.t() | Ecto.Changeset.t()}
+          {:ok, term()} | {:error, Error.t() | ProviderError.t() | Ecto.Changeset.t()}
   def checkout_oauth_access_token(authorization_id, opts \\ []) do
     with {:ok, adapter, config} <- adapter_config("gmail") do
       GmailAuthorizations.checkout_access_token(
@@ -371,7 +371,11 @@ defmodule Manifold.Connectors do
           {:ok, SubmissionMethod.t()} | {:error, Error.t()}
   def enabled_send_method(account_id) do
     SendMethod
-    |> where([method], method.account_id == ^account_id and method.enabled == true)
+    |> where(
+      [method],
+      method.account_id == ^account_id and method.enabled == true and
+        method.status == "connected"
+    )
     |> Repo.one()
     |> case do
       %SendMethod{} = method -> {:ok, submission_method(method)}
@@ -1821,20 +1825,24 @@ defmodule Manifold.Connectors do
          opts
        )
        when is_binary(authorization_id) do
-    with {:ok, access_token} <-
-           checkout_oauth_access_token(
-             authorization_id,
-             opts
-             |> Keyword.delete(:after_oauth_checkout)
-             |> Keyword.put(:required_scope, GmailScopes.send())
-           ),
-         :ok <- after_oauth_checkout(opts),
-         {:ok, config} <- gmail_submission_config() do
-      lock_and_revalidate_gmail_method(
-        snapshot,
-        required_sender,
-        access_token,
-        config
+    with {:ok, config} <- gmail_submission_config() do
+      continuation = fn access_token ->
+        with :ok <- after_oauth_checkout(opts) do
+          lock_and_revalidate_gmail_method(
+            snapshot,
+            required_sender,
+            access_token,
+            config
+          )
+        end
+      end
+
+      checkout_oauth_access_token(
+        authorization_id,
+        opts
+        |> Keyword.delete(:after_oauth_checkout)
+        |> Keyword.put(:required_scope, GmailScopes.send())
+        |> Keyword.put(:access_token_continuation, continuation)
       )
     end
   end
@@ -1848,18 +1856,10 @@ defmodule Manifold.Connectors do
          access_token,
          config
        ) do
-    Repo.transaction(fn ->
-      with {:ok, method} <- lock_send_method(snapshot.id),
-           :ok <- validate_send_method_checkout(method, required_sender),
-           :ok <- validate_gmail_method_snapshot(method, snapshot) do
-        submission_method(method, credential: {:oauth, access_token}, config: config)
-      else
-        {:error, reason} -> Repo.rollback(reason)
-      end
-    end)
-    |> case do
-      {:ok, %SubmissionMethod{} = method} -> {:ok, method}
-      {:error, reason} -> {:error, reason}
+    with {:ok, method} <- lock_send_method(snapshot.id),
+         :ok <- validate_send_method_checkout(method, required_sender),
+         :ok <- validate_gmail_method_snapshot(method, snapshot) do
+      {:ok, submission_method(method, credential: {:oauth, access_token}, config: config)}
     end
   end
 

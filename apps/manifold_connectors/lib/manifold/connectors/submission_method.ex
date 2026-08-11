@@ -28,6 +28,7 @@ defimpl Inspect, for: Manifold.Connectors.SubmissionMethod do
       method
       |> Map.from_struct()
       |> Map.put(:credential, redact(method.credential))
+      |> Map.put(:config, redact(method.config))
 
     concat(["#Manifold.Connectors.SubmissionMethod<", to_doc(fields, opts), ">"])
   end

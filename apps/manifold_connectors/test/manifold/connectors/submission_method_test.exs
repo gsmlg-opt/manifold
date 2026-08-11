@@ -62,7 +62,10 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
         client_secret: "client-secret-must-not-escape",
         authorization_url: "https://accounts.google.test/authorize",
         base_url: "https://gmail.test",
-        req_options: [plug: {Req.Test, __MODULE__}]
+        req_options: [
+          plug: {Req.Test, __MODULE__},
+          headers: [{"cookie", "gmail-config-cookie-secret"}]
+        ]
       ]
     )
 
@@ -141,11 +144,13 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
     assert account_id == account.id
     assert sender == Accounts.account_address(account)
     assert gmail_config[:base_url] == "https://gmail.test"
-    assert gmail_config[:req_options] == [plug: {Req.Test, __MODULE__}]
+    assert gmail_config[:req_options][:plug] == {Req.Test, __MODULE__}
     refute Keyword.has_key?(gmail_config, :client_id)
     refute Keyword.has_key?(gmail_config, :client_secret)
     refute inspect(checked_out) =~ "sender-token"
     refute inspect(checked_out) =~ "client-secret-must-not-escape"
+    refute inspect(checked_out) =~ "gmail-config-cookie-secret"
+    assert inspect(checked_out) =~ "config: :redacted"
 
     assert {:ok, %SubmissionMethod{credential: {:oauth, "other-token"}}} =
              Connectors.checkout_send_method(
@@ -209,6 +214,24 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
              Connectors.checkout_send_method(reconnect.id, Accounts.account_address(account))
   end
 
+  test "enabled resolver rejects stale enabled methods that are not connected", %{
+    account: account
+  } do
+    smtp = insert_smtp_method!(account, "smtp-password-secret")
+
+    Enum.reduce(["failed", "disconnected", "reconnect_required"], smtp, fn status, method ->
+      method =
+        method
+        |> SendMethod.changeset(%{status: status, enabled: true})
+        |> Repo.update!()
+
+      assert {:error, %CoreError{reason: :send_method_required}} =
+               Connectors.enabled_send_method(account.id)
+
+      method
+    end)
+  end
+
   test "SMTP checkout decrypts only the purpose-bound password and redacts it", %{
     account: account
   } do
@@ -226,6 +249,12 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
     assert smtp_id == smtp.id
     assert username == Accounts.account_address(account)
     refute inspect(checked_out) =~ "smtp-password-secret"
+
+    future_config_secret =
+      %{checked_out | config: Map.put(checked_out.config, :future_secret, "smtp-config-secret")}
+
+    refute inspect(future_config_secret) =~ "smtp-config-secret"
+    assert inspect(future_config_secret) =~ "config: :redacted"
 
     credential = Repo.get_by!(SendCredential, send_method_id: smtp.id)
     {:ok, wrong_ciphertext} = Crypto.encrypt("wrong-aad-secret", "credential:other:smtp_password")
@@ -327,6 +356,58 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
 
     refute inspect(error) =~ "raced-token-secret"
     refute Repo.get!(SendMethod, gmail.id).enabled
+  end
+
+  test "Gmail token replacement cannot interleave with method validation", %{account: account} do
+    gmail = insert_gmail_method!(account, "sender-subject", access_token: "current-token")
+    test_pid = self()
+
+    checkout =
+      Task.async(fn ->
+        Connectors.checkout_send_method(gmail.id, Accounts.account_address(account),
+          after_oauth_checkout: fn ->
+            send(test_pid, {:gmail_continuation_ready, self()})
+
+            receive do
+              :finish_method_validation -> :ok
+            end
+          end
+        )
+      end)
+
+    assert_receive {:gmail_continuation_ready, checkout_pid}
+
+    replacement =
+      Task.async(fn ->
+        Repo.transaction(fn ->
+          authorization =
+            OAuthAuthorization
+            |> where([authorization], authorization.id == ^gmail.oauth_authorization_id)
+            |> lock("FOR UPDATE")
+            |> Repo.one!()
+
+          send(test_pid, :replacement_obtained_authorization_lock)
+
+          {:ok, replacement_ciphertext} =
+            Crypto.encrypt(
+              "replacement-token",
+              "credential:#{authorization.id}:access"
+            )
+
+          authorization
+          |> OAuthAuthorization.changeset(%{access_token_ciphertext: replacement_ciphertext})
+          |> Repo.update!()
+        end)
+      end)
+
+    refute_receive :replacement_obtained_authorization_lock, 100
+    send(checkout_pid, :finish_method_validation)
+
+    assert {:ok, %SubmissionMethod{credential: {:oauth, "current-token"}}} =
+             Task.await(checkout, 5_000)
+
+    assert_receive :replacement_obtained_authorization_lock
+    assert {:ok, %OAuthAuthorization{}} = Task.await(replacement, 5_000)
   end
 
   defp insert_gmail_method!(account, subject, opts \\ []) do

@@ -73,35 +73,33 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   end
 
   @spec checkout_access_token(Ecto.UUID.t(), module(), keyword(), keyword()) ::
-          {:ok, String.t()}
+          {:ok, term()}
           | {:error, CoreError.t() | ProviderError.t() | Ecto.Changeset.t()}
   def checkout_access_token(authorization_id, adapter, config, opts \\ []) do
     required_scope = Keyword.get(opts, :required_scope)
     now = Keyword.get(opts, :now, DateTime.utc_now())
     provider_opts = Keyword.get(opts, :provider_opts, [])
+    continuation = Keyword.get(opts, :access_token_continuation, &default_continuation/1)
 
     with :ok <- validate_required_scope(required_scope) do
       Repo.transaction(fn ->
         with {:ok, authorization} <- lock_authorization(authorization_id),
              :ok <- validate_checkout_authorization(authorization, required_scope) do
-          if token_current?(authorization, now) do
-            decrypt_access_token(authorization)
-          else
-            refresh_access_token_locked(
-              authorization,
-              required_scope,
-              adapter,
-              config,
-              now,
-              provider_opts
-            )
-          end
+          authorization
+          |> checkout_locked_access_token(
+            required_scope,
+            adapter,
+            config,
+            now,
+            provider_opts
+          )
+          |> continue_with_access_token(continuation)
         else
           {:error, reason} -> Repo.rollback(reason)
         end
       end)
       |> case do
-        {:ok, {:ok, access_token}} -> {:ok, access_token}
+        {:ok, {:ok, result}} -> {:ok, result}
         {:ok, {:reconnect, %ProviderError{} = error}} -> {:error, error}
         {:ok, {:error, reason}} -> {:error, reason}
         {:error, reason} -> {:error, reason}
@@ -113,6 +111,52 @@ defmodule Manifold.Connectors.GmailAuthorizations do
 
     error in Postgrex.Error ->
       normalize_transaction_error(error, __STACKTRACE__)
+  end
+
+  defp checkout_locked_access_token(
+         authorization,
+         required_scope,
+         adapter,
+         config,
+         now,
+         provider_opts
+       ) do
+    if token_current?(authorization, now) do
+      decrypt_access_token(authorization)
+    else
+      refresh_access_token_locked(
+        authorization,
+        required_scope,
+        adapter,
+        config,
+        now,
+        provider_opts
+      )
+    end
+  end
+
+  defp continue_with_access_token({:ok, access_token}, continuation)
+       when is_function(continuation, 1) do
+    case continuation.(access_token) do
+      {:ok, _result} = ok -> ok
+      {:error, _reason} = error -> error
+      _invalid -> {:error, invalid_continuation()}
+    end
+  end
+
+  defp continue_with_access_token({:ok, _access_token}, _invalid_continuation),
+    do: {:error, invalid_continuation()}
+
+  defp continue_with_access_token(other, _continuation), do: other
+
+  defp default_continuation(access_token), do: {:ok, access_token}
+
+  defp invalid_continuation do
+    CoreError.new(
+      :permanent,
+      :invalid_access_token_continuation,
+      "access token continuation is invalid"
+    )
   end
 
   @spec disconnect_method(:receive | :send, Ecto.UUID.t()) ::
