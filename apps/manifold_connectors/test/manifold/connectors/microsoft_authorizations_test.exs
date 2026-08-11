@@ -659,6 +659,250 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert Repo.aggregate(ConnectorEvent, :count) == events_before
   end
 
+  test "blocked receive add cannot undo a concurrent receive disconnect", %{
+    account: account,
+    address: address
+  } do
+    {receive, send_method, authorization} = complete_both(account, address)
+    reconnectable = mark_receive_reconnectable!(receive)
+    cursor_ids_before = sync_cursor_ids(receive.id)
+    jobs_before = sync_job_count(receive.id)
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+    gate = make_ref()
+
+    {add_task, cursor_process} = start_blocked_receive_add(account, gate)
+
+    assert {:ok, %ReceiveMethod{status: "disconnected"}} =
+             OAuthAuthorizations.disconnect_method(:receive, account.id, reconnectable.id)
+
+    send(cursor_process, {:release_cursors, gate})
+
+    assert {:error, %{class: :permanent, reason: :stale_oauth_authorization}} =
+             Task.await(add_task, 5_000)
+
+    persisted_authorization = Repo.get!(OAuthAuthorization, authorization.id)
+    assert persisted_authorization.status == "connected"
+    assert persisted_authorization.lock_version > authorization.lock_version
+
+    assert persisted_authorization.access_token_ciphertext ==
+             authorization.access_token_ciphertext
+
+    assert persisted_authorization.refresh_token_ciphertext ==
+             authorization.refresh_token_ciphertext
+
+    assert Repo.get!(ReceiveMethod, receive.id).status == "disconnected"
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+    assert sync_cursor_ids(receive.id) == cursor_ids_before
+    assert sync_job_count(receive.id) == jobs_before
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before + 1
+  end
+
+  test "blocked receive add cannot recreate a concurrently deleted receive method", %{
+    account: account,
+    address: address
+  } do
+    {receive, send_method, authorization} = complete_both(account, address)
+    reconnectable = mark_receive_reconnectable!(receive)
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+    gate = make_ref()
+
+    {add_task, cursor_process} = start_blocked_receive_add(account, gate)
+
+    assert {:ok, %ReceiveMethod{id: deleted_id}} =
+             OAuthAuthorizations.delete_receive_method(reconnectable.id)
+
+    assert deleted_id == receive.id
+    send(cursor_process, {:release_cursors, gate})
+
+    assert {:error, %{class: :permanent, reason: :stale_oauth_authorization}} =
+             Task.await(add_task, 5_000)
+
+    persisted_authorization = Repo.get!(OAuthAuthorization, authorization.id)
+    assert persisted_authorization.status == "connected"
+    assert persisted_authorization.lock_version > authorization.lock_version
+
+    assert persisted_authorization.access_token_ciphertext ==
+             authorization.access_token_ciphertext
+
+    assert persisted_authorization.refresh_token_ciphertext ==
+             authorization.refresh_token_ciphertext
+
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+    assert Repo.aggregate(ReceiveMethod, :count) == 0
+    assert Repo.aggregate(SyncCursor, :count) == 0
+    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before + 1
+  end
+
+  test "blocked receive add preserves a competing method enabled during cursor discovery", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, send_method} =
+             complete(:send, account, address, scopes: access_token_scopes(all_scopes()))
+
+    other_receive = insert_other_receive!(account.id, address, enabled: false)
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+    gate = make_ref()
+
+    {add_task, cursor_process} = start_blocked_receive_add(account, gate)
+
+    enabled_receive =
+      other_receive
+      |> ReceiveMethod.changeset(%{enabled: true})
+      |> Repo.update!()
+
+    send(cursor_process, {:release_cursors, gate})
+
+    assert {:error, %{class: :permanent, reason: :stale_oauth_authorization}} =
+             Task.await(add_task, 5_000)
+
+    assert receive_snapshot(Repo.get!(ReceiveMethod, other_receive.id)) ==
+             receive_snapshot(enabled_receive)
+
+    assert Repo.aggregate(
+             from(method in ReceiveMethod, where: method.kind == "microsoft"),
+             :count
+           ) == 0
+
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+    assert Repo.aggregate(SyncCursor, :count) == 0
+    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before
+  end
+
+  test "simultaneous receive adds from one lifecycle snapshot converge once", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, send_method} =
+             complete(:send, account, address, scopes: access_token_scopes(all_scopes()))
+
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+    gate = make_ref()
+
+    {first_task, first_cursor_process} = start_blocked_receive_add(account, gate)
+    {second_task, second_cursor_process} = start_blocked_receive_add(account, gate)
+
+    send(first_cursor_process, {:release_cursors, gate})
+    send(second_cursor_process, {:release_cursors, gate})
+
+    results = [Task.await(first_task, 5_000), Task.await(second_task, 5_000)]
+
+    assert Enum.count(results, &match?({:ok, %ReceiveMethod{}}, &1)) == 1
+
+    assert Enum.count(
+             results,
+             &match?(
+               {:error, %{class: :permanent, reason: :stale_oauth_authorization}},
+               &1
+             )
+           ) == 1
+
+    assert [%ReceiveMethod{status: "connected", enabled: true, sync_enabled: true} = receive] =
+             Repo.all(ReceiveMethod)
+
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+    assert Repo.aggregate(SyncCursor, :count) == 1
+    assert sync_job_count(receive.id) == 1
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before + 1
+  end
+
+  test "adding an already healthy active receive method returns before cursor discovery", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, %ReceiveMethod{} = receive} = complete(:receive, account, address)
+
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    receive_before = receive_snapshot(Repo.get!(ReceiveMethod, receive.id))
+    authorization_before = authorization_snapshot(authorization)
+    cursor_ids_before = sync_cursor_ids(receive.id)
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+    test_pid = self()
+
+    assert {:ok, %ReceiveMethod{id: receive_id}} =
+             OAuthAuthorizations.add_authorized_method(
+               "microsoft",
+               account.id,
+               :receive,
+               FakeMicrosoft,
+               [],
+               now: @refresh_now,
+               provider_opts: [test_pid: test_pid]
+             )
+
+    assert receive_id == receive.id
+    refute_receive :initial_cursors, 100
+    assert receive_snapshot(Repo.get!(ReceiveMethod, receive.id)) == receive_before
+
+    assert authorization_snapshot(Repo.get!(OAuthAuthorization, authorization.id)) ==
+             authorization_before
+
+    assert sync_cursor_ids(receive.id) == cursor_ids_before
+    assert sync_job_count(receive.id) == 1
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before
+  end
+
+  test "an active receive with a stale authorization binding rejects before provider I/O", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, %ReceiveMethod{} = receive} = complete(:receive, account, address)
+
+    misbound =
+      receive
+      |> ReceiveMethod.changeset(%{provider_account_id: "different-microsoft-subject"})
+      |> Repo.update!()
+
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    cursor_ids_before = sync_cursor_ids(receive.id)
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+    test_pid = self()
+
+    assert {:error, %{class: :permanent, reason: :stale_oauth_authorization}} =
+             OAuthAuthorizations.add_authorized_method(
+               "microsoft",
+               account.id,
+               :receive,
+               FakeMicrosoft,
+               [],
+               now: @refresh_now,
+               provider_opts: [test_pid: test_pid]
+             )
+
+    refute_receive :initial_cursors, 100
+    assert receive_snapshot(Repo.get!(ReceiveMethod, receive.id)) == receive_snapshot(misbound)
+    assert sync_cursor_ids(receive.id) == cursor_ids_before
+    assert sync_job_count(receive.id) == 1
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before
+
+    assert authorization_snapshot(Repo.get!(OAuthAuthorization, authorization.id)) ==
+             authorization_snapshot(authorization)
+  end
+
+  test "receive deletion locks cursors before the receive method", %{
+    account: account,
+    address: address
+  } do
+    {receive, _send_method, _authorization} = complete_both(account, address)
+
+    queries =
+      repo_queries_during(fn ->
+        assert {:ok, %ReceiveMethod{id: receive_id}} =
+                 OAuthAuthorizations.delete_receive_method(receive.id)
+
+        assert receive_id == receive.id
+      end)
+
+    cursor_lock = cursor_lock_index(queries)
+    receive_method_lock = receive_method_lock_index(queries)
+
+    assert is_integer(cursor_lock)
+    assert is_integer(receive_method_lock)
+    assert cursor_lock < receive_method_lock
+  end
+
   test "adding Microsoft Send disables only the previously enabled send method", %{
     account: account,
     address: address
@@ -816,7 +1060,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     ])
   end
 
-  defp insert_other_receive!(account_id, address) do
+  defp insert_other_receive!(account_id, address, opts \\ []) do
     %ReceiveMethod{}
     |> ReceiveMethod.changeset(%{
       account_id: account_id,
@@ -824,11 +1068,94 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
       provider_account_id: "imap:#{address}",
       email_address: address,
       status: "connected",
-      enabled: true,
+      enabled: Keyword.get(opts, :enabled, true),
       sync_enabled: true,
       granted_scopes: []
     })
     |> Repo.insert!()
+  end
+
+  defp mark_receive_reconnectable!(receive) do
+    receive
+    |> ReceiveMethod.changeset(%{
+      status: "failed",
+      enabled: false,
+      sync_enabled: false
+    })
+    |> Repo.update!()
+  end
+
+  defp start_blocked_receive_add(account, gate) do
+    test_pid = self()
+
+    task =
+      Task.async(fn ->
+        OAuthAuthorizations.add_authorized_method(
+          "microsoft",
+          account.id,
+          :receive,
+          FakeMicrosoft,
+          [],
+          now: @now,
+          provider_opts: [cursor_gate: gate, test_pid: test_pid]
+        )
+      end)
+
+    assert_receive {:initial_cursors_started, cursor_process, "access-secret"}
+    {task, cursor_process}
+  end
+
+  defp sync_cursor_ids(receive_method_id) do
+    SyncCursor
+    |> where([cursor], cursor.external_account_id == ^receive_method_id)
+    |> order_by([cursor], asc: cursor.id)
+    |> select([cursor], cursor.id)
+    |> Repo.all()
+  end
+
+  defp repo_queries_during(fun) do
+    handler_id = "microsoft-lifecycle-query-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :repo, :query],
+        fn _event, _measurements, metadata, pid ->
+          send(pid, {:microsoft_lifecycle_query, handler_id, metadata.query})
+        end,
+        test_pid
+      )
+
+    try do
+      fun.()
+      received_repo_queries(handler_id)
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp received_repo_queries(handler_id, queries \\ []) do
+    receive do
+      {:microsoft_lifecycle_query, ^handler_id, query} ->
+        received_repo_queries(handler_id, [query | queries])
+    after
+      0 -> Enum.reverse(queries)
+    end
+  end
+
+  defp cursor_lock_index(queries) do
+    Enum.find_index(queries, fn query ->
+      String.contains?(query, ~s(FROM "connector_sync_cursors")) and
+        String.contains?(query, "FOR UPDATE")
+    end)
+  end
+
+  defp receive_method_lock_index(queries) do
+    Enum.find_index(queries, fn query ->
+      String.contains?(query, ~s(FROM "connector_accounts")) and
+        String.contains?(query, "FOR UPDATE")
+    end)
   end
 
   defp insert_other_send!(account_id, address) do
