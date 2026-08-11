@@ -7,6 +7,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
 
   alias Manifold.Connectors.Provider.{
     Error,
+    FolderMapping,
     Identity,
     Page,
     RawMessage,
@@ -16,7 +17,15 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   }
 
   @default_scopes "openid profile offline_access User.Read Mail.Read"
-  @immutable_id_preference ~s(IdType="ImmutableId")
+  @folder_mapping_timeout 5_000
+  @folder_mapping_version 1
+  @graph_preference ~s(IdType="ImmutableId", odata.maxpagesize=100)
+  @well_known_folders [
+    {"inbox", "inbox"},
+    {"archive", "archive"},
+    {"deleteditems", "trash"},
+    {"sentitems", "sent"}
+  ]
 
   @impl true
   @spec exchange_code(String.t(), String.t(), String.t(), Keyword.t(), Keyword.t()) ::
@@ -63,20 +72,136 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   end
 
   @impl true
-  @spec initial_cursors(String.t(), Keyword.t(), Keyword.t()) ::
-          {:ok, [SyncCursor.t()]} | {:error, Error.t()}
-  def initial_cursors(_access_token, config, _opts) do
+  @spec resolve_folder_mapping(String.t(), Keyword.t(), Keyword.t()) ::
+          {:ok, FolderMapping.t()} | {:error, Error.t()}
+  def resolve_folder_mapping(access_token, config, _opts) do
     with {:ok, base_url} <- fetch_config(config, :base_url),
          :ok <- validate_graph_url(base_url, base_url) do
+      @well_known_folders
+      |> Task.async_stream(
+        fn {well_known_name, folder_kind} ->
+          resolve_well_known_folder(
+            access_token,
+            base_url,
+            well_known_name,
+            folder_kind,
+            config
+          )
+        end,
+        max_concurrency: 4,
+        ordered: true,
+        timeout: @folder_mapping_timeout,
+        on_timeout: :kill_task
+      )
+      |> normalize_folder_mapping()
+    end
+  end
+
+  @impl true
+  @spec initial_cursors(String.t(), Keyword.t(), Keyword.t()) ::
+          {:ok, [SyncCursor.t()]} | {:error, Error.t()}
+  def initial_cursors(access_token, config, opts) do
+    with {:ok, base_url} <- fetch_config(config, :base_url),
+         :ok <- validate_graph_url(base_url, base_url),
+         {:ok, %FolderMapping{} = mapping} <-
+           resolve_folder_mapping(access_token, config, opts) do
       {:ok,
        [
          %SyncCursor{
            scope: "folders",
            phase: "bootstrap",
-           page_cursor: base_url <> "/me/mailFolders/delta"
+           page_cursor: initial_folder_delta_url(base_url),
+           metadata: mapping_metadata(mapping)
          }
        ]}
     end
+  end
+
+  defp resolve_well_known_folder(
+         access_token,
+         base_url,
+         well_known_name,
+         folder_kind,
+         config
+       ) do
+    case graph_request(
+           :get,
+           base_url <> "/me/mailFolders/" <> well_known_name,
+           access_token,
+           config,
+           params: %{"$select" => "id"}
+         ) do
+      {:ok, %Req.Response{status: status, body: %{"id" => id}}}
+      when status in 200..299 and is_binary(id) ->
+        if String.trim(id) == "" do
+          {:error, invalid_response("Microsoft Graph well-known folder ID is blank")}
+        else
+          {:ok, {id, folder_kind}}
+        end
+
+      {:ok, %Req.Response{status: status}} when status in 200..299 ->
+        {:error, invalid_response("Microsoft Graph well-known folder response is invalid")}
+
+      {:ok, %Req.Response{status: 404}} when well_known_name == "archive" ->
+        :skip
+
+      {:ok, %Req.Response{status: 404}} ->
+        {:error, required_folder_missing_error(well_known_name)}
+
+      {:ok, %Req.Response{} = response} ->
+        {:error, classify_response(response)}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp normalize_folder_mapping(results) do
+    Enum.reduce_while(results, {:ok, %{}}, fn
+      {:ok, {:ok, {id, folder_kind}}}, {:ok, kinds_by_id} ->
+        if Map.has_key?(kinds_by_id, id) do
+          {:halt,
+           {:error, invalid_response("Microsoft Graph returned duplicate well-known folder IDs")}}
+        else
+          {:cont, {:ok, Map.put(kinds_by_id, id, folder_kind)}}
+        end
+
+      {:ok, :skip}, {:ok, kinds_by_id} ->
+        {:cont, {:ok, kinds_by_id}}
+
+      {:ok, {:error, %Error{} = error}}, _acc ->
+        {:halt, {:error, error}}
+
+      {:exit, _reason}, _acc ->
+        {:halt, {:error, transport_error(:folder_mapping_task_exit)}}
+    end)
+    |> case do
+      {:ok, kinds_by_id} ->
+        {:ok, %FolderMapping{version: @folder_mapping_version, kinds_by_id: kinds_by_id}}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp mapping_metadata(%FolderMapping{version: version, kinds_by_id: kinds_by_id}) do
+    %{
+      "folder_mapping_version" => version,
+      "folder_kinds_by_id" => kinds_by_id
+    }
+  end
+
+  defp initial_folder_delta_url(base_url) do
+    base_url <> "/me/mailFolders/delta?$select=id,displayName"
+  end
+
+  defp initial_message_delta_url(base_url, folder_id) do
+    encoded_id = URI.encode(folder_id, &URI.char_unreserved?/1)
+
+    base_url <>
+      "/me/mailFolders/" <>
+      encoded_id <>
+      "/messages/delta?$select=id,parentFolderId,conversationId,receivedDateTime,isRead,flag"
   end
 
   @impl true
@@ -245,10 +370,14 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   defp advance_cursor(_cursor, _body, _base_url),
     do: {:error, invalid_response("Microsoft Graph delta response did not include a cursor")}
 
-  defp normalize_scope(%SyncCursor{scope: "folders"}, values, base_url) do
+  defp normalize_scope(
+         %SyncCursor{scope: "folders", metadata: metadata},
+         values,
+         base_url
+       ) do
     cursors =
       values
-      |> Enum.map(&folder_cursor(&1, base_url))
+      |> Enum.map(&folder_cursor(&1, base_url, metadata))
 
     if Enum.all?(cursors, &match?({:ok, %SyncCursor{}}, &1)) do
       {:ok, [], Enum.map(cursors, fn {:ok, cursor} -> cursor end)}
@@ -282,24 +411,29 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
      }}
   end
 
-  defp folder_cursor(%{"id" => id, "@removed" => removed}, _base_url)
+  defp folder_cursor(%{"id" => id, "@removed" => removed}, _base_url, _metadata)
        when is_binary(id) and id != "" and is_map(removed) do
     {:ok, %SyncCursor{scope: "folder:" <> id, phase: "removed"}}
   end
 
-  defp folder_cursor(%{"id" => id} = folder, base_url) when is_binary(id) and id != "" do
-    encoded_id = URI.encode(id, &URI.char_unreserved?/1)
+  defp folder_cursor(%{"id" => id}, base_url, metadata)
+       when is_binary(id) and id != "" do
+    kinds_by_id = Map.get(metadata, "folder_kinds_by_id", %{})
+    folder_kind = Map.get(kinds_by_id, id, "archive")
 
     {:ok,
      %SyncCursor{
        scope: "folder:" <> id,
        phase: "bootstrap",
-       metadata: %{"folder_kind" => graph_folder_kind(folder["displayName"])},
-       page_cursor: base_url <> "/me/mailFolders/" <> encoded_id <> "/messages/delta"
+       metadata: %{
+         "folder_mapping_version" => @folder_mapping_version,
+         "folder_kind" => folder_kind
+       },
+       page_cursor: initial_message_delta_url(base_url, id)
      }}
   end
 
-  defp folder_cursor(_folder, _base_url), do: :error
+  defp folder_cursor(_folder, _base_url, _metadata), do: :error
 
   defp normalize_message(%{"id" => id} = message, folder_id, folder_kind)
        when is_binary(id) and id != "" do
@@ -330,39 +464,31 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
 
   defp normalize_message(_message, _folder_id, _folder_kind), do: :error
 
-  defp graph_folder_kind(display_name) when is_binary(display_name) do
-    case String.downcase(display_name) do
-      "inbox" -> "inbox"
-      "archive" -> "archive"
-      "deleted items" -> "trash"
-      "trash" -> "trash"
-      _other -> "archive"
-    end
-  end
-
-  defp graph_folder_kind(_display_name), do: "archive"
-
   defp reset_cursor(%SyncCursor{scope: "folders"} = cursor, base_url) do
     %SyncCursor{
       cursor
       | phase: "bootstrap",
-        bootstrap_cursor: nil,
-        page_cursor: base_url <> "/me/mailFolders/delta",
-        committed_cursor: nil
+        page_cursor: initial_folder_delta_url(base_url),
+        committed_cursor: nil,
+        metadata: mapping_refresh_metadata(cursor.metadata)
     }
   end
 
   defp reset_cursor(%SyncCursor{scope: "folder:" <> folder_id} = cursor, base_url) do
-    encoded_id = URI.encode(folder_id, &URI.char_unreserved?/1)
-
     %SyncCursor{
       cursor
       | phase: "bootstrap",
-        bootstrap_cursor: nil,
-        page_cursor: base_url <> "/me/mailFolders/" <> encoded_id <> "/messages/delta",
-        committed_cursor: nil
+        page_cursor: initial_message_delta_url(base_url, folder_id),
+        committed_cursor: nil,
+        metadata: mapping_refresh_metadata(cursor.metadata)
     }
   end
+
+  defp mapping_refresh_metadata(metadata) when is_map(metadata),
+    do: Map.put(metadata, "folder_mapping_refresh_required", true)
+
+  defp mapping_refresh_metadata(_metadata),
+    do: %{"folder_mapping_refresh_required" => true}
 
   defp removed?(%{"@removed" => removed}) when is_map(removed), do: true
   defp removed?(_item), do: false
@@ -390,7 +516,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
       Keyword.merge(
         [
           auth: {:bearer, access_token},
-          headers: [{"prefer", @immutable_id_preference}]
+          headers: [{"prefer", @graph_preference}]
         ],
         options
       )
@@ -502,6 +628,14 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
       class: :temporary,
       code: :cursor_reset,
       message: "Microsoft Graph delta cursor must be reset"
+    }
+  end
+
+  defp required_folder_missing_error(well_known_name) do
+    %Error{
+      class: :permanent,
+      code: :required_folder_missing,
+      message: "Microsoft Graph required folder #{well_known_name} is missing"
     }
   end
 

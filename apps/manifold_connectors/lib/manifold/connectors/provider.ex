@@ -8,6 +8,7 @@ defmodule Manifold.Connectors.Provider do
 
   alias Manifold.Connectors.Provider.{
     Error,
+    FolderMapping,
     Identity,
     Page,
     RawMessage,
@@ -19,6 +20,8 @@ defmodule Manifold.Connectors.Provider do
               {:ok, Token.t()} | {:error, Error.t()}
   @callback refresh_token(String.t(), Keyword.t(), Keyword.t()) ::
               {:ok, Token.t()} | {:error, Error.t()}
+  @callback resolve_folder_mapping(String.t(), Keyword.t(), Keyword.t()) ::
+              {:ok, FolderMapping.t()} | {:error, Error.t()}
   @callback identity(String.t(), Keyword.t(), Keyword.t()) ::
               {:ok, Identity.t()} | {:error, Error.t()}
   @callback initial_cursors(String.t(), Keyword.t(), Keyword.t()) ::
@@ -28,7 +31,20 @@ defmodule Manifold.Connectors.Provider do
   @callback fetch_raw(String.t(), String.t(), Keyword.t(), Keyword.t()) ::
               {:ok, RawMessage.t()} | {:error, Error.t()}
 
-  @optional_callbacks exchange_code: 5, refresh_token: 3
+  @optional_callbacks exchange_code: 5, refresh_token: 3, resolve_folder_mapping: 3
+end
+
+defmodule Manifold.Connectors.Provider.FolderMapping do
+  @moduledoc false
+
+  @enforce_keys [:version, :kinds_by_id]
+  defstruct @enforce_keys
+
+  @type folder_kind :: String.t()
+  @type t :: %__MODULE__{
+          version: pos_integer(),
+          kinds_by_id: %{required(String.t()) => folder_kind()}
+        }
 end
 
 defmodule Manifold.Connectors.Provider.Token do
