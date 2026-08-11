@@ -37,6 +37,192 @@ defmodule Manifold.Connectors.SMTP.Client do
     :ok
   end
 
+  @impl true
+  def submit(conn, submission) when is_map(submission) do
+    with {:ok, envelope_from} <- validate_address(Map.get(submission, :envelope_from)),
+         {:ok, recipients} <- validate_recipients(Map.get(submission, :recipients)),
+         {:ok, raw_message} <- validate_raw_message(Map.get(submission, :raw_message)) do
+      do_submit(get_conn(conn), envelope_from, recipients, raw_message)
+    end
+  end
+
+  defp do_submit(conn, envelope_from, recipients, raw_message) do
+    with {:ok, conn} <- mail_from(conn, envelope_from),
+         {:ok, conn} <- recipients(conn, recipients),
+         {:ok, conn} <- begin_data(conn) do
+      transmit_message(conn, raw_message)
+    end
+  end
+
+  defp mail_from(conn, envelope_from) do
+    case send_command(conn, "MAIL FROM:<#{envelope_from}>") do
+      {:ok, conn, code, _lines} when code in 200..299 ->
+        {:ok, conn}
+
+      {:ok, conn, code, _lines} ->
+        reset_transaction(conn)
+        {:error, command_rejected_error(code, :sender_rejected, "SMTP rejected the sender")}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp recipients(conn, recipients) do
+    Enum.reduce_while(recipients, {:ok, conn}, fn recipient, {:ok, conn} ->
+      case send_command(conn, "RCPT TO:<#{recipient}>") do
+        {:ok, conn, code, _lines} when code in 200..299 ->
+          {:cont, {:ok, conn}}
+
+        {:ok, conn, code, _lines} ->
+          reset_transaction(conn)
+
+          {:halt,
+           {:error,
+            command_rejected_error(code, :recipient_rejected, "SMTP rejected a recipient")}}
+
+        {:error, %Error{} = error} ->
+          {:halt, {:error, error}}
+      end
+    end)
+  end
+
+  defp begin_data(conn) do
+    case send_command(conn, "DATA") do
+      {:ok, conn, 354, _lines} ->
+        {:ok, conn}
+
+      {:ok, conn, code, _lines} ->
+        reset_transaction(conn)
+        {:error, command_rejected_error(code, :data_rejected, "SMTP rejected message data")}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp transmit_message(conn, raw_message) do
+    framed = frame_message(raw_message)
+
+    case send_data(conn.socket, framed) do
+      :ok -> receive_acceptance(conn)
+      {:error, reason} -> {:error, phase_error(:before_terminator, :send_failed, reason)}
+    end
+  end
+
+  defp receive_acceptance(conn) do
+    case recv_reply(conn) do
+      {:ok, conn, 250, lines} ->
+        put_conn(conn)
+        {:ok, %{response: format_response(250, lines)}}
+
+      {:ok, _conn, code, _lines} ->
+        {:error, command_rejected_error(code, :message_rejected, "SMTP rejected the message")}
+
+      {:error, _reason} ->
+        close_socket(conn.socket)
+        delete_conn()
+
+        {:error,
+         %Error{
+           class: :uncertain,
+           code: :acceptance_unknown,
+           message: "SMTP may have accepted the message"
+         }}
+    end
+  end
+
+  defp reset_transaction(conn) do
+    case send_command(conn, "RSET") do
+      {:ok, updated, code, _lines} when code in 200..299 -> put_conn(updated)
+      _failed -> close_socket(conn.socket)
+    end
+
+    :ok
+  end
+
+  defp frame_message(raw_message) do
+    normalized = String.replace(raw_message, ~r/\r\n|\r|\n/, "\r\n")
+
+    dot_stuffed =
+      normalized
+      |> String.split("\r\n", trim: false)
+      |> Enum.map_join("\r\n", fn
+        "." <> _rest = line -> "." <> line
+        line -> line
+      end)
+
+    if String.ends_with?(dot_stuffed, "\r\n") do
+      dot_stuffed <> ".\r\n"
+    else
+      dot_stuffed <> "\r\n.\r\n"
+    end
+  end
+
+  defp validate_recipients(recipients) when is_list(recipients) and recipients != [] do
+    Enum.reduce_while(recipients, {:ok, []}, fn recipient, {:ok, acc} ->
+      case validate_address(recipient) do
+        {:ok, address} -> {:cont, {:ok, [address | acc]}}
+        {:error, %Error{} = error} -> {:halt, {:error, error}}
+      end
+    end)
+    |> case do
+      {:ok, addresses} -> {:ok, Enum.reverse(addresses)}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  defp validate_recipients(_recipients), do: invalid_envelope_address()
+
+  defp validate_address(address) when is_binary(address) and address != "" do
+    if String.contains?(address, ["\r", "\n", <<0>>]) do
+      invalid_envelope_address()
+    else
+      {:ok, address}
+    end
+  end
+
+  defp validate_address(_address), do: invalid_envelope_address()
+
+  defp invalid_envelope_address do
+    {:error,
+     %Error{
+       class: :permanent,
+       code: :invalid_envelope_address,
+       message: "SMTP envelope address is invalid"
+     }}
+  end
+
+  defp validate_raw_message(raw_message) when is_binary(raw_message), do: {:ok, raw_message}
+
+  defp validate_raw_message(_raw_message) do
+    {:error,
+     %Error{
+       class: :permanent,
+       code: :invalid_message,
+       message: "SMTP message is invalid"
+     }}
+  end
+
+  defp command_rejected_error(code, error_code, message) do
+    %Error{
+      class: if(code in 500..599, do: :permanent, else: :temporary),
+      code: error_code,
+      message: message
+    }
+  end
+
+  defp phase_error(:before_terminator, code, _reason) do
+    %Error{
+      class: :temporary,
+      code: code,
+      message: "SMTP connection failed before message acceptance"
+    }
+  end
+
+  defp format_response(code, [line | _rest]), do: "#{code} #{String.slice(line, 0, 500)}"
+  defp format_response(code, []), do: Integer.to_string(code)
+
   defp open_and_greet_safe(host, port, tls_mode) do
     open_and_greet(host, port, tls_mode)
   rescue
@@ -81,14 +267,14 @@ defmodule Manifold.Connectors.SMTP.Client do
         put_conn(conn)
         {:ok, conn}
 
-      {:ok, conn, code, lines} ->
+      {:ok, conn, code, _lines} ->
         close_socket(conn.socket)
 
         {:error,
          %Error{
            class: :temporary,
            code: :bad_greeting,
-           message: "Unexpected SMTP greeting #{code}: #{Enum.join(lines, " ")}"
+           message: "Unexpected SMTP greeting #{code}"
          }}
 
       {:error, reason} ->
@@ -104,14 +290,14 @@ defmodule Manifold.Connectors.SMTP.Client do
         put_conn(conn)
         {:ok, conn}
 
-      {:ok, conn, code, lines} ->
+      {:ok, conn, code, _lines} ->
         close_socket(conn.socket)
 
         {:error,
          %Error{
            class: :temporary,
            code: :ehlo_failed,
-           message: "SMTP EHLO failed #{code}: #{Enum.join(lines, " ")}"
+           message: "SMTP EHLO failed #{code}"
          }}
 
       {:error, reason} ->
@@ -133,14 +319,14 @@ defmodule Manifold.Connectors.SMTP.Client do
       put_conn(conn)
       {:ok, conn}
     else
-      {:ok, conn, code, lines} ->
+      {:ok, conn, code, _lines} ->
         close_socket(conn.socket)
 
         {:error,
          %Error{
            class: :temporary,
            code: :starttls_failed,
-           message: "SMTP STARTTLS failed #{code}: #{Enum.join(lines, " ")}"
+           message: "SMTP STARTTLS failed #{code}"
          }}
 
       {:error, %Error{} = error} ->
@@ -177,9 +363,9 @@ defmodule Manifold.Connectors.SMTP.Client do
           put_conn(conn)
           {:ok, conn}
         else
-          {:ok, conn, _code, lines} ->
+          {:ok, conn, _code, _lines} ->
             close_socket(conn.socket)
-            {:error, auth_failed_error(Enum.join(lines, " "))}
+            {:error, auth_failed_error()}
 
           {:error, reason} ->
             {:error, reason}
@@ -201,20 +387,20 @@ defmodule Manifold.Connectors.SMTP.Client do
         put_conn(conn)
         {:ok, conn}
 
-      {:ok, conn, _code, lines} ->
+      {:ok, conn, _code, _lines} ->
         close_socket(conn.socket)
-        {:error, auth_failed_error(Enum.join(lines, " "))}
+        {:error, auth_failed_error()}
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  defp auth_failed_error(detail) do
+  defp auth_failed_error do
     %Error{
       class: :reconnect,
       code: :auth_failed,
-      message: "SMTP authentication failed: #{detail}"
+      message: "SMTP authentication failed"
     }
   end
 
@@ -248,7 +434,7 @@ defmodule Manifold.Connectors.SMTP.Client do
              %Error{
                class: :temporary,
                code: :bad_reply,
-               message: "Unexpected SMTP reply: #{line}"
+               message: "Unexpected SMTP reply"
              }}
         end
 
