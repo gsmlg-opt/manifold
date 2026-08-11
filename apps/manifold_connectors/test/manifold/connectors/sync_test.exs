@@ -3,8 +3,8 @@ defmodule Manifold.Connectors.SyncTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
-  alias Manifold.Connectors.Crypto
-  alias Manifold.Connectors.Jobs.ApplyRemoteState
+  alias Manifold.Connectors.{Crypto, MicrosoftScopes}
+  alias Manifold.Connectors.Jobs.{ApplyRemoteState, PollAccounts, SyncAccount}
   alias Manifold.Connectors.OAuth.Consumed
 
   alias Manifold.Connectors.Provider.{
@@ -129,8 +129,16 @@ defmodule Manifold.Connectors.SyncTest do
       Base.encode64(:crypto.strong_rand_bytes(32))
     )
 
-    Application.put_env(:manifold_connectors, :adapters, gmail: FakeProvider)
-    Application.put_env(:manifold_connectors, :providers, gmail: [client_id: "client"])
+    Application.put_env(:manifold_connectors, :adapters,
+      gmail: FakeProvider,
+      microsoft: FakeProvider
+    )
+
+    Application.put_env(:manifold_connectors, :providers,
+      gmail: [client_id: "client"],
+      microsoft: [client_id: "client"]
+    )
+
     Application.put_env(:manifold_storage, :spool_dir, Path.join(tmp_dir, "spool"))
     Application.put_env(:manifold_storage, :raw_store_dir, Path.join(tmp_dir, "raw"))
 
@@ -474,6 +482,73 @@ defmodule Manifold.Connectors.SyncTest do
              )
 
     refute Repo.get_by(Credential, external_account_id: account.id)
+  end
+
+  test "Microsoft sync checks out Mail.Read from shared authorization without a Credential row",
+       %{
+         account: account
+       } do
+    microsoft = convert_to_microsoft!(account)
+
+    refute Repo.get_by(Credential, external_account_id: microsoft.id)
+
+    assert :ok = Connectors.sync_account(microsoft.id)
+    assert_receive {:sync_access_token, "initial-access"}
+    refute Repo.get_by(Credential, external_account_id: microsoft.id)
+  end
+
+  test "Microsoft reconnect errors pause the shared authorization and both methods", %{
+    account: account,
+    cursor: cursor
+  } do
+    microsoft = convert_to_microsoft!(account)
+    send_method = insert_oauth_send_method!(microsoft, "microsoft")
+    authorization = Repo.get!(OAuthAuthorization, microsoft.oauth_authorization_id)
+    attach_sync_stop()
+
+    Process.put(
+      :sync_page_result,
+      {:error,
+       %Error{
+         class: :reconnect,
+         code: :invalid_grant,
+         message: "microsoft-provider-secret-must-not-escape"
+       }}
+    )
+
+    assert {:cancel, :reconnect_required} = Connectors.sync_account(microsoft.id)
+    assert_receive {:sync_stop, %{provider: "microsoft", error_message: sanitized}}
+    assert sanitized == "Microsoft authorization must be reconnected"
+    assert Repo.get!(SyncCursor, cursor.id).committed_cursor == "100"
+
+    assert_oauth_reconnect_required(
+      "Microsoft",
+      authorization.id,
+      microsoft.id,
+      send_method.id
+    )
+
+    refute_reconnect_secret("microsoft-provider-secret-must-not-escape")
+  end
+
+  test "polling remains unique for 300 seconds and creates no webhook job", %{account: account} do
+    _microsoft = convert_to_microsoft!(account)
+    Repo.delete_all(Oban.Job)
+
+    unique = SyncAccount.__opts__()[:unique]
+    assert unique[:period] == 300
+    assert unique[:keys] == [:external_account_id]
+    assert unique[:states] == :incomplete
+
+    assert :ok = PollAccounts.perform(%Oban.Job{args: %{}})
+    assert :ok = PollAccounts.perform(%Oban.Job{args: %{}})
+
+    assert [%Oban.Job{worker: worker, args: %{"external_account_id" => method_id}}] =
+             Repo.all(Oban.Job)
+
+    assert worker == inspect(SyncAccount)
+    assert method_id == account.id
+    refute String.contains?(worker, "Webhook")
   end
 
   test "Gmail sync-page reconnect pauses the shared authorization and both methods", %{
@@ -948,16 +1023,37 @@ defmodule Manifold.Connectors.SyncTest do
   end
 
   defp insert_gmail_send_method!(receive_method) do
+    insert_oauth_send_method!(receive_method, "gmail")
+  end
+
+  defp insert_oauth_send_method!(receive_method, provider) do
     %SendMethod{}
     |> SendMethod.changeset(%{
       account_id: receive_method.account_id,
       oauth_authorization_id: receive_method.oauth_authorization_id,
-      kind: "gmail",
+      kind: provider,
       email_address: receive_method.email_address,
       status: "connected",
       enabled: true
     })
     |> Repo.insert!()
+  end
+
+  defp convert_to_microsoft!(receive_method) do
+    receive_method.oauth_authorization_id
+    |> then(&Repo.get!(OAuthAuthorization, &1))
+    |> OAuthAuthorization.changeset(%{
+      provider: "microsoft",
+      granted_scopes: [MicrosoftScopes.read(), MicrosoftScopes.offline()]
+    })
+    |> Repo.update!()
+
+    receive_method
+    |> ReceiveMethod.changeset(%{
+      kind: "microsoft",
+      granted_scopes: [MicrosoftScopes.read()]
+    })
+    |> Repo.update!()
   end
 
   defp attach_sync_stop do
@@ -976,21 +1072,36 @@ defmodule Manifold.Connectors.SyncTest do
   end
 
   defp assert_gmail_reconnect_required(authorization_id, receive_method_id, send_method_id) do
+    assert_oauth_reconnect_required(
+      "Gmail",
+      authorization_id,
+      receive_method_id,
+      send_method_id
+    )
+  end
+
+  defp assert_oauth_reconnect_required(
+         provider_name,
+         authorization_id,
+         receive_method_id,
+         send_method_id
+       ) do
+    expected_message = "#{provider_name} authorization must be reconnected"
     authorization = Repo.get!(OAuthAuthorization, authorization_id)
     assert authorization.status == "reconnect_required"
     assert authorization.last_error_class == "reconnect"
-    assert authorization.last_error_message == "Gmail authorization must be reconnected"
+    assert authorization.last_error_message == expected_message
 
     receive_method = Repo.get!(ReceiveMethod, receive_method_id)
     assert receive_method.status == "reconnect_required"
     refute receive_method.enabled
     refute receive_method.sync_enabled
-    assert receive_method.last_error_message == "Gmail authorization must be reconnected"
+    assert receive_method.last_error_message == expected_message
 
     send_method = Repo.get!(SendMethod, send_method_id)
     assert send_method.status == "reconnect_required"
     refute send_method.enabled
-    assert send_method.last_error_message == "Gmail authorization must be reconnected"
+    assert send_method.last_error_message == expected_message
 
     assert Repo.get_by!(ConnectorEvent,
              oauth_authorization_id: authorization_id,

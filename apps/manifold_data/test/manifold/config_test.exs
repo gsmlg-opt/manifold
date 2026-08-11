@@ -149,6 +149,22 @@ defmodule Manifold.ConfigTest do
            ]
   end
 
+  test "Microsoft runtime defaults an unset tenant to organizations" do
+    put_runtime_env(%{
+      "RELEASE_NAME" => "manifold",
+      "MANIFOLD_CONNECTOR_ENCRYPTION_KEY" => Base.encode64(:crypto.strong_rand_bytes(32)),
+      "MANIFOLD_MICROSOFT_CLIENT_ID" => "microsoft-id",
+      "MANIFOLD_MICROSOFT_CLIENT_SECRET" => "microsoft-secret",
+      "SECRET_KEY_BASE" => String.duplicate("s", 64)
+    })
+
+    microsoft = read_runtime(:prod)[:manifold_connectors][:providers][:microsoft]
+
+    assert microsoft[:tenant] == "organizations"
+    assert microsoft[:authorization_url] =~ "/organizations/"
+    assert microsoft[:token_url] =~ "/organizations/"
+  end
+
   test "development runtime accepts optional OAuth credentials from the environment" do
     put_runtime_env(%{
       "MANIFOLD_GMAIL_CLIENT_ID" => "gmail-dev-id",

@@ -5,7 +5,7 @@ defmodule Manifold.Connectors.Sync do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
-  alias Manifold.Connectors.{Crypto, GmailScopes}
+  alias Manifold.Connectors.{Crypto, OAuthScopes}
   alias Manifold.Connectors.Jobs.ApplyRemoteState
   alias Manifold.Connectors.Provider
   alias Manifold.Connectors.Provider.Error, as: ProviderError
@@ -383,29 +383,36 @@ defmodule Manifold.Connectors.Sync do
   end
 
   defp auth_material(
-         %ReceiveMethod{kind: "gmail", oauth_authorization_id: authorization_id},
+         %ReceiveMethod{kind: provider, oauth_authorization_id: authorization_id},
          _adapter,
          _config,
          now,
          provider_opts
        )
-       when is_binary(authorization_id) do
-    Connectors.checkout_oauth_access_token(authorization_id,
-      required_scope: GmailScopes.read(),
-      now: now,
-      provider_opts: provider_opts
-    )
+       when provider in ["gmail", "microsoft"] and is_binary(authorization_id) do
+    with {:ok, required_scope} <- OAuthScopes.method_scope(provider, :receive) do
+      Connectors.checkout_oauth_access_token(authorization_id,
+        now: now,
+        required_scope: required_scope,
+        provider_opts: provider_opts
+      )
+    end
   end
 
   defp auth_material(
-         %ReceiveMethod{kind: "gmail"},
+         %ReceiveMethod{kind: provider},
          _adapter,
          _config,
          _now,
          _provider_opts
-       ) do
+       )
+       when provider in ["gmail", "microsoft"] do
     {:error,
-     Error.new(:permanent, :credential_missing, "Gmail authorization is missing for account")}
+     Error.new(
+       :permanent,
+       :credential_missing,
+       "#{oauth_provider_name(provider)} authorization is missing for account"
+     )}
   end
 
   defp auth_material(account, adapter, config, now, opts),
@@ -1110,14 +1117,15 @@ defmodule Manifold.Connectors.Sync do
 
   defp handle_account_provider_error(
          %ReceiveMethod{
-           kind: "gmail",
+           kind: provider,
            oauth_authorization_id: authorization_id
          },
          %ProviderError{class: :reconnect} = error,
          now,
          expected_access_token
        )
-       when is_binary(authorization_id) and is_binary(expected_access_token) do
+       when provider in ["gmail", "microsoft"] and is_binary(authorization_id) and
+              is_binary(expected_access_token) do
     case Connectors.mark_oauth_reconnect_required(authorization_id, error,
            now: now,
            expected_access_token: expected_access_token
@@ -1133,12 +1141,13 @@ defmodule Manifold.Connectors.Sync do
     do: handle_provider_error(account_id, error, now)
 
   defp handle_cursor_provider_error(
-         %ReceiveMethod{kind: "gmail"} = account,
+         %ReceiveMethod{kind: provider} = account,
          _cursor,
          %ProviderError{class: :reconnect} = error,
          now,
          expected_access_token
-       ) do
+       )
+       when provider in ["gmail", "microsoft"] do
     handle_account_provider_error(account, error, now, expected_access_token)
   end
 
@@ -1210,13 +1219,17 @@ defmodule Manifold.Connectors.Sync do
       )
 
   defp normalize_provider_error(
-         %ReceiveMethod{kind: "gmail"},
+         %ReceiveMethod{kind: provider},
          %ProviderError{class: :reconnect} = error
-       ) do
-    %{error | message: "Gmail authorization must be reconnected"}
+       )
+       when provider in ["gmail", "microsoft"] do
+    %{error | message: "#{oauth_provider_name(provider)} authorization must be reconnected"}
   end
 
   defp normalize_provider_error(_account, error), do: error
+
+  defp oauth_provider_name("gmail"), do: "Gmail"
+  defp oauth_provider_name("microsoft"), do: "Microsoft"
 
   defp receive_method_kind(account_id) do
     case Repo.get(ReceiveMethod, account_id) do

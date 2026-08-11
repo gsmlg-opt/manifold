@@ -11,7 +11,9 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
   alias Manifold.Connectors.OAuth.Consumed
   alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
   alias Manifold.Connectors.Provider.Error, as: ProviderError
+  alias Manifold.Connectors.Provider.MicrosoftGraph
   alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
+  alias Manifold.Connectors.View.OAuthMethodSetup
 
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
@@ -89,6 +91,36 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     @impl true
     def fetch_raw(_access_token, _message_id, _config, _opts),
       do: {:ok, %RawMessage{bytes: "Subject: test\r\n\r\nBody\r\n"}}
+  end
+
+  defmodule FailingMicrosoft do
+    @behaviour Manifold.Connectors.Provider
+
+    @impl true
+    defdelegate exchange_code(code, verifier, redirect_uri, config, opts), to: FakeMicrosoft
+
+    @impl true
+    defdelegate identity(access_token, config, opts), to: FakeMicrosoft
+
+    @impl true
+    def initial_cursors(_access_token, _config, _opts) do
+      {:error,
+       %ProviderError{
+         class: :temporary,
+         code: :provider_unavailable,
+         message: "Microsoft Graph is temporarily unavailable",
+         retry_after_seconds: 30
+       }}
+    end
+
+    @impl true
+    defdelegate refresh_token(refresh_token, config, opts), to: FakeMicrosoft
+
+    @impl true
+    defdelegate sync_page(access_token, cursor, config, opts), to: FakeMicrosoft
+
+    @impl true
+    defdelegate fetch_raw(access_token, message_id, config, opts), to: FakeMicrosoft
   end
 
   setup do
@@ -191,6 +223,250 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
         [] -> assert Repo.aggregate(Oban.Job, :count) == 0
       end
     end
+  end
+
+  test "OAuth setup returns connect without exposing account state", %{
+    account: account,
+    address: address
+  } do
+    for provider <- ["gmail", "microsoft"], purpose <- [:receive, :send] do
+      assert {:ok, setup} = Connectors.oauth_method_setup(account.id, provider, purpose)
+      assert_setup(setup, provider, purpose, :connect, [account.id, address])
+    end
+
+    assert {:error, %{class: :permanent}} =
+             Connectors.oauth_method_setup("not-a-uuid", "microsoft", :send)
+
+    assert {:error, %{class: :permanent}} =
+             Connectors.oauth_method_setup(account.id, "unsupported", :send)
+
+    assert {:error, %{class: :permanent}} =
+             Connectors.oauth_method_setup(account.id, "microsoft", :unsupported)
+  end
+
+  test "OAuth setup distinguishes upgrade add connected and reconnect without leaking state", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    assert {:ok, receive_setup} =
+             Connectors.oauth_method_setup(account.id, "microsoft", :receive)
+
+    assert_setup(receive_setup, "microsoft", :receive, :connected, [
+      authorization.id,
+      receive.id,
+      address,
+      MicrosoftScopes.read(),
+      "access-secret",
+      "refresh-secret"
+    ])
+
+    assert {:ok, send_upgrade} =
+             Connectors.oauth_method_setup(account.id, "microsoft", :send)
+
+    assert_setup(send_upgrade, "microsoft", :send, :upgrade, [
+      authorization.id,
+      receive.id,
+      address,
+      MicrosoftScopes.read()
+    ])
+
+    add_send_account = create_account!(account, "add-send")
+    add_send_address = Accounts.account_address(add_send_account)
+
+    assert {:ok, add_send_receive} =
+             complete(:receive, add_send_account, add_send_address,
+               subject: "add-send-subject",
+               required_scopes: all_scopes(),
+               scopes: access_token_scopes(all_scopes())
+             )
+
+    add_send_authorization =
+      Repo.get!(OAuthAuthorization, add_send_receive.oauth_authorization_id)
+
+    assert {:ok, send_add} =
+             Connectors.oauth_method_setup(add_send_account.id, "microsoft", :send)
+
+    assert_setup(send_add, "microsoft", :send, :add, [
+      add_send_authorization.id,
+      add_send_receive.id,
+      add_send_address,
+      MicrosoftScopes.send()
+    ])
+
+    assert {:ok, %SendMethod{} = added_send} =
+             Connectors.add_authorized_oauth_method(
+               add_send_account.id,
+               "microsoft",
+               :send
+             )
+
+    assert {:ok, added_send_setup} =
+             Connectors.oauth_method_setup(add_send_account.id, "microsoft", :send)
+
+    assert_setup(added_send_setup, "microsoft", :send, :connected, [
+      add_send_authorization.id,
+      added_send.id,
+      add_send_address
+    ])
+
+    add_receive_account = create_account!(account, "add-receive")
+    add_receive_address = Accounts.account_address(add_receive_account)
+
+    assert {:ok, add_receive_send} =
+             complete(:send, add_receive_account, add_receive_address,
+               subject: "add-receive-subject",
+               required_scopes: all_scopes(),
+               scopes: access_token_scopes(all_scopes())
+             )
+
+    add_receive_authorization =
+      Repo.get!(OAuthAuthorization, add_receive_send.oauth_authorization_id)
+
+    assert {:ok, receive_add} =
+             Connectors.oauth_method_setup(add_receive_account.id, "microsoft", :receive)
+
+    assert_setup(receive_add, "microsoft", :receive, :add, [
+      add_receive_authorization.id,
+      add_receive_send.id,
+      add_receive_address,
+      MicrosoftScopes.read()
+    ])
+
+    assert {:ok, %ReceiveMethod{} = added_receive} =
+             Connectors.add_authorized_oauth_method(
+               add_receive_account.id,
+               "microsoft",
+               :receive
+             )
+
+    assert {:ok, added_receive_setup} =
+             Connectors.oauth_method_setup(add_receive_account.id, "microsoft", :receive)
+
+    assert_setup(added_receive_setup, "microsoft", :receive, :connected, [
+      add_receive_authorization.id,
+      added_receive.id,
+      add_receive_address
+    ])
+
+    reconnect_error = %ProviderError{
+      class: :reconnect,
+      code: :invalid_grant,
+      message: "provider-error-body-secret"
+    }
+
+    assert {:ok, _authorization} =
+             Connectors.mark_oauth_reconnect_required(authorization.id, reconnect_error)
+
+    for purpose <- [:receive, :send] do
+      assert {:ok, reconnect_setup} =
+               Connectors.oauth_method_setup(account.id, "microsoft", purpose)
+
+      assert_setup(reconnect_setup, "microsoft", purpose, :reconnect, [
+        authorization.id,
+        receive.id,
+        address,
+        MicrosoftScopes.read(),
+        "access-secret",
+        "refresh-secret",
+        "provider-error-body-secret"
+      ])
+    end
+  end
+
+  test "OAuth setup does not report a misbound receive method as connected", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    from(method in ReceiveMethod, where: method.id == ^receive.id)
+    |> Repo.update_all(set: [provider_account_id: "different-microsoft-subject"])
+
+    assert {:ok, %OAuthMethodSetup{state: :add}} =
+             Connectors.oauth_method_setup(account.id, "microsoft", :receive)
+  end
+
+  test "OAuth setup does not report a method with the wrong sender as connected", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, send_method} = complete(:send, account, address)
+
+    from(method in SendMethod, where: method.id == ^send_method.id)
+    |> Repo.update_all(set: [email_address: "different@example.test"])
+
+    assert {:ok, %OAuthMethodSetup{state: :add}} =
+             Connectors.oauth_method_setup(account.id, "microsoft", :send)
+  end
+
+  test "public method addition normalizes provider errors", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, _send_method} =
+             complete(:send, account, address,
+               required_scopes: all_scopes(),
+               scopes: access_token_scopes(all_scopes())
+             )
+
+    Application.put_env(:manifold_connectors, :adapters, microsoft: FailingMicrosoft)
+
+    assert {:error,
+            %Manifold.Core.Error{
+              class: :temporary,
+              reason: :provider_unavailable,
+              message: "Microsoft Graph is temporarily unavailable",
+              details: %{
+                provider_class: :temporary,
+                retry_after_seconds: 30
+              }
+            }} =
+             Connectors.add_authorized_oauth_method(account.id, "microsoft", :receive)
+  end
+
+  test "Microsoft token exchange honors the snapshotted scope union when scope is omitted" do
+    requested_scopes =
+      Enum.sort([
+        "openid",
+        "User.Read",
+        MicrosoftScopes.offline(),
+        MicrosoftScopes.send(),
+        MicrosoftScopes.read()
+      ])
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      form = Plug.Conn.Query.decode(body)
+
+      assert form["scope"] == Enum.join(requested_scopes, " ")
+
+      Req.Test.json(conn, %{
+        "access_token" => "snapshotted-union-access-token",
+        "refresh_token" => "snapshotted-union-refresh-token",
+        "expires_in" => 3_600
+      })
+    end)
+
+    config = [
+      client_id: "scope-union-client",
+      client_secret: "scope-union-secret",
+      token_url: "https://login.microsoft.test/organizations/oauth2/v2.0/token",
+      scopes: MicrosoftScopes.read(),
+      req_options: [plug: {Req.Test, __MODULE__}]
+    ]
+
+    assert {:ok, %Token{scopes: ^requested_scopes}} =
+             MicrosoftGraph.exchange_code(
+               "authorization-code-secret",
+               "pkce-verifier-secret",
+               "https://mail.example.test/connectors/microsoft/callback",
+               config,
+               now: @now,
+               required_scopes: requested_scopes
+             )
   end
 
   test "an incremental response without refresh_token retains existing ciphertext", %{
@@ -479,14 +755,14 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
              authorization_snapshot(advanced)
   end
 
-  test "disconnecting receive leaves a healthy send reference and token ciphertext", %{
+  test "disconnecting Microsoft receive leaves send connected and vice versa", %{
     account: account,
     address: address
   } do
     {receive, send_method, authorization} = complete_both(account, address)
 
     assert {:ok, disconnected_receive} =
-             OAuthAuthorizations.disconnect_method(:receive, account.id, receive.id)
+             Connectors.disconnect(receive.id)
 
     assert disconnected_receive.status == "disconnected"
 
@@ -496,12 +772,44 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
     persisted_authorization = Repo.get!(OAuthAuthorization, authorization.id)
     assert persisted_authorization.status == "connected"
+    assert persisted_authorization.lock_version > authorization.lock_version
 
     assert persisted_authorization.access_token_ciphertext ==
              authorization.access_token_ciphertext
 
     assert persisted_authorization.refresh_token_ciphertext ==
              authorization.refresh_token_ciphertext
+
+    send_first_account = create_account!(account, "disconnect-send-first")
+    send_first_address = Accounts.account_address(send_first_account)
+
+    {send_first_receive, send_first_method, send_first_authorization} =
+      complete_both(send_first_account, send_first_address,
+        subject: "disconnect-send-first-subject"
+      )
+
+    assert {:ok, disconnected_send} =
+             Connectors.disconnect_send_method(send_first_account.id, send_first_method.id)
+
+    assert disconnected_send.status == "disconnected"
+
+    persisted_receive = Repo.get!(ReceiveMethod, send_first_receive.id)
+    assert persisted_receive.status == "connected"
+    assert persisted_receive.oauth_authorization_id == send_first_authorization.id
+
+    persisted_send_first_authorization =
+      Repo.get!(OAuthAuthorization, send_first_authorization.id)
+
+    assert persisted_send_first_authorization.status == "connected"
+
+    assert persisted_send_first_authorization.lock_version >
+             send_first_authorization.lock_version
+
+    assert persisted_send_first_authorization.access_token_ciphertext ==
+             send_first_authorization.access_token_ciphertext
+
+    assert persisted_send_first_authorization.refresh_token_ciphertext ==
+             send_first_authorization.refresh_token_ciphertext
   end
 
   test "repeated send disconnect advances method and authorization generations", %{
@@ -531,17 +839,17 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert Repo.aggregate(ConnectorEvent, :count) == events_before + 1
   end
 
-  test "disconnecting the final method erases ciphertext and disconnects authorization", %{
+  test "the final Microsoft disconnect erases both token ciphertext fields", %{
     account: account,
     address: address
   } do
     {receive, send_method, authorization} = complete_both(account, address)
 
     assert {:ok, %ReceiveMethod{status: "disconnected"}} =
-             OAuthAuthorizations.disconnect_method(:receive, account.id, receive.id)
+             Connectors.disconnect(receive.id)
 
     assert {:ok, %SendMethod{status: "disconnected"}} =
-             OAuthAuthorizations.disconnect_method(:send, account.id, send_method.id)
+             Connectors.disconnect_send_method(account.id, send_method.id)
 
     disconnected = Repo.get!(OAuthAuthorization, authorization.id)
     assert disconnected.status == "disconnected"
@@ -550,6 +858,30 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert is_nil(disconnected.access_token_ciphertext)
     assert is_nil(disconnected.refresh_token_ciphertext)
     assert is_nil(disconnected.token_expires_at)
+  end
+
+  test "deleting Microsoft receive through the public API advances shared lifecycle", %{
+    account: account,
+    address: address
+  } do
+    {receive, send_method, authorization} = complete_both(account, address)
+
+    assert {:ok, %ReceiveMethod{id: receive_id}} =
+             Connectors.delete_receive_method(receive.id)
+
+    assert receive_id == receive.id
+    refute Repo.get(ReceiveMethod, receive.id)
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+
+    persisted_authorization = Repo.get!(OAuthAuthorization, authorization.id)
+    assert persisted_authorization.status == "connected"
+    assert persisted_authorization.lock_version > authorization.lock_version
+
+    assert persisted_authorization.access_token_ciphertext ==
+             authorization.access_token_ciphertext
+
+    assert persisted_authorization.refresh_token_ciphertext ==
+             authorization.refresh_token_ciphertext
   end
 
   test "invalid_grant marks the authorization and both methods reconnect_required", %{
@@ -1189,14 +1521,37 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert sync_job_count(microsoft_receive.id) == 1
   end
 
-  defp complete_both(account, address) do
-    assert {:ok, receive} = complete(:receive, account, address)
+  defp create_account!(account, prefix) do
+    local_part = "#{prefix}-#{System.unique_integer([:positive])}"
+    {:ok, created} = Accounts.create_account(account.domain, %{local_part: local_part})
+    Repo.preload(created, :domain)
+  end
+
+  defp assert_setup(setup, provider, purpose, state, secrets) do
+    assert setup.__struct__ == OAuthMethodSetup
+
+    assert Map.from_struct(setup) == %{
+             provider: provider,
+             purpose: purpose,
+             state: state
+           }
+
+    inspected = inspect(setup)
+    Enum.each(secrets, fn secret -> refute inspected =~ secret end)
+  end
+
+  defp complete_both(account, address, opts \\ []) do
+    assert {:ok, receive} = complete(:receive, account, address, opts)
 
     assert {:ok, send_method} =
-             complete(:send, account, address,
-               required_scopes: all_scopes(),
-               scopes: access_token_scopes(all_scopes()),
-               refresh_token: nil
+             complete(
+               :send,
+               account,
+               address,
+               opts
+               |> Keyword.put(:required_scopes, all_scopes())
+               |> Keyword.put(:scopes, access_token_scopes(all_scopes()))
+               |> Keyword.put(:refresh_token, nil)
              )
 
     authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
@@ -1224,7 +1579,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
     identity =
       Keyword.get(opts, :identity, %Identity{
-        id: @subject,
+        id: Keyword.get(opts, :subject, @subject),
         email_address: address
       })
 

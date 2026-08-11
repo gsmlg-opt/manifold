@@ -10,13 +10,13 @@ defmodule Manifold.Connectors do
   alias Manifold.Accounts.Schema.Account
   alias Manifold.Connectors.ActivityLog
   alias Manifold.Connectors.Crypto
-  alias Manifold.Connectors.GmailScopes
   alias Manifold.Connectors.IMAP.Client
   alias Manifold.Connectors.EAS.Client, as: EASClient
   alias Manifold.Connectors.SMTP.Client, as: SmtpClient
   alias Manifold.Connectors.Jobs.{ApplyRemoteState, PushRemoteRead, SyncAccount}
   alias Manifold.Connectors.OAuth.Consumed
   alias Manifold.Connectors.OAuthAuthorizations
+  alias Manifold.Connectors.OAuthScopes
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.IMAP, as: ProviderIMAP
   alias Manifold.Connectors.Provider.EAS, as: ProviderEAS
@@ -245,6 +245,53 @@ defmodule Manifold.Connectors do
     end)
   end
 
+  @spec oauth_method_setup(Ecto.UUID.t(), String.t(), :receive | :send) ::
+          {:ok, View.OAuthMethodSetup.t()} | {:error, Error.t()}
+  def oauth_method_setup(account_id, provider, purpose) do
+    with {:ok, account_id} <- cast_oauth_account_id(account_id),
+         {:ok, required_scope} <- oauth_method_scope(provider, purpose),
+         {:ok, sender} <- Accounts.get_sender_identity(account_id) do
+      authorization =
+        Repo.get_by(OAuthAuthorization, account_id: account_id, provider: provider)
+
+      {:ok,
+       %View.OAuthMethodSetup{
+         provider: provider,
+         purpose: purpose,
+         state:
+           oauth_method_setup_state(
+             authorization,
+             purpose,
+             required_scope,
+             sender.canonical_address
+           )
+       }}
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  @spec add_authorized_oauth_method(Ecto.UUID.t(), String.t(), :receive | :send) ::
+          {:ok, ReceiveMethod.t() | SendMethod.t()}
+          | {:error, Error.t() | Ecto.Changeset.t()}
+  def add_authorized_oauth_method(account_id, provider, purpose) do
+    with {:ok, account_id} <- cast_oauth_account_id(account_id),
+         {:ok, _required_scope} <- oauth_method_scope(provider, purpose),
+         {:ok, adapter, config} <- adapter_config(provider) do
+      provider
+      |> OAuthAuthorizations.add_authorized_method(
+        account_id,
+        purpose,
+        adapter,
+        config,
+        []
+      )
+      |> normalize_authorized_method_result()
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
   @spec test_imap_connection(map()) :: :ok | {:error, Error.t() | ProviderError.t()}
   def test_imap_connection(attrs) when is_map(attrs) do
     attrs = normalize_imap_attrs(attrs)
@@ -408,8 +455,14 @@ defmodule Manifold.Connectors do
     with {:ok, parsed_sender} <- Address.parse(required_sender),
          {:ok, method} <- preflight_send_method(method_id, parsed_sender) do
       case method.kind do
-        "gmail" -> checkout_gmail_send_method(method, parsed_sender, opts)
-        "smtp" -> checkout_smtp_send_method(method, parsed_sender)
+        provider when provider in ["gmail", "microsoft"] ->
+          checkout_oauth_send_method(method, parsed_sender, opts)
+
+        "smtp" ->
+          checkout_smtp_send_method(method, parsed_sender)
+
+        _unsupported ->
+          {:error, send_method_required()}
       end
     end
   rescue
@@ -515,8 +568,8 @@ defmodule Manifold.Connectors do
           {:ok, SendMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def disconnect_send_method(account_id, send_method_id) do
     case Repo.get_by(SendMethod, id: send_method_id, account_id: account_id) do
-      %SendMethod{kind: "gmail", oauth_authorization_id: authorization_id}
-      when is_binary(authorization_id) ->
+      %SendMethod{kind: provider, oauth_authorization_id: authorization_id}
+      when provider in ["gmail", "microsoft"] and is_binary(authorization_id) ->
         OAuthAuthorizations.disconnect_method(:send, account_id, send_method_id)
 
       _method ->
@@ -813,8 +866,8 @@ defmodule Manifold.Connectors do
           {:ok, ReceiveMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def disconnect(account_id) do
     case Repo.get(ReceiveMethod, account_id) do
-      %ReceiveMethod{kind: "gmail", oauth_authorization_id: authorization_id}
-      when is_binary(authorization_id) ->
+      %ReceiveMethod{kind: provider, oauth_authorization_id: authorization_id}
+      when provider in ["gmail", "microsoft"] and is_binary(authorization_id) ->
         OAuthAuthorizations.disconnect_method(:receive, account_id)
 
       _method ->
@@ -879,8 +932,8 @@ defmodule Manifold.Connectors do
           {:ok, ReceiveMethod.t()} | {:error, Error.t()}
   def delete_receive_method(method_id) do
     case Repo.get(ReceiveMethod, method_id) do
-      %ReceiveMethod{kind: "gmail", oauth_authorization_id: authorization_id}
-      when is_binary(authorization_id) ->
+      %ReceiveMethod{kind: provider, oauth_authorization_id: authorization_id}
+      when provider in ["gmail", "microsoft"] and is_binary(authorization_id) ->
         OAuthAuthorizations.delete_receive_method(method_id)
 
       _method ->
@@ -1108,6 +1161,128 @@ defmodule Manifold.Connectors do
   defp validate_consumed(_provider, _consumed) do
     {:error, Error.new(:permanent, :oauth_provider_mismatch, "OAuth provider does not match")}
   end
+
+  defp cast_oauth_account_id(account_id) do
+    case Ecto.UUID.cast(account_id) do
+      {:ok, cast_id} -> {:ok, cast_id}
+      :error -> {:error, Error.new(:permanent, :account_not_found, "account not found")}
+    end
+  end
+
+  defp oauth_method_scope(provider, purpose)
+       when provider in ["gmail", "microsoft"] and purpose in [:receive, :send] do
+    case OAuthScopes.method_scope(provider, purpose) do
+      {:ok, scope} -> {:ok, scope}
+      :error -> unsupported_oauth_purpose()
+    end
+  end
+
+  defp oauth_method_scope(provider, _purpose) when provider not in ["gmail", "microsoft"] do
+    {:error, Error.new(:permanent, :unsupported_provider, "provider is not supported")}
+  end
+
+  defp oauth_method_scope(_provider, _purpose), do: unsupported_oauth_purpose()
+
+  defp unsupported_oauth_purpose do
+    {:error, Error.new(:permanent, :invalid_oauth_purpose, "OAuth purpose is invalid")}
+  end
+
+  defp oauth_method_setup_state(nil, _purpose, _required_scope, _canonical_sender), do: :connect
+
+  defp oauth_method_setup_state(
+         %OAuthAuthorization{status: "disconnected"},
+         _purpose,
+         _required_scope,
+         _canonical_sender
+       ),
+       do: :connect
+
+  defp oauth_method_setup_state(
+         %OAuthAuthorization{status: "reconnect_required"},
+         _purpose,
+         _required_scope,
+         _canonical_sender
+       ),
+       do: :reconnect
+
+  defp oauth_method_setup_state(
+         %OAuthAuthorization{status: "connected"} = authorization,
+         purpose,
+         required_scope,
+         canonical_sender
+       ) do
+    cond do
+      required_scope not in authorization.granted_scopes ->
+        :upgrade
+
+      live_oauth_method?(authorization, purpose, required_scope, canonical_sender) ->
+        :connected
+
+      true ->
+        :add
+    end
+  end
+
+  defp live_oauth_method?(authorization, :receive, required_scope, canonical_sender) do
+    case Repo.get_by(ReceiveMethod,
+           account_id: authorization.account_id,
+           kind: authorization.provider,
+           oauth_authorization_id: authorization.id
+         ) do
+      %ReceiveMethod{
+        status: status,
+        enabled: true,
+        sync_enabled: true,
+        granted_scopes: scopes
+      } = method
+      when status in ["connected", "syncing"] ->
+        method_scopes = MapSet.new(scopes)
+
+        method.provider_account_id == authorization.provider_subject_id and
+          MapSet.member?(method_scopes, required_scope) and
+          MapSet.subset?(method_scopes, MapSet.new(authorization.granted_scopes)) and
+          oauth_method_addresses_match?(authorization, method.email_address, canonical_sender)
+
+      _missing_or_inactive ->
+        false
+    end
+  end
+
+  defp live_oauth_method?(authorization, :send, _required_scope, canonical_sender) do
+    case Repo.get_by(SendMethod,
+           account_id: authorization.account_id,
+           kind: authorization.provider,
+           oauth_authorization_id: authorization.id
+         ) do
+      %SendMethod{status: "connected", enabled: true} = method ->
+        oauth_method_addresses_match?(authorization, method.email_address, canonical_sender)
+
+      _missing_or_inactive ->
+        false
+    end
+  end
+
+  defp oauth_method_addresses_match?(authorization, method_email, canonical_sender) do
+    with {:ok, authorization_address} <- Address.parse(authorization.email_address),
+         {:ok, method_address} <- Address.parse(method_email) do
+      authorization_address.canonical == canonical_sender and
+        method_address.canonical == canonical_sender
+    else
+      _invalid_address -> false
+    end
+  end
+
+  defp normalize_authorized_method_result({:error, %ProviderError{} = error}) do
+    class = if error.class == :temporary, do: :temporary, else: :permanent
+
+    {:error,
+     Error.new(class, error.code, error.message, %{
+       provider_class: error.class,
+       retry_after_seconds: error.retry_after_seconds
+     })}
+  end
+
+  defp normalize_authorized_method_result(result), do: result
 
   defp adapter_config(provider) when provider in ["gmail", "microsoft"] do
     key = String.to_existing_atom(provider)
@@ -1829,16 +2004,17 @@ defmodule Manifold.Connectors do
   defp validate_send_method_checkout(%SendMethod{}, _required_sender),
     do: {:error, send_method_required()}
 
-  defp checkout_gmail_send_method(
-         %SendMethod{kind: "gmail", oauth_authorization_id: authorization_id} = snapshot,
+  defp checkout_oauth_send_method(
+         %SendMethod{kind: provider, oauth_authorization_id: authorization_id} = snapshot,
          required_sender,
          opts
        )
-       when is_binary(authorization_id) do
-    with {:ok, config} <- gmail_submission_config() do
+       when provider in ["gmail", "microsoft"] and is_binary(authorization_id) do
+    with {:ok, config} <- oauth_submission_config(provider),
+         {:ok, required_scope} <- OAuthScopes.method_scope(provider, :send) do
       continuation = fn access_token ->
         with :ok <- after_oauth_checkout(opts) do
-          lock_and_revalidate_gmail_method(
+          lock_and_revalidate_oauth_method(
             snapshot,
             required_sender,
             access_token,
@@ -1851,16 +2027,21 @@ defmodule Manifold.Connectors do
         authorization_id,
         opts
         |> Keyword.delete(:after_oauth_checkout)
-        |> Keyword.put(:required_scope, GmailScopes.send())
+        |> Keyword.put(:required_scope, required_scope)
         |> Keyword.put(:access_token_continuation, continuation)
       )
     end
   end
 
-  defp checkout_gmail_send_method(%SendMethod{kind: "gmail"}, _required_sender, _opts),
-    do: {:error, send_method_required()}
+  defp checkout_oauth_send_method(
+         %SendMethod{kind: provider},
+         _required_sender,
+         _opts
+       )
+       when provider in ["gmail", "microsoft"],
+       do: {:error, send_method_required()}
 
-  defp lock_and_revalidate_gmail_method(
+  defp lock_and_revalidate_oauth_method(
          snapshot,
          required_sender,
          access_token,
@@ -1868,7 +2049,7 @@ defmodule Manifold.Connectors do
        ) do
     with {:ok, method} <- lock_send_method(snapshot.id),
          :ok <- validate_send_method_checkout(method, required_sender),
-         :ok <- validate_gmail_method_snapshot(method, snapshot) do
+         :ok <- validate_oauth_method_snapshot(method, snapshot) do
       {:ok, submission_method(method, credential: {:oauth, access_token}, config: config)}
     end
   end
@@ -1907,14 +2088,18 @@ defmodule Manifold.Connectors do
     end
   end
 
-  defp validate_gmail_method_snapshot(
+  defp validate_oauth_method_snapshot(
          %SendMethod{} = method,
          %SendMethod{} = snapshot
        ) do
-    if method.kind == "gmail" and
+    if method.id == snapshot.id and
+         method.kind in ["gmail", "microsoft"] and
+         method.kind == snapshot.kind and
          method.oauth_authorization_id == snapshot.oauth_authorization_id and
          method.account_id == snapshot.account_id and
-         method.email_address == snapshot.email_address do
+         method.email_address == snapshot.email_address and
+         method.status == snapshot.status and
+         method.enabled == snapshot.enabled do
       :ok
     else
       {:error, send_method_required()}
@@ -1941,10 +2126,30 @@ defmodule Manifold.Connectors do
     end
   end
 
-  defp gmail_submission_config do
-    case Application.get_env(:manifold_connectors, :providers, [])[:gmail] do
+  defp oauth_submission_config(provider) when provider in ["gmail", "microsoft"] do
+    provider_key = String.to_existing_atom(provider)
+
+    case Application.get_env(:manifold_connectors, :providers, [])[provider_key] do
       config when is_list(config) ->
-        {:ok, Keyword.take(config, [:base_url, :req_options])}
+        case Keyword.get(config, :base_url) do
+          base_url when is_binary(base_url) and base_url != "" ->
+            safe_req_options =
+              config
+              |> Keyword.get(:req_options, [])
+              |> Keyword.take([:plug])
+
+            submission_config = [base_url: base_url]
+
+            if safe_req_options == [] do
+              {:ok, submission_config}
+            else
+              {:ok, Keyword.put(submission_config, :req_options, safe_req_options)}
+            end
+
+          _missing ->
+            {:error,
+             Error.new(:permanent, :provider_not_configured, "provider is not configured")}
+        end
 
       _missing ->
         {:error, Error.new(:permanent, :provider_not_configured, "provider is not configured")}

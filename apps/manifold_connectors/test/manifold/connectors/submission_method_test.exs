@@ -3,8 +3,8 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
-  alias Manifold.Connectors.{Crypto, GmailScopes, SubmissionMethod}
-  alias Manifold.Connectors.Provider.{Error, Identity, Page, RawMessage}
+  alias Manifold.Connectors.{Crypto, GmailScopes, MicrosoftScopes, SubmissionMethod}
+  alias Manifold.Connectors.Provider.{Error, Identity, Page, RawMessage, Token}
 
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
@@ -54,7 +54,10 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
       Base.encode64(:crypto.strong_rand_bytes(32))
     )
 
-    Application.put_env(:manifold_connectors, :adapters, gmail: FakeGmail)
+    Application.put_env(:manifold_connectors, :adapters,
+      gmail: FakeGmail,
+      microsoft: FakeGmail
+    )
 
     Application.put_env(:manifold_connectors, :providers,
       gmail: [
@@ -65,6 +68,19 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
         req_options: [
           plug: {Req.Test, __MODULE__},
           headers: [{"cookie", "gmail-config-cookie-secret"}]
+        ]
+      ],
+      microsoft: [
+        client_id: "microsoft-client-id-must-not-escape",
+        client_secret: "microsoft-client-secret-must-not-escape",
+        authorization_url: "https://login.microsoft.test/authorize",
+        token_url: "https://login.microsoft.test/token",
+        base_url: "https://graph.microsoft.test/v1.0",
+        tenant: "organizations",
+        scopes: "Mail.Read",
+        req_options: [
+          plug: {Req.Test, __MODULE__},
+          headers: [{"cookie", "microsoft-config-cookie-secret"}]
         ]
       ]
     )
@@ -189,6 +205,152 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
              Connectors.checkout_send_method(gmail.id, Accounts.account_address(account))
 
     refute inspect(error) =~ "read-only-token"
+  end
+
+  test "Microsoft send checkout requires Mail.Send and exact canonical sender", %{
+    account: account
+  } do
+    microsoft =
+      insert_microsoft_method!(account, "microsoft-subject",
+        scopes: [MicrosoftScopes.read()],
+        access_token: "microsoft-read-only-token"
+      )
+
+    assert {:error, %CoreError{class: :permanent, reason: :insufficient_provider_scope}} =
+             Connectors.checkout_send_method(
+               microsoft.id,
+               Accounts.account_address(account)
+             )
+
+    OAuthAuthorization
+    |> Repo.get!(microsoft.oauth_authorization_id)
+    |> OAuthAuthorization.changeset(%{granted_scopes: [MicrosoftScopes.send()]})
+    |> Repo.update!()
+
+    assert {:error, %CoreError{class: :permanent, reason: :sender_address_mismatch}} =
+             Connectors.checkout_send_method(microsoft.id, "different@example.test")
+
+    assert {:ok, %SubmissionMethod{credential: {:oauth, "microsoft-read-only-token"}}} =
+             Connectors.checkout_send_method(
+               microsoft.id,
+               String.upcase(Accounts.account_address(account))
+             )
+  end
+
+  test "Microsoft send checkout returns only a redacted short-lived token and base URL", %{
+    account: account
+  } do
+    sentinel = "task5-access-token-sentinel-#{System.unique_integer([:positive])}"
+
+    microsoft =
+      insert_microsoft_method!(account, "microsoft-subject",
+        access_token: "expired-access-token-secret",
+        expires_at: ~U[2026-08-12 01:00:00.000000Z]
+      )
+
+    handler_id = "microsoft-send-checkout-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :connectors, :oauth, :refresh, :stop],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:microsoft_checkout_telemetry, event, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    try do
+      refreshed = %Token{
+        access_token: sentinel,
+        refresh_token: nil,
+        expires_at: ~U[2026-08-12 04:00:00.000000Z],
+        scopes: [MicrosoftScopes.send()]
+      }
+
+      assert {:ok,
+              %SubmissionMethod{
+                credential: {:oauth, ^sentinel},
+                config: config
+              } = method} =
+               Connectors.checkout_send_method(
+                 microsoft.id,
+                 Accounts.account_address(account),
+                 now: ~U[2026-08-12 03:00:00.000000Z],
+                 provider_opts: [refresh_result: {:ok, refreshed}]
+               )
+
+      assert Enum.sort(Keyword.keys(config)) == [:base_url, :req_options]
+      assert config[:base_url] == "https://graph.microsoft.test/v1.0"
+      assert config[:req_options] == [plug: {Req.Test, __MODULE__}]
+
+      assert_receive {:microsoft_checkout_telemetry, _event, measurements, metadata}
+
+      refute inspect(method) =~ sentinel
+      refute inspect(method.config) =~ sentinel
+      refute inspect(Repo.get!(SendMethod, microsoft.id)) =~ sentinel
+      refute inspect(Repo.get!(OAuthAuthorization, microsoft.oauth_authorization_id)) =~ sentinel
+      refute inspect(Repo.all(ConnectorEvent)) =~ sentinel
+      refute inspect(Repo.all(Oban.Job)) =~ sentinel
+      refute inspect({measurements, metadata}) =~ sentinel
+
+      refute inspect(method.config) =~ "microsoft-client-id-must-not-escape"
+      refute inspect(method.config) =~ "microsoft-client-secret-must-not-escape"
+      refute inspect(method.config) =~ "microsoft-config-cookie-secret"
+      refute inspect(method.config) =~ "organizations"
+      refute inspect(method.config) =~ "Mail.Read"
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  test "method changes after queue snapshot fail revalidation", %{account: account} do
+    sentinel = "snapshot-token-sentinel-#{System.unique_integer([:positive])}"
+
+    microsoft =
+      insert_microsoft_method!(account, "microsoft-subject", access_token: sentinel)
+
+    assert {:error, %CoreError{reason: :send_method_required} = error} =
+             Connectors.checkout_send_method(
+               microsoft.id,
+               Accounts.account_address(account),
+               after_oauth_checkout: fn ->
+                 microsoft
+                 |> SendMethod.changeset(%{email_address: String.upcase(microsoft.email_address)})
+                 |> Repo.update!()
+               end
+             )
+
+    refute inspect(error) =~ sentinel
+  end
+
+  test "a revoked authorization prevents unsent work from checking out a token", %{
+    account: account
+  } do
+    sentinel = "revoked-token-sentinel-#{System.unique_integer([:positive])}"
+    microsoft = insert_microsoft_method!(account, "microsoft-subject", access_token: sentinel)
+
+    OAuthAuthorization
+    |> Repo.get!(microsoft.oauth_authorization_id)
+    |> OAuthAuthorization.changeset(%{
+      status: "reconnect_required",
+      last_error_class: "reconnect",
+      last_error_code: "invalid_grant",
+      last_error_message: "provider-response-secret-must-not-escape"
+    })
+    |> Repo.update!()
+
+    assert Repo.get!(SendMethod, microsoft.id).enabled
+
+    assert {:error, %CoreError{class: :permanent, reason: :reauthorization_required} = error} =
+             Connectors.checkout_send_method(
+               microsoft.id,
+               Accounts.account_address(account)
+             )
+
+    refute inspect(error) =~ sentinel
+    refute inspect(error) =~ "provider-response-secret-must-not-escape"
   end
 
   test "checkout rejects sender mismatch and methods disabled after selection", %{
@@ -482,6 +644,51 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
       enabled: true,
       sync_enabled: true,
       granted_scopes: [GmailScopes.read()]
+    })
+    |> Repo.insert!()
+  end
+
+  defp insert_microsoft_method!(account, subject, opts) do
+    address = Accounts.account_address(account)
+    authorization_id = Ecto.UUID.generate()
+
+    {:ok, access_ciphertext} =
+      Crypto.encrypt(
+        Keyword.get(opts, :access_token, "microsoft-access-token"),
+        "credential:#{authorization_id}:access"
+      )
+
+    {:ok, refresh_ciphertext} =
+      Crypto.encrypt(
+        "microsoft-refresh-token",
+        "credential:#{authorization_id}:refresh"
+      )
+
+    authorization =
+      %OAuthAuthorization{id: authorization_id}
+      |> OAuthAuthorization.changeset(%{
+        account_id: account.id,
+        provider: "microsoft",
+        provider_subject_id: subject,
+        email_address: address,
+        granted_scopes: Keyword.get(opts, :scopes, [MicrosoftScopes.send()]),
+        status: "connected",
+        key_version: 1,
+        access_token_ciphertext: access_ciphertext,
+        refresh_token_ciphertext: refresh_ciphertext,
+        token_expires_at:
+          Keyword.get(opts, :expires_at, DateTime.add(DateTime.utc_now(), 3_600, :second))
+      })
+      |> Repo.insert!()
+
+    %SendMethod{}
+    |> SendMethod.changeset(%{
+      account_id: account.id,
+      oauth_authorization_id: authorization.id,
+      kind: "microsoft",
+      email_address: address,
+      status: Keyword.get(opts, :status, "connected"),
+      enabled: Keyword.get(opts, :enabled, true)
     })
     |> Repo.insert!()
   end

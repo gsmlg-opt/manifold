@@ -120,18 +120,26 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
     with {:ok, token_url} <- fetch_config(config, :token_url),
          {:ok, client_id} <- fetch_config(config, :client_id),
          {:ok, client_secret} <- fetch_config(config, :client_secret) do
+      requested_scopes =
+        opts
+        |> Keyword.get(
+          :required_scopes,
+          String.split(Keyword.get(config, :scopes, @default_scopes))
+        )
+        |> Enum.uniq()
+        |> Enum.sort()
+
       form =
         [
           client_id: client_id,
           client_secret: client_secret,
-          scope: Keyword.get(config, :scopes, @default_scopes)
-        ]
-        |> Keyword.merge(grant)
+          scope: Enum.join(requested_scopes, " ")
+        ] ++ grant
 
       request(:post, token_url, config, form: form)
       |> normalize_token_response(
         Keyword.get(opts, :now, DateTime.utc_now()),
-        Keyword.get(config, :scopes, @default_scopes)
+        requested_scopes
       )
     end
   end
@@ -150,7 +158,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
          requested_scopes
        )
        when status in 200..299 and is_binary(access_token) and is_integer(expires_in) and
-              is_binary(requested_scopes) do
+              is_list(requested_scopes) do
     {:ok,
      %Token{
        access_token: access_token,
@@ -169,7 +177,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   defp token_scopes(scopes, _requested_scopes) when is_binary(scopes),
     do: String.split(scopes)
 
-  defp token_scopes(_scopes, requested_scopes), do: String.split(requested_scopes)
+  defp token_scopes(_scopes, requested_scopes), do: requested_scopes
 
   defp normalize_identity_response(%Req.Response{
          status: status,

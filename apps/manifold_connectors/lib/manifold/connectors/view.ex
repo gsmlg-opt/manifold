@@ -55,3 +55,19 @@ defmodule Manifold.Connectors.View.SendMethod do
           last_error: String.t() | nil
         }
 end
+
+defmodule Manifold.Connectors.View.OAuthMethodSetup do
+  @moduledoc false
+
+  @enforce_keys [:provider, :purpose, :state]
+  defstruct @enforce_keys
+
+  @type purpose :: :receive | :send
+  @type state :: :connect | :upgrade | :add | :connected | :reconnect
+
+  @type t :: %__MODULE__{
+          provider: String.t(),
+          purpose: purpose(),
+          state: state()
+        }
+end
