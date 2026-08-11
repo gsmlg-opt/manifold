@@ -5,6 +5,9 @@ defmodule ManifoldWeb.AccountLiveTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
+  alias Manifold.Connectors.GmailScopes
+  alias Manifold.Connectors.Schema.{OAuthAuthorization, ReceiveMethod, SendMethod}
+  alias Manifold.Repo
 
   test "create account from name and address", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/settings/accounts/new")
@@ -135,6 +138,60 @@ defmodule ManifoldWeb.AccountLiveTest do
     assert has_element?(view, "#send-method-gmail[disabled]")
     assert has_element?(view, "#send-method-gmail", "Provider not configured")
     assert has_element?(view, "#send-method-smtp")
+  end
+
+  test "Gmail reconnect follows the method that actually requires reconnect", %{conn: conn} do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Send reconnect", address: "send-reconnect@gmail.test"})
+
+    authorization =
+      %OAuthAuthorization{}
+      |> OAuthAuthorization.changeset(%{
+        account_id: account.id,
+        provider: "gmail",
+        provider_subject_id: "send-reconnect-subject",
+        email_address: "send-reconnect@gmail.test",
+        granted_scopes: [GmailScopes.read(), GmailScopes.send()],
+        status: "reconnect_required",
+        key_version: 1
+      })
+      |> Repo.insert!()
+
+    receive_method =
+      %ReceiveMethod{}
+      |> ReceiveMethod.changeset(%{
+        account_id: account.id,
+        oauth_authorization_id: authorization.id,
+        kind: "gmail",
+        provider_account_id: "send-reconnect-subject",
+        email_address: "send-reconnect@gmail.test",
+        status: "disconnected",
+        enabled: false,
+        sync_enabled: false,
+        granted_scopes: [GmailScopes.read()]
+      })
+      |> Repo.insert!()
+
+    %SendMethod{}
+    |> SendMethod.changeset(%{
+      account_id: account.id,
+      oauth_authorization_id: authorization.id,
+      kind: "gmail",
+      email_address: "send-reconnect@gmail.test",
+      status: "reconnect_required",
+      enabled: false
+    })
+    |> Repo.insert!()
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts/#{account.id}")
+
+    assert has_element?(
+             view,
+             ~s|#reconnect-gmail[href*="account_id=#{account.id}&purpose=send"]|
+           )
+
+    refute has_element?(view, ~s|#reconnect-gmail[href*="purpose=receive"]|)
+    assert Repo.get!(ReceiveMethod, receive_method.id).status == "disconnected"
   end
 
   test "accounts index shows created account", %{conn: conn} do

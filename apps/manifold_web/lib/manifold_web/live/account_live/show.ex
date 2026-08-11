@@ -343,7 +343,9 @@ defmodule ManifoldWeb.AccountLive.Show do
   end
 
   defp gmail_reconnect_purpose(methods) do
-    if Enum.any?(methods, &(&1.kind == "gmail")), do: "receive", else: "send"
+    if Enum.any?(methods, &(&1.kind == "gmail" and &1.status == "reconnect_required")),
+      do: "receive",
+      else: "send"
   end
 
   defp format_datetime(nil), do: "Not yet"
