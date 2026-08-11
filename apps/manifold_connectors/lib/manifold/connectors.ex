@@ -132,6 +132,15 @@ defmodule Manifold.Connectors do
             Error.new(:permanent, :not_implemented, "receive method is not implemented yet")
           )
 
+        %ReceiveMethod{status: "reconnect_required"} ->
+          Repo.rollback(
+            Error.new(
+              :permanent,
+              :reauthorization_required,
+              "receive method requires reauthorization"
+            )
+          )
+
         %ReceiveMethod{} = method ->
           disable_other_methods(Repo, method.account_id, except_id: method.id)
 
@@ -401,6 +410,15 @@ defmodule Manifold.Connectors do
         %SendMethod{status: "disconnected"} ->
           Repo.rollback(
             Error.new(:permanent, :account_disconnected, "send method is disconnected")
+          )
+
+        %SendMethod{status: "reconnect_required"} ->
+          Repo.rollback(
+            Error.new(
+              :permanent,
+              :reauthorization_required,
+              "send method requires reauthorization"
+            )
           )
 
         %SendMethod{} = method ->

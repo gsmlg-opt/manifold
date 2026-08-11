@@ -486,6 +486,50 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert Repo.aggregate(ConnectorEvent, :count) == events_before
   end
 
+  test "a reconnect-required receive method cannot replace the working alternate", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, _authorization} =
+             Manifold.Connectors.GmailAuthorizations.mark_reconnect_required(
+               receive.oauth_authorization_id,
+               reconnect_error()
+             )
+
+    alternate = insert_other_receive!(account.id, address)
+
+    assert {:error, %{class: :permanent, reason: :reauthorization_required}} =
+             Connectors.enable_receive_method(receive.id)
+
+    refute Repo.get!(ReceiveMethod, receive.id).enabled
+    refute Repo.get!(ReceiveMethod, receive.id).sync_enabled
+    assert Repo.get!(ReceiveMethod, alternate.id).enabled
+    assert Repo.get!(ReceiveMethod, alternate.id).sync_enabled
+  end
+
+  test "a reconnect-required send method cannot replace the working alternate", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, send_method} = complete(:send, account, address)
+
+    assert {:ok, _authorization} =
+             Manifold.Connectors.GmailAuthorizations.mark_reconnect_required(
+               send_method.oauth_authorization_id,
+               reconnect_error()
+             )
+
+    alternate = insert_other_send!(account.id, address)
+
+    assert {:error, %{class: :permanent, reason: :reauthorization_required}} =
+             Connectors.enable_send_method(send_method.id)
+
+    refute Repo.get!(SendMethod, send_method.id).enabled
+    assert Repo.get!(SendMethod, alternate.id).enabled
+  end
+
   test "connector events require exactly one legacy or Gmail authorization anchor" do
     now = ~U[2026-08-11 01:00:00.000000Z]
 
@@ -696,6 +740,14 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
       ),
       :count
     )
+  end
+
+  defp reconnect_error do
+    %ProviderError{
+      class: :reconnect,
+      code: :invalid_grant,
+      message: "provider authentication failed"
+    }
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)
