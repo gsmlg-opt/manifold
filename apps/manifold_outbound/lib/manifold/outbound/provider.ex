@@ -92,7 +92,7 @@ defmodule Manifold.Outbound.Provider.Error do
   defstruct [:http_status, :retry_after | @enforce_keys]
 
   @type t :: %__MODULE__{
-          class: :transient | :permanent,
+          class: :transient | :permanent | :uncertain,
           code: String.t(),
           message: String.t(),
           http_status: non_neg_integer() | nil,
