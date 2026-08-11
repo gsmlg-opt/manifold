@@ -6,6 +6,7 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
 
   schema "provider_submissions" do
     field(:outbound_message_id, :binary_id)
+    field(:send_method_id, :binary_id)
     field(:provider, :string)
     field(:idempotency_key, :string)
     field(:request_sha256, :string)
@@ -30,6 +31,7 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
     submission
     |> cast(attrs, [
       :outbound_message_id,
+      :send_method_id,
       :provider,
       :idempotency_key,
       :request_sha256,
@@ -52,17 +54,26 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
       :idempotency_key,
       :request_sha256,
       :state,
-      :attempt_count,
-      :idempotency_expires_at
+      :attempt_count
     ])
+    |> maybe_require_idempotency_expiry()
     |> validate_inclusion(:state, ~w(pending submitting accepted failed uncertain))
     |> validate_number(:attempt_count, greater_than_or_equal_to: 0)
     |> validate_format(:request_sha256, ~r/\A[0-9a-f]{64}\z/)
     |> foreign_key_constraint(:outbound_message_id)
+    |> foreign_key_constraint(:send_method_id)
     |> unique_constraint(:outbound_message_id)
     |> unique_constraint([:provider, :idempotency_key])
     |> unique_constraint([:provider, :provider_message_id])
     |> check_constraint(:attempt_count, name: :provider_submissions_attempt_nonnegative)
     |> check_constraint(:state, name: :provider_submissions_state_valid)
+  end
+
+  defp maybe_require_idempotency_expiry(changeset) do
+    if get_field(changeset, :provider) == "resend" do
+      validate_required(changeset, [:idempotency_expires_at])
+    else
+      changeset
+    end
   end
 end

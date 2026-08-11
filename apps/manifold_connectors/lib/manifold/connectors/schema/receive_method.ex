@@ -9,6 +9,7 @@ defmodule Manifold.Connectors.Schema.ReceiveMethod do
 
   schema "connector_accounts" do
     field(:account_id, :binary_id, source: :mailbox_id)
+    field(:oauth_authorization_id, :binary_id)
     field(:kind, :string, source: :provider)
     field(:provider_account_id, :string)
     field(:email_address, :string)
@@ -41,6 +42,7 @@ defmodule Manifold.Connectors.Schema.ReceiveMethod do
     receive_method
     |> cast(attrs, [
       :account_id,
+      :oauth_authorization_id,
       :kind,
       :provider_account_id,
       :email_address,
@@ -70,6 +72,7 @@ defmodule Manifold.Connectors.Schema.ReceiveMethod do
     |> validate_length(:provider_account_id, min: 1, max: 255)
     |> validate_length(:email_address, min: 3, max: 998)
     |> validate_length(:last_error_message, max: 1_000)
+    |> foreign_key_constraint(:oauth_authorization_id)
     |> unique_constraint([:kind, :provider_account_id],
       name: :connector_accounts_provider_account_index
     )
