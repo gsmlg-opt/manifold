@@ -385,19 +385,11 @@ defmodule Manifold.Connectors do
           {:ok, SubmissionMethod.t()}
           | {:error, Error.t() | ProviderError.t() | Ecto.Changeset.t()}
   def checkout_send_method(method_id, required_sender, opts \\ []) do
-    with {:ok, parsed_sender} <- Address.parse(required_sender) do
-      Repo.transaction(fn ->
-        with {:ok, method} <- lock_send_method(method_id),
-             :ok <- validate_send_method_checkout(method, parsed_sender),
-             {:ok, credential, config} <- checkout_send_credential(method, opts) do
-          submission_method(method, credential: credential, config: config)
-        else
-          {:error, reason} -> Repo.rollback(reason)
-        end
-      end)
-      |> case do
-        {:ok, %SubmissionMethod{} = method} -> {:ok, method}
-        {:error, reason} -> {:error, reason}
+    with {:ok, parsed_sender} <- Address.parse(required_sender),
+         {:ok, method} <- preflight_send_method(method_id, parsed_sender) do
+      case method.kind do
+        "gmail" -> checkout_gmail_send_method(method, parsed_sender, opts)
+        "smtp" -> checkout_smtp_send_method(method, parsed_sender)
       end
     end
   rescue
@@ -1772,6 +1764,19 @@ defmodule Manifold.Connectors do
     end
   end
 
+  defp preflight_send_method(method_id, required_sender) do
+    case Repo.get(SendMethod, method_id) do
+      %SendMethod{} = method ->
+        case validate_send_method_checkout(method, required_sender) do
+          :ok -> {:ok, method}
+          {:error, _reason} = error -> error
+        end
+
+      nil ->
+        {:error, send_method_required()}
+    end
+  end
+
   defp validate_send_method_checkout(
          %SendMethod{status: "disconnected"},
          _required_sender
@@ -1810,25 +1815,72 @@ defmodule Manifold.Connectors do
   defp validate_send_method_checkout(%SendMethod{}, _required_sender),
     do: {:error, send_method_required()}
 
-  defp checkout_send_credential(
-         %SendMethod{kind: "gmail", oauth_authorization_id: authorization_id},
+  defp checkout_gmail_send_method(
+         %SendMethod{kind: "gmail", oauth_authorization_id: authorization_id} = snapshot,
+         required_sender,
          opts
        )
        when is_binary(authorization_id) do
     with {:ok, access_token} <-
            checkout_oauth_access_token(
              authorization_id,
-             Keyword.put(opts, :required_scope, GmailScopes.send())
+             opts
+             |> Keyword.delete(:after_oauth_checkout)
+             |> Keyword.put(:required_scope, GmailScopes.send())
            ),
+         :ok <- after_oauth_checkout(opts),
          {:ok, config} <- gmail_submission_config() do
-      {:ok, {:oauth, access_token}, config}
+      lock_and_revalidate_gmail_method(
+        snapshot,
+        required_sender,
+        access_token,
+        config
+      )
     end
   end
 
-  defp checkout_send_credential(%SendMethod{kind: "gmail"}, _opts),
+  defp checkout_gmail_send_method(%SendMethod{kind: "gmail"}, _required_sender, _opts),
     do: {:error, send_method_required()}
 
-  defp checkout_send_credential(%SendMethod{kind: "smtp"} = method, _opts) do
+  defp lock_and_revalidate_gmail_method(
+         snapshot,
+         required_sender,
+         access_token,
+         config
+       ) do
+    Repo.transaction(fn ->
+      with {:ok, method} <- lock_send_method(snapshot.id),
+           :ok <- validate_send_method_checkout(method, required_sender),
+           :ok <- validate_gmail_method_snapshot(method, snapshot) do
+        submission_method(method, credential: {:oauth, access_token}, config: config)
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, %SubmissionMethod{} = method} -> {:ok, method}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp checkout_smtp_send_method(snapshot, required_sender) do
+    Repo.transaction(fn ->
+      with {:ok, method} <- lock_send_method(snapshot.id),
+           :ok <- validate_send_method_checkout(method, required_sender),
+           :ok <- validate_smtp_method_snapshot(method, snapshot),
+           {:ok, credential, config} <- checkout_smtp_credential(method) do
+        submission_method(method, credential: credential, config: config)
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, %SubmissionMethod{} = method} -> {:ok, method}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp checkout_smtp_credential(%SendMethod{kind: "smtp"} = method) do
     with %SendCredential{} = credential <-
            Repo.get_by(SendCredential, send_method_id: method.id),
          %SmtpSettings{} = settings <- Repo.get_by(SmtpSettings, send_method_id: method.id),
@@ -1842,6 +1894,40 @@ defmodule Manifold.Connectors do
     else
       nil -> {:error, send_method_required()}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_gmail_method_snapshot(
+         %SendMethod{} = method,
+         %SendMethod{} = snapshot
+       ) do
+    if method.kind == "gmail" and
+         method.oauth_authorization_id == snapshot.oauth_authorization_id and
+         method.account_id == snapshot.account_id and
+         method.email_address == snapshot.email_address do
+      :ok
+    else
+      {:error, send_method_required()}
+    end
+  end
+
+  defp validate_smtp_method_snapshot(method, snapshot) do
+    if method.kind == "smtp" and method.account_id == snapshot.account_id and
+         method.email_address == snapshot.email_address do
+      :ok
+    else
+      {:error, send_method_required()}
+    end
+  end
+
+  defp after_oauth_checkout(opts) do
+    case Keyword.get(opts, :after_oauth_checkout) do
+      callback when is_function(callback, 0) ->
+        callback.()
+        :ok
+
+      nil ->
+        :ok
     end
   end
 
