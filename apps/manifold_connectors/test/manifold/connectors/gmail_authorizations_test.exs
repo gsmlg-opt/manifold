@@ -7,6 +7,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
   alias Manifold.Connectors.Jobs.SyncAccount
   alias Manifold.Connectors.OAuth.Consumed
   alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
+  alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
 
   alias Manifold.Connectors.Schema.{
@@ -115,10 +116,9 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert %SyncCursor{scope: "mailbox", phase: "initial"} =
              Repo.get_by!(SyncCursor, external_account_id: receive.id)
 
-    assert Repo.get_by!(ConnectorEvent,
-             external_account_id: receive.id,
-             event_type: "connected"
-           )
+    connected_event = Repo.get_by!(ConnectorEvent, event_type: "connected")
+    assert Map.get(connected_event, :oauth_authorization_id) == authorization.id
+    assert is_nil(connected_event.external_account_id)
 
     assert Repo.get_by!(Oban.Job,
              worker: inspect(SyncAccount),
@@ -139,12 +139,14 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert Repo.aggregate(ReceiveMethod, :count) == 0
     assert Repo.aggregate(SyncCursor, :count) == 0
     assert Repo.aggregate(Oban.Job, :count) == 0
-    # ConnectorEvent is receive-method keyed today, so send-first has no legal event anchor.
-    assert Repo.aggregate(ConnectorEvent, :count) == 0
 
     authorization = Repo.get!(OAuthAuthorization, send_method.oauth_authorization_id)
     assert authorization.granted_scopes == [GmailScopes.send()]
     refute Repo.get_by(Credential, external_account_id: send_method.id)
+
+    connected_event = Repo.get_by!(ConnectorEvent, event_type: "connected")
+    assert Map.get(connected_event, :oauth_authorization_id) == authorization.id
+    assert is_nil(connected_event.external_account_id)
   end
 
   test "receive-to-send upgrade preserves refresh and adds only send state", %{
@@ -177,10 +179,9 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
                "credential:#{authorization.id}:access"
              )
 
-    assert Repo.get_by!(ConnectorEvent,
-             external_account_id: receive.id,
-             event_type: "scope_upgraded"
-           )
+    scope_event = Repo.get_by!(ConnectorEvent, event_type: "scope_upgraded")
+    assert Map.get(scope_event, :oauth_authorization_id) == authorization.id
+    assert is_nil(scope_event.external_account_id)
   end
 
   test "send-to-receive upgrade preserves send scope and initializes receive only then", %{
@@ -390,6 +391,177 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert is_nil(final.access_token_ciphertext)
     assert is_nil(final.refresh_token_ciphertext)
     assert is_nil(final.token_expires_at)
+
+    assert Enum.all?(Repo.all(ConnectorEvent), fn event ->
+             Map.get(event, :oauth_authorization_id) == final.id and
+               is_nil(event.external_account_id)
+           end)
+  end
+
+  test "mark_reconnect_required disables every dependent Gmail method and retains secrets", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, send_method} =
+             complete(:send, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    before = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    error = %ProviderError{
+      class: :reconnect,
+      code: :invalid_grant,
+      message: "raw-refresh-secret must never be stored"
+    }
+
+    assert function_exported?(
+             Manifold.Connectors.GmailAuthorizations,
+             :mark_reconnect_required,
+             2
+           )
+
+    assert {:ok, authorization} =
+             Manifold.Connectors.GmailAuthorizations.mark_reconnect_required(before.id, error)
+
+    assert authorization.status == "reconnect_required"
+    assert authorization.last_error_class == "reconnect"
+    assert authorization.last_error_code == "invalid_grant"
+    assert authorization.last_error_message == "Gmail authorization must be reconnected"
+    assert authorization.access_token_ciphertext == before.access_token_ciphertext
+    assert authorization.refresh_token_ciphertext == before.refresh_token_ciphertext
+
+    persisted_receive = Repo.get!(ReceiveMethod, receive.id)
+    assert persisted_receive.status == "reconnect_required"
+    refute persisted_receive.enabled
+    refute persisted_receive.sync_enabled
+
+    persisted_send = Repo.get!(SendMethod, send_method.id)
+    assert persisted_send.status == "reconnect_required"
+    refute persisted_send.enabled
+
+    event = Repo.get_by!(ConnectorEvent, event_type: "reconnect_required")
+    assert Map.get(event, :oauth_authorization_id) == before.id
+    refute inspect(event) =~ "raw-refresh-secret"
+    refute Enum.any?(Repo.all(Oban.Job), &(inspect(&1) =~ "raw-refresh-secret"))
+  end
+
+  test "mark_reconnect_required rolls back authorization and methods atomically", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, send_method} =
+             complete(:send, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+
+    error = %ProviderError{
+      class: :reconnect,
+      code: :invalid_grant,
+      message: "provider authentication failed"
+    }
+
+    assert {:error, %{reason: :after_methods_before_event}} =
+             Manifold.Connectors.GmailAuthorizations.mark_reconnect_required(
+               authorization.id,
+               error,
+               fail_at: :after_methods_before_event
+             )
+
+    assert Repo.get!(OAuthAuthorization, authorization.id).status == "connected"
+    assert Repo.get!(ReceiveMethod, receive.id).status == "connected"
+    assert Repo.get!(ReceiveMethod, receive.id).enabled
+    assert Repo.get!(ReceiveMethod, receive.id).sync_enabled
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+    assert Repo.get!(SendMethod, send_method.id).enabled
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before
+  end
+
+  test "connector events require exactly one legacy or Gmail authorization anchor" do
+    now = ~U[2026-08-11 01:00:00.000000Z]
+
+    legacy =
+      ConnectorEvent.changeset(%ConnectorEvent{}, %{
+        external_account_id: Ecto.UUID.generate(),
+        event_type: "connected",
+        metadata: %{},
+        occurred_at: now
+      })
+
+    assert legacy.valid?
+
+    authorization =
+      ConnectorEvent.changeset(%ConnectorEvent{}, %{
+        oauth_authorization_id: Ecto.UUID.generate(),
+        event_type: "connected",
+        metadata: %{},
+        occurred_at: now
+      })
+
+    assert authorization.valid?
+
+    refute ConnectorEvent.changeset(%ConnectorEvent{}, %{
+             external_account_id: Ecto.UUID.generate(),
+             oauth_authorization_id: Ecto.UUID.generate(),
+             event_type: "connected",
+             metadata: %{},
+             occurred_at: now
+           }).valid?
+
+    refute ConnectorEvent.changeset(%ConnectorEvent{}, %{
+             event_type: "connected",
+             metadata: %{},
+             occurred_at: now
+           }).valid?
+
+    constraints =
+      authorization.constraints
+      |> Enum.map(&to_string(&1.constraint))
+
+    assert "connector_events_anchor_valid" in constraints
+  end
+
+  test "database rejects connector events with both or neither anchor", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    now = ~U[2026-08-11 01:00:00.000000Z]
+
+    both = %{
+      id: Ecto.UUID.generate(),
+      external_account_id: receive.id,
+      oauth_authorization_id: receive.oauth_authorization_id,
+      event_type: "connected",
+      metadata: %{},
+      occurred_at: now,
+      inserted_at: now
+    }
+
+    neither = %{
+      both
+      | id: Ecto.UUID.generate(),
+        external_account_id: nil,
+        oauth_authorization_id: nil
+    }
+
+    for invalid <- [both, neither] do
+      assert_raise Postgrex.Error, fn ->
+        Repo.transaction(
+          fn -> Repo.insert_all(ConnectorEvent, [invalid]) end,
+          mode: :savepoint
+        )
+      end
+    end
   end
 
   test "account deletion cascades both Gmail methods and the shared authorization", %{

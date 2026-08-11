@@ -79,7 +79,8 @@ defmodule Manifold.Connectors.GmailAuthorizations do
            :ok <- delete_method_secrets(direction, method.id),
            {:ok, authorization} <- lock_authorization(method.oauth_authorization_id),
            {:ok, _authorization} <- maybe_disconnect_authorization(authorization, now),
-           {:ok, _event} <- insert_method_event(disconnected, "disconnected", direction, now) do
+           {:ok, _event} <-
+             insert_authorization_event(authorization.id, "disconnected", direction, now) do
         disconnected
       else
         {:error, reason} -> Repo.rollback(reason)
@@ -87,6 +88,46 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     end)
     |> case do
       {:ok, method} -> {:ok, method}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error()}
+  end
+
+  @spec mark_reconnect_required(Ecto.UUID.t(), ProviderError.t(), keyword()) ::
+          {:ok, OAuthAuthorization.t()} | {:error, CoreError.t() | Ecto.Changeset.t()}
+  def mark_reconnect_required(authorization_id, %ProviderError{} = provider_error, opts \\ []) do
+    now = Keyword.get(opts, :now, DateTime.utc_now())
+    error_attrs = reconnect_error_attrs(provider_error)
+
+    Repo.transaction(fn ->
+      with {:ok, authorization} <- lock_authorization(authorization_id),
+           {:ok, authorization} <-
+             authorization
+             |> OAuthAuthorization.changeset(
+               Map.merge(error_attrs, %{status: "reconnect_required", disconnected_at: nil})
+             )
+             |> Repo.update(),
+           :ok <- disable_dependent_methods(authorization.id, error_attrs, now),
+           :ok <- maybe_fault(opts, :after_methods_before_event),
+           {:ok, _event} <-
+             insert_authorization_event(
+               authorization.id,
+               "reconnect_required",
+               :authorization,
+               now,
+               %{
+                 error_class: error_attrs.last_error_class,
+                 error_code: error_attrs.last_error_code
+               }
+             ) do
+        authorization
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, authorization} -> {:ok, authorization}
       {:error, reason} -> {:error, reason}
     end
   rescue
@@ -129,7 +170,8 @@ defmodule Manifold.Connectors.GmailAuthorizations do
                now
              ),
            :ok <- persist_receive_state(purpose, method, cursors, now),
-           {:ok, _event} <- insert_method_event(method, event_type, purpose, now) do
+           {:ok, _event} <-
+             insert_authorization_event(authorization.id, event_type, purpose, now) do
         method
       else
         {:error, reason} -> Repo.rollback(reason)
@@ -478,31 +520,80 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     end
   end
 
-  defp insert_method_event(%ReceiveMethod{id: method_id}, event_type, direction, now),
-    do: insert_event(method_id, event_type, direction, now)
-
-  defp insert_method_event(%SendMethod{account_id: account_id}, event_type, direction, now) do
-    ReceiveMethod
-    |> where([method], method.account_id == ^account_id and method.kind == @provider)
-    |> order_by([method], asc: method.id)
-    |> select([method], method.id)
-    |> limit(1)
-    |> Repo.one()
-    |> case do
-      nil -> {:ok, nil}
-      receive_method_id -> insert_event(receive_method_id, event_type, direction, now)
-    end
-  end
-
-  defp insert_event(method_id, event_type, direction, now) do
+  defp insert_authorization_event(
+         authorization_id,
+         event_type,
+         direction,
+         now,
+         extra_metadata \\ %{}
+       ) do
     %ConnectorEvent{}
     |> ConnectorEvent.changeset(%{
-      external_account_id: method_id,
+      oauth_authorization_id: authorization_id,
       event_type: event_type,
-      metadata: %{provider: @provider, direction: Atom.to_string(direction)},
+      metadata:
+        Map.merge(
+          %{provider: @provider, direction: Atom.to_string(direction)},
+          extra_metadata
+        ),
       occurred_at: now
     })
     |> Repo.insert()
+  end
+
+  defp reconnect_error_attrs(%ProviderError{} = error) do
+    %{
+      last_error_class: Atom.to_string(error.class),
+      last_error_code: Atom.to_string(error.code),
+      last_error_message: "Gmail authorization must be reconnected"
+    }
+  end
+
+  defp disable_dependent_methods(authorization_id, error_attrs, now) do
+    ReceiveMethod
+    |> where(
+      [method],
+      method.oauth_authorization_id == ^authorization_id and method.kind == @provider and
+        method.status != "disconnected"
+    )
+    |> Repo.update_all(
+      set: [
+        status: "reconnect_required",
+        enabled: false,
+        sync_enabled: false,
+        last_error_class: error_attrs.last_error_class,
+        last_error_code: error_attrs.last_error_code,
+        last_error_message: error_attrs.last_error_message,
+        updated_at: now
+      ]
+    )
+
+    SendMethod
+    |> where(
+      [method],
+      method.oauth_authorization_id == ^authorization_id and method.kind == @provider and
+        method.status != "disconnected"
+    )
+    |> Repo.update_all(
+      set: [
+        status: "reconnect_required",
+        enabled: false,
+        last_error_class: error_attrs.last_error_class,
+        last_error_code: error_attrs.last_error_code,
+        last_error_message: error_attrs.last_error_message,
+        updated_at: now
+      ]
+    )
+
+    :ok
+  end
+
+  defp maybe_fault(opts, point) do
+    if Keyword.get(opts, :fail_at) == point do
+      {:error, CoreError.new(:temporary, point, "injected connector transaction failure")}
+    else
+      :ok
+    end
   end
 
   defp initial_cursors(:send, _adapter, _token, _config, _provider_opts), do: {:ok, nil}

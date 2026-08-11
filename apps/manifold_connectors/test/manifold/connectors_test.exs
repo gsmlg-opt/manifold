@@ -132,10 +132,13 @@ defmodule Manifold.ConnectorsTest do
     assert %SyncCursor{scope: "mailbox", phase: "bootstrap"} =
              Repo.get_by!(SyncCursor, external_account_id: account.id)
 
-    assert Repo.get_by!(ConnectorEvent,
-             external_account_id: account.id,
-             event_type: "connected"
-           )
+    legacy_event =
+      Repo.get_by!(ConnectorEvent,
+        external_account_id: account.id,
+        event_type: "connected"
+      )
+
+    assert is_nil(legacy_event.oauth_authorization_id)
 
     assert Repo.get_by!(Oban.Job,
              worker: inspect(SyncAccount),
