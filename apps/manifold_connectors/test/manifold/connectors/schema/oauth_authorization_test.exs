@@ -1,6 +1,7 @@
-defmodule Manifold.Connectors.Schema.GmailAuthorizationTest do
-  use ExUnit.Case, async: true
+defmodule Manifold.Connectors.Schema.OAuthAuthorizationTest do
+  use Manifold.DataCase, async: true
 
+  alias Manifold.Accounts
   alias Manifold.Connectors.GmailScopes
 
   alias Manifold.Connectors.Schema.{
@@ -11,6 +12,7 @@ defmodule Manifold.Connectors.Schema.GmailAuthorizationTest do
   }
 
   alias Manifold.Outbound.Schema.ProviderSubmission
+  alias Manifold.Repo
 
   test "Gmail authorization accepts identity, canonical address, scopes, and tokens" do
     changeset =
@@ -26,13 +28,87 @@ defmodule Manifold.Connectors.Schema.GmailAuthorizationTest do
            ]
   end
 
-  test "Gmail authorization validates provider and status" do
-    refute authorization_changeset(%{provider: "microsoft"}).valid?
+  test "OAuth authorization validates provider and status" do
+    refute authorization_changeset(%{provider: "unsupported"}).valid?
     refute authorization_changeset(%{status: "failed"}).valid?
 
     for status <- ~w(connected reconnect_required disconnected) do
       assert authorization_changeset(%{status: status}).valid?
     end
+  end
+
+  test "Microsoft authorization and send method are accepted" do
+    authorization =
+      OAuthAuthorization.changeset(%OAuthAuthorization{}, %{
+        account_id: Ecto.UUID.generate(),
+        provider: "microsoft",
+        provider_subject_id: "graph-user-1",
+        email_address: "person@example.test",
+        granted_scopes: ["Mail.Read", "offline_access"],
+        status: "connected",
+        refresh_token_ciphertext: <<1, 2, 3>>
+      })
+
+    assert authorization.valid?
+
+    method =
+      SendMethod.changeset(%SendMethod{}, %{
+        account_id: Ecto.UUID.generate(),
+        oauth_authorization_id: Ecto.UUID.generate(),
+        kind: "microsoft",
+        email_address: "person@example.test",
+        status: "connected",
+        enabled: true
+      })
+
+    assert method.valid?
+  end
+
+  test "database enforces shared authorization uniqueness and provider allowlists" do
+    suffix = System.unique_integer([:positive])
+    {:ok, domain} = Accounts.create_domain(%{name: "oauth-constraints-#{suffix}.test"})
+
+    accounts =
+      for local_part <- ~w(first second third) do
+        {:ok, account} = Accounts.create_account(domain, %{local_part: local_part})
+        account
+      end
+
+    [first, second, third] = accounts
+    now = DateTime.utc_now()
+
+    first_authorization = authorization_row(first.id, "graph-user-1", now)
+    second_authorization = authorization_row(second.id, "graph-user-2", now)
+
+    assert {1, nil} = Repo.insert_all(OAuthAuthorization, [first_authorization])
+    assert {1, nil} = Repo.insert_all(OAuthAuthorization, [second_authorization])
+
+    assert_database_constraint(fn ->
+      Repo.insert_all(OAuthAuthorization, [
+        authorization_row(first.id, "graph-user-3", now)
+      ])
+    end)
+
+    assert_database_constraint(fn ->
+      Repo.insert_all(OAuthAuthorization, [
+        authorization_row(third.id, "graph-user-1", now)
+      ])
+    end)
+
+    assert_database_constraint(fn ->
+      Repo.insert_all(OAuthAuthorization, [
+        authorization_row(third.id, "unsupported-user", now, "unsupported")
+      ])
+    end)
+
+    assert {1, nil} =
+             Repo.insert_all(SendMethod, [
+               send_method_row(first.id, first_authorization.id, "microsoft", now)
+             ])
+
+    assert_database_constraint(fn ->
+      Repo.insert_all(SendMethod, [send_method_row(second.id, nil, "unsupported", now)])
+    end)
   end
 
   test "only connected Gmail authorizations require a refresh token" do
@@ -89,6 +165,14 @@ defmodule Manifold.Connectors.Schema.GmailAuthorizationTest do
       assert changeset.valid?
       assert Ecto.Changeset.get_field(changeset, :oauth_authorization_id) == authorization_id
     end
+
+    refute SendMethod.changeset(%SendMethod{}, %{
+             account_id: Ecto.UUID.generate(),
+             kind: "unsupported",
+             email_address: "person@example.test",
+             status: "connected",
+             enabled: true
+           }).valid?
   end
 
   test "receive methods cast authorization IDs" do
@@ -246,5 +330,43 @@ defmodule Manifold.Connectors.Schema.GmailAuthorizationTest do
       redirect_uri: "https://mail.example.test/connectors/gmail/callback",
       expires_at: DateTime.add(DateTime.utc_now(), 600)
     }
+  end
+
+  defp authorization_row(account_id, subject_id, now, provider \\ "microsoft") do
+    %{
+      id: Ecto.UUID.generate(),
+      account_id: account_id,
+      provider: provider,
+      provider_subject_id: subject_id,
+      email_address: "#{subject_id}@example.test",
+      granted_scopes: ["Mail.Read", "offline_access"],
+      status: "connected",
+      key_version: 1,
+      refresh_token_ciphertext: <<1, 2, 3>>,
+      lock_version: 1,
+      inserted_at: now,
+      updated_at: now
+    }
+  end
+
+  defp send_method_row(account_id, authorization_id, kind, now) do
+    %{
+      id: Ecto.UUID.generate(),
+      account_id: account_id,
+      oauth_authorization_id: authorization_id,
+      kind: kind,
+      email_address: "person@example.test",
+      status: "connected",
+      enabled: true,
+      lock_version: 1,
+      inserted_at: now,
+      updated_at: now
+    }
+  end
+
+  defp assert_database_constraint(fun) do
+    assert_raise Postgrex.Error, fn ->
+      Repo.transaction(fun, mode: :savepoint)
+    end
   end
 end

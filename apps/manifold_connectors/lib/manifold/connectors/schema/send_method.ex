@@ -5,7 +5,7 @@ defmodule Manifold.Connectors.Schema.SendMethod do
   import Ecto.Changeset
 
   @statuses ~w(connected failed disconnected reconnect_required)
-  @kinds ~w(smtp gmail)
+  @kinds ~w(smtp gmail microsoft)
 
   schema "connector_send_methods" do
     field(:account_id, :binary_id, source: :mailbox_id)

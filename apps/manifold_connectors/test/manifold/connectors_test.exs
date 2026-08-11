@@ -17,6 +17,7 @@ defmodule Manifold.ConnectorsTest do
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
     Credential,
+    OAuthAuthorization,
     OAuthTransaction,
     ReceiveMethod,
     RemoteMessage,
@@ -163,6 +164,142 @@ defmodule Manifold.ConnectorsTest do
              worker: inspect(SyncAccount),
              args: %{"external_account_id" => account.id}
            )
+  end
+
+  test "migrated Microsoft authorization preserves ciphertext and receive references", %{
+    mailbox: mailbox
+  } do
+    receive_method_id = Ecto.UUID.generate()
+    address = mailbox |> Repo.preload(:domain) |> Accounts.account_address()
+    committed_url = "https://graph.microsoft.test/delta/#{Ecto.UUID.generate()}"
+    provider_message_id = "graph-message-#{Ecto.UUID.generate()}"
+    token_expires_at = ~U[2026-08-12 02:00:00.000000Z]
+    now = ~U[2026-08-12 01:00:00.000000Z]
+
+    assert {:ok, access_token_ciphertext} =
+             Crypto.encrypt(
+               "legacy-access",
+               "credential:#{receive_method_id}:access"
+             )
+
+    assert {:ok, refresh_token_ciphertext} =
+             Crypto.encrypt(
+               "legacy-refresh",
+               "credential:#{receive_method_id}:refresh"
+             )
+
+    authorization =
+      %OAuthAuthorization{id: receive_method_id, lock_version: 6}
+      |> OAuthAuthorization.changeset(%{
+        account_id: mailbox.id,
+        provider: "microsoft",
+        provider_subject_id: "graph-user-migrated",
+        email_address: address,
+        granted_scopes: ["offline_access", "Mail.Read", "Mail.Read"],
+        status: "connected",
+        key_version: 3,
+        access_token_ciphertext: access_token_ciphertext,
+        refresh_token_ciphertext: refresh_token_ciphertext,
+        token_expires_at: token_expires_at,
+        last_error_class: "temporary",
+        last_error_code: "legacy_error",
+        last_error_message: "legacy provider error"
+      })
+      |> Repo.insert!()
+
+    receive_method =
+      %ReceiveMethod{id: receive_method_id, lock_version: 2}
+      |> ReceiveMethod.changeset(%{
+        account_id: mailbox.id,
+        oauth_authorization_id: authorization.id,
+        kind: "microsoft",
+        provider_account_id: "graph-user-migrated",
+        email_address: address,
+        status: "failed",
+        enabled: true,
+        sync_enabled: true,
+        granted_scopes: ["offline_access", "Mail.Read", "Mail.Read"],
+        last_error_class: "temporary",
+        last_error_code: "legacy_error",
+        last_error_message: "legacy provider error"
+      })
+      |> Repo.insert!()
+
+    cursor =
+      %SyncCursor{}
+      |> SyncCursor.changeset(%{
+        external_account_id: receive_method.id,
+        scope: "mailbox",
+        phase: "incremental",
+        committed_cursor: committed_url,
+        metadata: %{"source" => "legacy"},
+        generation: 4
+      })
+      |> Repo.insert!()
+
+    remote =
+      %RemoteMessage{}
+      |> RemoteMessage.changeset(
+        remote_attrs(receive_method.id, provider_message_id, now, %{state: "imported"})
+      )
+      |> Repo.insert!()
+
+    job =
+      %{"external_account_id" => receive_method.id}
+      |> SyncAccount.new()
+      |> Repo.insert!()
+
+    for event_type <- ~w(connected token_refreshed) do
+      %ConnectorEvent{}
+      |> ConnectorEvent.changeset(%{
+        oauth_authorization_id: authorization.id,
+        event_type: event_type,
+        metadata: %{"source" => "legacy"},
+        occurred_at: now
+      })
+      |> Repo.insert!()
+    end
+
+    assert authorization.id == receive_method.id
+    assert receive_method.oauth_authorization_id == authorization.id
+    refute Repo.get_by(Credential, external_account_id: receive_method.id)
+
+    assert Crypto.decrypt(
+             authorization.access_token_ciphertext,
+             "credential:#{receive_method.id}:access"
+           ) == {:ok, "legacy-access"}
+
+    assert Crypto.decrypt(
+             authorization.refresh_token_ciphertext,
+             "credential:#{receive_method.id}:refresh"
+           ) == {:ok, "legacy-refresh"}
+
+    assert authorization.provider == "microsoft"
+    assert authorization.provider_subject_id == receive_method.provider_account_id
+    assert authorization.email_address == receive_method.email_address
+    assert authorization.granted_scopes == ["Mail.Read", "offline_access"]
+    assert authorization.status == "connected"
+    assert receive_method.status == "failed"
+    assert authorization.key_version == 3
+    assert authorization.lock_version == 7
+    assert authorization.token_expires_at == token_expires_at
+    assert authorization.last_error_class == receive_method.last_error_class
+    assert authorization.last_error_code == receive_method.last_error_code
+    assert authorization.last_error_message == receive_method.last_error_message
+    persisted_cursor = Repo.get!(SyncCursor, cursor.id)
+    assert persisted_cursor.external_account_id == receive_method.id
+    assert persisted_cursor.committed_cursor == committed_url
+
+    persisted_remote = Repo.get!(RemoteMessage, remote.id)
+    assert persisted_remote.external_account_id == receive_method.id
+    assert persisted_remote.provider_message_id == provider_message_id
+
+    assert Repo.get!(Oban.Job, job.id).args == %{"external_account_id" => receive_method.id}
+
+    assert Enum.all?(Repo.all(ConnectorEvent), fn event ->
+             event.oauth_authorization_id == authorization.id and
+               is_nil(event.external_account_id)
+           end)
   end
 
   test "failure before initial job rolls back the entire local connection", %{mailbox: mailbox} do

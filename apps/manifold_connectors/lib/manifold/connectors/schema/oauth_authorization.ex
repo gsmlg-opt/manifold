@@ -4,7 +4,7 @@ defmodule Manifold.Connectors.Schema.OAuthAuthorization do
   use Manifold.Connectors.Schema
   import Ecto.Changeset
 
-  @providers ~w(gmail)
+  @providers ~w(gmail microsoft)
   @statuses ~w(connected reconnect_required disconnected)
 
   schema "connector_oauth_authorizations" do
