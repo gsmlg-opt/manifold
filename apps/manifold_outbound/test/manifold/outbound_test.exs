@@ -444,6 +444,7 @@ defmodule Manifold.OutboundSendMethodLockTest do
 
   import Ecto.Query
 
+  alias Ecto.Adapters.SQL
   alias Ecto.Adapters.SQL.Sandbox
   alias Manifold.Accounts
   alias Manifold.Connectors
@@ -457,7 +458,7 @@ defmodule Manifold.OutboundSendMethodLockTest do
     :ok
   end
 
-  test "queueing holds the selected method lock until its snapshot commits" do
+  test "queueing holds the selected method lock through a concurrent disconnect" do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "outbound-lock#{suffix}.test"})
 
@@ -475,64 +476,116 @@ defmodule Manifold.OutboundSendMethodLockTest do
       })
 
     test_pid = self()
+    telemetry_token = make_ref()
+    handler_id = "outbound-send-method-lock-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :repo, :query],
+        &block_selected_method_query/4,
+        %{parent: test_pid, token: telemetry_token}
+      )
+
+    queue =
+      Task.async(fn ->
+        unboxed(fn ->
+          Process.put(:outbound_send_method_lock_test, telemetry_token)
+          Outbound.queue_draft(account.id, draft.id)
+        end)
+      end)
 
     try do
-      queue =
+      assert_receive {:send_method_row_locked, queue_pid, ^telemetry_token}
+
+      disconnect =
         Task.async(fn ->
           unboxed(fn ->
-            Outbound.queue_draft(account.id, draft.id,
-              after_send_method_selected: fn selected ->
-                send(test_pid, {:send_method_selected, self(), selected.id})
-
-                receive do
-                  :finish_queue -> :ok
-                end
-              end
-            )
-          end)
-        end)
-
-      assert_receive {:send_method_selected, queue_pid, selected_id}
-      assert selected_id == gmail.id
-
-      switch =
-        Task.async(fn ->
-          unboxed(fn ->
-            result =
-              Repo.transaction(fn ->
-                send(test_pid, :send_method_switch_started)
-
-                gmail
-                |> SendMethod.changeset(%{enabled: false})
-                |> Repo.update!()
-
-                insert_send_method!(account.id, address, "smtp")
-              end)
-
-            send(test_pid, {:send_method_switched, result})
+            [[backend_pid]] = SQL.query!(Repo, "SELECT pg_backend_pid()", []).rows
+            send(test_pid, {:disconnect_backend, backend_pid})
+            result = Connectors.disconnect_send_method(gmail.id)
+            send(test_pid, {:send_method_disconnected, result})
             result
           end)
         end)
 
-      assert_receive :send_method_switch_started
-      refute_receive {:send_method_switched, _result}, 100
-      send(queue_pid, :finish_queue)
+      Process.put(:outbound_disconnect_task, disconnect)
+
+      assert_receive {:disconnect_backend, backend_pid}
+      assert is_binary(wait_for_backend_lock(backend_pid))
+
+      send(queue_pid, {:release_send_method_query, telemetry_token})
 
       assert {:ok, queued} = Task.await(queue, 5_000)
-      assert {:ok, smtp} = Task.await(switch, 5_000)
-      assert_receive {:send_method_switched, {:ok, ^smtp}}
+      assert {:ok, disconnected} = Task.await(disconnect, 5_000)
+      assert_receive {:send_method_disconnected, {:ok, ^disconnected}}
+      assert disconnected.id == gmail.id
+      assert disconnected.status == "disconnected"
+      refute disconnected.enabled
 
       submission = Repo.get_by!(ProviderSubmission, outbound_message_id: queued.id)
       assert submission.send_method_id == gmail.id
       assert submission.provider == "gmail"
 
-      assert {:ok, %{id: enabled_id, kind: "smtp"}} =
+      assert {:error, %{reason: :send_method_required}} =
                Connectors.enabled_send_method(account.id)
 
-      assert enabled_id == smtp.id
+      assert {:error, %{reason: :account_disconnected}} =
+               Connectors.checkout_send_method(gmail.id, address)
+
+      persisted = Repo.get!(ProviderSubmission, submission.id)
+      assert persisted.send_method_id == gmail.id
+      assert persisted.request_sha256 == submission.request_sha256
     after
+      stop_task(Process.delete(:outbound_disconnect_task))
+      release_and_stop_task(queue, telemetry_token)
+      :telemetry.detach(handler_id)
       cleanup!(account, domain, draft.id)
     end
+  end
+
+  defp block_selected_method_query(_event, _measurements, metadata, config) do
+    if Process.get(:outbound_send_method_lock_test) == config.token and
+         String.contains?(metadata.query, ~s(FROM "connector_send_methods")) and
+         String.contains?(metadata.query, "FOR UPDATE") do
+      send(config.parent, {:send_method_row_locked, self(), config.token})
+
+      receive do
+        {:release_send_method_query, token} when token == config.token -> :ok
+      end
+    end
+  end
+
+  defp wait_for_backend_lock(backend_pid, attempts \\ 200)
+
+  defp wait_for_backend_lock(backend_pid, attempts) when attempts > 0 do
+    case SQL.query!(
+           Repo,
+           "SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1",
+           [backend_pid]
+         ).rows do
+      [["Lock", wait_event]] when is_binary(wait_event) ->
+        wait_event
+
+      _not_waiting ->
+        Process.sleep(10)
+        wait_for_backend_lock(backend_pid, attempts - 1)
+    end
+  end
+
+  defp wait_for_backend_lock(backend_pid, 0) do
+    flunk("PostgreSQL backend #{backend_pid} never waited on the send-method row lock")
+  end
+
+  defp release_and_stop_task(%Task{pid: pid} = task, telemetry_token) do
+    send(pid, {:release_send_method_query, telemetry_token})
+    stop_task(task)
+  end
+
+  defp stop_task(nil), do: :ok
+
+  defp stop_task(%Task{pid: pid} = task) do
+    if Process.alive?(pid), do: Task.shutdown(task, :brutal_kill), else: :ok
   end
 
   defp insert_send_method!(account_id, address, kind) do
