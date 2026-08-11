@@ -71,6 +71,7 @@ defmodule Manifold.Outbound.Submission do
     sender_rejected
     sender_address_mismatch
     smtp_error
+    stale_access_token
     stale_submission_result
     starttls_failed
     submission_not_found
@@ -463,21 +464,39 @@ defmodule Manifold.Outbound.Submission do
   defp connector_error_code(_code), do: "connector_error"
 
   defp maybe_mark_gmail_reconnect(
-         {:error, %Provider.Error{class: :permanent, code: "reconnect_required"}} = result,
+         {:error, %Provider.Error{class: :permanent, code: code} = error} = result,
          %SubmissionMethod{id: method_id, kind: "gmail", credential: {:oauth, access_token}},
          opts
-       ) do
+       )
+       when code in ["reconnect_required", "insufficient_scope"] do
     case Connectors.mark_gmail_send_reconnect_required(
            method_id,
            access_token,
+           gmail_reconnect_error_code(code),
            Keyword.get(opts, :reconnect_opts, [])
          ) do
-      {:ok, _authorization} -> result
-      {:error, _sanitized_reason} -> {:error, reconnect_lifecycle_error()}
+      {:ok, outcome, _authorization} when outcome in [:marked, :already_marked, :inactive] ->
+        result
+
+      {:ok, :stale, _authorization} ->
+        {:error,
+         %{
+           error
+           | class: :transient,
+             code: "stale_access_token",
+             message: "Gmail access token was replaced; retry with the current authorization",
+             retry_after: nil
+         }}
+
+      {:error, _sanitized_reason} ->
+        {:error, reconnect_lifecycle_error()}
     end
   end
 
   defp maybe_mark_gmail_reconnect(result, _method, _opts), do: result
+
+  defp gmail_reconnect_error_code("reconnect_required"), do: :invalid_grant
+  defp gmail_reconnect_error_code("insufficient_scope"), do: :insufficient_scope
 
   defp reconnect_lifecycle_error do
     Error.new(

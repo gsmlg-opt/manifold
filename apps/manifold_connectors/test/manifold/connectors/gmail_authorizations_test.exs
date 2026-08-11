@@ -562,7 +562,9 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert still_live.access_token_ciphertext
     assert still_live.refresh_token_ciphertext
 
-    assert {:ok, disconnected_send} = Connectors.disconnect_send_method(send_method.id)
+    assert {:ok, disconnected_send} =
+             Connectors.disconnect_send_method(account.id, send_method.id)
+
     assert disconnected_send.status == "disconnected"
 
     final = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
@@ -673,7 +675,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
              )
 
     assert {:ok, _receive} = Connectors.disconnect(receive.id)
-    assert {:ok, _send} = Connectors.disconnect_send_method(send_method.id)
+    assert {:ok, _send} = Connectors.disconnect_send_method(account.id, send_method.id)
     events_before = Repo.aggregate(ConnectorEvent, :count)
 
     assert {:ok, authorization} =
@@ -819,7 +821,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     alternate = insert_other_send!(account.id, address)
 
     assert {:error, %{class: :permanent, reason: :reauthorization_required}} =
-             Connectors.enable_send_method(send_method.id)
+             Connectors.enable_send_method(account.id, send_method.id)
 
     refute Repo.get!(SendMethod, send_method.id).enabled
     assert Repo.get!(SendMethod, alternate.id).enabled

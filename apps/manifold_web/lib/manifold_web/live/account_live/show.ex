@@ -78,7 +78,7 @@ defmodule ManifoldWeb.AccountLive.Show do
   end
 
   def handle_event("enable-send", %{"id" => method_id}, socket) do
-    case Connectors.enable_send_method(method_id) do
+    case Connectors.enable_send_method(socket.assigns.account.id, method_id) do
       {:ok, _} ->
         {:noreply,
          socket
@@ -91,7 +91,7 @@ defmodule ManifoldWeb.AccountLive.Show do
   end
 
   def handle_event("disconnect-send", %{"id" => method_id}, socket) do
-    case Connectors.disconnect_send_method(method_id) do
+    case Connectors.disconnect_send_method(socket.assigns.account.id, method_id) do
       {:ok, _} ->
         {:noreply,
          socket

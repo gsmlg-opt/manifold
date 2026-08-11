@@ -38,7 +38,10 @@ Feature migrations:
 
 - `20260811000100_add_shared_gmail_authorizations.exs` creates the shared OAuth
   authorization, links Gmail methods, adds OAuth purposes/scopes, snapshots send
-  method IDs, and migrates legacy Gmail token material.
+  method IDs, and migrates legacy Gmail token material. Before any DDL it refuses
+  legacy Gmail data containing more than one row per Manifold account or an
+  address that does not canonically equal the account address; operators must
+  resolve those records explicitly rather than relying on destructive guessing.
 - `20260811000200_add_oauth_authorization_events.exs` allows connector lifecycle
   events to anchor to a shared authorization.
 - `20260811000300_enforce_provider_submission_methods.exs` constrains provider
@@ -81,6 +84,15 @@ submissions exist.
   ambiguous provider result becomes `submission_uncertain`; no automatic resend
   is allowed.
 - Gmail reconnect marking must persist before its provider failure is committed.
+- A Gmail rejection against a stale access-token generation is definitively
+  unaccepted and returns to the retryable queue so the worker checks out the
+  current token; a current-generation rejection marks the shared authorization
+  and all Gmail methods `reconnect_required` before permanently failing the
+  message. `insufficient_scope` follows the current-generation path so account UI
+  always exposes a reconnect action.
+- Account settings enable/disconnect operations require both the Manifold account
+  ID and send-method ID at the Connectors transaction boundary. Client-supplied
+  method IDs cannot mutate another account or erase its shared Gmail tokens.
 - Legacy `provider = "resend"` rows retain their nil-method, expiring-idempotency
   shape and existing webhook lifecycle.
 - Telemetry stop events contain only internal IDs, provider/method kind, adapter,

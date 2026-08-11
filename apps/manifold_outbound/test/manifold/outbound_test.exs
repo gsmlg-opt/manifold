@@ -569,7 +569,7 @@ defmodule Manifold.OutboundSendMethodLockTest do
           unboxed(fn ->
             [[backend_pid]] = SQL.query!(Repo, "SELECT pg_backend_pid()", []).rows
             send(test_pid, {:disconnect_backend, backend_pid})
-            result = Connectors.disconnect_send_method(gmail.id)
+            result = Connectors.disconnect_send_method(account.id, gmail.id)
             send(test_pid, {:send_method_disconnected, result})
             result
           end)

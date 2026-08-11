@@ -162,7 +162,7 @@ defmodule Manifold.Connectors.SmtpSendMethodTest do
                tls_mode: "tls"
              })
 
-    assert {:ok, disconnected} = Connectors.disconnect_send_method(method.id)
+    assert {:ok, disconnected} = Connectors.disconnect_send_method(account.id, method.id)
     assert disconnected.status == "disconnected"
     refute disconnected.enabled
     assert is_nil(Repo.get_by(SendCredential, send_method_id: method.id))

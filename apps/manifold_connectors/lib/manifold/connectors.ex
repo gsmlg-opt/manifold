@@ -120,12 +120,18 @@ defmodule Manifold.Connectors do
     GmailAuthorizations.mark_reconnect_required(authorization_id, error, opts)
   end
 
-  @spec mark_gmail_send_reconnect_required(Ecto.UUID.t(), String.t(), Keyword.t()) ::
-          {:ok, Manifold.Connectors.Schema.OAuthAuthorization.t()}
+  @spec mark_gmail_send_reconnect_required(Ecto.UUID.t(), String.t(), atom(), Keyword.t()) ::
+          {:ok, :marked | :already_marked | :stale | :inactive,
+           Manifold.Connectors.Schema.OAuthAuthorization.t()}
           | {:error, Error.t() | Ecto.Changeset.t()}
-  def mark_gmail_send_reconnect_required(method_id, expected_access_token, opts \\ [])
+  def mark_gmail_send_reconnect_required(method_id, expected_access_token, error_code, opts \\ [])
       when is_binary(method_id) and is_binary(expected_access_token) do
-    GmailAuthorizations.mark_send_reconnect_required(method_id, expected_access_token, opts)
+    GmailAuthorizations.mark_send_reconnect_required(
+      method_id,
+      expected_access_token,
+      error_code,
+      opts
+    )
   end
 
   @spec list_receive_methods() :: [View.ReceiveMethod.t()]
@@ -468,13 +474,13 @@ defmodule Manifold.Connectors do
        }}
   end
 
-  @spec enable_send_method(Ecto.UUID.t()) ::
+  @spec enable_send_method(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, SendMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
-  def enable_send_method(send_method_id) do
+  def enable_send_method(account_id, send_method_id) do
     Repo.transaction(fn ->
       method =
         SendMethod
-        |> where([m], m.id == ^send_method_id)
+        |> where([m], m.id == ^send_method_id and m.account_id == ^account_id)
         |> lock("FOR UPDATE")
         |> Repo.one()
 
@@ -509,29 +515,29 @@ defmodule Manifold.Connectors do
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
-  @spec disconnect_send_method(Ecto.UUID.t()) ::
+  @spec disconnect_send_method(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, SendMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
-  def disconnect_send_method(send_method_id) do
-    case Repo.get(SendMethod, send_method_id) do
+  def disconnect_send_method(account_id, send_method_id) do
+    case Repo.get_by(SendMethod, id: send_method_id, account_id: account_id) do
       %SendMethod{kind: "gmail", oauth_authorization_id: authorization_id}
       when is_binary(authorization_id) ->
-        GmailAuthorizations.disconnect_method(:send, send_method_id)
+        GmailAuthorizations.disconnect_method(:send, account_id, send_method_id)
 
       _method ->
-        disconnect_legacy_send_method(send_method_id)
+        disconnect_legacy_send_method(account_id, send_method_id)
     end
   rescue
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
-  defp disconnect_legacy_send_method(send_method_id) do
+  defp disconnect_legacy_send_method(account_id, send_method_id) do
     now = DateTime.utc_now()
 
     Multi.new()
     |> Multi.run(:method, fn repo, _changes ->
       method =
         SendMethod
-        |> where([m], m.id == ^send_method_id)
+        |> where([m], m.id == ^send_method_id and m.account_id == ^account_id)
         |> lock("FOR UPDATE")
         |> repo.one()
 

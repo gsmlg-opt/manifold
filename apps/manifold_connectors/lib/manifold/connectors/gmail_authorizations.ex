@@ -191,15 +191,27 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     )
   end
 
-  @spec disconnect_method(:receive | :send, Ecto.UUID.t()) ::
+  @spec disconnect_method(:receive, Ecto.UUID.t()) ::
+          {:ok, ReceiveMethod.t()}
+          | {:error, CoreError.t() | Ecto.Changeset.t()}
+  def disconnect_method(:receive, method_id) do
+    with {:ok, account_id} <- method_account_id(:receive, method_id) do
+      disconnect_method(:receive, account_id, method_id)
+    end
+  end
+
+  @spec disconnect_method(:receive | :send, Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, ReceiveMethod.t() | SendMethod.t()}
           | {:error, CoreError.t() | Ecto.Changeset.t()}
-  def disconnect_method(direction, method_id) when direction in [:receive, :send] do
+  def disconnect_method(direction, account_id, method_id)
+      when direction in [:receive, :send] and is_binary(account_id) do
     now = DateTime.utc_now()
 
-    with {:ok, authorization_id} <- method_authorization_id(direction, method_id) do
+    with {:ok, authorization_id} <-
+           method_authorization_id(direction, account_id, method_id) do
       Repo.transaction(fn ->
         with {:ok, authorization} <- lock_authorization(authorization_id),
+             true <- authorization.account_id == account_id,
              {:ok, method} <- lock_method(direction, method_id, authorization),
              {:ok, disconnected} <- disconnect_locked_method(direction, method, now),
              :ok <- delete_method_secrets(direction, method.id),
@@ -208,6 +220,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
                insert_authorization_event(authorization.id, "disconnected", direction, now) do
           disconnected
         else
+          false -> Repo.rollback(method_not_found())
           {:error, reason} -> Repo.rollback(reason)
         end
       end)
@@ -253,19 +266,26 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   @spec mark_reconnect_required(Ecto.UUID.t(), ProviderError.t(), keyword()) ::
           {:ok, OAuthAuthorization.t()} | {:error, CoreError.t() | Ecto.Changeset.t()}
   def mark_reconnect_required(authorization_id, %ProviderError{} = provider_error, opts \\ []) do
+    case mark_reconnect_required_with_outcome(authorization_id, provider_error, opts) do
+      {:ok, _outcome, authorization} -> {:ok, authorization}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp mark_reconnect_required_with_outcome(authorization_id, provider_error, opts) do
     now = Keyword.get(opts, :now, DateTime.utc_now())
 
     Repo.transaction(fn ->
       with {:ok, authorization} <- lock_authorization(authorization_id),
-           {:ok, authorization} <-
+           {:ok, outcome, authorization} <-
              maybe_mark_reconnect_required_locked(authorization, provider_error, now, opts) do
-        authorization
+        {outcome, authorization}
       else
         {:error, reason} -> Repo.rollback(reason)
       end
     end)
     |> case do
-      {:ok, authorization} -> {:ok, authorization}
+      {:ok, {outcome, authorization}} -> {:ok, outcome, authorization}
       {:error, reason} -> {:error, reason}
     end
   rescue
@@ -273,19 +293,21 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     error in Postgrex.Error -> normalize_transaction_error(error, __STACKTRACE__)
   end
 
-  @spec mark_send_reconnect_required(Ecto.UUID.t(), String.t(), Keyword.t()) ::
-          {:ok, OAuthAuthorization.t()} | {:error, CoreError.t() | Ecto.Changeset.t()}
-  def mark_send_reconnect_required(method_id, expected_access_token, opts \\ [])
-      when is_binary(method_id) and is_binary(expected_access_token) do
+  @spec mark_send_reconnect_required(Ecto.UUID.t(), String.t(), atom(), Keyword.t()) ::
+          {:ok, :marked | :already_marked | :stale | :inactive, OAuthAuthorization.t()}
+          | {:error, CoreError.t() | Ecto.Changeset.t()}
+  def mark_send_reconnect_required(method_id, expected_access_token, error_code, opts \\ [])
+      when is_binary(method_id) and is_binary(expected_access_token) and
+             error_code in [:invalid_grant, :insufficient_scope] do
     error = %ProviderError{
       class: :reconnect,
-      code: :invalid_grant,
+      code: error_code,
       message: "Gmail authorization must be reconnected"
     }
 
     with {:ok, authorization_id} <- method_authorization_id(:send, method_id) do
       opts = Keyword.put(opts, :expected_access_token, expected_access_token)
-      mark_reconnect_required(authorization_id, error, opts)
+      mark_reconnect_required_with_outcome(authorization_id, error, opts)
     end
   end
 
@@ -461,24 +483,34 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   end
 
   defp maybe_mark_reconnect_required_locked(authorization, provider_error, now, opts) do
-    with {:ok, applicable?} <- reconnect_applicable?(authorization, opts) do
-      if applicable? do
-        mark_reconnect_required_locked(authorization, provider_error, now, opts)
-      else
-        {:ok, authorization}
+    with {:ok, applicability} <- reconnect_applicability(authorization, opts) do
+      case applicability do
+        :current ->
+          with {:ok, authorization} <-
+                 mark_reconnect_required_locked(authorization, provider_error, now, opts) do
+            {:ok, :marked, authorization}
+          end
+
+        outcome when outcome in [:already_marked, :stale, :inactive] ->
+          {:ok, outcome, authorization}
       end
     end
   end
 
-  defp reconnect_applicable?(%OAuthAuthorization{status: "connected"} = authorization, opts) do
+  defp reconnect_applicability(%OAuthAuthorization{status: "connected"} = authorization, opts) do
     if live_dependent_methods?(authorization.id) do
-      expected_access_token_matches?(authorization, opts)
+      with {:ok, matches?} <- expected_access_token_matches?(authorization, opts) do
+        {:ok, if(matches?, do: :current, else: :stale)}
+      end
     else
-      {:ok, false}
+      {:ok, :inactive}
     end
   end
 
-  defp reconnect_applicable?(_authorization, _opts), do: {:ok, false}
+  defp reconnect_applicability(%OAuthAuthorization{status: "reconnect_required"}, _opts),
+    do: {:ok, :already_marked}
+
+  defp reconnect_applicability(_authorization, _opts), do: {:ok, :inactive}
 
   defp live_dependent_methods?(authorization_id) do
     receive_live? =
@@ -1205,6 +1237,25 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   defp method_authorization_id(:send, method_id),
     do: do_method_authorization_id(SendMethod, method_id)
 
+  defp method_authorization_id(:receive, account_id, method_id),
+    do: do_method_authorization_id(ReceiveMethod, account_id, method_id)
+
+  defp method_authorization_id(:send, account_id, method_id),
+    do: do_method_authorization_id(SendMethod, account_id, method_id)
+
+  defp method_account_id(:receive, method_id), do: do_method_account_id(ReceiveMethod, method_id)
+
+  defp do_method_account_id(schema, method_id) do
+    schema
+    |> where([method], method.id == ^method_id)
+    |> select([method], method.account_id)
+    |> Repo.one()
+    |> case do
+      nil -> {:error, method_not_found()}
+      account_id -> {:ok, account_id}
+    end
+  end
+
   defp do_method_authorization_id(schema, method_id) do
     schema
     |> where([method], method.id == ^method_id)
@@ -1222,6 +1273,27 @@ defmodule Manifold.Connectors.GmailAuthorizations do
          CoreError.new(:permanent, :invalid_gmail_method, "connector method is not Gmail")}
     end
   end
+
+  defp do_method_authorization_id(schema, account_id, method_id) do
+    schema
+    |> where([method], method.id == ^method_id and method.account_id == ^account_id)
+    |> select([method], {method.kind, method.oauth_authorization_id})
+    |> Repo.one()
+    |> case do
+      nil ->
+        {:error, method_not_found()}
+
+      {@provider, authorization_id} when is_binary(authorization_id) ->
+        {:ok, authorization_id}
+
+      _method ->
+        {:error,
+         CoreError.new(:permanent, :invalid_gmail_method, "connector method is not Gmail")}
+    end
+  end
+
+  defp method_not_found,
+    do: CoreError.new(:permanent, :account_not_found, "connector method not found")
 
   defp lock_method(:receive, method_id, authorization),
     do: do_lock_method(ReceiveMethod, method_id, authorization)

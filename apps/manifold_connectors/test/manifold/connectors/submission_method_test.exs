@@ -367,7 +367,8 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
     assert {:error, %CoreError{reason: :account_disconnected} = error} =
              Connectors.checkout_send_method(gmail.id, Accounts.account_address(account),
                after_oauth_checkout: fn ->
-                 assert {:ok, _disconnected} = Connectors.disconnect_send_method(gmail.id)
+                 assert {:ok, _disconnected} =
+                          Connectors.disconnect_send_method(account.id, gmail.id)
                end
              )
 

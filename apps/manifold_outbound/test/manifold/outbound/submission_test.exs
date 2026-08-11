@@ -787,7 +787,7 @@ defmodule Manifold.Outbound.SubmissionTest do
     end
   end
 
-  test "Gmail API reconnect marks the current token generation but ignores a stale token" do
+  test "Gmail API reconnect marks the current token generation and retries a stale token" do
     %{message: current_message, method: current_method} = queued_operational_fixture("gmail")
 
     Req.Test.expect(__MODULE__, fn conn ->
@@ -825,7 +825,7 @@ defmodule Manifold.Outbound.SubmissionTest do
       conn |> Plug.Conn.put_status(401) |> Req.Test.json(%{"error" => "invalid_grant"})
     end)
 
-    assert {:error, %Provider.Error{code: "reconnect_required"}} =
+    assert {:error, %Provider.Error{class: :transient, code: "stale_access_token"}} =
              Outbound.submit_message(stale_message.id,
                provider_config: [
                  base_url: "https://gmail.test",
@@ -837,6 +837,73 @@ defmodule Manifold.Outbound.SubmissionTest do
              "connected"
 
     assert Repo.get!(SendMethod, stale_method.id).status == "connected"
+
+    assert Repo.get!(OutboundMessage, stale_message.id).state == "queued"
+
+    assert Repo.get_by!(ProviderSubmission, outbound_message_id: stale_message.id).state ==
+             "pending"
+
+    previous_providers = Application.get_env(:manifold_connectors, :providers)
+
+    Application.put_env(:manifold_connectors, :providers,
+      gmail: [
+        base_url: "https://gmail.test",
+        req_options: [plug: {Req.Test, __MODULE__}]
+      ]
+    )
+
+    on_exit(fn -> restore_env(:manifold_connectors, :providers, previous_providers) end)
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer new-access-token"]
+
+      Req.Test.json(conn, %{"id" => "gmail-retried", "threadId" => "thread-retried"})
+    end)
+
+    assert :ok =
+             SubmitOutbound.perform(%Oban.Job{
+               args: %{"outbound_message_id" => stale_message.id}
+             })
+
+    assert Repo.get!(OutboundMessage, stale_message.id).state == "accepted_by_provider"
+
+    assert Repo.get_by!(ProviderSubmission, outbound_message_id: stale_message.id).attempt_count ==
+             2
+  end
+
+  test "Gmail insufficient scope marks the current authorization actionable" do
+    %{message: message, method: method} = queued_operational_fixture("gmail")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      conn
+      |> Plug.Conn.put_status(403)
+      |> Req.Test.json(%{
+        "error" => %{
+          "errors" => [%{"reason" => "insufficientPermissions"}]
+        }
+      })
+    end)
+
+    assert {:error, %Provider.Error{class: :permanent, code: "insufficient_scope"}} =
+             Outbound.submit_message(message.id,
+               provider_config: [
+                 base_url: "https://gmail.test",
+                 req_options: [plug: {Req.Test, __MODULE__}]
+               ]
+             )
+
+    authorization = Repo.get!(OAuthAuthorization, method.oauth_authorization_id)
+    assert authorization.status == "reconnect_required"
+    assert authorization.last_error_code == "insufficient_scope"
+
+    persisted_method = Repo.get!(SendMethod, method.id)
+    assert persisted_method.status == "reconnect_required"
+    refute persisted_method.enabled
+
+    persisted_message = Repo.get!(OutboundMessage, message.id)
+    assert persisted_message.state == "failed"
+    assert persisted_message.last_error_class == "permanent"
+    assert persisted_message.last_error_code == "insufficient_scope"
   end
 
   test "Gmail reconnect lifecycle failure is retryable without resending" do
