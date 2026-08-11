@@ -6,7 +6,7 @@ defmodule Manifold.Connectors.Sync do
   alias Manifold.Accounts
   alias Manifold.Connectors
   alias Manifold.Connectors.{Crypto, OAuthScopes}
-  alias Manifold.Connectors.Jobs.ApplyRemoteState
+  alias Manifold.Connectors.{MicrosoftFolderMapping, RemoteStateJobs}
   alias Manifold.Connectors.Provider
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.{Page, RawMessage}
@@ -114,7 +114,16 @@ defmodule Manifold.Connectors.Sync do
       opts = prepare_provider_session(account, adapter, opts)
 
       try do
-        with {:ok, %Page{} = page} <-
+        with {:ok, cursor} <-
+               maybe_reconcile_folder_mapping(
+                 account,
+                 cursor,
+                 auth,
+                 adapter,
+                 config,
+                 provider_opts(opts)
+               ),
+             {:ok, %Page{} = page} <-
                sync_page(adapter, auth, cursor, config, provider_opts(opts)),
              messages = collapse_messages(page.messages),
              :ok <-
@@ -204,6 +213,34 @@ defmodule Manifold.Connectors.Sync do
       :ok
     end
   end
+
+  defp maybe_reconcile_folder_mapping(
+         %ReceiveMethod{kind: "microsoft"} = account,
+         cursor,
+         access_token,
+         adapter,
+         config,
+         opts
+       ) do
+    MicrosoftFolderMapping.ensure_current(
+      account,
+      cursor,
+      access_token,
+      adapter,
+      config,
+      opts
+    )
+  end
+
+  defp maybe_reconcile_folder_mapping(
+         %ReceiveMethod{},
+         cursor,
+         _auth,
+         _adapter,
+         _config,
+         _opts
+       ),
+       do: {:ok, cursor}
 
   defp emit_sync_stop(account_id, start, provider, :ok, counts) do
     :telemetry.execute(
@@ -827,7 +864,7 @@ defmodule Manifold.Connectors.Sync do
       end
 
       if is_binary(remote.inbound_delivery_id) do
-        ensure_remote_state_job(remote.id)
+        RemoteStateJobs.ensure(remote.id)
       end
 
       remote
@@ -955,25 +992,6 @@ defmodule Manifold.Connectors.Sync do
     Enum.all?([:phase, :bootstrap_cursor, :page_cursor, :committed_cursor, :metadata], fn field ->
       Map.get(left, field) == Map.get(right, field)
     end)
-  end
-
-  defp ensure_remote_state_job(remote_message_id) do
-    existing =
-      Oban.Job
-      |> where([job], job.worker == ^inspect(ApplyRemoteState))
-      |> where([job], job.state in ~w(available scheduled executing retryable suspended))
-      |> where(
-        [job],
-        fragment("?->>'remote_message_id' = ?", job.args, ^remote_message_id)
-      )
-      |> order_by([job], asc: job.id)
-      |> limit(1)
-      |> Repo.one()
-
-    existing ||
-      remote_message_id
-      |> then(&ApplyRemoteState.new(%{"remote_message_id" => &1}))
-      |> Repo.insert!()
   end
 
   defp collapse_messages(messages) do

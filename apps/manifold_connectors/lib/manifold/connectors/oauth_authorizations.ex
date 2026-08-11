@@ -6,7 +6,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
 
   alias Manifold.Accounts
   alias Manifold.Accounts.Schema.Account
-  alias Manifold.Connectors.Crypto
+  alias Manifold.Connectors.{Crypto, MicrosoftFolderMapping}
   alias Manifold.Connectors.Jobs.SyncAccount
   alias Manifold.Connectors.MicrosoftScopes
   alias Manifold.Connectors.OAuth.Consumed
@@ -62,7 +62,16 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
                 {:ok, %Identity{} = identity} <-
                   adapter.identity(token.access_token, config, provider_opts),
                 {:ok, provider_address} <- Address.parse(identity.email_address),
-                {:ok, cursors} <- initial_cursors(purpose, adapter, token, config, provider_opts),
+                {:ok, cursors} <-
+                  initial_cursors(
+                    provider,
+                    purpose,
+                    consumed,
+                    adapter,
+                    token,
+                    config,
+                    provider_opts
+                  ),
                 :ok <- validate_cursors(purpose, cursors) do
              persist(provider, consumed, purpose, token, identity, provider_address, cursors, now)
            else
@@ -1099,6 +1108,13 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
                token,
                now
              ),
+           :ok <-
+             lock_preserved_receive_lifecycle(
+               provider,
+               account.id,
+               authorization,
+               cursors
+             ),
            {:ok, method} <-
              upsert_method(
                provider,
@@ -1143,6 +1159,47 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
 
       {:error, %CoreError{} = error} ->
         {:error, error}
+    end
+  end
+
+  defp lock_preserved_receive_lifecycle(_provider, _account_id, _authorization, cursors)
+       when is_list(cursors),
+       do: :ok
+
+  defp lock_preserved_receive_lifecycle(
+         "microsoft",
+         account_id,
+         authorization,
+         {:preserve_reconnected_receive, snapshot}
+       ) do
+    _cursors =
+      StoredCursor
+      |> where([cursor], cursor.external_account_id == ^snapshot.method_id)
+      |> order_by([cursor], asc: cursor.id)
+      |> lock("FOR UPDATE")
+      |> Repo.all()
+
+    method =
+      ReceiveMethod
+      |> where([receive_method], receive_method.id == ^snapshot.method_id)
+      |> lock("FOR UPDATE")
+      |> Repo.one()
+
+    case method do
+      %ReceiveMethod{
+        account_id: ^account_id,
+        kind: "microsoft",
+        status: "reconnect_required",
+        oauth_authorization_id: authorization_id,
+        lock_version: lock_version
+      }
+      when authorization_id == authorization.id and
+             authorization_id == snapshot.authorization_id and
+             lock_version == snapshot.method_lock_version ->
+        :ok
+
+      _changed_or_missing ->
+        {:error, stale_oauth_authorization()}
     end
   end
 
@@ -1513,6 +1570,22 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
   defp maybe_except(query, nil), do: query
   defp maybe_except(query, except_id), do: where(query, [method], method.id != ^except_id)
 
+  defp persist_receive_state(
+         :receive,
+         %ReceiveMethod{id: method_id},
+         {:preserve_reconnected_receive, %{method_id: method_id}},
+         _now
+       ),
+       do: MicrosoftFolderMapping.invalidate(method_id)
+
+  defp persist_receive_state(
+         :send,
+         _send_method,
+         {:preserve_reconnected_receive, %{method_id: receive_method_id}},
+         _now
+       ),
+       do: MicrosoftFolderMapping.invalidate(receive_method_id)
+
   defp persist_receive_state(:send, _method, [], _now), do: :ok
 
   defp persist_receive_state(:receive, method, cursors, now) do
@@ -1745,12 +1818,58 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     end
   end
 
+  defp initial_cursors(
+         "microsoft",
+         purpose,
+         %Consumed{mailbox_id: account_id},
+         adapter,
+         token,
+         config,
+         provider_opts
+       )
+       when purpose in [:receive, :send] do
+    case reconnect_receive_snapshot(account_id) do
+      nil -> initial_cursors(purpose, adapter, token, config, provider_opts)
+      snapshot -> {:ok, {:preserve_reconnected_receive, snapshot}}
+    end
+  end
+
+  defp initial_cursors(
+         _provider,
+         purpose,
+         %Consumed{},
+         adapter,
+         token,
+         config,
+         provider_opts
+       ),
+       do: initial_cursors(purpose, adapter, token, config, provider_opts)
+
   defp initial_cursors(:send, _adapter, _token, _config, _provider_opts), do: {:ok, []}
 
   defp initial_cursors(:receive, adapter, token, config, provider_opts),
     do: adapter.initial_cursors(token.access_token, config, provider_opts)
 
+  defp reconnect_receive_snapshot(account_id) do
+    ReceiveMethod
+    |> where(
+      [method],
+      method.account_id == ^account_id and method.kind == "microsoft" and
+        method.status == "reconnect_required"
+    )
+    |> select([method], %{
+      method_id: method.id,
+      method_lock_version: method.lock_version,
+      authorization_id: method.oauth_authorization_id
+    })
+    |> Repo.one()
+  end
+
   defp validate_cursors(:send, []), do: :ok
+
+  defp validate_cursors(purpose, {:preserve_reconnected_receive, snapshot})
+       when purpose in [:receive, :send] and is_map(snapshot),
+       do: :ok
 
   defp validate_cursors(:receive, cursors) when is_list(cursors) and cursors != [] do
     if Enum.all?(cursors, &match?(%SyncCursor{}, &1)) do

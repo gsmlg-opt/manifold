@@ -3,12 +3,13 @@ defmodule Manifold.Connectors.SyncTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
-  alias Manifold.Connectors.{Crypto, MicrosoftScopes}
+  alias Manifold.Connectors.{Crypto, MicrosoftFolderMapping, MicrosoftScopes}
   alias Manifold.Connectors.Jobs.{ApplyRemoteState, PollAccounts, SyncAccount}
   alias Manifold.Connectors.OAuth.Consumed
 
   alias Manifold.Connectors.Provider.{
     Error,
+    FolderMapping,
     Identity,
     Page,
     RawMessage,
@@ -76,6 +77,23 @@ defmodule Manifold.Connectors.SyncTest do
     end
 
     @impl true
+    def resolve_folder_mapping(access_token, _config, _opts) do
+      Process.put(:folder_mapping_count, Process.get(:folder_mapping_count, 0) + 1)
+      send(self(), {:folder_mapping_access_token, access_token})
+
+      Process.get(:folder_mapping_result) ||
+        {:ok,
+         %FolderMapping{
+           version: 1,
+           kinds_by_id: %{
+             "folder-inbox" => "inbox",
+             "folder-deleted" => "trash",
+             "folder-sent" => "sent"
+           }
+         }}
+    end
+
+    @impl true
     def sync_page(access_token, cursor, _config, _opts) do
       send(self(), {:sync_access_token, access_token})
 
@@ -96,6 +114,7 @@ defmodule Manifold.Connectors.SyncTest do
 
     @impl true
     def fetch_raw(access_token, message_id, _config, _opts) do
+      Process.put(:raw_fetch_count, Process.get(:raw_fetch_count, 0) + 1)
       send(self(), {:raw_access_token, access_token, message_id})
 
       case Process.get({:raw_result, message_id}) do
@@ -150,6 +169,9 @@ defmodule Manifold.Connectors.SyncTest do
       Application.put_env(:manifold_storage, :raw_store_dir, old_raw)
       Process.delete(:sync_page_result)
       Process.delete(:refresh_result)
+      Process.delete(:folder_mapping_count)
+      Process.delete(:folder_mapping_result)
+      Process.delete(:raw_fetch_count)
     end)
 
     suffix = System.unique_integer([:positive])
@@ -488,13 +510,178 @@ defmodule Manifold.Connectors.SyncTest do
        %{
          account: account
        } do
-    microsoft = convert_to_microsoft!(account)
+    microsoft = account.id |> then(&Repo.get!(ReceiveMethod, &1)) |> convert_to_microsoft!()
 
     refute Repo.get_by(Credential, external_account_id: microsoft.id)
 
     assert :ok = Connectors.sync_account(microsoft.id)
     assert_receive {:sync_access_token, "initial-access"}
     refute Repo.get_by(Credential, external_account_id: microsoft.id)
+  end
+
+  test "Microsoft selected-lane sync repairs upgraded folder mappings without raw fetches", %{
+    account: account,
+    cursor: cursor,
+    mailbox: mailbox
+  } do
+    fixture = upgraded_microsoft_fixture!(account, cursor, mailbox)
+    attach_folder_mapping_stop()
+
+    Process.put(:folder_mapping_count, 0)
+    Process.put(:raw_fetch_count, 0)
+
+    Process.put(:sync_page_result, fn provider_cursor ->
+      assert provider_cursor.scope == fixture.selected.scope
+      assert provider_cursor.committed_cursor == fixture.selected.committed_cursor
+      assert provider_cursor.metadata["folder_mapping_version"] == 1
+      assert provider_cursor.metadata["folder_kind"] == "inbox"
+      send(self(), {:selected_lane_synced, provider_cursor.scope})
+      {:ok, %Page{cursor: provider_cursor}}
+    end)
+
+    assert :ok = Connectors.sync_account(fixture.account.id)
+    assert_receive {:selected_lane_synced, "folder:folder-inbox"}
+    assert_receive {:folder_mapping_access_token, "initial-access"}
+
+    assert_receive {:folder_mapping_stop, measurements, metadata}
+    assert measurements.cursor_count == 2
+    assert measurements.changed_message_count == 3
+
+    assert metadata == %{
+             account_id: fixture.account.account_id,
+             error_code: nil,
+             method_id: fixture.account.id,
+             outcome: :repaired,
+             provider: "microsoft"
+           }
+
+    refreshed_folders = Repo.get!(SyncCursor, fixture.folders.id)
+    refreshed_selected = Repo.get!(SyncCursor, fixture.selected.id)
+
+    assert refreshed_folders.committed_cursor == fixture.folders.committed_cursor
+    assert refreshed_selected.committed_cursor == fixture.selected.committed_cursor
+    assert refreshed_folders.metadata["folder_mapping_version"] == 1
+
+    assert refreshed_folders.metadata["folder_kinds_by_id"] == %{
+             "folder-inbox" => "inbox",
+             "folder-deleted" => "trash",
+             "folder-sent" => "sent"
+           }
+
+    assert Repo.get!(RemoteMessage, fixture.remotes.inbox.id).remote_folder_kind == "inbox"
+    assert Repo.get!(RemoteMessage, fixture.remotes.deleted.id).remote_folder_kind == "trash"
+    assert Repo.get!(RemoteMessage, fixture.remotes.sent.id).remote_folder_kind == "sent"
+    assert Repo.get!(RemoteMessage, fixture.remotes.custom.id).remote_folder_kind == "archive"
+
+    assert Enum.all?(
+             [fixture.remotes.inbox, fixture.remotes.deleted, fixture.remotes.sent],
+             fn remote ->
+               apply_remote_state_job_count(remote.id) == 1
+             end
+           )
+
+    assert apply_remote_state_job_count(fixture.remotes.custom.id) == 0
+
+    assert Process.get(:folder_mapping_count) == 1
+    assert Process.get(:raw_fetch_count) == 0
+
+    cursor_positions = cursor_position_snapshots(fixture.account.id)
+    remote_snapshots = remote_state_snapshots(fixture.account.id)
+    job_ids = apply_remote_state_job_ids(fixture.account.id)
+
+    assert {:ok, %SyncCursor{id: selected_id}} =
+             MicrosoftFolderMapping.ensure_current(
+               Repo.get!(ReceiveMethod, fixture.account.id),
+               refreshed_selected,
+               "initial-access",
+               FakeProvider,
+               [],
+               []
+             )
+
+    assert selected_id == refreshed_selected.id
+    assert cursor_position_snapshots(fixture.account.id) == cursor_positions
+    assert remote_state_snapshots(fixture.account.id) == remote_snapshots
+    assert apply_remote_state_job_ids(fixture.account.id) == job_ids
+    assert Process.get(:folder_mapping_count) == 1
+    assert Process.get(:raw_fetch_count) == 0
+  end
+
+  test "Microsoft reset metadata forces mapping resolution before the selected page", %{
+    account: account,
+    cursor: cursor
+  } do
+    microsoft = convert_to_microsoft!(account)
+
+    cursor
+    |> Repo.reload!()
+    |> SyncCursor.changeset(%{last_completed_at: ~U[2026-08-12 02:00:00.000000Z]})
+    |> Repo.update!()
+
+    selected =
+      insert_sync_cursor!(microsoft.id, %{
+        scope: "folder:folder-sent",
+        phase: "incremental",
+        committed_cursor: "https://graph.microsoft.test/messages/sent-delta",
+        metadata: %{
+          "folder_kind" => "archive",
+          "folder_mapping_version" => 1,
+          "folder_mapping_refresh_required" => true
+        }
+      })
+
+    Process.put(:folder_mapping_count, 0)
+    Process.put(:raw_fetch_count, 0)
+
+    Process.put(:sync_page_result, fn provider_cursor ->
+      assert provider_cursor.scope == selected.scope
+      assert provider_cursor.metadata["folder_kind"] == "sent"
+      refute Map.has_key?(provider_cursor.metadata, "folder_mapping_refresh_required")
+      {:ok, %Page{cursor: provider_cursor}}
+    end)
+
+    assert :ok = Connectors.sync_account(microsoft.id)
+    assert Process.get(:folder_mapping_count) == 1
+    assert Process.get(:raw_fetch_count) == 0
+
+    refreshed_folders = Repo.get!(SyncCursor, cursor.id)
+    refreshed_selected = Repo.get!(SyncCursor, selected.id)
+
+    assert refreshed_folders.committed_cursor == cursor.committed_cursor
+    assert refreshed_selected.committed_cursor == selected.committed_cursor
+    assert refreshed_selected.metadata["folder_mapping_version"] == 1
+    refute Map.has_key?(refreshed_selected.metadata, "folder_mapping_refresh_required")
+  end
+
+  test "Microsoft mapping failures use provider throttling before cursor advancement", %{
+    account: account,
+    cursor: cursor
+  } do
+    microsoft = convert_to_microsoft!(account)
+
+    cursor
+    |> Repo.reload!()
+    |> SyncCursor.changeset(%{metadata: %{"folder_mapping_refresh_required" => true}})
+    |> Repo.update!()
+
+    Process.put(:folder_mapping_count, 0)
+
+    Process.put(
+      :folder_mapping_result,
+      {:error,
+       %Error{
+         class: :temporary,
+         code: :rate_limited,
+         message: "Microsoft Graph rate limited folder discovery",
+         retry_after_seconds: 47
+       }}
+    )
+
+    assert {:snooze, 47} = Connectors.sync_account(microsoft.id)
+    assert Process.get(:folder_mapping_count) == 1
+    refute_receive {:sync_access_token, "initial-access"}
+    assert Repo.get!(SyncCursor, cursor.id).committed_cursor == cursor.committed_cursor
+    assert Repo.get!(ReceiveMethod, microsoft.id).last_error_code == "rate_limited"
   end
 
   test "Microsoft reconnect errors pause the shared authorization and both methods", %{
@@ -1001,6 +1188,175 @@ defmodule Manifold.Connectors.SyncTest do
     assert entry.folder_id == Manifold.Mail.Folders.get_system(mailbox.id, "inbox").id
   end
 
+  defp upgraded_microsoft_fixture!(account, cursor, mailbox) do
+    folder_ids = %{
+      inbox: "folder-inbox",
+      deleted: "folder-deleted",
+      sent: "folder-sent",
+      custom: "folder-custom"
+    }
+
+    messages =
+      Enum.map(folder_ids, fn {kind, _folder_id} ->
+        %{remote_message("upgraded-#{kind}") | folder_kind: "archive", labels: []}
+      end)
+
+    Process.put(
+      :sync_page_result,
+      {:ok,
+       %Page{
+         messages: messages,
+         cursor: %{provider_cursor(cursor) | committed_cursor: "101"}
+       }}
+    )
+
+    assert :ok = Connectors.sync_account(account.id)
+
+    remotes =
+      Map.new(folder_ids, fn {kind, folder_id} ->
+        remote =
+          Repo.get_by!(RemoteMessage,
+            external_account_id: account.id,
+            provider_message_id: "upgraded-#{kind}"
+          )
+
+        assert :ok = Ingest.archive_delivery(remote.inbound_delivery_id)
+        assert :ok = Ingest.project_delivery(remote.inbound_delivery_id)
+
+        repaired_fixture =
+          remote
+          |> RemoteMessage.changeset(%{
+            remote_folder_id: folder_id,
+            remote_folder_kind: "archive"
+          })
+          |> Repo.update!()
+
+        assert :ok = Connectors.apply_remote_state(repaired_fixture.id)
+
+        {kind, repaired_fixture}
+      end)
+
+    archive = Manifold.Mail.Folders.get_system(mailbox.id, "archive")
+
+    assert Enum.all?(Map.values(remotes), fn remote ->
+             Repo.get_by!(MailboxEntry, inbound_delivery_id: remote.inbound_delivery_id).folder_id ==
+               archive.id
+           end)
+
+    microsoft =
+      account.id
+      |> then(&Repo.get!(ReceiveMethod, &1))
+      |> convert_to_microsoft!()
+
+    Repo.delete_all(from(job in Oban.Job, where: job.worker == ^inspect(ApplyRemoteState)))
+
+    Repo.delete_all(
+      from(stored in SyncCursor, where: stored.external_account_id == ^microsoft.id)
+    )
+
+    folders =
+      insert_sync_cursor!(microsoft.id, %{
+        scope: "folders",
+        phase: "incremental",
+        committed_cursor: "https://graph.microsoft.test/folders/committed-delta",
+        metadata: %{},
+        last_completed_at: ~U[2026-08-12 02:00:00.000000Z]
+      })
+
+    selected =
+      insert_sync_cursor!(microsoft.id, %{
+        scope: "folder:folder-inbox",
+        phase: "incremental",
+        committed_cursor: "https://graph.microsoft.test/messages/inbox-committed-delta",
+        metadata: %{"folder_kind" => "archive"}
+      })
+
+    %{account: microsoft, folders: folders, selected: selected, remotes: remotes}
+  end
+
+  defp insert_sync_cursor!(receive_method_id, attrs) do
+    defaults = %{
+      external_account_id: receive_method_id,
+      phase: "incremental",
+      metadata: %{},
+      generation: 1
+    }
+
+    %SyncCursor{}
+    |> SyncCursor.changeset(Map.merge(defaults, attrs))
+    |> Repo.insert!()
+  end
+
+  defp cursor_position_snapshots(receive_method_id) do
+    SyncCursor
+    |> where([cursor], cursor.external_account_id == ^receive_method_id)
+    |> order_by([cursor], asc: cursor.id)
+    |> Repo.all()
+    |> Enum.map(
+      &Map.take(&1, [
+        :id,
+        :scope,
+        :phase,
+        :bootstrap_cursor,
+        :page_cursor,
+        :committed_cursor,
+        :generation,
+        :last_completed_at
+      ])
+    )
+  end
+
+  defp remote_state_snapshots(receive_method_id) do
+    RemoteMessage
+    |> where([remote], remote.external_account_id == ^receive_method_id)
+    |> order_by([remote], asc: remote.id)
+    |> Repo.all()
+    |> Enum.map(&Map.take(&1, [:id, :remote_folder_kind, :lock_version, :updated_at]))
+  end
+
+  defp apply_remote_state_job_ids(receive_method_id) do
+    remote_ids =
+      RemoteMessage
+      |> where([remote], remote.external_account_id == ^receive_method_id)
+      |> select([remote], remote.id)
+      |> Repo.all()
+      |> MapSet.new()
+
+    Oban.Job
+    |> where([job], job.worker == ^inspect(ApplyRemoteState))
+    |> order_by([job], asc: job.id)
+    |> Repo.all()
+    |> Enum.filter(&MapSet.member?(remote_ids, &1.args["remote_message_id"]))
+    |> Enum.map(& &1.id)
+  end
+
+  defp apply_remote_state_job_count(remote_message_id) do
+    Oban.Job
+    |> where([job], job.worker == ^inspect(ApplyRemoteState))
+    |> where(
+      [job],
+      fragment("?->>'remote_message_id' = ?", job.args, ^remote_message_id)
+    )
+    |> Repo.aggregate(:count)
+  end
+
+  defp attach_folder_mapping_stop do
+    handler_id = "microsoft-folder-mapping-stop-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :connectors, :microsoft, :folder_mapping, :stop],
+        fn _event, measurements, metadata, pid ->
+          send(pid, {:folder_mapping_stop, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
   defp remote_message(id) do
     %ProviderRemoteMessage{
       id: id,
@@ -1018,7 +1374,8 @@ defmodule Manifold.Connectors.SyncTest do
       phase: cursor.phase,
       bootstrap_cursor: cursor.bootstrap_cursor,
       page_cursor: cursor.page_cursor,
-      committed_cursor: cursor.committed_cursor
+      committed_cursor: cursor.committed_cursor,
+      metadata: cursor.metadata
     }
   end
 
@@ -1048,12 +1405,30 @@ defmodule Manifold.Connectors.SyncTest do
     })
     |> Repo.update!()
 
-    receive_method
-    |> ReceiveMethod.changeset(%{
-      kind: "microsoft",
-      granted_scopes: [MicrosoftScopes.read()]
+    microsoft =
+      receive_method
+      |> ReceiveMethod.changeset(%{
+        kind: "microsoft",
+        granted_scopes: [MicrosoftScopes.read()]
+      })
+      |> Repo.update!()
+
+    microsoft.id
+    |> then(&Repo.get_by!(SyncCursor, external_account_id: &1))
+    |> SyncCursor.changeset(%{
+      scope: "folders",
+      metadata: %{
+        "folder_mapping_version" => 1,
+        "folder_kinds_by_id" => %{
+          "folder-inbox" => "inbox",
+          "folder-deleted" => "trash",
+          "folder-sent" => "sent"
+        }
+      }
     })
     |> Repo.update!()
+
+    microsoft
   end
 
   defp attach_sync_stop do

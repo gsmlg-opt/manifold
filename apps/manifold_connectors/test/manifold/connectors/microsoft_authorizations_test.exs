@@ -964,6 +964,142 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
            )
   end
 
+  test "successful Microsoft reconnect invalidates mapping metadata without replacing cursors", %{
+    account: account,
+    address: address
+  } do
+    {receive, _send_method, authorization} = complete_both(account, address)
+
+    [initial_cursor] =
+      Repo.all(from(cursor in SyncCursor, where: cursor.external_account_id == ^receive.id))
+
+    folders =
+      initial_cursor
+      |> SyncCursor.changeset(%{
+        scope: "folders",
+        phase: "incremental",
+        committed_cursor: "https://graph.microsoft.test/folders/committed-delta",
+        metadata: %{
+          "folder_mapping_version" => 1,
+          "folder_kinds_by_id" => %{"folder-inbox" => "inbox"},
+          "fixture_marker" => "retain"
+        },
+        last_completed_at: @now
+      })
+      |> Repo.update!()
+
+    selected =
+      %SyncCursor{}
+      |> SyncCursor.changeset(%{
+        external_account_id: receive.id,
+        scope: "folder:folder-inbox",
+        phase: "incremental",
+        committed_cursor: "https://graph.microsoft.test/messages/inbox-committed-delta",
+        metadata: %{
+          "folder_mapping_version" => 1,
+          "folder_kind" => "inbox",
+          "fixture_marker" => "retain"
+        },
+        generation: 7,
+        last_completed_at: @now
+      })
+      |> Repo.insert!()
+
+    positions_before = reconnect_cursor_positions(receive.id)
+
+    assert {:ok, _authorization} =
+             Connectors.mark_oauth_reconnect_required(
+               authorization.id,
+               %ProviderError{
+                 class: :reconnect,
+                 code: :invalid_grant,
+                 message: "provider reconnect required"
+               }
+             )
+
+    assert {:ok, %ReceiveMethod{id: receive_id, status: "connected"}} =
+             complete(:receive, account, address,
+               access_token: "reconnected-access",
+               refresh_token: nil,
+               required_scopes: all_scopes(),
+               scopes: access_token_scopes(all_scopes()),
+               provider_opts: [test_pid: self()]
+             )
+
+    assert receive_id == receive.id
+    assert_receive {:exchange_required_scopes, required_scopes}
+    assert required_scopes == all_scopes()
+    refute_receive :initial_cursors, 100
+    assert reconnect_cursor_positions(receive.id) == positions_before
+
+    refreshed_folders = Repo.get!(SyncCursor, folders.id)
+    refreshed_selected = Repo.get!(SyncCursor, selected.id)
+
+    assert refreshed_folders.metadata == %{
+             "folder_kinds_by_id" => %{"folder-inbox" => "inbox"},
+             "folder_mapping_refresh_required" => true,
+             "fixture_marker" => "retain"
+           }
+
+    assert refreshed_selected.metadata == %{
+             "folder_kind" => "inbox",
+             "folder_mapping_refresh_required" => true,
+             "fixture_marker" => "retain"
+           }
+  end
+
+  test "successful Microsoft send reconnect invalidates the restored receive mapping", %{
+    account: account,
+    address: address
+  } do
+    {receive, _send_method, authorization} = complete_both(account, address)
+
+    cursor =
+      SyncCursor
+      |> Repo.get_by!(external_account_id: receive.id)
+      |> SyncCursor.changeset(%{
+        scope: "folders",
+        phase: "incremental",
+        committed_cursor: "https://graph.microsoft.test/folders/committed-delta",
+        metadata: %{
+          "folder_mapping_version" => 1,
+          "folder_kinds_by_id" => %{"folder-sent" => "sent"}
+        },
+        last_completed_at: @now
+      })
+      |> Repo.update!()
+
+    positions_before = reconnect_cursor_positions(receive.id)
+    jobs_before = sync_job_count(receive.id)
+
+    assert {:ok, _authorization} =
+             Connectors.mark_oauth_reconnect_required(
+               authorization.id,
+               %ProviderError{
+                 class: :reconnect,
+                 code: :invalid_grant,
+                 message: "provider reconnect required"
+               }
+             )
+
+    assert {:ok, %SendMethod{status: "connected"}} =
+             complete(:send, account, address,
+               access_token: "reconnected-send-access",
+               refresh_token: nil,
+               required_scopes: all_scopes(),
+               scopes: access_token_scopes(all_scopes())
+             )
+
+    assert Repo.get!(ReceiveMethod, receive.id).status == "connected"
+    assert reconnect_cursor_positions(receive.id) == positions_before
+    assert sync_job_count(receive.id) == jobs_before
+
+    assert Repo.get!(SyncCursor, cursor.id).metadata == %{
+             "folder_kinds_by_id" => %{"folder-sent" => "sent"},
+             "folder_mapping_refresh_required" => true
+           }
+  end
+
   test "receive add keeps a rotated refresh token when initial cursors fails", %{
     account: account,
     address: address
@@ -1734,6 +1870,25 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     |> order_by([cursor], asc: cursor.id)
     |> select([cursor], cursor.id)
     |> Repo.all()
+  end
+
+  defp reconnect_cursor_positions(receive_method_id) do
+    SyncCursor
+    |> where([cursor], cursor.external_account_id == ^receive_method_id)
+    |> order_by([cursor], asc: cursor.id)
+    |> Repo.all()
+    |> Enum.map(
+      &Map.take(&1, [
+        :id,
+        :scope,
+        :phase,
+        :bootstrap_cursor,
+        :page_cursor,
+        :committed_cursor,
+        :generation,
+        :last_completed_at
+      ])
+    )
   end
 
   defp repo_queries_during(fun) do
