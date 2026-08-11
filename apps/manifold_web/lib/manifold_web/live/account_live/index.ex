@@ -20,8 +20,7 @@ defmodule ManifoldWeb.AccountLive.Index do
         delete_error: nil,
         refresh_timer: nil
       )
-      |> load_accounts()
-      |> maybe_schedule_refresh()
+      |> reload_accounts()
 
     {:ok, socket}
   end
@@ -30,7 +29,7 @@ defmodule ManifoldWeb.AccountLive.Index do
   def handle_event("disable-account", %{"id" => account_id}, socket) do
     with {:ok, account_id} <- cast_account_id(account_id),
          {:ok, _account} <- AccountLifecycle.disable_account(account_id) do
-      {:noreply, load_accounts(socket)}
+      {:noreply, reload_accounts(socket)}
     else
       _error -> {:noreply, put_flash(socket, :error, "Unable to disable this account.")}
     end
@@ -49,7 +48,7 @@ defmodule ManifoldWeb.AccountLive.Index do
       :error ->
         {:noreply,
          socket
-         |> load_accounts()
+         |> reload_accounts()
          |> put_flash(:error, "Account not found.")}
     end
   end
@@ -70,8 +69,7 @@ defmodule ManifoldWeb.AccountLive.Index do
             socket =
               socket
               |> close_delete_dialog()
-              |> load_accounts()
-              |> maybe_schedule_refresh()
+              |> reload_accounts()
               |> put_flash(:info, "Account deletion queued.")
 
             {:noreply, socket}
@@ -112,8 +110,7 @@ defmodule ManifoldWeb.AccountLive.Index do
       :ok ->
         socket =
           socket
-          |> load_accounts()
-          |> maybe_schedule_refresh()
+          |> reload_accounts()
           |> put_flash(:info, "Account deletion retry queued.")
 
         {:noreply, socket}
@@ -121,7 +118,7 @@ defmodule ManifoldWeb.AccountLive.Index do
       :error ->
         {:noreply,
          socket
-         |> load_accounts()
+         |> reload_accounts()
          |> put_flash(:error, "Unable to retry account deletion.")}
     end
   end
@@ -131,8 +128,7 @@ defmodule ManifoldWeb.AccountLive.Index do
     socket =
       socket
       |> clear_refresh_timer()
-      |> load_accounts()
-      |> maybe_schedule_refresh()
+      |> reload_accounts()
 
     {:noreply, socket}
   end
@@ -371,16 +367,32 @@ defmodule ManifoldWeb.AccountLive.Index do
     assign(socket, :accounts, rows)
   end
 
-  defp maybe_schedule_refresh(socket) do
-    if connected?(socket) && is_nil(socket.assigns.refresh_timer) &&
-         Enum.any?(socket.assigns.accounts, &deleting?/1) do
-      assign(
-        socket,
-        :refresh_timer,
-        Process.send_after(self(), :refresh_accounts, @refresh_interval)
-      )
-    else
-      socket
+  defp reload_accounts(socket) do
+    socket
+    |> load_accounts()
+    |> reconcile_refresh_timer()
+  end
+
+  defp reconcile_refresh_timer(socket) do
+    should_poll? = connected?(socket) && Enum.any?(socket.assigns.accounts, &deleting?/1)
+    timer? = is_reference(socket.assigns.refresh_timer)
+
+    cond do
+      should_poll? and timer? ->
+        socket
+
+      should_poll? ->
+        assign(
+          socket,
+          :refresh_timer,
+          Process.send_after(self(), :refresh_accounts, @refresh_interval)
+        )
+
+      timer? ->
+        clear_refresh_timer(socket)
+
+      true ->
+        socket
     end
   end
 
@@ -414,7 +426,7 @@ defmodule ManifoldWeb.AccountLive.Index do
           :error ->
             socket
             |> close_delete_dialog()
-            |> load_accounts()
+            |> reload_accounts()
             |> put_flash(:error, "Account not found.")
         end
 

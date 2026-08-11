@@ -205,7 +205,7 @@ defmodule ManifoldWeb.AccountLiveTest do
 
   test "delete requires the exact fresh address and queues local-only deletion", %{conn: conn} do
     {:ok, account} =
-      Accounts.create_account(%{name: "Delete account", address: "delete@example.test"})
+      Accounts.create_account(%{name: "Archive Relay", address: "delete@example.test"})
 
     {:ok, view, _html} = live(conn, ~p"/settings/accounts")
 
@@ -219,8 +219,8 @@ defmodule ManifoldWeb.AccountLiveTest do
            )
 
     assert has_element?(view, "#delete-account-title", "Delete account?")
-    assert has_element?(view, "#delete-account-dialog", "Delete account")
-    assert has_element?(view, "#delete-account-dialog", "delete@example.test")
+    assert has_element?(view, ".account-delete-identity strong", "Archive Relay")
+    assert has_element?(view, ".account-delete-identity span", "delete@example.test")
 
     assert has_element?(
              view,
@@ -234,22 +234,30 @@ defmodule ManifoldWeb.AccountLiveTest do
              "Mail and accounts held by the remote provider are not deleted"
            )
 
+    assert {:ok, _updated} =
+             Accounts.update_account(account, %{
+               name: "Archive Relay",
+               address: "renamed@example.test"
+             })
+
     view
-    |> form("#delete-account-form", confirmation: "wrong@example.test")
+    |> form("#delete-account-form", confirmation: "delete@example.test")
     |> render_submit()
 
     assert has_element?(view, "#delete-account-error[role='alert']", "address does not match")
+    assert has_element?(view, ".account-delete-identity strong", "Archive Relay")
+    assert has_element?(view, ".account-delete-identity span", "renamed@example.test")
     assert is_nil(Repo.get_by(AccountPurge, mailbox_id: account.id))
     assert purge_jobs_for_mailbox(account.id) == []
 
     view
-    |> form("#delete-account-form", confirmation: "delete@example.test")
+    |> form("#delete-account-form", confirmation: "renamed@example.test")
     |> render_change()
 
     assert has_element?(view, "#confirm-delete-account:not([disabled])")
 
     view
-    |> form("#delete-account-form", confirmation: "delete@example.test")
+    |> form("#delete-account-form", confirmation: "renamed@example.test")
     |> render_submit()
 
     purge = Repo.get_by!(AccountPurge, mailbox_id: account.id)
@@ -258,6 +266,66 @@ defmodule ManifoldWeb.AccountLiveTest do
     assert render(view) =~ "Account deletion queued."
     assert [%Oban.Job{}] = purge_jobs(purge.id)
     assert is_reference(socket_assign(view, :refresh_timer))
+  end
+
+  test "stale retry reloads requested state and starts polling", %{conn: conn} do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Stale retry", address: "stale-retry@example.test"})
+
+    {:ok, purge} =
+      Manifold.AccountLifecycle.request_deletion(account.id, "stale-retry@example.test")
+
+    discard_purge_jobs(purge.id)
+
+    purge
+    |> AccountPurge.changeset(%{status: "failed"})
+    |> Repo.update!()
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts")
+    assert has_element?(view, "#retry-delete-account-#{account.id}")
+    assert is_nil(socket_assign(view, :refresh_timer))
+
+    assert {:ok, _requested} = Manifold.AccountLifecycle.retry_deletion(purge.id)
+
+    view
+    |> element("#retry-delete-account-#{account.id}")
+    |> render_click()
+
+    assert has_element?(view, "#account-#{account.id} [aria-live='polite']", "Deleting...")
+    assert is_reference(socket_assign(view, :refresh_timer))
+  end
+
+  test "event reload cancels polling when no account is deleting", %{conn: conn} do
+    {:ok, deleting_account} =
+      Accounts.create_account(%{name: "Deleting", address: "deleting@example.test"})
+
+    {:ok, active_account} =
+      Accounts.create_account(%{name: "Still active", address: "active@example.test"})
+
+    {:ok, purge} =
+      Manifold.AccountLifecycle.request_deletion(
+        deleting_account.id,
+        "deleting@example.test"
+      )
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts")
+    timer = socket_assign(view, :refresh_timer)
+    assert is_reference(timer)
+
+    discard_purge_jobs(purge.id)
+
+    purge
+    |> AccountPurge.changeset(%{status: "failed"})
+    |> Repo.update!()
+
+    view
+    |> element("#disable-account-#{active_account.id}")
+    |> render_click()
+
+    assert has_element?(view, "#account-#{deleting_account.id}", "Delete failed")
+    assert is_nil(socket_assign(view, :refresh_timer))
+    assert Process.read_timer(timer) == false
+    refute :refresh_accounts in process_messages(view.pid)
   end
 
   test "failed deletion exposes an accessible retry action without polling", %{conn: conn} do
@@ -374,6 +442,12 @@ defmodule ManifoldWeb.AccountLiveTest do
     |> Map.fetch!(:socket)
     |> Map.fetch!(:assigns)
     |> Map.fetch!(key)
+  end
+
+  defp process_messages(pid) do
+    pid
+    |> Process.info(:messages)
+    |> elem(1)
   end
 
   defp purge_jobs_for_mailbox(mailbox_id) do
