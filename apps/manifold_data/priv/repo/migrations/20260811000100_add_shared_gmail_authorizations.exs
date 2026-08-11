@@ -5,6 +5,8 @@ defmodule Manifold.Repo.Migrations.AddSharedGmailAuthorizations do
   # before running either direction. The up migration deletes migrated legacy credentials,
   # so old and new code must never run concurrently during this cutover.
   def up do
+    preflight_legacy_gmail_receive_methods!()
+
     create table(:connector_oauth_authorizations, primary_key: false) do
       add(:id, :binary_id, primary_key: true)
       add(:legacy_credential_id, :binary_id)
@@ -346,5 +348,68 @@ defmodule Manifold.Repo.Migrations.AddSharedGmailAuthorizations do
     end
 
     drop(table(:connector_oauth_authorizations))
+  end
+
+  defp preflight_legacy_gmail_receive_methods! do
+    case repo().query!("""
+         SELECT mailbox_id::text, provider, COUNT(*)
+         FROM connector_accounts
+         WHERE provider = 'gmail'
+         GROUP BY mailbox_id, provider
+         HAVING COUNT(*) > 1
+         ORDER BY mailbox_id, provider
+         LIMIT 1
+         """).rows do
+      [[mailbox_id, "gmail", count]] ->
+        raise """
+        cannot migrate shared Gmail authorizations: mailbox #{mailbox_id} has #{count} legacy Gmail receive methods; resolve the duplicate receive methods explicitly before retrying
+        """
+
+      [] ->
+        :ok
+    end
+
+    rows =
+      repo().query!("""
+      SELECT
+        connector_account.id::text,
+        connector_account.mailbox_id::text,
+        connector_account.email_address,
+        mailbox.local_part || '@' || domain.normalized_domain
+      FROM connector_accounts AS connector_account
+      JOIN mailboxes AS mailbox ON mailbox.id = connector_account.mailbox_id
+      JOIN domains AS domain ON domain.id = mailbox.domain_id
+      WHERE connector_account.provider = 'gmail'
+      ORDER BY connector_account.id
+      """).rows
+
+    Enum.each(rows, &preflight_legacy_gmail_address!/1)
+  end
+
+  defp preflight_legacy_gmail_address!([
+         receive_method_id,
+         mailbox_id,
+         provider_address,
+         mailbox_address
+       ]) do
+    with {:ok, provider_canonical} <- canonical_address(provider_address),
+         {:ok, mailbox_canonical} <- canonical_address(mailbox_address),
+         true <- provider_canonical == mailbox_canonical do
+      :ok
+    else
+      _ ->
+        raise """
+        cannot migrate shared Gmail authorizations: legacy Gmail receive method #{receive_method_id} has provider address #{inspect(provider_address)} that does not match mailbox #{mailbox_id} address #{inspect(mailbox_address)}; reconnect or correct the receive method explicitly before retrying
+        """
+    end
+  end
+
+  # Keep migration-time comparison aligned with the application's exact address
+  # contract: ASCII syntax validation, path unwrapping, and ASCII case folding only.
+  defp canonical_address(address) do
+    case Manifold.Core.Address.parse(address) do
+      {:ok, %{canonical: canonical}} -> {:ok, canonical}
+      {:error, _error} -> :error
+    end
   end
 end
