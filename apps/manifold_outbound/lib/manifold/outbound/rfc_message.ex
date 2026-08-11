@@ -23,7 +23,7 @@ defmodule Manifold.Outbound.RfcMessage do
          {:ok, body} <- encoded_body(envelope.text) do
       headers =
         []
-        |> add_header("From", from)
+        |> add_address_header("From", [from])
         |> add_address_header("To", to)
         |> add_address_header("Cc", cc)
         |> maybe_add_bcc(provider, bcc)
@@ -63,7 +63,7 @@ defmodule Manifold.Outbound.RfcMessage do
 
   defp required_message_id(opts) do
     case Keyword.fetch(opts, :message_id) do
-      {:ok, value} -> message_id(value)
+      {:ok, value} -> generated_message_id(value)
       :error -> invalid()
     end
   end
@@ -164,9 +164,9 @@ defmodule Manifold.Outbound.RfcMessage do
   end
 
   defp optional_message_id(value) when value in [nil, ""], do: {:ok, nil}
-  defp optional_message_id(value), do: message_id(value)
+  defp optional_message_id(value), do: external_message_id(value)
 
-  defp message_id(value) when is_binary(value) do
+  defp generated_message_id(value) when is_binary(value) do
     with true <- safe_header?(value),
          true <- ascii?(value),
          {:ok, id_left, id_right} <- split_message_id(value),
@@ -178,7 +178,21 @@ defmodule Manifold.Outbound.RfcMessage do
     end
   end
 
-  defp message_id(_value), do: invalid()
+  defp generated_message_id(_value), do: invalid()
+
+  defp external_message_id(value) when is_binary(value) do
+    with true <- safe_header?(value),
+         true <- ascii?(value),
+         {:ok, id_left, id_right} <- split_message_id(value),
+         true <- dot_atom?(id_left),
+         true <- dot_atom?(id_right) or no_fold_literal?(id_right) do
+      {:ok, value}
+    else
+      _invalid -> invalid()
+    end
+  end
+
+  defp external_message_id(_value), do: invalid()
 
   defp split_message_id("<" <> rest) do
     if String.ends_with?(rest, ">") do
@@ -209,9 +223,30 @@ defmodule Manifold.Outbound.RfcMessage do
   defp atext?(byte) when byte in ~c"!#$%&'*+-/=?^_`{|}~", do: true
   defp atext?(_byte), do: false
 
+  defp no_fold_literal?("[" <> rest) do
+    if String.ends_with?(rest, "]") do
+      content = binary_part(rest, 0, byte_size(rest) - 1)
+
+      content != "" and
+        content
+        |> :binary.bin_to_list()
+        |> Enum.all?(&domain_literal_byte?/1)
+    else
+      false
+    end
+  end
+
+  defp no_fold_literal?(_value), do: false
+
+  defp domain_literal_byte?(byte)
+       when byte in ?A..?Z or byte in ?a..?z or byte in ?0..?9 or byte in ~c".:-",
+       do: true
+
+  defp domain_literal_byte?(_byte), do: false
+
   defp references(values) when is_list(values) do
     Enum.reduce_while(values, {:ok, []}, fn value, {:ok, ids} ->
-      case message_id(value) do
+      case external_message_id(value) do
         {:ok, id} when byte_size(id) < @hard_header_line_bytes ->
           {:cont, {:ok, [id | ids]}}
 
@@ -294,7 +329,33 @@ defmodule Manifold.Outbound.RfcMessage do
   defp add_address_header(headers, _name, []), do: headers
 
   defp add_address_header(headers, name, values),
-    do: add_header(headers, name, Enum.join(values, ", "))
+    do: [fold_address_header(name, values) | headers]
+
+  defp fold_address_header(name, values) do
+    last_index = length(values) - 1
+
+    values
+    |> Enum.with_index()
+    |> Enum.map(fn {mailbox, index} ->
+      if index == last_index, do: mailbox, else: mailbox <> ","
+    end)
+    |> Enum.reduce({[], name <> ":"}, fn mailbox, {lines, line} ->
+      candidate = line <> " " <> mailbox
+
+      if not String.contains?(candidate, "\r\n") and
+           byte_size(candidate) <= @soft_header_line_bytes do
+        {lines, candidate}
+      else
+        {[line | lines], " " <> mailbox}
+      end
+    end)
+    |> then(fn {lines, line} ->
+      [line | lines]
+      |> Enum.reverse()
+      |> Enum.intersperse("\r\n")
+      |> Kernel.++(["\r\n"])
+    end)
+  end
 
   defp maybe_add_bcc(headers, :gmail, values), do: add_address_header(headers, "Bcc", values)
   defp maybe_add_bcc(headers, :smtp, _values), do: headers

@@ -237,6 +237,87 @@ defmodule Manifold.Outbound.RfcMessageTest do
     assert Enum.all?(String.split(raw, "\r\n"), &(byte_size(&1) <= 998))
   end
 
+  test "folds large address lists between mailboxes while preserving syntax and order" do
+    to = Enum.map(1..50, &long_address/1)
+    cc = Enum.map(51..100, &long_address/1)
+    bcc = Enum.map(101..150, &long_address/1)
+    envelope = %{@envelope | to: to, cc: cc, bcc: bcc}
+    gmail_opts = [provider: :gmail, message_id: @message_id, date: @date]
+    smtp_opts = [provider: :smtp, message_id: @message_id, date: @date]
+
+    gmail_raw = RfcMessage.render!(envelope, gmail_opts)
+    smtp_raw = RfcMessage.render!(envelope, smtp_opts)
+
+    assert unfold_header(gmail_raw, "To") == "To: " <> Enum.join(to, ", ")
+    assert unfold_header(gmail_raw, "Cc") == "Cc: " <> Enum.join(cc, ", ")
+    assert unfold_header(gmail_raw, "Bcc") == "Bcc: " <> Enum.join(bcc, ", ")
+    assert unfold_header(smtp_raw, "To") == "To: " <> Enum.join(to, ", ")
+    assert unfold_header(smtp_raw, "Cc") == "Cc: " <> Enum.join(cc, ", ")
+    assert unfold_header(smtp_raw, "Bcc") == nil
+
+    assert gmail_raw == RfcMessage.render!(envelope, gmail_opts)
+    assert smtp_raw == RfcMessage.render!(envelope, smtp_opts)
+    assert Enum.all?(header_lines(gmail_raw), &(byte_size(&1) <= 998))
+    assert Enum.all?(header_lines(smtp_raw), &(byte_size(&1) <= 998))
+  end
+
+  test "accepts safe no-fold domain literals only for external reply IDs" do
+    for external_id <- ["<id@[127.0.0.1]>", "<id@[IPv6:2001:db8::1]>"] do
+      envelope = %{@envelope | in_reply_to: external_id, references: [external_id]}
+
+      assert {:ok, raw} =
+               RfcMessage.render(envelope,
+                 provider: :gmail,
+                 message_id: @message_id,
+                 date: @date
+               )
+
+      assert raw =~ "In-Reply-To: #{external_id}\r\n"
+      assert raw =~ "References: #{external_id}\r\n"
+      assert_invalid(message_id: external_id)
+    end
+  end
+
+  test "rejects unsafe no-fold domain literals in reply headers" do
+    invalid_ids = [
+      "<id@[127.0.0.1]extra>",
+      "<id@[[127.0.0.1]]>",
+      "<id@[127.0.0.1\\evil]>",
+      "<id@[bad,comma]>",
+      "<id@[bad space]>",
+      "<id@[bad\tspace]>",
+      "<id@[127.0.0.1]>\r\nX-Test: injected"
+    ]
+
+    for invalid_id <- invalid_ids do
+      assert_invalid(envelope: %{@envelope | in_reply_to: invalid_id})
+      assert_invalid(envelope: %{@envelope | references: [invalid_id]})
+    end
+  end
+
+  test "quoted-printable body lines stay within 76 octets and round-trip CRLF and trailing WSP" do
+    text =
+      String.duplicate("界", 80) <>
+        " trailing space \rline with tab\t\n\r\n.leading dot\nfinal"
+
+    raw =
+      RfcMessage.render!(%{@envelope | text: text},
+        provider: :smtp,
+        message_id: @message_id,
+        date: @date
+      )
+
+    [_headers, encoded_body] = String.split(raw, "\r\n\r\n", parts: 2)
+
+    assert Enum.all?(String.split(encoded_body, "\r\n"), &(byte_size(&1) <= 76))
+    assert encoded_body =~ "trailing space=20\r\n"
+    assert encoded_body =~ "line with tab=09\r\n"
+
+    assert Mail.Encoders.QuotedPrintable.decode(encoded_body) ==
+             String.duplicate("界", 80) <>
+               " trailing space \r\nline with tab\t\r\n\r\n.leading dot\r\nfinal\r\n"
+  end
+
   defp assert_invalid(opts) do
     envelope = Keyword.get(opts, :envelope, @envelope)
     message_id = Keyword.get(opts, :message_id, @message_id)
@@ -251,5 +332,28 @@ defmodule Manifold.Outbound.RfcMessageTest do
 
   defp message_id_with_size(size) when size >= 10 do
     "<#{String.duplicate("a", size - 10)}@example>"
+  end
+
+  defp long_address(index) do
+    suffix = index |> Integer.to_string() |> String.pad_leading(3, "0")
+    "#{String.duplicate("a", 57)}#{suffix}@mailbox.example.net"
+  end
+
+  defp unfold_header(raw, name) do
+    lines = header_lines(raw)
+
+    case Enum.split_while(lines, &(!String.starts_with?(&1, name <> ":"))) do
+      {_before, []} ->
+        nil
+
+      {_before, [first | rest]} ->
+        continuations = Enum.take_while(rest, &String.starts_with?(&1, [" ", "\t"]))
+        Enum.join([first | continuations], "\r\n") |> String.replace(~r/\r\n[ \t]+/, " ")
+    end
+  end
+
+  defp header_lines(raw) do
+    [headers, _body] = String.split(raw, "\r\n\r\n", parts: 2)
+    String.split(headers, "\r\n")
   end
 end
