@@ -434,6 +434,45 @@ defmodule Manifold.Connectors.SMTP.ClientSubmissionTest do
     end
   end
 
+  test "classifies final DATA replies by acceptance certainty" do
+    cases = [
+      {"250 accepted\r\n", :accepted},
+      {"450 temporary rejection\r\n", {:temporary, :message_rejected}},
+      {"550 permanent rejection\r\n", {:permanent, :message_rejected}},
+      {"200 context-invalid success\r\n", {:uncertain, :acceptance_unknown}},
+      {"251 context-invalid success\r\n", {:uncertain, :acceptance_unknown}},
+      {"252 context-invalid success\r\n", {:uncertain, :acceptance_unknown}},
+      {"300 context-invalid intermediate\r\n", {:uncertain, :acceptance_unknown}},
+      {"354 context-invalid intermediate\r\n", {:uncertain, :acceptance_unknown}}
+    ]
+
+    for {reply, expected} <- cases do
+      {:ok, socket} =
+        ScriptedSocket.start(
+          replies: [
+            "250 sender\r\n",
+            "250 recipient\r\n",
+            "250 recipient\r\n",
+            "354 data\r\n",
+            reply
+          ]
+        )
+
+      conn = %Client{socket: {:adapter, ScriptedSocket, socket}, buffer: ""}
+
+      case expected do
+        :accepted ->
+          assert {:ok, %{response: "250 accepted"}} = Client.submit(conn, @submission)
+
+        {class, code} ->
+          assert {:error, %Error{class: ^class, code: ^code} = error} =
+                   Client.submit(conn, @submission)
+
+          refute inspect(error) =~ "context-invalid"
+      end
+    end
+  end
+
   test "bounds SMTP reply line length, continuation count, and total size" do
     oversized_line = "250 " <> String.duplicate("x", 507) <> "\r\n"
 

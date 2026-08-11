@@ -108,6 +108,23 @@ defmodule Manifold.Outbound.Provider.SMTPTest do
     end)
   end
 
+  test "keeps ambiguous final SMTP acceptance uncertain" do
+    connector_error = %ConnectorError{
+      class: :uncertain,
+      code: :acceptance_unknown,
+      message: "context-invalid 354 reply #{@password}"
+    }
+
+    method = method(self(), {:error, connector_error})
+
+    assert {:error, %Provider.Error{class: :uncertain, code: "acceptance_unknown"} = error} =
+             SMTP.submit([submission_method: method, transport: Fake], @request)
+
+    refute inspect(error) =~ "context-invalid"
+    refute inspect(error) =~ @password
+    assert_receive :smtp_fake_quit
+  end
+
   test "maps connect and authentication errors and cannot quit a connection that was not opened" do
     connector_error = %ConnectorError{
       class: :reconnect,

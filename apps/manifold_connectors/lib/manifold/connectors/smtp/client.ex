@@ -152,20 +152,27 @@ defmodule Manifold.Connectors.SMTP.Client do
         put_conn(conn)
         {:ok, %{response: format_response(250, lines)}}
 
-      {:ok, _conn, code, _lines} ->
+      {:ok, _conn, code, _lines} when code in 400..599 ->
         {:error, command_rejected_error(code, :message_rejected, "SMTP rejected the message")}
 
-      {:error, _reason} ->
-        close_socket(conn.socket)
-        delete_conn()
+      {:ok, _conn, _code, _lines} ->
+        acceptance_unknown(conn)
 
-        {:error,
-         %Error{
-           class: :uncertain,
-           code: :acceptance_unknown,
-           message: "SMTP may have accepted the message"
-         }}
+      {:error, _reason} ->
+        acceptance_unknown(conn)
     end
+  end
+
+  defp acceptance_unknown(conn) do
+    close_socket(conn.socket)
+    delete_conn()
+
+    {:error,
+     %Error{
+       class: :uncertain,
+       code: :acceptance_unknown,
+       message: "SMTP may have accepted the message"
+     }}
   end
 
   defp reset_transaction(conn) do
