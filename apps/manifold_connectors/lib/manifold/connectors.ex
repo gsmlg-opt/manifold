@@ -120,6 +120,14 @@ defmodule Manifold.Connectors do
     GmailAuthorizations.mark_reconnect_required(authorization_id, error, opts)
   end
 
+  @spec mark_gmail_send_reconnect_required(Ecto.UUID.t(), String.t()) ::
+          {:ok, Manifold.Connectors.Schema.OAuthAuthorization.t()}
+          | {:error, Error.t() | Ecto.Changeset.t()}
+  def mark_gmail_send_reconnect_required(method_id, expected_access_token)
+      when is_binary(method_id) and is_binary(expected_access_token) do
+    GmailAuthorizations.mark_send_reconnect_required(method_id, expected_access_token)
+  end
+
   @spec list_receive_methods() :: [View.ReceiveMethod.t()]
   def list_receive_methods do
     ReceiveMethod

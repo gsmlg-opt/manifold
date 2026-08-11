@@ -1,5 +1,5 @@
 defmodule Manifold.Outbound.SubmissionTest do
-  use Manifold.DataCase, async: true
+  use Manifold.DataCase, async: false
 
   alias Manifold.Accounts
   alias Manifold.Connectors
@@ -13,6 +13,7 @@ defmodule Manifold.Outbound.SubmissionTest do
   }
 
   alias Manifold.Outbound
+  alias Manifold.Outbound.Jobs.SubmitOutbound
   alias Manifold.Outbound.LegacyResendFixture
   alias Manifold.Outbound.Provider
   alias Manifold.Outbound.Schema.{OutboundEvent, OutboundMessage, ProviderSubmission}
@@ -24,6 +25,13 @@ defmodule Manifold.Outbound.SubmissionTest do
     @impl true
     def submit(config, request) do
       send(Keyword.fetch!(config, :test_pid), {:provider_submit, request, config})
+
+      if Keyword.get(config, :gate) do
+        receive do
+          :release_provider -> :ok
+        end
+      end
+
       Keyword.fetch!(config, :result)
     end
   end
@@ -40,6 +48,22 @@ defmodule Manifold.Outbound.SubmissionTest do
     end
 
     def quit(_conn), do: :ok
+  end
+
+  defmodule CheckoutFailureGmail do
+    @behaviour Manifold.Connectors.Provider
+
+    def exchange_code(_, _, _, _, _), do: raise("not used")
+    def identity(_, _, _), do: raise("not used")
+    def initial_cursors(_, _, _), do: raise("not used")
+
+    def refresh_token(_, _, opts) do
+      send(Keyword.fetch!(opts, :test_pid), :gmail_refresh_attempted)
+      {:error, Keyword.fetch!(opts, :refresh_error)}
+    end
+
+    def sync_page(_, _, _, _), do: raise("not used")
+    def fetch_raw(_, _, _, _), do: raise("not used")
   end
 
   test "provider acceptance commits message and logical submission state" do
@@ -234,6 +258,110 @@ defmodule Manifold.Outbound.SubmissionTest do
     assert second_request == first_request
   end
 
+  test "interrupted non-idempotent submission becomes uncertain without a second provider call" do
+    %{message: message} = queued_operational_fixture("smtp")
+    success = {:ok, %Provider.Submission{provider_message_id: "maybe-accepted", metadata: %{}}}
+
+    assert {:error, %{reason: :after_provider_accept_before_commit}} =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: success],
+               fail_at: :after_provider_accept_before_commit
+             )
+
+    assert_receive {:provider_submit, _, _}
+    assert Repo.get!(OutboundMessage, message.id).state == "submitting"
+
+    assert :ok =
+             SubmitOutbound.perform(%Oban.Job{
+               args: %{"outbound_message_id" => message.id}
+             })
+
+    refute_receive {:provider_submit, _, _}
+    assert Repo.get!(OutboundMessage, message.id).state == "submission_uncertain"
+    assert Repo.get_by!(ProviderSubmission, outbound_message_id: message.id).state == "uncertain"
+  end
+
+  test "concurrent Gmail and SMTP submissions make exactly one provider call" do
+    for kind <- ["gmail", "smtp"] do
+      %{message: message} = queued_operational_fixture(kind)
+      test_pid = self()
+
+      submit = fn ->
+        Outbound.submit_message(message.id,
+          provider: TestProvider,
+          provider_config: [
+            test_pid: test_pid,
+            gate: true,
+            result: {:ok, %Provider.Submission{provider_message_id: "winner", metadata: %{}}}
+          ]
+        )
+      end
+
+      first = sandbox_task(submit)
+      assert_receive {:provider_submit, _, first_config}
+      first_pid = Keyword.fetch!(first_config, :test_pid)
+
+      second = sandbox_task(submit)
+      assert {:error, %{reason: :submission_uncertain}} = Task.await(second)
+      refute_receive {:provider_submit, _, _}
+
+      send(first.pid, :release_provider)
+      assert {:error, %{reason: :submission_uncertain}} = Task.await(first)
+      assert first_pid == self()
+      assert Repo.get!(OutboundMessage, message.id).state == "submission_uncertain"
+    end
+  end
+
+  test "stale provider results cannot overwrite a terminal or newer attempt" do
+    %{message: accepted_message} = queued_operational_fixture("smtp")
+
+    mark_accepted = fn preparation, _result ->
+      Repo.get!(OutboundMessage, preparation.message_id)
+      |> Ecto.Changeset.change(state: "accepted_by_provider", accepted_at: DateTime.utc_now())
+      |> Repo.update!()
+
+      Repo.get!(ProviderSubmission, preparation.submission_id)
+      |> Ecto.Changeset.change(state: "accepted", provider_message_id: "winner")
+      |> Repo.update!()
+    end
+
+    transient =
+      {:error, %Provider.Error{class: :transient, code: "later", message: "later"}}
+
+    assert :ok =
+             Outbound.submit_message(accepted_message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: transient],
+               before_result_persist: mark_accepted
+             )
+
+    assert Repo.get!(OutboundMessage, accepted_message.id).state == "accepted_by_provider"
+
+    assert Repo.get_by!(ProviderSubmission, outbound_message_id: accepted_message.id).provider_message_id ==
+             "winner"
+
+    %{message: newer_message} = queued_message_fixture() |> then(&%{message: &1})
+
+    bump_attempt = fn preparation, _result ->
+      Repo.get!(ProviderSubmission, preparation.submission_id)
+      |> Ecto.Changeset.change(attempt_count: preparation.attempt_count + 1)
+      |> Repo.update!()
+    end
+
+    assert {:error, %{class: :temporary, reason: :stale_submission_result}} =
+             Outbound.submit_message(newer_message.id,
+               provider: TestProvider,
+               provider_config: [
+                 test_pid: self(),
+                 result: {:ok, %Provider.Submission{provider_message_id: "stale", metadata: %{}}}
+               ],
+               before_result_persist: bump_attempt
+             )
+
+    refute Repo.get_by!(ProviderSubmission, outbound_message_id: newer_message.id).provider_message_id
+  end
+
   test "ambiguous submission outside the idempotency window becomes uncertain" do
     message = queued_message_fixture()
     submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
@@ -332,19 +460,13 @@ defmodule Manifold.Outbound.SubmissionTest do
     assert Repo.get!(OutboundMessage, message.id).state == "failed"
   end
 
-  test "provider mismatch and rendered SHA tampering fail before provider I/O" do
-    %{message: mismatch_message} = queued_operational_fixture("gmail")
-    mismatch = Repo.get_by!(ProviderSubmission, outbound_message_id: mismatch_message.id)
-    mismatch |> Ecto.Changeset.change(provider: "smtp") |> Repo.update!()
-
-    assert {:error, %Provider.Error{class: :permanent, code: "send_method_provider_mismatch"}} =
-             Outbound.submit_message(mismatch_message.id,
-               provider: TestProvider,
-               provider_config: [test_pid: self(), result: :unused]
-             )
-
+  test "rendered SHA tampering fails before credential decryption or provider I/O" do
     %{message: tampered_message} = queued_operational_fixture("smtp")
     tampered = Repo.get_by!(ProviderSubmission, outbound_message_id: tampered_message.id)
+
+    Repo.get_by!(SendCredential, send_method_id: tampered.send_method_id)
+    |> Ecto.Changeset.change(password_ciphertext: <<1, 2, 3>>)
+    |> Repo.update!()
 
     tampered
     |> Ecto.Changeset.change(request_sha256: String.duplicate("0", 64))
@@ -357,6 +479,137 @@ defmodule Manifold.Outbound.SubmissionTest do
              )
 
     refute_receive {:provider_submit, _, _}
+  end
+
+  test "checkout provider errors are normalized and SHA failure precedes Gmail refresh" do
+    previous_adapters = Application.get_env(:manifold_connectors, :adapters)
+    Application.put_env(:manifold_connectors, :adapters, gmail: CheckoutFailureGmail)
+    on_exit(fn -> restore_env(:manifold_connectors, :adapters, previous_adapters) end)
+
+    for {connector_class, expected_class} <- [
+          {:temporary, :transient},
+          {:permanent, :permanent},
+          {:reconnect, :permanent},
+          {:uncertain, :uncertain}
+        ] do
+      %{message: message, method: method} = queued_operational_fixture("gmail")
+      expire_authorization!(method.oauth_authorization_id)
+
+      error = %Manifold.Connectors.Provider.Error{
+        class: connector_class,
+        code: :checkout_failed,
+        message: "sanitized checkout failure"
+      }
+
+      result =
+        Outbound.submit_message(message.id,
+          checkout_opts: [provider_opts: [test_pid: self(), refresh_error: error]],
+          provider: TestProvider,
+          provider_config: [test_pid: self(), result: :unused]
+        )
+
+      if expected_class == :uncertain do
+        assert {:error, %{class: :permanent, reason: :submission_uncertain}} = result
+        assert Repo.get!(OutboundMessage, message.id).last_error_class == "uncertain"
+      else
+        assert {:error, %Provider.Error{class: ^expected_class, code: "checkout_failed"}} = result
+      end
+
+      assert_receive :gmail_refresh_attempted
+      refute_receive {:provider_submit, _, _}
+    end
+
+    %{message: tampered_message, method: tampered_method} = queued_operational_fixture("gmail")
+    expire_authorization!(tampered_method.oauth_authorization_id)
+    tampered = Repo.get_by!(ProviderSubmission, outbound_message_id: tampered_message.id)
+    tampered |> Ecto.Changeset.change(request_sha256: String.duplicate("0", 64)) |> Repo.update!()
+
+    assert {:error, %Provider.Error{code: "request_integrity_failed"}} =
+             Outbound.submit_message(tampered_message.id,
+               checkout_opts: [
+                 provider_opts: [
+                   test_pid: self(),
+                   refresh_error: %Manifold.Connectors.Provider.Error{
+                     class: :temporary,
+                     code: :must_not_refresh,
+                     message: "must not refresh"
+                   }
+                 ]
+               ],
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: :unused]
+             )
+
+    refute_receive :gmail_refresh_attempted
+  end
+
+  test "database rejects invalid provider and method snapshot combinations" do
+    %{message: message} = queued_operational_fixture("gmail")
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+
+    assert_raise Ecto.ConstraintError, fn ->
+      submission |> Ecto.Changeset.change(provider: "smtp") |> Repo.update!()
+    end
+
+    assert_raise Ecto.ConstraintError, fn ->
+      submission |> Ecto.Changeset.change(send_method_id: nil) |> Repo.update!()
+    end
+
+    assert_raise Ecto.ConstraintError, fn ->
+      submission |> Ecto.Changeset.change(provider: "unknown") |> Repo.update!()
+    end
+  end
+
+  test "Gmail API reconnect marks the current token generation but ignores a stale token" do
+    %{message: current_message, method: current_method} = queued_operational_fixture("gmail")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      conn |> Plug.Conn.put_status(401) |> Req.Test.json(%{"error" => "invalid_grant"})
+    end)
+
+    assert {:error, %Provider.Error{class: :permanent, code: "reconnect_required"}} =
+             Outbound.submit_message(current_message.id,
+               provider_config: [
+                 base_url: "https://gmail.test",
+                 req_options: [plug: {Req.Test, __MODULE__}]
+               ]
+             )
+
+    assert Repo.get!(OAuthAuthorization, current_method.oauth_authorization_id).status ==
+             "reconnect_required"
+
+    assert Repo.get!(SendMethod, current_method.id).status == "reconnect_required"
+
+    %{message: stale_message, method: stale_method} = queued_operational_fixture("gmail")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      authorization = Repo.get!(OAuthAuthorization, stale_method.oauth_authorization_id)
+
+      {:ok, replacement} =
+        Crypto.encrypt("new-access-token", "credential:#{authorization.id}:access")
+
+      authorization
+      |> OAuthAuthorization.changeset(%{
+        access_token_ciphertext: replacement,
+        token_expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second)
+      })
+      |> Repo.update!()
+
+      conn |> Plug.Conn.put_status(401) |> Req.Test.json(%{"error" => "invalid_grant"})
+    end)
+
+    assert {:error, %Provider.Error{code: "reconnect_required"}} =
+             Outbound.submit_message(stale_message.id,
+               provider_config: [
+                 base_url: "https://gmail.test",
+                 req_options: [plug: {Req.Test, __MODULE__}]
+               ]
+             )
+
+    assert Repo.get!(OAuthAuthorization, stale_method.oauth_authorization_id).status ==
+             "connected"
+
+    assert Repo.get!(SendMethod, stale_method.id).status == "connected"
   end
 
   test "disconnected and reconnect-required snapshots block submission" do
@@ -566,5 +819,31 @@ defmodule Manifold.Outbound.SubmissionTest do
 
   defp sha256(bytes) do
     :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+  end
+
+  defp expire_authorization!(authorization_id) do
+    Repo.get!(OAuthAuthorization, authorization_id)
+    |> OAuthAuthorization.changeset(%{
+      token_expires_at: DateTime.add(DateTime.utc_now(), -60, :second)
+    })
+    |> Repo.update!()
+  end
+
+  defp restore_env(app, key, nil), do: Application.delete_env(app, key)
+  defp restore_env(app, key, value), do: Application.put_env(app, key, value)
+
+  defp sandbox_task(fun) do
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        receive do
+          :start -> fun.()
+        end
+      end)
+
+    Ecto.Adapters.SQL.Sandbox.allow(Repo, parent, task.pid)
+    send(task.pid, :start)
+    task
   end
 end

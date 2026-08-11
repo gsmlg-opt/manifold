@@ -4,6 +4,7 @@ defmodule Manifold.Outbound.Submission do
   import Ecto.Query
 
   alias Manifold.Connectors
+  alias Manifold.Connectors.Provider.Error, as: ConnectorProviderError
   alias Manifold.Connectors.SubmissionMethod
   alias Manifold.Core.Error
   alias Manifold.Outbound.Provider
@@ -64,8 +65,13 @@ defmodule Manifold.Outbound.Submission do
            message: message,
            submission: submission,
            recipients: recipients,
-           submission_id: submission.id
+           submission_id: submission.id,
+           attempt_count: submission.attempt_count
          }}
+
+      {:ok, {:marked_uncertain, error, outbound_message_id}} ->
+        emit_uncertain(outbound_message_id)
+        {:error, error}
 
       {:ok, :already_accepted} ->
         {:ok, :already_accepted}
@@ -95,12 +101,33 @@ defmodule Manifold.Outbound.Submission do
     {:error, Error.new(:permanent, :submission_not_retryable, "submission is not retryable")}
   end
 
+  defp prepare_locked(
+         %OutboundMessage{state: "submitting"} = message,
+         %{provider: provider} = submission,
+         _recipients
+       )
+       when provider in ["gmail", "smtp"] do
+    mark_uncertain(
+      message,
+      submission,
+      DateTime.utc_now(),
+      "interrupted_submission",
+      "provider acceptance is ambiguous after an interrupted submission"
+    )
+  end
+
   defp prepare_locked(message, submission, recipients) do
     now = DateTime.utc_now()
 
     if submission.provider == "resend" and submission.attempt_count > 0 and
          DateTime.compare(now, submission.idempotency_expires_at) != :lt do
-      mark_uncertain(message, submission, now)
+      mark_uncertain(
+        message,
+        submission,
+        now,
+        "idempotency_expired",
+        "provider acceptance is ambiguous after idempotency expiry"
+      )
     else
       start_attempt(message, submission, recipients, now)
     end
@@ -135,41 +162,40 @@ defmodule Manifold.Outbound.Submission do
     end
   end
 
-  defp mark_uncertain(message, submission, now) do
+  defp mark_uncertain(message, submission, now, code, message_text) do
     message
     |> Ecto.Changeset.change(
       state: "submission_uncertain",
       last_error_class: "uncertain",
-      last_error_code: "idempotency_expired",
-      last_error_message: "provider acceptance is ambiguous after idempotency expiry"
+      last_error_code: code,
+      last_error_message: message_text
     )
     |> Repo.update!()
 
     submission
     |> Ecto.Changeset.change(
       state: "uncertain",
-      last_error_code: "idempotency_expired",
-      last_error_message: "provider acceptance is ambiguous after idempotency expiry"
+      last_error_code: code,
+      last_error_message: message_text
     )
     |> Repo.update!()
 
-    insert_event!(message.id, "submission_uncertain", %{}, now)
+    insert_event!(message.id, "submission_uncertain", %{code: code}, now)
 
-    {:error,
-     Error.new(
-       :permanent,
-       :submission_uncertain,
-       "submission was not retried after provider idempotency expired"
-     )}
+    {:marked_uncertain,
+     Error.new(:permanent, :submission_uncertain, "submission was not retried"), message.id}
   end
 
   defp call_provider(:already_accepted, _opts), do: :already_accepted
 
   defp call_provider(preparation, opts) do
     result =
-      with {:ok, provider, config, request} <- dispatch(preparation, opts) do
+      with {:ok, provider, config, request, method} <- dispatch(preparation, opts) do
         provider.submit(config, request)
+        |> maybe_mark_gmail_reconnect(method)
       end
+
+    maybe_before_persist(opts, preparation, result)
 
     if Keyword.get(opts, :fail_at) == :after_provider_accept_before_commit and
          match?({:ok, %Provider.Submission{}}, result) do
@@ -196,7 +222,7 @@ defmodule Manifold.Outbound.Submission do
         request_sha256: preparation.submission.request_sha256
       }
 
-      {:ok, provider, legacy_resend_config(opts), request}
+      {:ok, provider, legacy_resend_config(opts), request, nil}
     end
   end
 
@@ -205,18 +231,19 @@ defmodule Manifold.Outbound.Submission do
          opts
        )
        when provider in ["gmail", "smtp"] and is_binary(method_id) do
-    with {:ok, method} <-
+    with {:ok, request} <- request(preparation, provider, method_id),
+         {:ok, method} <-
            Connectors.checkout_send_method(
              method_id,
              preparation.message.sender_address,
              Keyword.get(opts, :checkout_opts, [])
            ),
          :ok <- require_provider(method, provider),
-         {:ok, request} <- request(preparation, provider, method_id),
          {:ok, adapter} <- provider_adapter(provider, opts) do
-      {:ok, adapter, provider_config(method, provider, opts), request}
+      {:ok, adapter, provider_config(method, provider, opts), request, method}
     else
       {:error, %Provider.Error{} = error} -> {:error, error}
+      {:error, %ConnectorProviderError{} = error} -> {:error, connector_provider_error(error)}
       {:error, %Error{} = error} -> {:error, connector_error(error)}
       {:error, %Ecto.Changeset{}} -> {:error, provider_error("send_method_required")}
       :error -> {:error, provider_error("unsupported_provider")}
@@ -305,6 +332,43 @@ defmodule Manifold.Outbound.Submission do
     }
   end
 
+  defp connector_provider_error(%ConnectorProviderError{} = error) do
+    class =
+      case error.class do
+        :temporary -> :transient
+        :uncertain -> :uncertain
+        class when class in [:permanent, :reconnect] -> :permanent
+      end
+
+    %Provider.Error{
+      class: class,
+      code: connector_error_code(error.code),
+      message: error.message,
+      retry_after: error.retry_after_seconds
+    }
+  end
+
+  defp connector_error_code(code) when is_atom(code), do: Atom.to_string(code)
+  defp connector_error_code(code) when is_binary(code), do: code
+  defp connector_error_code(_code), do: "connector_error"
+
+  defp maybe_mark_gmail_reconnect(
+         {:error, %Provider.Error{class: :permanent, code: "reconnect_required"}} = result,
+         %SubmissionMethod{id: method_id, kind: "gmail", credential: {:oauth, access_token}}
+       ) do
+    _ = Connectors.mark_gmail_send_reconnect_required(method_id, access_token)
+    result
+  end
+
+  defp maybe_mark_gmail_reconnect(result, _method), do: result
+
+  defp maybe_before_persist(opts, preparation, result) do
+    case Keyword.get(opts, :before_result_persist) do
+      callback when is_function(callback, 2) -> callback.(preparation, result)
+      _none -> :ok
+    end
+  end
+
   defp provider_error(code) do
     %Provider.Error{class: :permanent, code: code, message: "outbound submission is invalid"}
   end
@@ -322,29 +386,31 @@ defmodule Manifold.Outbound.Submission do
         {message, submission} = lock_submission!(preparation)
         maybe_fail(opts, :provider_error_commit)
 
-        if message.state == "submission_uncertain" do
-          :already_uncertain
-        else
-          message
-          |> Ecto.Changeset.change(
-            state: "submission_uncertain",
-            last_error_class: "uncertain",
-            last_error_code: error.code,
-            last_error_message: error.message
-          )
-          |> Repo.update!()
+        case result_fence(message, submission, preparation) do
+          :current ->
+            message
+            |> Ecto.Changeset.change(
+              state: "submission_uncertain",
+              last_error_class: "uncertain",
+              last_error_code: error.code,
+              last_error_message: error.message
+            )
+            |> Repo.update!()
 
-          submission
-          |> Ecto.Changeset.change(
-            state: "uncertain",
-            last_http_status: error.http_status,
-            last_error_code: error.code,
-            last_error_message: error.message
-          )
-          |> Repo.update!()
+            submission
+            |> Ecto.Changeset.change(
+              state: "uncertain",
+              last_http_status: error.http_status,
+              last_error_code: error.code,
+              last_error_message: error.message
+            )
+            |> Repo.update!()
 
-          insert_event!(message.id, "submission_uncertain", %{code: error.code}, now)
-          :transitioned
+            insert_event!(message.id, "submission_uncertain", %{code: error.code}, now)
+            :transitioned
+
+          terminal_or_stale ->
+            terminal_or_stale
         end
       end)
 
@@ -363,13 +429,11 @@ defmodule Manifold.Outbound.Submission do
            "provider acceptance is uncertain; automatic retry is disabled"
          )}
 
-      {:ok, :already_uncertain} ->
-        {:error,
-         Error.new(
-           :permanent,
-           :submission_uncertain,
-           "provider acceptance is uncertain; automatic retry is disabled"
-         )}
+      {:ok, {:terminal, "uncertain"}} ->
+        submission_uncertain_error()
+
+      {:ok, terminal_or_stale} ->
+        stale_result(terminal_or_stale)
 
       {:error, reason} ->
         {:error, database_error(reason)}
@@ -384,38 +448,44 @@ defmodule Manifold.Outbound.Submission do
         {message, submission} = lock_submission!(preparation)
         maybe_fail(opts, :provider_accept_commit)
 
-        unless message.state == "accepted_by_provider" do
-          message
-          |> Ecto.Changeset.change(state: "accepted_by_provider", accepted_at: now)
-          |> Repo.update!()
+        case result_fence(message, submission, preparation) do
+          :current ->
+            message
+            |> Ecto.Changeset.change(state: "accepted_by_provider", accepted_at: now)
+            |> Repo.update!()
 
-          submission
-          |> Ecto.Changeset.change(
-            state: "accepted",
-            provider_message_id: provider_submission.provider_message_id,
-            accepted_at: now,
-            provider_metadata: provider_submission.metadata
-          )
-          |> Repo.update!()
+            submission
+            |> Ecto.Changeset.change(
+              state: "accepted",
+              provider_message_id: provider_submission.provider_message_id,
+              accepted_at: now,
+              provider_metadata: provider_submission.metadata
+            )
+            |> Repo.update!()
 
-          insert_event!(
-            message.id,
-            "provider_accepted",
-            %{provider_message_id: provider_submission.provider_message_id},
-            now
-          )
+            insert_event!(
+              message.id,
+              "provider_accepted",
+              %{provider_message_id: provider_submission.provider_message_id},
+              now
+            )
 
-          ProviderEvents.reconcile_pending(
-            submission.provider,
-            provider_submission.provider_message_id,
-            message.id,
-            now
-          )
+            ProviderEvents.reconcile_pending(
+              submission.provider,
+              provider_submission.provider_message_id,
+              message.id,
+              now
+            )
+
+            :accepted
+
+          terminal_or_stale ->
+            terminal_or_stale
         end
       end)
 
     case result do
-      {:ok, _result} ->
+      {:ok, :accepted} ->
         :telemetry.execute(
           [:manifold, :outbound, :submit, :stop],
           %{attempts: 1},
@@ -423,6 +493,15 @@ defmodule Manifold.Outbound.Submission do
         )
 
         :ok
+
+      {:ok, {:terminal, "accepted_by_provider"}} ->
+        :ok
+
+      {:ok, {:terminal, "uncertain"}} ->
+        submission_uncertain_error()
+
+      {:ok, terminal_or_stale} ->
+        stale_result(terminal_or_stale)
 
       {:error, reason} ->
         {:error, database_error(reason)}
@@ -439,33 +518,43 @@ defmodule Manifold.Outbound.Submission do
         {message, submission} = lock_submission!(preparation)
         maybe_fail(opts, :provider_error_commit)
 
-        message
-        |> Ecto.Changeset.change(
-          state: state,
-          last_error_class: Atom.to_string(error.class),
-          last_error_code: error.code,
-          last_error_message: error.message,
-          failed_at: if(error.class == :permanent, do: now)
-        )
-        |> Repo.update!()
+        case result_fence(message, submission, preparation) do
+          :current ->
+            message
+            |> Ecto.Changeset.change(
+              state: state,
+              last_error_class: Atom.to_string(error.class),
+              last_error_code: error.code,
+              last_error_message: error.message,
+              failed_at: if(error.class == :permanent, do: now)
+            )
+            |> Repo.update!()
 
-        submission
-        |> Ecto.Changeset.change(
-          state: submission_state,
-          last_http_status: error.http_status,
-          last_error_code: error.code,
-          last_error_message: error.message
-        )
-        |> Repo.update!()
+            submission
+            |> Ecto.Changeset.change(
+              state: submission_state,
+              last_http_status: error.http_status,
+              last_error_code: error.code,
+              last_error_message: error.message
+            )
+            |> Repo.update!()
 
-        event_type =
-          if error.class == :transient, do: "submission_retryable", else: "submission_failed"
+            event_type =
+              if error.class == :transient, do: "submission_retryable", else: "submission_failed"
 
-        insert_event!(message.id, event_type, %{code: error.code}, now)
+            insert_event!(message.id, event_type, %{code: error.code}, now)
+            :persisted_error
+
+          terminal_or_stale ->
+            terminal_or_stale
+        end
       end)
 
     case result do
-      {:ok, _result} -> {:error, error}
+      {:ok, :persisted_error} -> {:error, error}
+      {:ok, {:terminal, "accepted_by_provider"}} -> :ok
+      {:ok, {:terminal, "uncertain"}} -> submission_uncertain_error()
+      {:ok, terminal_or_stale} -> stale_result(terminal_or_stale)
       {:error, reason} -> {:error, database_error(reason)}
     end
   end
@@ -484,6 +573,49 @@ defmodule Manifold.Outbound.Submission do
       |> Repo.one!()
 
     {message, submission}
+  end
+
+  defp result_fence(message, submission, preparation) do
+    cond do
+      message.state == "accepted_by_provider" ->
+        {:terminal, "accepted_by_provider"}
+
+      message.state == "submission_uncertain" ->
+        {:terminal, "uncertain"}
+
+      message.state == "failed" ->
+        {:terminal, "failed"}
+
+      message.state == "submitting" and submission.state == "submitting" and
+          submission.attempt_count == preparation.attempt_count ->
+        :current
+
+      true ->
+        :stale
+    end
+  end
+
+  defp submission_uncertain_error do
+    {:error,
+     Error.new(
+       :permanent,
+       :submission_uncertain,
+       "provider acceptance is uncertain; automatic retry is disabled"
+     )}
+  end
+
+  defp stale_result({:terminal, "failed"}),
+    do: {:error, Error.new(:permanent, :submission_not_retryable, "submission failed")}
+
+  defp stale_result(_stale),
+    do: {:error, Error.new(:temporary, :stale_submission_result, "stale submission result")}
+
+  defp emit_uncertain(outbound_message_id) do
+    :telemetry.execute(
+      [:manifold, :outbound, :submit, :stop],
+      %{attempts: 1},
+      %{outbound_message_id: outbound_message_id, outcome: :uncertain}
+    )
   end
 
   defp envelope(message, submission, recipients) do

@@ -181,6 +181,39 @@ defmodule Manifold.Connectors.Schema.GmailAuthorizationTest do
     assert {"can't be blank", _} = changeset.errors[:idempotency_expires_at]
   end
 
+  test "provider submissions enforce provider-specific method and expiry shape" do
+    base = %{
+      outbound_message_id: Ecto.UUID.generate(),
+      idempotency_key: Ecto.UUID.generate(),
+      request_sha256: String.duplicate("a", 64),
+      state: "pending",
+      attempt_count: 0
+    }
+
+    refute ProviderSubmission.changeset(%ProviderSubmission{}, Map.put(base, :provider, "gmail")).valid?
+
+    refute ProviderSubmission.changeset(
+             %ProviderSubmission{},
+             base
+             |> Map.put(:provider, "resend")
+             |> Map.put(:send_method_id, Ecto.UUID.generate())
+             |> Map.put(:idempotency_expires_at, DateTime.utc_now())
+           ).valid?
+
+    refute ProviderSubmission.changeset(
+             %ProviderSubmission{},
+             base
+             |> Map.put(:provider, "smtp")
+             |> Map.put(:send_method_id, Ecto.UUID.generate())
+             |> Map.put(:idempotency_expires_at, DateTime.utc_now())
+           ).valid?
+
+    refute ProviderSubmission.changeset(
+             %ProviderSubmission{},
+             Map.put(base, :provider, "unknown")
+           ).valid?
+  end
+
   defp authorization_changeset(overrides \\ %{}) do
     OAuthAuthorization.changeset(
       %OAuthAuthorization{},
