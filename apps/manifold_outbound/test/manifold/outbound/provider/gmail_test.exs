@@ -173,20 +173,120 @@ defmodule Manifold.Outbound.Provider.GmailTest do
     Process.delete(:gmail_failure)
   end
 
-  test "does not retry or follow redirects even when Req options request them" do
-    Req.Test.expect(Gmail, fn conn ->
-      conn
-      |> Plug.Conn.put_resp_header("location", "https://private-redirect.test/secret")
-      |> Plug.Conn.put_status(302)
-      |> Req.Test.json(%{"error" => %{"message" => "do not follow"}})
+  test "protects request semantics from Req options and deprecated redirect aliases" do
+    test_pid = self()
+
+    Req.Test.stub(Gmail, fn conn ->
+      case conn.host do
+        "gmail.googleapis.test" ->
+          {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+          send(
+            test_pid,
+            {:origin_request, conn.method, conn.request_path,
+             Plug.Conn.get_req_header(conn, "authorization"), body}
+          )
+
+          conn
+          |> Plug.Conn.put_resp_header("location", "https://redirect-attacker.test/capture")
+          |> Plug.Conn.put_status(302)
+          |> Req.Test.json(%{"error" => %{"message" => "do not follow"}})
+
+        "redirect-attacker.test" ->
+          send(
+            test_pid,
+            {:redirect_request, Plug.Conn.get_req_header(conn, "authorization")}
+          )
+
+          Req.Test.json(conn, %{"id" => "stolen", "threadId" => "stolen"})
+      end
     end)
 
     config =
-      Keyword.put(@config, :req_options, plug: {Req.Test, Gmail}, retry: true, redirect: true)
+      Keyword.put(@config, :req_options,
+        plug: {Req.Test, Gmail},
+        url: "https://redirect-attacker.test/capture",
+        base_url: "https://redirect-attacker.test",
+        path: "/capture",
+        method: :get,
+        headers: [{"authorization", "Bearer attacker-token"}],
+        auth: {:bearer, "attacker-token"},
+        bearer: "attacker-token",
+        body: "attacker-body",
+        json: %{raw: "attacker-json"},
+        form: [raw: "attacker-form"],
+        form_multipart: [raw: "attacker-multipart"],
+        retry: :transient,
+        retry_delay: fn _ -> 0 end,
+        max_retries: 10,
+        redirect: true,
+        follow_redirects: true,
+        redirect_trusted: true,
+        location_trusted: true
+      )
 
     assert {:error,
             %Provider.Error{class: :permanent, code: "request_rejected", http_status: 302}} =
              Gmail.submit(config, @request)
+
+    expected_body = Jason.encode!(%{raw: Base.url_encode64(@raw_message, padding: false)})
+
+    assert_received {:origin_request, "POST", "/gmail/v1/users/me/messages/send",
+                     ["Bearer #{@access_token}"], ^expected_body}
+
+    refute_received {:redirect_request, _authorization}
+  end
+
+  test "scans every Gmail 403 reason and gives insufficient scope precedence" do
+    Req.Test.expect(Gmail, 3, fn conn ->
+      {reasons, retry_after} =
+        case Process.get(:gmail_403_failure) do
+          :rate_not_first -> {~w(domainPolicy userRateLimitExceeded), "45"}
+          :scope_after_rate -> {~w(rateLimitExceeded insufficientPermissions), nil}
+          :other -> {~w(domainPolicy), nil}
+        end
+
+      conn =
+        if retry_after,
+          do: Plug.Conn.put_resp_header(conn, "retry-after", retry_after),
+          else: conn
+
+      conn
+      |> Plug.Conn.put_status(403)
+      |> Req.Test.json(%{
+        "error" => %{"errors" => Enum.map(reasons, &%{"reason" => &1})}
+      })
+    end)
+
+    Process.put(:gmail_403_failure, :rate_not_first)
+
+    assert {:error,
+            %Provider.Error{
+              class: :transient,
+              code: "rate_limited",
+              http_status: 403,
+              retry_after: 45
+            }} = Gmail.submit(@config, @request)
+
+    Process.put(:gmail_403_failure, :scope_after_rate)
+
+    assert {:error,
+            %Provider.Error{
+              class: :permanent,
+              code: "insufficient_scope",
+              http_status: 403
+            }} = Gmail.submit(@config, @request)
+
+    Process.put(:gmail_403_failure, :other)
+
+    assert {:error,
+            %Provider.Error{
+              class: :permanent,
+              code: "request_rejected",
+              http_status: 403
+            }} = Gmail.submit(@config, @request)
+  after
+    Process.delete(:gmail_403_failure)
   end
 
   test "treats malformed successful responses as acceptance uncertainty" do
@@ -217,26 +317,29 @@ defmodule Manifold.Outbound.Provider.GmailTest do
     Process.delete(:gmail_invalid_success)
   end
 
-  test "uses explicit transport phase evidence and defaults unknown failures to uncertain" do
-    Req.Test.expect(Gmail, 3, &Req.Test.transport_error(&1, :timeout))
+  test "uses only transport-error phase evidence and defaults other failures to uncertain" do
+    Req.Test.expect(Gmail, 4, fn conn ->
+      reason =
+        case Process.get(:gmail_transport_failure) do
+          :pre -> {:manifold_transport_phase, :pre_transmission, :econnrefused}
+          :post -> {:manifold_transport_phase, :post_transmission, :timeout}
+          :malformed -> {:manifold_transport_phase, :pre_transmission}
+          :unknown -> :timeout
+        end
 
-    pre_transmission = Keyword.put(@config, :transport_failure_phase, :pre_transmission)
+      tagged_transport_error(conn, reason)
+    end)
+
+    Process.put(:gmail_transport_failure, :pre)
 
     assert {:error,
             %Provider.Error{
               class: :transient,
               code: "transport_error",
               message: "Gmail request could not be transmitted"
-            }} = Gmail.submit(pre_transmission, @request)
+            }} = Gmail.submit(@config, @request)
 
-    post_transmission = Keyword.put(@config, :transport_failure_phase, :post_transmission)
-
-    assert {:error,
-            %Provider.Error{
-              class: :uncertain,
-              code: "acceptance_unknown",
-              message: "Gmail may have accepted the message"
-            }} = Gmail.submit(post_transmission, @request)
+    Process.put(:gmail_transport_failure, :post)
 
     assert {:error,
             %Provider.Error{
@@ -244,6 +347,24 @@ defmodule Manifold.Outbound.Provider.GmailTest do
               code: "acceptance_unknown",
               message: "Gmail may have accepted the message"
             }} = Gmail.submit(@config, @request)
+
+    Process.put(:gmail_transport_failure, :malformed)
+
+    assert {:error, %Provider.Error{class: :uncertain, code: "acceptance_unknown"}} =
+             Gmail.submit(@config, @request)
+
+    Process.put(:gmail_transport_failure, :unknown)
+
+    old_static_marker = Keyword.put(@config, :transport_failure_phase, :pre_transmission)
+
+    assert {:error,
+            %Provider.Error{
+              class: :uncertain,
+              code: "acceptance_unknown",
+              message: "Gmail may have accepted the message"
+            }} = Gmail.submit(old_static_marker, @request)
+  after
+    Process.delete(:gmail_transport_failure)
   end
 
   test "sanitizes long malicious responses and never exposes request or token secrets" do
@@ -266,5 +387,9 @@ defmodule Manifold.Outbound.Provider.GmailTest do
     refute inspect(error) =~ response_secret
     refute inspect(error) =~ @access_token
     refute inspect(error) =~ @raw_message
+  end
+
+  defp tagged_transport_error(conn, reason) do
+    put_in(conn.private[:req_test_exception], %Req.TransportError{reason: reason})
   end
 end

@@ -13,6 +13,13 @@ defmodule Manifold.Outbound.Provider.Gmail do
 
   @default_base_url "https://gmail.googleapis.com"
   @send_path "/gmail/v1/users/me/messages/send"
+  @safe_req_options [:plug, :receive_timeout, :pool_timeout]
+  @rate_limit_reasons ~w(
+    dailyLimitExceeded
+    quotaExceeded
+    rateLimitExceeded
+    userRateLimitExceeded
+  )
 
   @impl true
   def submit(config, %Request{raw_message: raw_message}) when is_list(config) do
@@ -36,6 +43,7 @@ defmodule Manifold.Outbound.Provider.Gmail do
     request_options =
       config
       |> Keyword.get(:req_options, [])
+      |> transport_req_options()
       |> Keyword.put(:url, base_url <> @send_path)
       |> Keyword.put(:auth, {:bearer, access_token})
       |> Keyword.put(:json, %{raw: Base.url_encode64(raw_message, padding: false)})
@@ -49,10 +57,25 @@ defmodule Manifold.Outbound.Provider.Gmail do
       {:ok, %Req.Response{} = response} ->
         {:error, classify_response(response)}
 
-      {:error, _reason} ->
-        {:error, classify_transport_failure(Keyword.get(config, :transport_failure_phase))}
+      {:error, reason} ->
+        {:error, classify_transport_failure(reason)}
     end
   end
+
+  defp transport_req_options(options) do
+    options
+    |> Keyword.take(@safe_req_options)
+    |> maybe_put_connect_timeout(Keyword.get(options, :connect_options))
+  end
+
+  defp maybe_put_connect_timeout(options, connect_options) when is_list(connect_options) do
+    case Keyword.fetch(connect_options, :timeout) do
+      {:ok, timeout} -> Keyword.put(options, :connect_options, timeout: timeout)
+      :error -> options
+    end
+  end
+
+  defp maybe_put_connect_timeout(options, _connect_options), do: options
 
   defp accepted(%{"id" => id, "threadId" => thread_id})
        when is_binary(id) and id != "" and is_binary(thread_id) and thread_id != "",
@@ -91,6 +114,15 @@ defmodule Manifold.Outbound.Provider.Gmail do
           status
         )
 
+      status == 403 and rate_limited?(body) ->
+        error(
+          :transient,
+          "rate_limited",
+          "Gmail rate limit reached",
+          status,
+          retry_after(response)
+        )
+
       status == 429 ->
         error(
           :transient,
@@ -119,7 +151,9 @@ defmodule Manifold.Outbound.Provider.Gmail do
     end
   end
 
-  defp classify_transport_failure(:pre_transmission) do
+  defp classify_transport_failure(%Req.TransportError{
+         reason: {:manifold_transport_phase, :pre_transmission, _reason}
+       }) do
     error(
       :transient,
       "transport_error",
@@ -140,13 +174,22 @@ defmodule Manifold.Outbound.Provider.Gmail do
 
   defp insufficient_scope?(%{"error" => "insufficient_scope"}), do: true
 
-  defp insufficient_scope?(%{
-         "error" => %{"errors" => [%{"reason" => reason} | _]}
-       })
-       when reason in ["insufficientPermissions", "insufficient_scope"],
-       do: true
+  defp insufficient_scope?(body) do
+    Enum.any?(provider_reasons(body), &(&1 in ["insufficientPermissions", "insufficient_scope"]))
+  end
 
-  defp insufficient_scope?(_body), do: false
+  defp rate_limited?(body) do
+    Enum.any?(provider_reasons(body), &(&1 in @rate_limit_reasons))
+  end
+
+  defp provider_reasons(%{"error" => %{"errors" => errors}}) when is_list(errors) do
+    Enum.flat_map(errors, fn
+      %{"reason" => reason} when is_binary(reason) -> [reason]
+      _invalid -> []
+    end)
+  end
+
+  defp provider_reasons(_body), do: []
 
   defp retry_after(response) do
     case Req.Response.get_header(response, "retry-after") do
