@@ -7,6 +7,7 @@ defmodule ManifoldWeb.MailLive.Index do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
+  alias Manifold.Core.Error
   alias Manifold.Mail
   alias Manifold.Outbound
   alias ManifoldWeb.MailNotifier
@@ -30,6 +31,7 @@ defmodule ManifoldWeb.MailLive.Index do
        sent_items: [],
        draft: nil,
        draft_params: nil,
+       send_method_required: false,
        sent_detail: nil,
        query: "",
        unread_only: false,
@@ -69,6 +71,7 @@ defmodule ManifoldWeb.MailLive.Index do
            sent_items: [],
            draft: nil,
            draft_params: nil,
+           send_method_required: false,
            sent_detail: nil,
            query: "",
            unread_only: false,
@@ -98,6 +101,7 @@ defmodule ManifoldWeb.MailLive.Index do
             sent_items: loaded.sent_items,
             draft: loaded.draft,
             draft_params: draft_form_params(loaded.draft),
+            send_method_required: false,
             sent_detail: loaded.sent_detail,
             query: loaded.query,
             unread_only: loaded.unread_only,
@@ -225,17 +229,31 @@ defmodule ManifoldWeb.MailLive.Index do
   def handle_event("send-draft", %{"draft" => params}, socket) do
     socket = assign(socket, :draft_params, params)
 
-    with {:ok, draft} <- persist_draft(socket, params),
-         {:ok, queued} <-
-           Outbound.queue_draft(socket.assigns.mailbox.id, draft.id,
-             expected_revision: draft.lock_version
-           ) do
-      {:noreply,
-       socket
-       |> put_flash(:info, "Message queued for delivery.")
-       |> push_navigate(to: ~p"/mail/#{socket.assigns.mailbox.id}/sent/#{queued.id}")}
-    else
-      {:error, reason} -> {:noreply, draft_error(socket, reason)}
+    case persist_draft(socket, params) do
+      {:ok, draft} ->
+        case Outbound.queue_draft(socket.assigns.mailbox.id, draft.id,
+               expected_revision: draft.lock_version
+             ) do
+          {:ok, queued} ->
+            {:noreply,
+             socket
+             |> put_flash(:info, "Message queued for delivery.")
+             |> push_navigate(to: ~p"/mail/#{socket.assigns.mailbox.id}/sent/#{queued.id}")}
+
+          {:error, %Error{reason: :send_method_required}} ->
+            {:noreply,
+             assign(socket,
+               draft: draft,
+               draft_params: draft_form_params(draft),
+               send_method_required: true
+             )}
+
+          {:error, reason} ->
+            {:noreply, draft_error(socket, reason)}
+        end
+
+      {:error, reason} ->
+        {:noreply, draft_error(socket, reason)}
     end
   end
 
@@ -1195,6 +1213,12 @@ defmodule ManifoldWeb.MailLive.Index do
           phx-change="change-draft"
           phx-submit="send-draft"
         >
+          <p :if={@send_method_required} class="settings-error">
+            An enabled send method is required.
+            <.link href={~p"/settings/accounts/#{@mailbox.id}/send_methods/new"}>
+              Add send method
+            </.link>
+          </p>
           <div class="draft-address-row">
             <label>From</label>
             <span>{@draft.sender_address}</span>

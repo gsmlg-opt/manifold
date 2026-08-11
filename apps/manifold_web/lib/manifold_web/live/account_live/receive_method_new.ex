@@ -319,7 +319,7 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
           <div class="add-account-panel-footer">
             <button type="button" class="settings-action" phx-click="back">Back</button>
             <.link
-              href={~p"/connectors/#{@selected_kind}/start?account_id=#{@account.id}"}
+              href={~p"/connectors/#{@selected_kind}/start?account_id=#{@account.id}&purpose=receive"}
               class="settings-action settings-action-primary"
             >
               Continue with {kind_label(@selected_kind)}

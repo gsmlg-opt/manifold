@@ -10,6 +10,8 @@ defmodule Manifold.Connectors do
   alias Manifold.Accounts.Schema.Account
   alias Manifold.Connectors.ActivityLog
   alias Manifold.Connectors.Crypto
+  alias Manifold.Connectors.GmailAuthorizations
+  alias Manifold.Connectors.GmailScopes
   alias Manifold.Connectors.IMAP.Client
   alias Manifold.Connectors.EAS.Client, as: EASClient
   alias Manifold.Connectors.SMTP.Client, as: SmtpClient
@@ -20,6 +22,7 @@ defmodule Manifold.Connectors do
   alias Manifold.Connectors.Provider.EAS, as: ProviderEAS
   alias Manifold.Connectors.Provider.{Identity, Token}
   alias Manifold.Connectors.Sync
+  alias Manifold.Connectors.SubmissionMethod
 
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
@@ -47,8 +50,28 @@ defmodule Manifold.Connectors do
   }
 
   @spec complete_authorization(String.t(), String.t(), Consumed.t(), Keyword.t()) ::
-          {:ok, ReceiveMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
-  def complete_authorization(provider, code, %Consumed{} = consumed, opts \\ []) do
+          {:ok, ReceiveMethod.t() | SendMethod.t()}
+          | {:error, Error.t() | Ecto.Changeset.t()}
+  def complete_authorization(provider, code, consumed, opts \\ [])
+
+  def complete_authorization("gmail", code, %Consumed{} = consumed, opts) do
+    provider_opts =
+      opts
+      |> provider_opts()
+      |> Keyword.put(:required_scopes, consumed.required_scopes)
+
+    opts = Keyword.put(opts, :provider_opts, provider_opts)
+
+    with :ok <- validate_consumed("gmail", consumed),
+         {:ok, adapter, config} <- adapter_config("gmail") do
+      GmailAuthorizations.complete(code, consumed, adapter, config, opts)
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error, database_error(:unavailable)}
+  end
+
+  def complete_authorization(provider, code, %Consumed{} = consumed, opts) do
     now = Keyword.get(opts, :now, DateTime.utc_now())
 
     with :ok <- validate_consumed(provider, consumed),
@@ -75,6 +98,43 @@ defmodule Manifold.Connectors do
   rescue
     DBConnection.ConnectionError ->
       {:error, database_error(:unavailable)}
+  end
+
+  @spec checkout_oauth_access_token(Ecto.UUID.t(), Keyword.t()) ::
+          {:ok, term()} | {:error, Error.t() | ProviderError.t() | Ecto.Changeset.t()}
+  def checkout_oauth_access_token(authorization_id, opts \\ []) do
+    with {:ok, adapter, config} <- adapter_config("gmail") do
+      GmailAuthorizations.checkout_access_token(
+        authorization_id,
+        adapter,
+        config,
+        opts
+      )
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error, database_error(:unavailable)}
+  end
+
+  @spec mark_oauth_reconnect_required(Ecto.UUID.t(), ProviderError.t(), Keyword.t()) ::
+          {:ok, Manifold.Connectors.Schema.OAuthAuthorization.t()}
+          | {:error, Error.t() | Ecto.Changeset.t()}
+  def mark_oauth_reconnect_required(authorization_id, %ProviderError{} = error, opts \\ []) do
+    GmailAuthorizations.mark_reconnect_required(authorization_id, error, opts)
+  end
+
+  @spec mark_gmail_send_reconnect_required(Ecto.UUID.t(), String.t(), atom(), Keyword.t()) ::
+          {:ok, :marked | :already_marked | :stale | :inactive,
+           Manifold.Connectors.Schema.OAuthAuthorization.t()}
+          | {:error, Error.t() | Ecto.Changeset.t()}
+  def mark_gmail_send_reconnect_required(method_id, expected_access_token, error_code, opts \\ [])
+      when is_binary(method_id) and is_binary(expected_access_token) do
+    GmailAuthorizations.mark_send_reconnect_required(
+      method_id,
+      expected_access_token,
+      error_code,
+      opts
+    )
   end
 
   @spec list_receive_methods() :: [View.ReceiveMethod.t()]
@@ -322,6 +382,40 @@ defmodule Manifold.Connectors do
     |> Enum.map(&send_method_view/1)
   end
 
+  @spec enabled_send_method(Ecto.UUID.t()) ::
+          {:ok, SubmissionMethod.t()} | {:error, Error.t()}
+  def enabled_send_method(account_id) do
+    SendMethod
+    |> where(
+      [method],
+      method.account_id == ^account_id and method.enabled == true and
+        method.status == "connected"
+    )
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+    |> case do
+      %SendMethod{} = method -> {:ok, submission_method(method)}
+      nil -> {:error, send_method_required()}
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  @spec checkout_send_method(Ecto.UUID.t(), String.t(), Keyword.t()) ::
+          {:ok, SubmissionMethod.t()}
+          | {:error, Error.t() | ProviderError.t() | Ecto.Changeset.t()}
+  def checkout_send_method(method_id, required_sender, opts \\ []) do
+    with {:ok, parsed_sender} <- Address.parse(required_sender),
+         {:ok, method} <- preflight_send_method(method_id, parsed_sender) do
+      case method.kind do
+        "gmail" -> checkout_gmail_send_method(method, parsed_sender, opts)
+        "smtp" -> checkout_smtp_send_method(method, parsed_sender)
+      end
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
   @spec test_smtp_connection(map()) :: :ok | {:error, Error.t() | ProviderError.t()}
   def test_smtp_connection(attrs) when is_map(attrs) do
     attrs = normalize_smtp_attrs(attrs)
@@ -358,8 +452,9 @@ defmodule Manifold.Connectors do
     account_id = attr(attrs, :account_id)
 
     with {:ok, parsed} <- Address.parse(attr(attrs, :email_address) || ""),
-         :ok <- maybe_test_smtp(attrs, skip_test?),
-         {:ok, mailbox} <- resolve_send_account(account_id) do
+         {:ok, mailbox} <- resolve_send_account(account_id),
+         :ok <- require_account_sender(parsed, mailbox),
+         :ok <- maybe_test_smtp(attrs, skip_test?) do
       persist_smtp_send_method(attrs, parsed, mailbox, now)
     else
       {:error, %ProviderError{} = error} -> {:error, error}
@@ -380,13 +475,13 @@ defmodule Manifold.Connectors do
        }}
   end
 
-  @spec enable_send_method(Ecto.UUID.t()) ::
+  @spec enable_send_method(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, SendMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
-  def enable_send_method(send_method_id) do
+  def enable_send_method(account_id, send_method_id) do
     Repo.transaction(fn ->
       mailbox_id =
         SendMethod
-        |> where([m], m.id == ^send_method_id)
+        |> where([m], m.id == ^send_method_id and m.account_id == ^account_id)
         |> select([m], m.account_id)
         |> Repo.one()
 
@@ -404,7 +499,7 @@ defmodule Manifold.Connectors do
                   )
 
                 method ->
-                  enable_send_method(Repo, method)
+                  enable_locked_send_method(Repo, method)
               end
 
             {:error, reason} ->
@@ -416,16 +511,29 @@ defmodule Manifold.Connectors do
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
-  @spec disconnect_send_method(Ecto.UUID.t()) ::
+  @spec disconnect_send_method(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, SendMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
-  def disconnect_send_method(send_method_id) do
+  def disconnect_send_method(account_id, send_method_id) do
+    case Repo.get_by(SendMethod, id: send_method_id, account_id: account_id) do
+      %SendMethod{kind: "gmail", oauth_authorization_id: authorization_id}
+      when is_binary(authorization_id) ->
+        GmailAuthorizations.disconnect_method(:send, account_id, send_method_id)
+
+      _method ->
+        disconnect_legacy_send_method(account_id, send_method_id)
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  defp disconnect_legacy_send_method(account_id, send_method_id) do
     now = DateTime.utc_now()
 
     Multi.new()
     |> Multi.run(:method, fn repo, _changes ->
       method =
         SendMethod
-        |> where([m], m.id == ^send_method_id)
+        |> where([m], m.id == ^send_method_id and m.account_id == ^account_id)
         |> lock("FOR UPDATE")
         |> repo.one()
 
@@ -462,8 +570,6 @@ defmodule Manifold.Connectors do
       {:ok, %{method: method}} -> {:ok, method}
       {:error, _step, reason, _changes} -> {:error, reason}
     end
-  rescue
-    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
   defp resolve_imap_account(nil, address), do: Accounts.ensure_account_for_address(address)
@@ -706,6 +812,19 @@ defmodule Manifold.Connectors do
   @spec disconnect(Ecto.UUID.t()) ::
           {:ok, ReceiveMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def disconnect(account_id) do
+    case Repo.get(ReceiveMethod, account_id) do
+      %ReceiveMethod{kind: "gmail", oauth_authorization_id: authorization_id}
+      when is_binary(authorization_id) ->
+        GmailAuthorizations.disconnect_method(:receive, account_id)
+
+      _method ->
+        disconnect_legacy_receive_method(account_id)
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  defp disconnect_legacy_receive_method(account_id) do
     now = DateTime.utc_now()
 
     Multi.new()
@@ -754,13 +873,24 @@ defmodule Manifold.Connectors do
       {:ok, %{account: account}} -> {:ok, account}
       {:error, _step, reason, _changes} -> {:error, reason}
     end
-  rescue
-    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
   @spec delete_receive_method(Ecto.UUID.t()) ::
           {:ok, ReceiveMethod.t()} | {:error, Error.t()}
   def delete_receive_method(method_id) do
+    case Repo.get(ReceiveMethod, method_id) do
+      %ReceiveMethod{kind: "gmail", oauth_authorization_id: authorization_id}
+      when is_binary(authorization_id) ->
+        GmailAuthorizations.delete_receive_method(method_id)
+
+      _method ->
+        delete_legacy_receive_method(method_id)
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  defp delete_legacy_receive_method(method_id) do
     Multi.new()
     |> Multi.run(:method, fn repo, _changes ->
       method =
@@ -796,8 +926,6 @@ defmodule Manifold.Connectors do
       {:ok, %{deleted: method}} -> {:ok, method}
       {:error, _step, reason, _changes} -> {:error, reason}
     end
-  rescue
-    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
   @doc false
@@ -1192,6 +1320,17 @@ defmodule Manifold.Connectors do
       enabled: method.enabled,
       last_verified_at: method.last_verified_at,
       last_error: method.last_error_message
+    }
+  end
+
+  defp submission_method(method, opts \\ []) do
+    %SubmissionMethod{
+      id: method.id,
+      account_id: method.account_id,
+      kind: method.kind,
+      email_address: method.email_address,
+      credential: Keyword.get(opts, :credential),
+      config: Keyword.get(opts, :config)
     }
   end
 
@@ -1787,6 +1926,211 @@ defmodule Manifold.Connectors do
     {:error, Error.new(:permanent, :account_not_found, "account not found")}
   end
 
+  defp lock_send_method(method_id) do
+    SendMethod
+    |> where([method], method.id == ^method_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+    |> case do
+      %SendMethod{} = method -> {:ok, method}
+      nil -> {:error, send_method_required()}
+    end
+  end
+
+  defp preflight_send_method(method_id, required_sender) do
+    case Repo.get(SendMethod, method_id) do
+      %SendMethod{} = method ->
+        case validate_send_method_checkout(method, required_sender) do
+          :ok -> {:ok, method}
+          {:error, _reason} = error -> error
+        end
+
+      nil ->
+        {:error, send_method_required()}
+    end
+  end
+
+  defp validate_send_method_checkout(
+         %SendMethod{status: "disconnected"},
+         _required_sender
+       ) do
+    {:error, Error.new(:permanent, :account_disconnected, "send method is disconnected")}
+  end
+
+  defp validate_send_method_checkout(
+         %SendMethod{status: "reconnect_required"},
+         _required_sender
+       ) do
+    {:error,
+     Error.new(:permanent, :reauthorization_required, "send method requires reauthorization")}
+  end
+
+  defp validate_send_method_checkout(%SendMethod{enabled: false}, _required_sender),
+    do: {:error, send_method_required()}
+
+  defp validate_send_method_checkout(
+         %SendMethod{status: "connected"} = method,
+         required_sender
+       ) do
+    with %{} = account <- Accounts.get_account(method.account_id),
+         {:ok, method_sender} <- Address.parse(method.email_address),
+         {:ok, account_sender} <- Address.parse(Accounts.account_address(account)),
+         true <-
+           required_sender.canonical == method_sender.canonical and
+             method_sender.canonical == account_sender.canonical do
+      :ok
+    else
+      nil -> {:error, send_method_required()}
+      _mismatch -> {:error, sender_address_mismatch()}
+    end
+  end
+
+  defp validate_send_method_checkout(%SendMethod{}, _required_sender),
+    do: {:error, send_method_required()}
+
+  defp checkout_gmail_send_method(
+         %SendMethod{kind: "gmail", oauth_authorization_id: authorization_id} = snapshot,
+         required_sender,
+         opts
+       )
+       when is_binary(authorization_id) do
+    with {:ok, config} <- gmail_submission_config() do
+      continuation = fn access_token ->
+        with :ok <- after_oauth_checkout(opts) do
+          lock_and_revalidate_gmail_method(
+            snapshot,
+            required_sender,
+            access_token,
+            config
+          )
+        end
+      end
+
+      checkout_oauth_access_token(
+        authorization_id,
+        opts
+        |> Keyword.delete(:after_oauth_checkout)
+        |> Keyword.put(:required_scope, GmailScopes.send())
+        |> Keyword.put(:access_token_continuation, continuation)
+      )
+    end
+  end
+
+  defp checkout_gmail_send_method(%SendMethod{kind: "gmail"}, _required_sender, _opts),
+    do: {:error, send_method_required()}
+
+  defp lock_and_revalidate_gmail_method(
+         snapshot,
+         required_sender,
+         access_token,
+         config
+       ) do
+    with {:ok, method} <- lock_send_method(snapshot.id),
+         :ok <- validate_send_method_checkout(method, required_sender),
+         :ok <- validate_gmail_method_snapshot(method, snapshot) do
+      {:ok, submission_method(method, credential: {:oauth, access_token}, config: config)}
+    end
+  end
+
+  defp checkout_smtp_send_method(snapshot, required_sender) do
+    Repo.transaction(fn ->
+      with {:ok, method} <- lock_send_method(snapshot.id),
+           :ok <- validate_send_method_checkout(method, required_sender),
+           :ok <- validate_smtp_method_snapshot(method, snapshot),
+           {:ok, credential, config} <- checkout_smtp_credential(method) do
+        submission_method(method, credential: credential, config: config)
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, %SubmissionMethod{} = method} -> {:ok, method}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp checkout_smtp_credential(%SendMethod{kind: "smtp"} = method) do
+    with %SendCredential{} = credential <-
+           Repo.get_by(SendCredential, send_method_id: method.id),
+         %SmtpSettings{} = settings <- Repo.get_by(SmtpSettings, send_method_id: method.id),
+         {:ok, password} <-
+           Crypto.decrypt(
+             credential.password_ciphertext,
+             credential_context(method.id, :smtp_password)
+           ) do
+      config = Map.take(settings, [:host, :port, :tls_mode, :username])
+      {:ok, {:password, password}, config}
+    else
+      nil -> {:error, send_method_required()}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_gmail_method_snapshot(
+         %SendMethod{} = method,
+         %SendMethod{} = snapshot
+       ) do
+    if method.kind == "gmail" and
+         method.oauth_authorization_id == snapshot.oauth_authorization_id and
+         method.account_id == snapshot.account_id and
+         method.email_address == snapshot.email_address do
+      :ok
+    else
+      {:error, send_method_required()}
+    end
+  end
+
+  defp validate_smtp_method_snapshot(method, snapshot) do
+    if method.kind == "smtp" and method.account_id == snapshot.account_id and
+         method.email_address == snapshot.email_address do
+      :ok
+    else
+      {:error, send_method_required()}
+    end
+  end
+
+  defp after_oauth_checkout(opts) do
+    case Keyword.get(opts, :after_oauth_checkout) do
+      callback when is_function(callback, 0) ->
+        callback.()
+        :ok
+
+      nil ->
+        :ok
+    end
+  end
+
+  defp gmail_submission_config do
+    case Application.get_env(:manifold_connectors, :providers, [])[:gmail] do
+      config when is_list(config) ->
+        {:ok, Keyword.take(config, [:base_url, :req_options])}
+
+      _missing ->
+        {:error, Error.new(:permanent, :provider_not_configured, "provider is not configured")}
+    end
+  end
+
+  defp require_account_sender(parsed, account) do
+    with {:ok, account_address} <- Address.parse(Accounts.account_address(account)),
+         true <- parsed.canonical == account_address.canonical do
+      :ok
+    else
+      _mismatch -> {:error, sender_address_mismatch()}
+    end
+  end
+
+  defp send_method_required do
+    Error.new(:permanent, :send_method_required, "an enabled send method is required")
+  end
+
+  defp sender_address_mismatch do
+    Error.new(
+      :permanent,
+      :sender_address_mismatch,
+      "send method address does not match the account sender"
+    )
+  end
+
   defp maybe_test_smtp(_attrs, true), do: :ok
 
   defp maybe_test_smtp(attrs, false) do
@@ -1952,6 +2296,16 @@ defmodule Manifold.Connectors do
     )
   end
 
+  defp enable_receive_method(repo, %ReceiveMethod{status: "reconnect_required"}) do
+    repo.rollback(
+      Error.new(
+        :permanent,
+        :reauthorization_required,
+        "receive method requires reauthorization"
+      )
+    )
+  end
+
   defp enable_receive_method(repo, %ReceiveMethod{} = method) do
     disable_other_methods(repo, method.account_id, except_id: method.id)
 
@@ -1961,11 +2315,21 @@ defmodule Manifold.Connectors do
     end
   end
 
-  defp enable_send_method(repo, %SendMethod{status: "disconnected"}) do
+  defp enable_locked_send_method(repo, %SendMethod{status: "disconnected"}) do
     repo.rollback(Error.new(:permanent, :account_disconnected, "send method is disconnected"))
   end
 
-  defp enable_send_method(repo, %SendMethod{} = method) do
+  defp enable_locked_send_method(repo, %SendMethod{status: "reconnect_required"}) do
+    repo.rollback(
+      Error.new(
+        :permanent,
+        :reauthorization_required,
+        "send method requires reauthorization"
+      )
+    )
+  end
+
+  defp enable_locked_send_method(repo, %SendMethod{} = method) do
     disable_other_send_methods(repo, method.account_id, except_id: method.id)
 
     case SendMethod.changeset(method, %{enabled: true}) |> repo.update() do

@@ -8,7 +8,7 @@
 - [x] Add centralized connector and external-ingress migrations.
 - [x] Implement one-time OAuth state, PKCE `S256`, and encrypted secret
       envelopes.
-- [x] Implement Gmail read-only profile, list/history, and raw fetch adapters.
+- [x] Implement Gmail receive-only profile, list/history, and raw fetch adapters.
 - [x] Implement Microsoft Graph profile, folder/message delta, immutable ID, and
       raw fetch adapters.
 - [x] Import provider raw bytes through the durable spool and atomic Ingest

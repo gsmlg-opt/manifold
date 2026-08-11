@@ -17,7 +17,8 @@ composing, and sending email. Its browser interface is the primary mail client a
 is intended to replace desktop clients such as Microsoft Outlook and Apple Mail
 for mailboxes hosted by Manifold. Milestone 6 extends that client experience by
 importing mail read-only from Gmail and Microsoft 365 into local Manifold
-mailboxes.
+mailboxes. Account-selected delivery can also submit through Gmail API or an
+authenticated SMTP relay without turning Manifold into a direct-MX MTA.
 
 The product combines the user-facing webmail experience with an Elixir-native
 mail platform. Manifold accepts SMTP deliveries for configured domains, validates
@@ -68,7 +69,6 @@ The first release will not implement:
 
 - Direct outbound MX delivery.
 - Public outbound IP reputation management.
-- SMTP submission on ports 465 or 587.
 - IMAP.
 - POP3.
 - JMAP.
@@ -76,7 +76,7 @@ The first release will not implement:
 - Full calendar or contact support.
 - A complete anti-spam engine.
 - A complete antivirus engine.
-- Gmail or Microsoft 365 mailbox mutation or sending.
+- Gmail or Microsoft 365 mailbox mutation, and Microsoft Graph sending.
 - Native desktop or mobile applications.
 - An IMAP backend intended for Outlook, Apple Mail, or other desktop clients.
 - Multi-region or active-active clustering.
@@ -87,9 +87,10 @@ The first release will not implement:
 
 These were Release 0.1 boundaries, not architectural dead ends. Milestones 0-4
 form the Release 0.1 local mailbox core. Milestone 5 adds the optional cloud
-ingress edge. Milestone 6 implements read-only Gmail and Microsoft 365
-connectors while leaving IMAP, POP3, JMAP, provider mutation, and provider send
-out of scope.
+ingress edge. Milestone 6 implements read-only Gmail and Microsoft 365 receive
+connectors. Gmail API send and authenticated SMTP submission are later
+account-selected outbound capabilities; IMAP server access, POP3, JMAP,
+provider mailbox mutation, and Microsoft Graph send remain out of scope.
 
 ---
 
@@ -464,10 +465,11 @@ applications and stores no long-term mailbox state.
 
 ### 6.13 `manifold_connectors`
 
-Owns read-only external mailbox synchronization:
+Owns external mailbox synchronization and shared Gmail authorization lifecycle:
 
 - OAuth authorization transactions and PKCE.
-- Encrypted access and refresh credentials.
+- Encrypted access and refresh credentials, including incremental Gmail receive
+  and send grants.
 - Gmail and Microsoft Graph provider adapters.
 - Provider account, message identity, cursor, and operational event schemas.
 - Bounded Oban synchronization and remote-state jobs.
@@ -478,9 +480,10 @@ and Mail. Provider adapters never write another application's schemas directly.
 They fetch provider-supplied raw RFC message bytes and pass them through
 `Manifold.Ingest.import_external/3`.
 
-This boundary is read-only with respect to Gmail and Microsoft 365. It does not
-send mail, mutate remote messages, register push subscriptions, or implement
-direct outbound MX delivery.
+The synchronization side of this boundary is read-only with respect to Gmail and
+Microsoft 365. It does not mutate remote messages, register push subscriptions,
+or implement direct outbound MX delivery. It exposes checked-out Gmail send
+credentials to `manifold_outbound`, which owns rendering and submission.
 
 ### 6.14 `manifold_api`
 
@@ -1354,7 +1357,10 @@ MANIFOLD_OUTBOUND_PROVIDER
 MANIFOLD_CONNECTOR_ENCRYPTION_KEY
 MANIFOLD_GMAIL_CLIENT_ID
 MANIFOLD_GMAIL_CLIENT_SECRET
+MANIFOLD_GMAIL_AUTHORIZATION_URL
+MANIFOLD_GMAIL_TOKEN_URL
 MANIFOLD_GMAIL_USERINFO_URL
+MANIFOLD_GMAIL_API_BASE_URL
 MANIFOLD_MICROSOFT_CLIENT_ID
 MANIFOLD_MICROSOFT_CLIENT_SECRET
 MANIFOLD_MICROSOFT_TENANT
@@ -1456,7 +1462,9 @@ durable spool -> manifold_ingest -> raw store -> mailbox projection
   bounded interval, and is consumed once under a database lock.
 - PKCE verifiers and provider tokens use versioned AES-256-GCM envelopes.
 - Encryption associated data binds credentials to their account and purpose.
-- Gmail requests `openid`, `email`, and `gmail.readonly`.
+- Gmail receive requests `openid`, `email`, and
+  `https://www.googleapis.com/auth/gmail.readonly`; Gmail send incrementally adds
+  `https://www.googleapis.com/auth/gmail.send` to the same authorization.
 - Gmail uses the OpenID UserInfo `sub` as the durable account identity; its
   email address remains mutable display metadata.
 - Microsoft requests `openid`, `profile`, `offline_access`, `User.Read`, and
@@ -1477,6 +1485,14 @@ https://<PHX_HOST>/connectors/microsoft/callback
 Local development uses the same paths at `http://localhost:4290`. The exact
 redirect URI is stored with the OAuth transaction and must match on callback.
 The Phoenix controller derives the callback from the configured Endpoint URL.
+
+Operators must enable the Gmail API, configure both `gmail.readonly` and
+`gmail.send` on the Google OAuth consent screen, and register the exact production
+HTTPS callback. While the consent application is in testing mode, every Gmail
+identity must be listed as a test user. Public use requires completing Google's
+consent publication and scope-verification process. The connector encryption key
+must remain stable across releases; real client credentials and deployment
+endpoints are never stored in this design document or the repository.
 
 ### 22.2 Provider synchronization
 
@@ -1530,7 +1546,7 @@ the immutable local raw message.
 
 - No provider push; recurring synchronization polls every five minutes.
 - No Gmail or Microsoft remote mutation.
-- No Gmail or Microsoft send adapter.
+- No Microsoft Graph send adapter.
 - A provider message disappearing between listing and raw fetch is normalized
   into an idempotent remote tombstone without deleting local immutable data.
 - Microsoft folder membership removals probe the global message resource; an
@@ -1539,8 +1555,35 @@ the immutable local raw message.
   environment variables. Production additionally requires a stable connector
   encryption key.
 
-These limits keep provider connectivity isolated from SMTP and outbound
-delivery. Manifold never performs direct outbound MX delivery.
+These limits keep receive synchronization isolated from provider mutation and
+push lifecycle. Manifold never performs direct outbound MX delivery.
+
+### 22.5 Account-selected outbound methods
+
+Each account has at most one enabled Gmail or SMTP send method. Queueing freezes
+the method ID, provider, sender address, deterministic RFC bytes hash, and
+provider RFC `Message-ID`. Workers must use that snapshot and must verify the
+rendered hash before credential checkout or network I/O; a settings change never
+reroutes queued mail. Legacy Resend rows retain their provider-only shape for
+compatibility.
+
+Gmail and SMTP submissions are text-only in this milestone and preserve `Date`,
+`Message-ID`, `In-Reply-To`, and `References`. Gmail uses the exact connected
+account identity and Gmail API `gmail.send`; SMTP uses the account's encrypted
+relay credential. HTML, attachments, aliases, Microsoft Graph send, and provider
+push are follow-ups.
+
+Gmail and SMTP are non-idempotent once a remote endpoint may have accepted the
+request. An ambiguous response, lost connection, or interrupted `submitting`
+attempt transitions to `submission_uncertain`. Automatic resend is disabled and
+manual reconciliation is required.
+
+Gmail receive and send methods share one authorization record, refresh token,
+scope union, and reconnect state. Deploying the shared-authorization migrations
+is non-rolling: drain all old app instances, connector workers, and Oban workers
+before migration. Migration `20260811000500` performs lossless rollback
+preflights; `20260811000600` requires a unique legacy receive event anchor; and
+`20260811000700` refuses rollback while Gmail or SMTP submissions exist.
 
 ---
 
@@ -1670,7 +1713,8 @@ Implemented.
 
 - Compose, drafts, reply, reply-all, and forward.
 - Sent-mail views.
-- Provider behaviour and Resend HTTPS adapter.
+- Provider behaviour, account-selected Gmail API and authenticated SMTP
+  adapters, and legacy Resend HTTPS compatibility.
 - Outbound Oban queue.
 - Authenticated raw-body provider webhooks.
 - Per-recipient delivery, bounce, complaint, suppression, delay, and failure
@@ -1709,7 +1753,7 @@ Gmail and Microsoft provider adapters, bounded sync engine, durable external
 import, remote-state application, runtime configuration, local-release/Oban
 wiring, polling, and no-auth account settings are implemented and verified.
 
-- Read-only Gmail API synchronization.
+- Read-only Gmail API receive synchronization.
 - Read-only Microsoft Graph synchronization.
 - Encrypted OAuth credentials and one-time PKCE transactions.
 - Provider-message identity and resumable cursors.

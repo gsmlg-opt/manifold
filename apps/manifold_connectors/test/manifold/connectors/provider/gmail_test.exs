@@ -4,6 +4,7 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   import ExUnit.CaptureLog
 
   alias Manifold.Connectors.Provider
+  alias Manifold.Connectors.GmailScopes
   alias Manifold.Connectors.Provider.Gmail
 
   @config [
@@ -60,6 +61,56 @@ defmodule Manifold.Connectors.Provider.GmailTest do
                @config,
                now: now
              )
+  end
+
+  test "uses trusted callback scopes when the authorization response omits scope" do
+    for required_scopes <- [
+          [GmailScopes.send()],
+          [GmailScopes.read(), GmailScopes.send()]
+        ] do
+      Req.Test.expect(Gmail, fn conn ->
+        Req.Test.json(conn, %{
+          "access_token" => "access-token",
+          "refresh_token" => "refresh-token",
+          "expires_in" => 3_600,
+          "token_type" => "Bearer"
+        })
+      end)
+
+      assert {:ok, %Provider.Token{scopes: ^required_scopes}} =
+               Gmail.exchange_code(
+                 "authorization-code",
+                 "pkce-verifier",
+                 "https://mail.example.test/oauth/gmail/callback",
+                 @config,
+                 now: ~U[2026-07-29 01:00:00Z],
+                 required_scopes: required_scopes
+               )
+    end
+  end
+
+  test "prefers provider response scopes over the callback fallback" do
+    Req.Test.expect(Gmail, fn conn ->
+      Req.Test.json(conn, %{
+        "access_token" => "access-token",
+        "refresh_token" => "refresh-token",
+        "expires_in" => 3_600,
+        "scope" => GmailScopes.read(),
+        "token_type" => "Bearer"
+      })
+    end)
+
+    assert {:ok, %Provider.Token{scopes: [scope]}} =
+             Gmail.exchange_code(
+               "authorization-code",
+               "pkce-verifier",
+               "https://mail.example.test/oauth/gmail/callback",
+               @config,
+               now: ~U[2026-07-29 01:00:00Z],
+               required_scopes: ["attacker-supplied-scope"]
+             )
+
+    assert scope == GmailScopes.read()
   end
 
   test "refreshes access without inventing a replacement refresh token" do

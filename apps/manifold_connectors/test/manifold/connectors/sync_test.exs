@@ -19,9 +19,12 @@ defmodule Manifold.Connectors.SyncTest do
   alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
 
   alias Manifold.Connectors.Schema.{
+    ConnectorEvent,
     Credential,
+    OAuthAuthorization,
     ReceiveMethod,
     RemoteMessage,
+    SendMethod,
     SyncCursor
   }
 
@@ -52,18 +55,19 @@ defmodule Manifold.Connectors.SyncTest do
     def refresh_token("initial-refresh", _config, opts) do
       now = Keyword.get(opts, :now, DateTime.utc_now())
 
-      {:ok,
-       %Token{
-         access_token: "refreshed-access",
-         refresh_token: "rotated-refresh",
-         expires_at: DateTime.add(now, 3_600, :second),
-         scopes: ["https://www.googleapis.com/auth/gmail.readonly"]
-       }}
+      Process.get(:refresh_result) ||
+        {:ok,
+         %Token{
+           access_token: "refreshed-access",
+           refresh_token: "rotated-refresh",
+           expires_at: DateTime.add(now, 3_600, :second),
+           scopes: ["https://www.googleapis.com/auth/gmail.readonly"]
+         }}
     end
 
     @impl true
-    def identity("initial-access", _config, _opts) do
-      {:ok, %Identity{id: "sync-account", email_address: "person@gmail.example"}}
+    def identity("initial-access", _config, opts) do
+      {:ok, %Identity{id: "sync-account", email_address: Keyword.fetch!(opts, :identity_address)}}
     end
 
     @impl true
@@ -81,6 +85,9 @@ defmodule Manifold.Connectors.SyncTest do
            %Page{
              cursor: %{cursor | phase: "incremental", committed_cursor: "101"}
            }}
+
+        fun when is_function(fun, 1) ->
+          fun.(cursor)
 
         result ->
           result
@@ -134,11 +141,14 @@ defmodule Manifold.Connectors.SyncTest do
       Application.put_env(:manifold_storage, :spool_dir, old_spool)
       Application.put_env(:manifold_storage, :raw_store_dir, old_raw)
       Process.delete(:sync_page_result)
+      Process.delete(:refresh_result)
     end)
 
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "sync#{suffix}.test"})
     {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "person"})
+    mailbox = Repo.preload(mailbox, :domain)
+    address = Accounts.account_address(mailbox)
 
     assert {:ok, account} =
              Connectors.complete_authorization(
@@ -151,7 +161,7 @@ defmodule Manifold.Connectors.SyncTest do
                  pkce_verifier: "verifier"
                },
                now: DateTime.utc_now(),
-               provider_opts: [now: DateTime.utc_now()]
+               provider_opts: [now: DateTime.utc_now(), identity_address: address]
              )
 
     cursor = Repo.get_by!(SyncCursor, external_account_id: account.id)
@@ -444,22 +454,148 @@ defmodule Manifold.Connectors.SyncTest do
   test "rotated refresh token commits before the provider page", %{
     account: account
   } do
-    credential = Repo.get_by!(Credential, external_account_id: account.id)
+    authorization = Repo.get!(OAuthAuthorization, account.oauth_authorization_id)
 
-    credential
-    |> Credential.changeset(%{token_expires_at: DateTime.add(DateTime.utc_now(), -60, :second)})
+    authorization
+    |> OAuthAuthorization.changeset(%{
+      token_expires_at: DateTime.add(DateTime.utc_now(), -60, :second)
+    })
     |> Repo.update!()
 
     assert :ok = Connectors.sync_account(account.id)
     assert_receive {:sync_access_token, "refreshed-access"}
 
-    updated = Repo.get!(Credential, credential.id)
+    updated = Repo.get!(OAuthAuthorization, authorization.id)
 
     assert {:ok, "rotated-refresh"} =
              Crypto.decrypt(
                updated.refresh_token_ciphertext,
-               "credential:#{account.id}:refresh"
+               "credential:#{authorization.id}:refresh"
              )
+
+    refute Repo.get_by(Credential, external_account_id: account.id)
+  end
+
+  test "Gmail sync-page reconnect pauses the shared authorization and both methods", %{
+    account: account,
+    cursor: cursor
+  } do
+    send_method = insert_gmail_send_method!(account)
+    authorization = Repo.get!(OAuthAuthorization, account.oauth_authorization_id)
+    attach_sync_stop()
+
+    Process.put(
+      :sync_page_result,
+      {:error,
+       %Error{
+         class: :reconnect,
+         code: :invalid_grant,
+         message: "raw-sync-page-secret must never escape"
+       }}
+    )
+
+    assert {:cancel, :reconnect_required} = Connectors.sync_account(account.id)
+    assert_receive {:sync_stop, %{provider: "gmail", error_message: sanitized}}
+    assert sanitized == "Gmail authorization must be reconnected"
+    assert Repo.get!(SyncCursor, cursor.id).committed_cursor == "100"
+    assert_gmail_reconnect_required(authorization.id, account.id, send_method.id)
+    refute_reconnect_secret("raw-sync-page-secret")
+  end
+
+  test "Gmail checkout reconnect reports Gmail telemetry and pauses both methods", %{
+    account: account,
+    cursor: cursor
+  } do
+    send_method = insert_gmail_send_method!(account)
+    authorization = Repo.get!(OAuthAuthorization, account.oauth_authorization_id)
+    attach_sync_stop()
+
+    authorization
+    |> OAuthAuthorization.changeset(%{token_expires_at: DateTime.add(DateTime.utc_now(), -60)})
+    |> Repo.update!()
+
+    Process.put(
+      :refresh_result,
+      {:error,
+       %Error{
+         class: :reconnect,
+         code: :invalid_grant,
+         message: "raw-checkout-secret must never escape"
+       }}
+    )
+
+    assert {:cancel, :reconnect_required} = Connectors.sync_account(account.id)
+    assert_receive {:sync_stop, %{provider: "gmail", error_message: sanitized}}
+    assert sanitized == "Gmail authorization must be reconnected"
+    assert Repo.get!(SyncCursor, cursor.id).committed_cursor == "100"
+    assert_gmail_reconnect_required(authorization.id, account.id, send_method.id)
+    refute_reconnect_secret("raw-checkout-secret")
+  end
+
+  test "Gmail raw-fetch reconnect pauses the shared authorization and both methods", %{
+    account: account,
+    cursor: cursor
+  } do
+    send_method = insert_gmail_send_method!(account)
+    authorization = Repo.get!(OAuthAuthorization, account.oauth_authorization_id)
+    attach_sync_stop()
+
+    Process.put(
+      :sync_page_result,
+      {:ok,
+       %Page{
+         messages: [remote_message("message-reconnect")],
+         cursor: %{provider_cursor(cursor) | committed_cursor: "101"}
+       }}
+    )
+
+    Process.put(
+      {:raw_result, "message-reconnect"},
+      {:error,
+       %Error{
+         class: :reconnect,
+         code: :authentication_expired,
+         message: "raw-fetch-secret must never escape"
+       }}
+    )
+
+    assert {:cancel, :reconnect_required} = Connectors.sync_account(account.id)
+    assert_receive {:sync_stop, %{provider: "gmail", error_message: sanitized}}
+    assert sanitized == "Gmail authorization must be reconnected"
+    assert Repo.get!(SyncCursor, cursor.id).committed_cursor == "100"
+    assert_gmail_reconnect_required(authorization.id, account.id, send_method.id)
+    refute_reconnect_secret("raw-fetch-secret")
+  end
+
+  test "a reconnect race makes the stale checkpoint cancel without restoring connected", %{
+    account: account,
+    cursor: cursor
+  } do
+    send_method = insert_gmail_send_method!(account)
+    authorization = Repo.get!(OAuthAuthorization, account.oauth_authorization_id)
+
+    Process.put(:sync_page_result, fn provider_cursor ->
+      assert {:ok, _authorization} =
+               Connectors.mark_oauth_reconnect_required(
+                 authorization.id,
+                 %Error{
+                   class: :reconnect,
+                   code: :invalid_grant,
+                   message: "raw-checkpoint-race-secret must never escape"
+                 },
+                 expected_access_token: "initial-access"
+               )
+
+      {:ok,
+       %Page{
+         cursor: %{provider_cursor | committed_cursor: "101"}
+       }}
+    end)
+
+    assert {:cancel, :reconnect_required} = Connectors.sync_account(account.id)
+    assert Repo.get!(SyncCursor, cursor.id).committed_cursor == "100"
+    assert_gmail_reconnect_required(authorization.id, account.id, send_method.id)
+    refute_reconnect_secret("raw-checkpoint-race-secret")
   end
 
   test "retry-after leaves the cursor unchanged and snoozes", %{
@@ -809,6 +945,63 @@ defmodule Manifold.Connectors.SyncTest do
       page_cursor: cursor.page_cursor,
       committed_cursor: cursor.committed_cursor
     }
+  end
+
+  defp insert_gmail_send_method!(receive_method) do
+    %SendMethod{}
+    |> SendMethod.changeset(%{
+      account_id: receive_method.account_id,
+      oauth_authorization_id: receive_method.oauth_authorization_id,
+      kind: "gmail",
+      email_address: receive_method.email_address,
+      status: "connected",
+      enabled: true
+    })
+    |> Repo.insert!()
+  end
+
+  defp attach_sync_stop do
+    handler_id = "gmail-sync-stop-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :connectors, :sync, :stop],
+        fn _event, _measurements, metadata, pid -> send(pid, {:sync_stop, metadata}) end,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp assert_gmail_reconnect_required(authorization_id, receive_method_id, send_method_id) do
+    authorization = Repo.get!(OAuthAuthorization, authorization_id)
+    assert authorization.status == "reconnect_required"
+    assert authorization.last_error_class == "reconnect"
+    assert authorization.last_error_message == "Gmail authorization must be reconnected"
+
+    receive_method = Repo.get!(ReceiveMethod, receive_method_id)
+    assert receive_method.status == "reconnect_required"
+    refute receive_method.enabled
+    refute receive_method.sync_enabled
+    assert receive_method.last_error_message == "Gmail authorization must be reconnected"
+
+    send_method = Repo.get!(SendMethod, send_method_id)
+    assert send_method.status == "reconnect_required"
+    refute send_method.enabled
+    assert send_method.last_error_message == "Gmail authorization must be reconnected"
+
+    assert Repo.get_by!(ConnectorEvent,
+             oauth_authorization_id: authorization_id,
+             event_type: "reconnect_required"
+           )
+  end
+
+  defp refute_reconnect_secret(secret) do
+    refute Enum.any?(Repo.all(ConnectorEvent), &(inspect(&1) =~ secret))
+    refute Enum.any?(Repo.all(ReceiveMethod), &(inspect(&1) =~ secret))
+    refute Enum.any?(Repo.all(SendMethod), &(inspect(&1) =~ secret))
   end
 
   defp restore_env(app, key, nil), do: Application.delete_env(app, key)

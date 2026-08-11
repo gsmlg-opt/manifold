@@ -2,8 +2,11 @@ defmodule Manifold.OutboundTest do
   use Manifold.DataCase, async: false
 
   alias Manifold.Accounts
+  alias Manifold.Connectors.Schema.SendMethod
   alias Manifold.Outbound
   alias Manifold.Outbound.Jobs.SubmitOutbound
+  alias Manifold.Outbound.Provider.Envelope
+  alias Manifold.Outbound.RfcMessage
 
   alias Manifold.Outbound.Schema.{
     OutboundEvent,
@@ -66,8 +69,9 @@ defmodule Manifold.OutboundTest do
   end
 
   test "queueing freezes the draft and inserts exactly one Oban job transactionally" do
-    %{mailbox: mailbox} = mailbox_fixture()
-    draft = draft_fixture(mailbox.id)
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
+    method = send_method_fixture(mailbox.id, address, "gmail")
+    draft = draft_fixture(mailbox.id, include_bcc: true)
 
     assert {:ok, queued} =
              Outbound.queue_draft(mailbox.id, draft.id, expected_revision: draft.lock_version)
@@ -78,70 +82,56 @@ defmodule Manifold.OutboundTest do
     assert %Oban.Job{
              worker: worker,
              args: %{"outbound_message_id" => outbound_message_id}
-           } =
-             Repo.get_by!(Oban.Job,
-               worker: inspect(SubmitOutbound),
-               args: %{"outbound_message_id" => draft.id}
-             )
+           } = Repo.one!(jobs_for(draft.id))
 
     assert worker == inspect(SubmitOutbound)
     assert outbound_message_id == draft.id
 
     assert %ProviderSubmission{
              outbound_message_id: ^outbound_message_id,
-             provider: "resend",
+             send_method_id: send_method_id,
+             provider: "gmail",
              state: "pending",
              idempotency_key: idempotency_key,
              request_sha256: request_sha256,
-             idempotency_expires_at: %DateTime{}
-           } = Repo.get_by!(ProviderSubmission, outbound_message_id: draft.id)
+             provider_rfc_message_id: provider_rfc_message_id,
+             idempotency_expires_at: nil
+           } = Repo.one!(submissions_for(draft.id))
 
+    assert send_method_id == method.id
+    assert provider_rfc_message_id == "<#{queued.id}@manifold.local>"
     assert byte_size(idempotency_key) > 0
-    assert byte_size(request_sha256) == 64
+
+    expected_raw = expected_raw(queued, "gmail", idempotency_key)
+    assert expected_raw =~ "Bcc: hidden@example.net\r\n"
+    assert request_sha256 == sha256(expected_raw)
     assert Repo.get_by!(OutboundEvent, outbound_message_id: draft.id, event_type: "queued")
 
     assert {:ok, repeated} = Outbound.queue_draft(mailbox.id, draft.id)
     assert repeated.id == draft.id
-
-    assert Repo.aggregate(
-             from(job in Oban.Job,
-               where:
-                 job.worker == ^inspect(SubmitOutbound) and
-                   fragment("?->>'outbound_message_id'", job.args) == ^draft.id
-             ),
-             :count
-           ) == 1
-
-    assert Repo.aggregate(
-             from(submission in ProviderSubmission,
-               where: submission.outbound_message_id == ^draft.id
-             ),
-             :count
-           ) == 1
+    assert Repo.aggregate(jobs_for(draft.id), :count) == 1
+    assert Repo.aggregate(submissions_for(draft.id), :count) == 1
 
     assert {:error, %{reason: :message_not_editable}} =
              Outbound.update_draft(mailbox.id, draft.id, %{subject: "Too late"})
   end
 
   test "queue transaction failure rolls back state and job insertion" do
-    %{mailbox: mailbox} = mailbox_fixture()
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
+    send_method_fixture(mailbox.id, address, "gmail")
     draft = draft_fixture(mailbox.id)
 
     assert {:error, %{reason: :after_queue_before_job}} =
              Outbound.queue_draft(mailbox.id, draft.id, fail_at: :after_queue_before_job)
 
     assert Repo.get!(OutboundMessage, draft.id).state == "draft"
-
-    refute Repo.get_by(Oban.Job,
-             worker: inspect(SubmitOutbound),
-             args: %{"outbound_message_id" => draft.id}
-           )
-
-    refute Repo.get_by(ProviderSubmission, outbound_message_id: draft.id)
+    assert Repo.aggregate(jobs_for(draft.id), :count) == 0
+    assert Repo.aggregate(submissions_for(draft.id), :count) == 0
   end
 
   test "queueing rechecks and locks the active sender before the draft" do
-    %{mailbox: mailbox} = mailbox_fixture()
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
+    send_method_fixture(mailbox.id, address, "gmail")
     draft = draft_fixture(mailbox.id)
 
     {result, queries} =
@@ -152,7 +142,7 @@ defmodule Manifold.OutboundTest do
     assert {:ok, %OutboundMessage{state: "queued"}} = result
 
     lock_queries = Enum.filter(queries, &String.contains?(&1, "FOR UPDATE"))
-    assert [sender_lock, draft_lock] = lock_queries
+    assert [sender_lock, draft_lock | _additional_locks] = lock_queries
     assert String.contains?(sender_lock, ~s(FROM "mailboxes"))
     assert String.contains?(draft_lock, ~s(FROM "outbound_messages"))
   end
@@ -274,8 +264,10 @@ defmodule Manifold.OutboundTest do
   test "account job cancellation is bounded and preserves unrelated jobs" do
     start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
 
-    %{mailbox: mailbox} = mailbox_fixture()
-    %{mailbox: other_mailbox} = mailbox_fixture()
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
+    %{mailbox: other_mailbox, address: other_address} = mailbox_fixture()
+    send_method_fixture(mailbox.id, address, "gmail")
+    send_method_fixture(other_mailbox.id, other_address, "smtp")
 
     target_messages =
       for _index <- 1..4 do
@@ -346,7 +338,8 @@ defmodule Manifold.OutboundTest do
   test "account job cancellation keeps bounded ownership selection in SQL" do
     start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
 
-    %{mailbox: mailbox} = mailbox_fixture()
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
+    send_method_fixture(mailbox.id, address, "gmail")
 
     for _index <- 1..25 do
       draft = draft_fixture(mailbox.id)
@@ -393,6 +386,7 @@ defmodule Manifold.OutboundTest do
         {:ok, mailbox} =
           Accounts.create_account(domain, %{local_part: "inbox", name: "Race Sender"})
 
+        send_method_fixture(mailbox.id, "inbox@#{domain.normalized_domain}", "gmail")
         draft = draft_fixture(mailbox.id)
         assert {:ok, message} = Outbound.queue_draft(mailbox.id, draft.id)
 
@@ -406,7 +400,7 @@ defmodule Manifold.OutboundTest do
       end)
 
     on_exit(fn ->
-      cleanup_race_fixture(race_repo, job.id, mailbox.id, domain.id)
+      cleanup_race_fixture(race_repo, job.id, message.id, mailbox.id, domain.id)
     end)
 
     event = Keyword.fetch!(Repo.config(), :telemetry_prefix) ++ [:query]
@@ -474,7 +468,7 @@ defmodule Manifold.OutboundTest do
     assert on_repo(race_repo, fn -> Repo.get!(Oban.Job, job.id).state end) == "cancelled"
     assert on_repo(race_repo, fn -> Repo.get!(OutboundMessage, message.id).id end) == message.id
 
-    cleanup_race_fixture(race_repo, job.id, mailbox.id, domain.id)
+    cleanup_race_fixture(race_repo, job.id, message.id, mailbox.id, domain.id)
   end
 
   test "outbound purge index supports bounded mailbox ID scans" do
@@ -537,8 +531,10 @@ defmodule Manifold.OutboundTest do
   end
 
   test "account purge deletes bounded messages and provider events before cascades" do
-    %{mailbox: mailbox} = mailbox_fixture()
-    %{mailbox: other_mailbox} = mailbox_fixture()
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
+    %{mailbox: other_mailbox, address: other_address} = mailbox_fixture()
+    send_method_fixture(mailbox.id, address, "gmail")
+    send_method_fixture(other_mailbox.id, other_address, "smtp")
 
     target_messages =
       for _index <- 1..3 do
@@ -611,6 +607,119 @@ defmodule Manifold.OutboundTest do
     assert Outbound.account_data_remaining?(other_mailbox.id)
   end
 
+  test "queueing without an operational send method leaves the draft unchanged" do
+    %{mailbox: mailbox} = mailbox_fixture()
+
+    {:ok, draft} =
+      Outbound.create_draft(mailbox.id, %{
+        subject: "Selection failure",
+        text_body: "send-method-selection-secret-body",
+        recipients: [%{kind: "to", address: "person@example.net"}]
+      })
+
+    handler_id = "send-method-selection-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :outbound, :send_method, :select, :stop],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:telemetry, event, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert {:error, %{class: :permanent, reason: :send_method_required}} =
+             Outbound.queue_draft(mailbox.id, draft.id)
+
+    assert_receive {:telemetry, [:manifold, :outbound, :send_method, :select, :stop],
+                    %{duration_ms: duration_ms, attempt_count: 1} = measurements,
+                    %{
+                      account_id: account_id,
+                      outbound_message_id: outbound_message_id,
+                      outcome: :error,
+                      error_code: :send_method_required
+                    } = metadata}
+
+    assert is_integer(duration_ms) and duration_ms >= 0
+    assert account_id == mailbox.id
+    assert outbound_message_id == draft.id
+
+    assert_secret_free_telemetry(measurements, metadata, [
+      "send-method-selection-secret-body"
+    ])
+
+    assert Repo.get!(OutboundMessage, draft.id).state == "draft"
+    assert Repo.aggregate(jobs_for(draft.id), :count) == 0
+    assert Repo.aggregate(submissions_for(draft.id), :count) == 0
+  end
+
+  test "queueing snapshots SMTP bytes without a Bcc header" do
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
+    method = send_method_fixture(mailbox.id, address, "smtp")
+    draft = draft_fixture(mailbox.id, include_bcc: true)
+
+    assert {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
+
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: queued.id)
+    expected_raw = expected_raw(queued, "smtp", submission.idempotency_key)
+
+    assert submission.send_method_id == method.id
+    assert submission.provider == "smtp"
+    assert submission.provider_rfc_message_id == "<#{queued.id}@manifold.local>"
+    assert submission.idempotency_expires_at == nil
+    refute expected_raw =~ "Bcc:"
+    assert submission.request_sha256 == sha256(expected_raw)
+  end
+
+  test "queueing rejects a draft sender that differs from the selected method" do
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
+    send_method_fixture(mailbox.id, address, "gmail")
+
+    draft =
+      mailbox.id
+      |> draft_fixture()
+      |> Ecto.Changeset.change(
+        sender_address: "other@example.test",
+        canonical_sender_address: "other@example.test"
+      )
+      |> Repo.update!()
+
+    assert {:error, %{class: :permanent, reason: :sender_address_mismatch}} =
+             Outbound.queue_draft(mailbox.id, draft.id)
+
+    assert Repo.get!(OutboundMessage, draft.id).state == "draft"
+    assert Repo.aggregate(jobs_for(draft.id), :count) == 0
+    assert Repo.aggregate(submissions_for(draft.id), :count) == 0
+  end
+
+  test "an already queued message keeps its method snapshot after the enabled method changes" do
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
+    gmail = send_method_fixture(mailbox.id, address, "gmail")
+    draft = draft_fixture(mailbox.id)
+
+    assert {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
+    original = Repo.get_by!(ProviderSubmission, outbound_message_id: queued.id)
+
+    gmail |> SendMethod.changeset(%{enabled: false}) |> Repo.update!()
+    smtp = send_method_fixture(mailbox.id, address, "smtp")
+
+    assert {:ok, repeated} = Outbound.queue_draft(mailbox.id, draft.id)
+    assert repeated.id == queued.id
+
+    persisted = Repo.get!(ProviderSubmission, original.id)
+    assert persisted.send_method_id == gmail.id
+    refute persisted.send_method_id == smtp.id
+    assert persisted.provider == "gmail"
+    assert persisted.request_sha256 == original.request_sha256
+    assert persisted.provider_rfc_message_id == original.provider_rfc_message_id
+    assert Repo.aggregate(submissions_for(draft.id), :count) == 1
+    assert Repo.aggregate(jobs_for(draft.id), :count) == 1
+  end
+
   test "rejects invalid or duplicate recipient addresses" do
     %{mailbox: mailbox} = mailbox_fixture()
 
@@ -631,19 +740,18 @@ defmodule Manifold.OutboundTest do
                ]
              })
 
-    assert Repo.aggregate(
-             from(message in OutboundMessage, where: message.mailbox_id == ^mailbox.id),
-             :count
-           ) == 0
+    mailbox_messages =
+      from(message in OutboundMessage, where: message.mailbox_id == ^mailbox.id)
 
-    assert Repo.aggregate(
-             from(recipient in OutboundRecipient,
-               join: message in OutboundMessage,
-               on: message.id == recipient.outbound_message_id,
-               where: message.mailbox_id == ^mailbox.id
-             ),
-             :count
-           ) == 0
+    mailbox_recipients =
+      from(recipient in OutboundRecipient,
+        join: message in OutboundMessage,
+        on: message.id == recipient.outbound_message_id,
+        where: message.mailbox_id == ^mailbox.id
+      )
+
+    assert Repo.aggregate(mailbox_messages, :count) == 0
+    assert Repo.aggregate(mailbox_recipients, :count) == 0
   end
 
   test "inactive mailbox cannot create an outbound draft" do
@@ -694,8 +802,10 @@ defmodule Manifold.OutboundTest do
   end
 
   test "sent list excludes drafts and remains mailbox scoped" do
-    %{mailbox: mailbox} = mailbox_fixture()
-    %{mailbox: other_mailbox} = mailbox_fixture()
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
+    %{mailbox: other_mailbox, address: other_address} = mailbox_fixture()
+    send_method_fixture(mailbox.id, address, "gmail")
+    send_method_fixture(other_mailbox.id, other_address, "smtp")
     draft = draft_fixture(mailbox.id)
     queued = draft_fixture(mailbox.id)
     other_queued = draft_fixture(other_mailbox.id)
@@ -730,8 +840,9 @@ defmodule Manifold.OutboundTest do
   end
 
   test "loads sent detail with recipient, submission, and audit projections" do
-    %{mailbox: mailbox} = mailbox_fixture()
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
     %{mailbox: other_mailbox} = mailbox_fixture()
+    send_method_fixture(mailbox.id, address, "gmail")
     draft = draft_fixture(mailbox.id)
     assert {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
 
@@ -740,7 +851,7 @@ defmodule Manifold.OutboundTest do
     assert detail.state == "queued"
     assert detail.subject == "Ready"
     assert [%{kind: "to", delivery_state: "pending"}] = detail.recipients
-    assert detail.submission.provider == "resend"
+    assert detail.submission.provider == "gmail"
     assert detail.submission.state == "pending"
     assert Enum.map(detail.events, & &1.event_type) == ["draft_created", "queued"]
 
@@ -751,12 +862,20 @@ defmodule Manifold.OutboundTest do
              Outbound.get_sent(mailbox.id, draft_fixture(mailbox.id).id)
   end
 
-  defp draft_fixture(mailbox_id) do
+  defp draft_fixture(mailbox_id, opts \\ []) do
+    recipients =
+      [%{kind: "to", address: "person@example.net"}] ++
+        if Keyword.get(opts, :include_bcc, false) do
+          [%{kind: "bcc", address: "hidden@example.net"}]
+        else
+          []
+        end
+
     {:ok, draft} =
       Outbound.create_draft(mailbox_id, %{
         subject: "Ready",
         text_body: "Body",
-        recipients: [%{kind: "to", address: "person@example.net"}]
+        recipients: recipients
       })
 
     draft
@@ -782,13 +901,17 @@ defmodule Manifold.OutboundTest do
     end
   end
 
-  defp cleanup_race_fixture(repo, job_id, mailbox_id, domain_id) do
+  defp cleanup_race_fixture(repo, job_id, message_id, mailbox_id, domain_id) do
     if Process.alive?(repo) do
       try do
         on_repo(repo, fn ->
           Oban.Job
           |> where([candidate], candidate.id == ^job_id)
           |> Repo.delete_all()
+
+          Repo.query!("DELETE FROM outbound_messages WHERE id = $1", [
+            Ecto.UUID.dump!(message_id)
+          ])
 
           Repo.query!("DELETE FROM mailboxes WHERE id = $1", [Ecto.UUID.dump!(mailbox_id)])
           Repo.query!("DELETE FROM domains WHERE id = $1", [Ecto.UUID.dump!(domain_id)])
@@ -884,4 +1007,272 @@ defmodule Manifold.OutboundTest do
       0 -> Enum.reverse(queries)
     end
   end
+
+  defp send_method_fixture(account_id, address, kind) do
+    %SendMethod{}
+    |> SendMethod.changeset(%{
+      account_id: account_id,
+      kind: kind,
+      email_address: address,
+      status: "connected",
+      enabled: true
+    })
+    |> Repo.insert!()
+  end
+
+  defp expected_raw(message, provider, idempotency_key) do
+    recipients = Outbound.list_recipients(message.id)
+
+    envelope = %Envelope{
+      from: mailbox(message.sender_name, message.sender_address),
+      to: recipient_mailboxes(recipients, "to"),
+      cc: recipient_mailboxes(recipients, "cc"),
+      bcc: recipient_mailboxes(recipients, "bcc"),
+      subject: message.subject,
+      text: message.text_body || "",
+      message_id: "<#{message.id}@manifold.local>",
+      queued_at: message.queued_at,
+      in_reply_to: message.in_reply_to,
+      references: message.references,
+      idempotency_key: idempotency_key
+    }
+
+    RfcMessage.render!(envelope,
+      provider: String.to_existing_atom(provider),
+      message_id: envelope.message_id,
+      date: envelope.queued_at
+    )
+  end
+
+  defp recipient_mailboxes(recipients, kind) do
+    recipients
+    |> Enum.filter(&(&1.kind == kind))
+    |> Enum.map(&mailbox(&1.display_name, &1.address))
+  end
+
+  defp mailbox(nil, address), do: address
+  defp mailbox("", address), do: address
+  defp mailbox(display_name, address), do: "#{display_name} <#{address}>"
+
+  defp sha256(bytes) do
+    bytes
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp assert_secret_free_telemetry(measurements, metadata, secret_values) do
+    assert Map.keys(measurements) |> Enum.sort() == [:attempt_count, :duration_ms]
+
+    forbidden_fragments =
+      ~w(token password authorization_code raw_message) ++
+        Enum.map(secret_values, &String.downcase/1)
+
+    telemetry_terms(measurements)
+    |> Enum.concat(telemetry_terms(metadata))
+    |> Enum.each(fn term ->
+      downcased = term |> to_string() |> String.downcase()
+
+      refute Enum.any?(forbidden_fragments, &String.contains?(downcased, &1)),
+             "unsafe telemetry term: #{inspect(term)}"
+    end)
+  end
+
+  defp telemetry_terms(map) when is_map(map) do
+    Enum.flat_map(map, fn {key, value} -> [key | telemetry_terms(value)] end)
+  end
+
+  defp telemetry_terms(list) when is_list(list), do: Enum.flat_map(list, &telemetry_terms/1)
+
+  defp telemetry_terms(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> telemetry_terms()
+
+  defp telemetry_terms(value), do: [value]
+
+  defp jobs_for(message_id) do
+    from(job in Oban.Job,
+      where: fragment("?->>'outbound_message_id'", job.args) == ^message_id
+    )
+  end
+
+  defp submissions_for(message_id) do
+    from(submission in ProviderSubmission,
+      where: submission.outbound_message_id == ^message_id
+    )
+  end
+end
+
+defmodule Manifold.OutboundSendMethodLockTest do
+  use ExUnit.Case, async: false
+
+  import Ecto.Query
+
+  alias Ecto.Adapters.SQL
+  alias Ecto.Adapters.SQL.Sandbox
+  alias Manifold.Accounts
+  alias Manifold.Connectors
+  alias Manifold.Connectors.Schema.SendMethod
+  alias Manifold.Outbound
+  alias Manifold.Outbound.Schema.ProviderSubmission
+  alias Manifold.Repo
+
+  setup do
+    :ok = Sandbox.checkout(Repo, sandbox: false)
+    :ok
+  end
+
+  test "queueing holds the selected method lock through a concurrent disconnect" do
+    suffix = System.unique_integer([:positive])
+    {:ok, domain} = Accounts.create_domain(%{name: "outbound-lock#{suffix}.test"})
+
+    {:ok, account} =
+      Accounts.create_account(domain, %{local_part: "inbox", name: "Local Inbox"})
+
+    address = "inbox@#{domain.normalized_domain}"
+    gmail = insert_send_method!(account.id, address, "gmail")
+
+    {:ok, draft} =
+      Outbound.create_draft(account.id, %{
+        subject: "Ready",
+        text_body: "Body",
+        recipients: [%{kind: "to", address: "person@example.net"}]
+      })
+
+    test_pid = self()
+    telemetry_token = make_ref()
+    handler_id = "outbound-send-method-lock-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :repo, :query],
+        &block_selected_method_query/4,
+        %{parent: test_pid, token: telemetry_token}
+      )
+
+    queue =
+      Task.async(fn ->
+        unboxed(fn ->
+          Process.put(:outbound_send_method_lock_test, telemetry_token)
+          Outbound.queue_draft(account.id, draft.id)
+        end)
+      end)
+
+    try do
+      assert_receive {:send_method_row_locked, queue_pid, ^telemetry_token}
+
+      disconnect =
+        Task.async(fn ->
+          unboxed(fn ->
+            [[backend_pid]] = SQL.query!(Repo, "SELECT pg_backend_pid()", []).rows
+            send(test_pid, {:disconnect_backend, backend_pid})
+            result = Connectors.disconnect_send_method(account.id, gmail.id)
+            send(test_pid, {:send_method_disconnected, result})
+            result
+          end)
+        end)
+
+      Process.put(:outbound_disconnect_task, disconnect)
+
+      assert_receive {:disconnect_backend, backend_pid}
+      assert is_binary(wait_for_backend_lock(backend_pid))
+
+      send(queue_pid, {:release_send_method_query, telemetry_token})
+
+      assert {:ok, queued} = Task.await(queue, 5_000)
+      assert {:ok, disconnected} = Task.await(disconnect, 5_000)
+      assert_receive {:send_method_disconnected, {:ok, ^disconnected}}
+      assert disconnected.id == gmail.id
+      assert disconnected.status == "disconnected"
+      refute disconnected.enabled
+
+      submission = Repo.get_by!(ProviderSubmission, outbound_message_id: queued.id)
+      assert submission.send_method_id == gmail.id
+      assert submission.provider == "gmail"
+
+      assert {:error, %{reason: :send_method_required}} =
+               Connectors.enabled_send_method(account.id)
+
+      assert {:error, %{reason: :account_disconnected}} =
+               Connectors.checkout_send_method(gmail.id, address)
+
+      persisted = Repo.get!(ProviderSubmission, submission.id)
+      assert persisted.send_method_id == gmail.id
+      assert persisted.request_sha256 == submission.request_sha256
+    after
+      stop_task(Process.delete(:outbound_disconnect_task))
+      release_and_stop_task(queue, telemetry_token)
+      :telemetry.detach(handler_id)
+      cleanup!(account, domain, draft.id)
+    end
+  end
+
+  defp block_selected_method_query(_event, _measurements, metadata, config) do
+    if Process.get(:outbound_send_method_lock_test) == config.token and
+         String.contains?(metadata.query, ~s(FROM "connector_send_methods")) and
+         String.contains?(metadata.query, "FOR UPDATE") do
+      send(config.parent, {:send_method_row_locked, self(), config.token})
+
+      receive do
+        {:release_send_method_query, token} when token == config.token -> :ok
+      end
+    end
+  end
+
+  defp wait_for_backend_lock(backend_pid, attempts \\ 200)
+
+  defp wait_for_backend_lock(backend_pid, attempts) when attempts > 0 do
+    case SQL.query!(
+           Repo,
+           "SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1",
+           [backend_pid]
+         ).rows do
+      [["Lock", wait_event]] when is_binary(wait_event) ->
+        wait_event
+
+      _not_waiting ->
+        Process.sleep(10)
+        wait_for_backend_lock(backend_pid, attempts - 1)
+    end
+  end
+
+  defp wait_for_backend_lock(backend_pid, 0) do
+    flunk("PostgreSQL backend #{backend_pid} never waited on the send-method row lock")
+  end
+
+  defp release_and_stop_task(%Task{pid: pid} = task, telemetry_token) do
+    send(pid, {:release_send_method_query, telemetry_token})
+    stop_task(task)
+  end
+
+  defp stop_task(nil), do: :ok
+
+  defp stop_task(%Task{pid: pid} = task) do
+    if Process.alive?(pid), do: Task.shutdown(task, :brutal_kill), else: :ok
+  end
+
+  defp insert_send_method!(account_id, address, kind) do
+    %SendMethod{}
+    |> SendMethod.changeset(%{
+      account_id: account_id,
+      kind: kind,
+      email_address: address,
+      status: "connected",
+      enabled: true
+    })
+    |> Repo.insert!()
+  end
+
+  defp cleanup!(account, domain, message_id) do
+    Oban.Job
+    |> where(
+      [job],
+      fragment("?->>'outbound_message_id'", job.args) == ^message_id
+    )
+    |> Repo.delete_all()
+
+    account |> Repo.reload!() |> Repo.delete!()
+    domain |> Repo.reload!() |> Repo.delete!()
+  end
+
+  defp unboxed(fun), do: Sandbox.unboxed_run(Repo, fun)
 end

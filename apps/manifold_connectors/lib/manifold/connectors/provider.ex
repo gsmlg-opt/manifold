@@ -157,7 +157,7 @@ defmodule Manifold.Connectors.Provider.Error do
   defstruct [:retry_after_seconds | @enforce_keys]
 
   @type t :: %__MODULE__{
-          class: :temporary | :permanent | :reconnect,
+          class: :temporary | :permanent | :reconnect | :uncertain,
           code: atom(),
           message: String.t(),
           retry_after_seconds: pos_integer() | nil

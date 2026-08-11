@@ -111,6 +111,33 @@ defmodule Manifold.Connectors.SmtpSendMethodTest do
     assert Repo.aggregate(SendMethod, :count) == before
   end
 
+  test "create_smtp_send_method rejects a mismatched sender before provider I/O", %{
+    account: account
+  } do
+    {:ok, connect_count} = Agent.start_link(fn -> 0 end)
+
+    Application.put_env(:manifold_connectors, :smtp_fake, %{
+      password_expected: "secret",
+      connect_count: connect_count
+    })
+
+    before = Repo.aggregate(SendMethod, :count)
+
+    assert {:error, %Manifold.Core.Error{class: :permanent, reason: :sender_address_mismatch}} =
+             Connectors.create_smtp_send_method(%{
+               account_id: account.id,
+               email_address: "other@smtp.example",
+               username: "sender@smtp.example",
+               password: "secret",
+               host: "smtp.example",
+               port: 465,
+               tls_mode: "tls"
+             })
+
+    assert Agent.get(connect_count, & &1) == 0
+    assert Repo.aggregate(SendMethod, :count) == before
+  end
+
   test "test_smtp_connection returns error for invalid settings without raising" do
     assert {:error, %Manifold.Core.Error{reason: :invalid_smtp_settings}} =
              Connectors.test_smtp_connection(%{
@@ -135,7 +162,7 @@ defmodule Manifold.Connectors.SmtpSendMethodTest do
                tls_mode: "tls"
              })
 
-    assert {:ok, disconnected} = Connectors.disconnect_send_method(method.id)
+    assert {:ok, disconnected} = Connectors.disconnect_send_method(account.id, method.id)
     assert disconnected.status == "disconnected"
     refute disconnected.enabled
     assert is_nil(Repo.get_by(SendCredential, send_method_id: method.id))

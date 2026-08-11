@@ -2,6 +2,7 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
   use ManifoldWeb.ConnCase, async: false
 
   alias Manifold.Accounts
+  alias Manifold.Connectors
   alias Manifold.Ingest.Schema.InboundDelivery
   alias Manifold.Mail.Schema.{MailboxEntry, Message, MessageAddress}
   alias Manifold.Outbound
@@ -27,6 +28,7 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
 
   test "draft edits survive reconnect and send queues exactly once", %{conn: conn} do
     mailbox = mailbox_fixture()
+    add_smtp_method(mailbox)
     {:ok, draft} = Outbound.create_draft(mailbox.id, %{})
     path = ~p"/mail/#{mailbox.id}/drafts/#{draft.id}/edit"
     assert {:ok, view, _html} = live(conn, path)
@@ -98,6 +100,39 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
     assert Outbound.list_sent(mailbox.id) == []
   end
 
+  test "missing send method preserves the saved draft and links account setup", %{conn: conn} do
+    mailbox = mailbox_fixture()
+    {:ok, draft} = Outbound.create_draft(mailbox.id, %{})
+    assert {:ok, view, _html} = live(conn, ~p"/mail/#{mailbox.id}/drafts/#{draft.id}/edit")
+
+    html =
+      view
+      |> form("#outbound-draft-form", %{
+        "draft" => %{
+          "to" => "person@example.net",
+          "cc" => "",
+          "bcc" => "",
+          "subject" => "Needs a method",
+          "text_body" => "Saved before setup"
+        }
+      })
+      |> render_submit()
+
+    assert html =~ "Add send method"
+
+    assert has_element?(
+             view,
+             ~s|a[href="/settings/accounts/#{mailbox.id}/send_methods/new"]|,
+             "Add send method"
+           )
+
+    saved = Repo.get!(Manifold.Outbound.Schema.OutboundMessage, draft.id)
+    assert saved.state == "draft"
+    assert saved.subject == "Needs a method"
+    assert saved.text_body == "Saved before setup"
+    refute_redirected(view)
+  end
+
   test "reply-all and forward drafts use the mailbox-scoped reply source" do
     mailbox = mailbox_fixture()
     message = reply_source_fixture(mailbox)
@@ -131,6 +166,22 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
       Accounts.create_account(domain, %{local_part: "inbox", name: "Local Inbox"})
 
     %{mailbox | domain: domain}
+  end
+
+  defp add_smtp_method(mailbox) do
+    address = "#{mailbox.local_part}@#{mailbox.domain.normalized_domain}"
+
+    assert {:ok, _method} =
+             Connectors.create_smtp_send_method(%{
+               account_id: mailbox.id,
+               email_address: address,
+               host: "smtp.example.test",
+               port: 465,
+               tls_mode: "tls",
+               username: address,
+               password: "secret",
+               skip_test: true
+             })
   end
 
   defp reply_source_fixture(mailbox) do

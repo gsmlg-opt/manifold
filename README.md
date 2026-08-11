@@ -8,8 +8,9 @@ installations that deploy it.
 ## Milestones 0-6
 
 Milestones 0-6 implement durable inbound delivery, mailbox projection, managed
-outbound submission, fail-closed inbound policy, optional cloud ingress, and
-read-only Gmail and Microsoft 365 synchronization:
+outbound submission, fail-closed inbound policy, optional cloud ingress,
+read-only Gmail and Microsoft 365 synchronization, and account-selected Gmail
+API or SMTP submission:
 
 - Phoenix umbrella with explicit Core, Data, Accounts, Storage, Ingest, SMTP,
   Mail, Security, Outbound, Cloud, Edge, Connectors, and Web application
@@ -29,8 +30,8 @@ read-only Gmail and Microsoft 365 synchronization:
   state workflows.
 - Persistent plain-text drafts with compose, reply, reply-all, and forward
   workflows.
-- Atomic outbound queueing with Oban, stable provider idempotency, and a Resend
-  HTTPS adapter.
+- Atomic outbound queueing with Oban, frozen account send-method snapshots,
+  Gmail API and authenticated SMTP submission, and legacy Resend compatibility.
 - Authenticated Resend webhook ingestion with per-recipient delivered, bounced,
   complained, suppressed, delayed, and failed state.
 - Sent-mail and provider lifecycle views that distinguish provider acceptance
@@ -57,18 +58,18 @@ read-only Gmail and Microsoft 365 synchronization:
 
 The current milestones intentionally do not implement rich-text composition,
 outbound attachments, bundled DNS authentication engines, bundled spam or
-malware engines, POP3, JMAP, provider push notifications, Gmail or
-Microsoft mailbox mutation, provider-backed sending, or cloud provider hosting.
+malware engines, POP3, JMAP, provider push notifications, Gmail or Microsoft
+mailbox mutation, Microsoft Graph sending, or cloud provider hosting.
 Read-only IMAP and Exchange ActiveSync (EAS) Inbox import are supported via the
 connectors application; POP3 and JMAP remain out of scope. Production
 authentication and scanning engines
 plug into the Milestone 4 adapter boundaries. The optional edge is ingress-only
 and never performs outbound MX delivery.
 
-Manifold never performs direct outbound Internet SMTP delivery. Milestone 3
-submits locally composed mail through the configured managed-provider HTTPS
-adapter. The Milestone 6 Gmail and Microsoft adapters are read-only and are not
-outbound providers.
+Manifold never performs direct outbound Internet MX delivery. Outbound messages
+use the sending account's frozen Gmail API or authenticated SMTP method. Legacy
+Resend submissions remain supported for messages queued with that provider
+shape. Microsoft Graph remains receive-only.
 
 ## External Mailbox Connectors
 
@@ -78,12 +79,15 @@ for Manifold and does not bypass the durable local acceptance pipeline.
 
 The current implementation includes:
 
-- OAuth authorization-code primitives with one-time, hashed state and PKCE
-  `S256`.
-- AES-256-GCM encryption envelopes for access tokens, refresh tokens, and PKCE
-  verifiers. Encryption binds each secret to its account and purpose.
+- Purpose-scoped OAuth authorization-code primitives with one-time, hashed state
+  and PKCE `S256`; Gmail receive and send grants incrementally share one
+  authorization record.
+- AES-256-GCM encryption envelopes with context-bound associated data. Shared
+  Gmail tokens bind the authorization ID plus access/refresh kind; PKCE verifiers
+  bind the provider plus account ID.
 - Gmail OpenID identity, message-list, history, and `format=RAW` operations
-  using the stable subject identifier and `gmail.readonly` scope.
+  using the stable subject identifier and `gmail.readonly` scope. The shared
+  authorization can also hold `gmail.send` for outbound Gmail API submission.
 - Microsoft Graph profile, folder-delta, message-delta, immutable message ID,
   and `/$value` raw-message operations using `Mail.Read`.
 - Transactional account, credential, cursor, event, and first Oban sync-job
@@ -113,9 +117,10 @@ A provider message that disappears between listing and raw fetch is normalized
 into an idempotent remote tombstone. The local raw object and accepted delivery
 remain immutable when a provider later deletes its copy.
 
-Each provider account identity is permanently bound to the local mailbox chosen
-at first connection. Reauthorization refreshes that account but cannot silently
-move it to a different mailbox.
+Each provider account identity is permanently bound to the local Manifold account
+chosen at first connection. Reauthorization refreshes that account but cannot
+silently move it to a different account. Gmail additionally requires the exact
+connected canonical address to match the Manifold account address.
 
 ### Provider Configuration
 
@@ -187,12 +192,54 @@ Development and test configuration use non-production encryption keys;
 development has no provider client credentials and test uses inert endpoints.
 Set the provider client environment variables before
 `devenv processes start` to exercise a real provider in `MIX_ENV=dev`.
-The requested read-only scopes are:
+The configured Gmail OAuth consent screen must include the receive and send
+scopes used by the application:
 
 ```text
 Gmail:     openid email https://www.googleapis.com/auth/gmail.readonly
+Gmail send:             https://www.googleapis.com/auth/gmail.send
 Microsoft: openid profile offline_access User.Read Mail.Read
 ```
+
+Enable the Gmail API in the Google Cloud project before connecting an account.
+Register the exact callback `https://<your-manifold-host>/connectors/gmail/callback`,
+configure both Gmail scopes on the OAuth consent screen, and add development
+accounts as test users while the app remains in testing mode. Keep
+`MANIFOLD_CONNECTOR_ENCRYPTION_KEY` stable across deploys; rotating or losing it
+without a credential migration makes stored OAuth credentials unreadable. Before
+public use, complete Google's consent-screen publication and verification
+requirements for the requested scopes. Never commit client credentials or use a
+callback for a host other than the deployed Manifold endpoint.
+
+## Account Send Methods
+
+Each Manifold account can have one enabled send method. Gmail uses the Gmail API
+with `gmail.send`; SMTP uses the configured relay host, TLS mode, username, and
+encrypted password. A queued message permanently snapshots its method and sender
+address, so later settings changes do not reroute it. Gmail and SMTP render
+text-only RFC messages and preserve reply headers.
+
+If a provider response or process interruption makes acceptance ambiguous,
+Manifold marks the message `submission_uncertain` and does not resend it
+automatically. Reconcile the provider's Sent folder or SMTP relay state before
+taking any manual action. Existing Resend submissions and webhooks remain
+supported for legacy queued rows; new account-selected routing does not rewrite
+them.
+
+### Non-rolling Gmail authorization cutover
+
+The shared Gmail authorization migrations require a non-rolling deployment.
+Before migrating, drain and stop every old Phoenix instance, connector worker,
+and Oban worker. Run migrations only after no old process can create or refresh
+connector state, then start the new release.
+
+Rollback is intentionally guarded. Migration
+`20260811000500_add_shared_gmail_authorizations.exs` first proves it can restore
+legacy Gmail credentials losslessly and refuses unsafe rollback. Migration
+`20260811000600_add_oauth_authorization_events.exs` requires each authorization
+event to have exactly one legacy receive anchor. Migration
+`20260811000700_enforce_provider_submission_methods.exs` refuses rollback while
+Gmail or SMTP provider submissions exist. Do not bypass these preflights.
 
 ## Development
 
@@ -245,17 +292,18 @@ Open Phoenix at `http://localhost:4290`; the API listens at
 The root page is the mailbox inbox; transport lifecycle details remain under
 `/deliveries`.
 
-To enable outbound delivery through Resend, set `RESEND_API_KEY` and configure
-the Resend webhook endpoint as:
+Resend configuration is retained only for legacy rows already queued with
+`provider = 'resend'` and their webhook lifecycle. If such rows exist, set
+`RESEND_API_KEY` and configure the Resend webhook endpoint as:
 
 ```text
 https://<your-manifold-host>/webhooks/providers/resend
 ```
 
 Set `RESEND_WEBHOOK_SECRET` to the endpoint signing secret. An optional
-`RESEND_API_BASE_URL` is supported for controlled testing. Without an API key,
-drafts remain usable but queued submissions fail with a classified
-`provider_not_configured` state instead of making a network request.
+`RESEND_API_BASE_URL` is supported for controlled testing. New drafts never
+select Resend: each account must have an enabled Gmail or SMTP send method before
+it can queue mail.
 
 SMTP abuse limits can be tuned with
 `MANIFOLD_SMTP_MAX_CONNECTIONS_PER_PEER`,

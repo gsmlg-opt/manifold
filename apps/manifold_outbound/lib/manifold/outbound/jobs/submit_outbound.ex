@@ -37,6 +37,9 @@ defmodule Manifold.Outbound.Jobs.SubmitOutbound do
       {:error, %Error{class: :temporary, reason: reason}} ->
         {:error, Atom.to_string(reason)}
 
+      {:error, %Error{class: :permanent, reason: :submission_uncertain}} ->
+        :ok
+
       {:error, %Error{class: :permanent, reason: reason}} ->
         {:cancel, Atom.to_string(reason)}
     end

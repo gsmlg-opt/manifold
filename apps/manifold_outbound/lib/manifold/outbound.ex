@@ -7,11 +7,14 @@ defmodule Manifold.Outbound do
 
   alias Ecto.Multi
   alias Manifold.Accounts
+  alias Manifold.Connectors
   alias Manifold.Core.{Address, Error}
   alias Manifold.Mail
   alias Manifold.Outbound.Composition
   alias Manifold.Outbound.Jobs.SubmitOutbound
+  alias Manifold.Outbound.Provider.Envelope
   alias Manifold.Outbound.ProviderEvents
+  alias Manifold.Outbound.RfcMessage
   alias Manifold.Outbound.Submission
 
   alias Manifold.Outbound.Schema.{
@@ -28,6 +31,8 @@ defmodule Manifold.Outbound do
 
   @recipient_kinds ~w(to cc bcc)
   @max_recipients 50
+  @telemetry_forbidden_fragments ~w(token password authorization_code raw_message)
+  @telemetry_code_pattern ~r/\A[a-z0-9_.:-]{1,128}\z/
 
   @spec create_draft(Ecto.UUID.t(), map()) ::
           {:ok, OutboundMessage.t()} | {:error, Error.t() | Ecto.Changeset.t()}
@@ -253,6 +258,7 @@ defmodule Manifold.Outbound do
   @spec queue_draft(Ecto.UUID.t(), Ecto.UUID.t(), Keyword.t()) ::
           {:ok, OutboundMessage.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def queue_draft(mailbox_id, draft_id, opts \\ []) do
+    start = System.monotonic_time()
     now = DateTime.utc_now()
 
     multi =
@@ -275,10 +281,47 @@ defmodule Manifold.Outbound do
             {:ok, {draft, false}}
 
           %OutboundMessage{} = draft ->
-            with :ok <- expected_revision(draft, opts),
-                 :ok <- validate_queueable(draft) do
+            with :ok <- expected_revision(draft, opts) do
               {:ok, {draft, true}}
             end
+        end
+      end)
+      |> Multi.run(:recipients, fn repo, %{draft: {draft, queue?}} ->
+        if queue? do
+          recipients =
+            OutboundRecipient
+            |> where([recipient], recipient.outbound_message_id == ^draft.id)
+            |> order_by([recipient], asc: recipient.kind, asc: recipient.position)
+            |> lock("FOR UPDATE")
+            |> repo.all()
+
+          with :ok <- validate_queueable(draft, recipients) do
+            {:ok, recipients}
+          end
+        else
+          {:ok, []}
+        end
+      end)
+      |> Multi.run(:send_method, fn _repo, %{draft: {draft, queue?}} ->
+        if queue? do
+          with {:ok, method} <- Connectors.enabled_send_method(draft.mailbox_id),
+               :ok <- validate_sender(draft, method) do
+            {:ok, method}
+          end
+        else
+          {:ok, nil}
+        end
+      end)
+      |> Multi.run(:rendered, fn _repo,
+                                 %{
+                                   draft: {draft, queue?},
+                                   recipients: recipients,
+                                   send_method: method
+                                 } ->
+        if queue? do
+          render_submission(draft, recipients, method, now)
+        else
+          {:ok, nil}
         end
       end)
       |> Multi.run(:queued, fn repo, %{draft: {draft, queue?}} ->
@@ -290,10 +333,15 @@ defmodule Manifold.Outbound do
           {:ok, draft}
         end
       end)
-      |> Multi.run(:submission, fn repo, %{draft: {_draft, queue?}, queued: queued} ->
+      |> Multi.run(:submission, fn repo,
+                                   %{
+                                     draft: {_draft, queue?},
+                                     queued: queued,
+                                     rendered: rendered
+                                   } ->
         if queue? do
-          queued
-          |> submission_changeset(now)
+          rendered
+          |> submission_changeset(queued)
           |> repo.insert()
         else
           {:ok, repo.get_by(ProviderSubmission, outbound_message_id: queued.id)}
@@ -326,8 +374,15 @@ defmodule Manifold.Outbound do
       end)
 
     case Repo.transaction(multi) do
-      {:ok, %{queued: queued}} -> {:ok, queued}
-      {:error, _step, reason, _changes} -> {:error, reason}
+      {:ok, %{queued: queued}} ->
+        {:ok, queued}
+
+      {:error, :send_method, reason, %{draft: {%OutboundMessage{} = draft, true}}} ->
+        emit_send_method_selection_failure(draft, reason, start)
+        {:error, reason}
+
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
     end
   rescue
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
@@ -640,37 +695,132 @@ defmodule Manifold.Outbound do
     |> normalize_stale()
   end
 
-  defp submission_changeset(message, now) do
-    recipients = list_recipients(message.id)
-
-    payload = %{
-      sender: message.sender_address,
-      subject: message.subject,
-      text_body: message.text_body,
-      recipients:
-        Enum.map(recipients, fn recipient ->
-          {recipient.kind, recipient.position, recipient.canonical_address}
-        end),
-      in_reply_to: message.in_reply_to,
-      references: message.references
-    }
-
-    request_sha256 =
-      payload
-      |> :erlang.term_to_binary([:deterministic])
-      |> then(&:crypto.hash(:sha256, &1))
-      |> Base.encode16(case: :lower)
-
+  defp submission_changeset(rendered, message) do
     %ProviderSubmission{}
     |> ProviderSubmission.changeset(%{
       outbound_message_id: message.id,
-      provider: "resend",
-      idempotency_key: Ecto.UUID.generate(),
-      request_sha256: request_sha256,
+      send_method_id: rendered.send_method_id,
+      provider: rendered.provider,
+      idempotency_key: rendered.idempotency_key,
+      request_sha256: rendered.request_sha256,
+      provider_rfc_message_id: rendered.provider_rfc_message_id,
       state: "pending",
       attempt_count: 0,
-      idempotency_expires_at: DateTime.add(now, 24, :hour)
+      idempotency_expires_at: nil
     })
+  end
+
+  defp render_submission(message, recipients, method, now) do
+    provider_rfc_message_id = "<#{message.id}@manifold.local>"
+    idempotency_key = Ecto.UUID.generate()
+
+    envelope = %Envelope{
+      from: mailbox(message.sender_name, message.sender_address),
+      to: recipient_mailboxes(recipients, "to"),
+      cc: recipient_mailboxes(recipients, "cc"),
+      bcc: recipient_mailboxes(recipients, "bcc"),
+      subject: message.subject,
+      text: message.text_body || "",
+      message_id: provider_rfc_message_id,
+      queued_at: now,
+      in_reply_to: message.in_reply_to,
+      references: message.references,
+      idempotency_key: idempotency_key
+    }
+
+    with {:ok, provider} <- provider(method.kind),
+         {:ok, raw_message} <-
+           RfcMessage.render(envelope,
+             provider: provider,
+             message_id: provider_rfc_message_id,
+             date: now
+           ) do
+      {:ok,
+       %{
+         send_method_id: method.id,
+         provider: method.kind,
+         provider_rfc_message_id: provider_rfc_message_id,
+         idempotency_key: idempotency_key,
+         request_sha256: sha256(raw_message)
+       }}
+    end
+  end
+
+  defp provider("gmail"), do: {:ok, :gmail}
+  defp provider("smtp"), do: {:ok, :smtp}
+
+  defp provider(_kind),
+    do: {:error, error(:permanent, :send_method_required, "an enabled send method is required")}
+
+  defp emit_send_method_selection_failure(draft, reason, start) do
+    :telemetry.execute(
+      [:manifold, :outbound, :send_method, :select, :stop],
+      %{
+        duration_ms:
+          System.convert_time_unit(System.monotonic_time() - start, :native, :millisecond),
+        attempt_count: 1
+      },
+      %{
+        account_id: draft.mailbox_id,
+        outbound_message_id: draft.id,
+        outcome: :error,
+        error_code: telemetry_error_code(reason)
+      }
+    )
+  end
+
+  defp telemetry_error_code(%Error{reason: reason}), do: telemetry_error_code(reason)
+  defp telemetry_error_code(%Ecto.Changeset{}), do: :send_method_selection_failed
+
+  defp telemetry_error_code(code) when is_atom(code) do
+    if safe_telemetry_code?(Atom.to_string(code)), do: code, else: :send_method_selection_failed
+  end
+
+  defp telemetry_error_code(code) when is_binary(code) do
+    if safe_telemetry_code?(code), do: code, else: "send_method_selection_failed"
+  end
+
+  defp telemetry_error_code(_reason), do: :send_method_selection_failed
+
+  defp safe_telemetry_code?(code) do
+    downcased = String.downcase(code)
+
+    Regex.match?(@telemetry_code_pattern, downcased) and
+      not Enum.any?(@telemetry_forbidden_fragments, &String.contains?(downcased, &1))
+  end
+
+  defp validate_sender(draft, method) do
+    with true <- method.account_id == draft.mailbox_id,
+         {:ok, draft_address} <- Address.parse(draft.sender_address),
+         {:ok, method_address} <- Address.parse(method.email_address),
+         true <- draft_address.canonical == draft.canonical_sender_address,
+         true <- method_address.canonical == draft.canonical_sender_address do
+      :ok
+    else
+      _mismatch ->
+        {:error,
+         error(
+           :permanent,
+           :sender_address_mismatch,
+           "send method sender does not match draft sender"
+         )}
+    end
+  end
+
+  defp recipient_mailboxes(recipients, kind) do
+    recipients
+    |> Enum.filter(&(&1.kind == kind))
+    |> Enum.map(&mailbox(&1.display_name, &1.address))
+  end
+
+  defp mailbox(nil, address), do: address
+  defp mailbox("", address), do: address
+  defp mailbox(display_name, address), do: "#{display_name} <#{address}>"
+
+  defp sha256(bytes) do
+    bytes
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   defp insert_event!(message_id, event_type, now) do
@@ -700,9 +850,7 @@ defmodule Manifold.Outbound do
     end
   end
 
-  defp validate_queueable(draft) do
-    recipients = list_recipients(draft.id)
-
+  defp validate_queueable(draft, recipients) do
     cond do
       recipients == [] ->
         {:error, error(:permanent, :missing_recipient, "at least one recipient is required")}

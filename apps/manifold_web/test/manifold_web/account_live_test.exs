@@ -8,6 +8,9 @@ defmodule ManifoldWeb.AccountLiveTest do
   alias Manifold.AccountLifecycle.Schema.AccountPurge
   alias Manifold.Accounts
   alias Manifold.Connectors
+  alias Manifold.Connectors.Crypto
+  alias Manifold.Connectors.GmailScopes
+  alias Manifold.Connectors.Schema.{OAuthAuthorization, ReceiveMethod, SendMethod}
   alias Manifold.Repo
 
   setup do
@@ -96,6 +99,11 @@ defmodule ManifoldWeb.AccountLiveTest do
       |> render_click()
       |> follow_redirect(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
 
+    assert html =~ "Choose send method"
+    assert html =~ "Gmail"
+    assert html =~ "SMTP"
+
+    html = new_view |> element("#send-method-smtp") |> render_click()
     assert html =~ "SMTP settings"
 
     html =
@@ -122,6 +130,145 @@ defmodule ManifoldWeb.AccountLiveTest do
     [method] = Connectors.list_send_methods_for_account(account.id)
     assert method.kind == "smtp"
     assert method.enabled
+  end
+
+  test "add send keeps unconfigured Gmail visible but disabled", %{conn: conn} do
+    previous_providers = Application.get_env(:manifold_connectors, :providers)
+    Application.put_env(:manifold_connectors, :providers, [])
+
+    on_exit(fn -> restore_smtp_env(:providers, previous_providers) end)
+
+    {:ok, account} =
+      Accounts.create_account(%{name: "No OAuth", address: "no-oauth@example.test"})
+
+    {:ok, view, html} = live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
+
+    assert html =~ "Choose send method"
+    assert has_element?(view, "#send-method-gmail[disabled]")
+    assert has_element?(view, "#send-method-gmail", "Provider not configured")
+    assert has_element?(view, "#send-method-smtp")
+  end
+
+  test "Gmail reconnect follows the method that actually requires reconnect", %{conn: conn} do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Send reconnect", address: "send-reconnect@gmail.test"})
+
+    authorization =
+      %OAuthAuthorization{}
+      |> OAuthAuthorization.changeset(%{
+        account_id: account.id,
+        provider: "gmail",
+        provider_subject_id: "send-reconnect-subject",
+        email_address: "send-reconnect@gmail.test",
+        granted_scopes: [GmailScopes.read(), GmailScopes.send()],
+        status: "reconnect_required",
+        key_version: 1
+      })
+      |> Repo.insert!()
+
+    receive_method =
+      %ReceiveMethod{}
+      |> ReceiveMethod.changeset(%{
+        account_id: account.id,
+        oauth_authorization_id: authorization.id,
+        kind: "gmail",
+        provider_account_id: "send-reconnect-subject",
+        email_address: "send-reconnect@gmail.test",
+        status: "disconnected",
+        enabled: false,
+        sync_enabled: false,
+        granted_scopes: [GmailScopes.read()]
+      })
+      |> Repo.insert!()
+
+    %SendMethod{}
+    |> SendMethod.changeset(%{
+      account_id: account.id,
+      oauth_authorization_id: authorization.id,
+      kind: "gmail",
+      email_address: "send-reconnect@gmail.test",
+      status: "reconnect_required",
+      enabled: false
+    })
+    |> Repo.insert!()
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts/#{account.id}")
+
+    assert has_element?(
+             view,
+             ~s|#reconnect-gmail[href*="account_id=#{account.id}&purpose=send"]|
+           )
+
+    refute has_element?(view, ~s|#reconnect-gmail[href*="purpose=receive"]|)
+    assert Repo.get!(ReceiveMethod, receive_method.id).status == "disconnected"
+  end
+
+  test "account show cannot enable or disconnect another account's send method", %{conn: conn} do
+    {:ok, viewed_account} =
+      Accounts.create_account(%{name: "Viewed", address: "viewed@example.test"})
+
+    {:ok, foreign_account} =
+      Accounts.create_account(%{name: "Foreign", address: "foreign@example.test"})
+
+    foreign_smtp =
+      %SendMethod{}
+      |> SendMethod.changeset(%{
+        account_id: foreign_account.id,
+        kind: "smtp",
+        email_address: "foreign@example.test",
+        status: "connected",
+        enabled: false
+      })
+      |> Repo.insert!()
+
+    authorization_id = Ecto.UUID.generate()
+
+    {:ok, access_ciphertext} =
+      Crypto.encrypt("foreign-access-token", "credential:#{authorization_id}:access")
+
+    {:ok, refresh_ciphertext} =
+      Crypto.encrypt("foreign-refresh-token", "credential:#{authorization_id}:refresh")
+
+    authorization =
+      %OAuthAuthorization{id: authorization_id}
+      |> OAuthAuthorization.changeset(%{
+        account_id: foreign_account.id,
+        provider: "gmail",
+        provider_subject_id: "foreign-subject",
+        email_address: "foreign@example.test",
+        granted_scopes: [GmailScopes.send()],
+        status: "connected",
+        key_version: 1,
+        access_token_ciphertext: access_ciphertext,
+        refresh_token_ciphertext: refresh_ciphertext,
+        token_expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second)
+      })
+      |> Repo.insert!()
+
+    foreign_gmail =
+      %SendMethod{}
+      |> SendMethod.changeset(%{
+        account_id: foreign_account.id,
+        oauth_authorization_id: authorization.id,
+        kind: "gmail",
+        email_address: "foreign@example.test",
+        status: "connected",
+        enabled: true
+      })
+      |> Repo.insert!()
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts/#{viewed_account.id}")
+
+    render_click(view, "enable-send", %{"id" => foreign_smtp.id})
+    refute Repo.get!(SendMethod, foreign_smtp.id).enabled
+
+    render_click(view, "disconnect-send", %{"id" => foreign_gmail.id})
+
+    assert Repo.get!(SendMethod, foreign_gmail.id).status == "connected"
+    persisted_authorization = Repo.get!(OAuthAuthorization, authorization.id)
+    assert persisted_authorization.status == "connected"
+    assert persisted_authorization.access_token_ciphertext == access_ciphertext
+    assert persisted_authorization.refresh_token_ciphertext == refresh_ciphertext
   end
 
   test "accounts index shows created account", %{conn: conn} do

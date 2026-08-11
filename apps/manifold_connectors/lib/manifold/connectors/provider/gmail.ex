@@ -191,7 +191,7 @@ defmodule Manifold.Connectors.Provider.Gmail do
            opts
            |> Keyword.get(:now, DateTime.utc_now())
            |> DateTime.add(expires_in, :second),
-         scopes: token_scopes(response.body["scope"], config)
+         scopes: token_scopes(response.body["scope"], config, opts)
        }}
     end
   end
@@ -515,12 +515,12 @@ defmodule Manifold.Connectors.Provider.Gmail do
   defp optional_string(value) when is_binary(value) and value != "", do: value
   defp optional_string(_value), do: nil
 
-  defp token_scopes(scope, _config) when is_binary(scope) do
+  defp token_scopes(scope, _config, _opts) when is_binary(scope) do
     String.split(scope, ~r/\s+/, trim: true)
   end
 
-  defp token_scopes(_scope, config) do
-    Keyword.get(config, :scopes, [@readonly_scope])
+  defp token_scopes(_scope, config, opts) do
+    Keyword.get(opts, :required_scopes, Keyword.get(config, :scopes, [@readonly_scope]))
   end
 
   defp validate_oauth_config(config) do

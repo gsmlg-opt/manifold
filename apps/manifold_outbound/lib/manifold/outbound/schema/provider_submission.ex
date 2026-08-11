@@ -6,6 +6,7 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
 
   schema "provider_submissions" do
     field(:outbound_message_id, :binary_id)
+    field(:send_method_id, :binary_id)
     field(:provider, :string)
     field(:idempotency_key, :string)
     field(:request_sha256, :string)
@@ -30,6 +31,7 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
     submission
     |> cast(attrs, [
       :outbound_message_id,
+      :send_method_id,
       :provider,
       :idempotency_key,
       :request_sha256,
@@ -52,17 +54,47 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
       :idempotency_key,
       :request_sha256,
       :state,
-      :attempt_count,
-      :idempotency_expires_at
+      :attempt_count
     ])
+    |> validate_inclusion(:provider, ~w(resend gmail smtp))
+    |> validate_provider_shape()
     |> validate_inclusion(:state, ~w(pending submitting accepted failed uncertain))
     |> validate_number(:attempt_count, greater_than_or_equal_to: 0)
     |> validate_format(:request_sha256, ~r/\A[0-9a-f]{64}\z/)
     |> foreign_key_constraint(:outbound_message_id)
+    |> foreign_key_constraint(:send_method_id)
+    |> foreign_key_constraint(:send_method_id,
+      name: :provider_submissions_send_method_provider_fkey
+    )
     |> unique_constraint(:outbound_message_id)
     |> unique_constraint([:provider, :idempotency_key])
     |> unique_constraint([:provider, :provider_message_id])
     |> check_constraint(:attempt_count, name: :provider_submissions_attempt_nonnegative)
     |> check_constraint(:state, name: :provider_submissions_state_valid)
+    |> check_constraint(:provider, name: :provider_submissions_provider_valid)
+    |> check_constraint(:provider, name: :provider_submissions_method_shape_valid)
+  end
+
+  defp validate_provider_shape(changeset) do
+    case get_field(changeset, :provider) do
+      "resend" ->
+        changeset
+        |> validate_required([:idempotency_expires_at])
+        |> require_nil(:send_method_id)
+
+      provider when provider in ["gmail", "smtp"] ->
+        changeset
+        |> validate_required([:send_method_id])
+        |> require_nil(:idempotency_expires_at)
+
+      _provider ->
+        changeset
+    end
+  end
+
+  defp require_nil(changeset, field) do
+    if is_nil(get_field(changeset, field)),
+      do: changeset,
+      else: add_error(changeset, field, "must be blank")
   end
 end

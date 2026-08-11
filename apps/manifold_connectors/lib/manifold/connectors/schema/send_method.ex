@@ -5,10 +5,11 @@ defmodule Manifold.Connectors.Schema.SendMethod do
   import Ecto.Changeset
 
   @statuses ~w(connected failed disconnected reconnect_required)
-  @kinds ~w(smtp)
+  @kinds ~w(smtp gmail)
 
   schema "connector_send_methods" do
     field(:account_id, :binary_id, source: :mailbox_id)
+    field(:oauth_authorization_id, :binary_id)
     field(:kind, :string)
     field(:email_address, :string)
     field(:status, :string, default: "connected")
@@ -31,6 +32,7 @@ defmodule Manifold.Connectors.Schema.SendMethod do
     send_method
     |> cast(attrs, [
       :account_id,
+      :oauth_authorization_id,
       :kind,
       :email_address,
       :status,
@@ -46,6 +48,7 @@ defmodule Manifold.Connectors.Schema.SendMethod do
     |> validate_inclusion(:status, @statuses)
     |> validate_length(:email_address, min: 3, max: 998)
     |> validate_length(:last_error_message, max: 1_000)
+    |> foreign_key_constraint(:oauth_authorization_id)
     |> optimistic_lock(:lock_version)
   end
 end
