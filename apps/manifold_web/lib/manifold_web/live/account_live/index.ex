@@ -18,7 +18,8 @@ defmodule ManifoldWeb.AccountLive.Index do
         delete_account: nil,
         delete_confirmation: "",
         delete_error: nil,
-        refresh_timer: nil
+        refresh_timer: nil,
+        refresh_token: nil
       )
       |> reload_accounts()
 
@@ -124,7 +125,11 @@ defmodule ManifoldWeb.AccountLive.Index do
   end
 
   @impl Phoenix.LiveView
-  def handle_info(:refresh_accounts, socket) do
+  def handle_info(
+        {:refresh_accounts, token},
+        %{assigns: %{refresh_timer: timer, refresh_token: token}} = socket
+      )
+      when is_reference(timer) and is_reference(token) do
     socket =
       socket
       |> clear_refresh_timer()
@@ -132,6 +137,8 @@ defmodule ManifoldWeb.AccountLive.Index do
 
     {:noreply, socket}
   end
+
+  def handle_info({:refresh_accounts, _stale_token}, socket), do: {:noreply, socket}
 
   @impl Phoenix.LiveView
   def render(assigns) do
@@ -376,19 +383,19 @@ defmodule ManifoldWeb.AccountLive.Index do
   defp reconcile_refresh_timer(socket) do
     should_poll? = connected?(socket) && Enum.any?(socket.assigns.accounts, &deleting?/1)
     timer? = is_reference(socket.assigns.refresh_timer)
+    token? = is_reference(socket.assigns.refresh_token)
+    polling? = timer? and token?
 
     cond do
-      should_poll? and timer? ->
+      should_poll? and polling? ->
         socket
 
       should_poll? ->
-        assign(
-          socket,
-          :refresh_timer,
-          Process.send_after(self(), :refresh_accounts, @refresh_interval)
-        )
+        socket
+        |> clear_refresh_timer()
+        |> schedule_refresh()
 
-      timer? ->
+      timer? or token? ->
         clear_refresh_timer(socket)
 
       true ->
@@ -401,7 +408,14 @@ defmodule ManifoldWeb.AccountLive.Index do
       Process.cancel_timer(socket.assigns.refresh_timer)
     end
 
-    assign(socket, :refresh_timer, nil)
+    assign(socket, refresh_timer: nil, refresh_token: nil)
+  end
+
+  defp schedule_refresh(socket) do
+    token = make_ref()
+    timer = Process.send_after(self(), {:refresh_accounts, token}, @refresh_interval)
+
+    assign(socket, refresh_timer: timer, refresh_token: token)
   end
 
   defp close_delete_dialog(socket) do

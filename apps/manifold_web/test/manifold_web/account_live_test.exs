@@ -201,6 +201,7 @@ defmodule ManifoldWeb.AccountLiveTest do
            )
 
     assert is_nil(socket_assign(view, :refresh_timer))
+    assert is_nil(socket_assign(view, :refresh_token))
   end
 
   test "delete requires the exact fresh address and queues local-only deletion", %{conn: conn} do
@@ -266,6 +267,7 @@ defmodule ManifoldWeb.AccountLiveTest do
     assert render(view) =~ "Account deletion queued."
     assert [%Oban.Job{}] = purge_jobs(purge.id)
     assert is_reference(socket_assign(view, :refresh_timer))
+    assert is_reference(socket_assign(view, :refresh_token))
   end
 
   test "stale retry reloads requested state and starts polling", %{conn: conn} do
@@ -284,6 +286,7 @@ defmodule ManifoldWeb.AccountLiveTest do
     {:ok, view, _html} = live(conn, ~p"/settings/accounts")
     assert has_element?(view, "#retry-delete-account-#{account.id}")
     assert is_nil(socket_assign(view, :refresh_timer))
+    assert is_nil(socket_assign(view, :refresh_token))
 
     assert {:ok, _requested} = Manifold.AccountLifecycle.retry_deletion(purge.id)
 
@@ -293,6 +296,7 @@ defmodule ManifoldWeb.AccountLiveTest do
 
     assert has_element?(view, "#account-#{account.id} [aria-live='polite']", "Deleting...")
     assert is_reference(socket_assign(view, :refresh_timer))
+    assert is_reference(socket_assign(view, :refresh_token))
   end
 
   test "event reload cancels polling when no account is deleting", %{conn: conn} do
@@ -310,7 +314,9 @@ defmodule ManifoldWeb.AccountLiveTest do
 
     {:ok, view, _html} = live(conn, ~p"/settings/accounts")
     timer = socket_assign(view, :refresh_timer)
+    token = socket_assign(view, :refresh_token)
     assert is_reference(timer)
+    assert is_reference(token)
 
     discard_purge_jobs(purge.id)
 
@@ -324,8 +330,18 @@ defmodule ManifoldWeb.AccountLiveTest do
 
     assert has_element?(view, "#account-#{deleting_account.id}", "Delete failed")
     assert is_nil(socket_assign(view, :refresh_timer))
+    assert is_nil(socket_assign(view, :refresh_token))
     assert Process.read_timer(timer) == false
-    refute :refresh_accounts in process_messages(view.pid)
+
+    purge
+    |> AccountPurge.changeset(%{status: "requested"})
+    |> Repo.update!()
+
+    send(view.pid, {:refresh_accounts, token})
+
+    assert has_element?(view, "#account-#{deleting_account.id}", "Delete failed")
+    assert is_nil(socket_assign(view, :refresh_timer))
+    assert is_nil(socket_assign(view, :refresh_token))
   end
 
   test "failed deletion exposes an accessible retry action without polling", %{conn: conn} do
@@ -359,6 +375,7 @@ defmodule ManifoldWeb.AccountLiveTest do
     )
 
     assert is_nil(socket_assign(view, :refresh_timer))
+    assert is_nil(socket_assign(view, :refresh_token))
 
     view
     |> element("#retry-delete-account-#{account.id}")
@@ -367,20 +384,27 @@ defmodule ManifoldWeb.AccountLiveTest do
     assert has_element?(view, "#account-#{account.id} [aria-live='polite']", "Deleting...")
     refute has_element?(view, "#retry-delete-account-#{account.id}")
     assert is_reference(socket_assign(view, :refresh_timer))
+    assert is_reference(socket_assign(view, :refresh_token))
   end
 
   test "refresh removes an account row after purge completion deletes the mailbox", %{conn: conn} do
     {:ok, account} =
       Accounts.create_account(%{name: "Gone account", address: "gone@example.test"})
 
+    assert {:ok, _purge} =
+             Manifold.AccountLifecycle.request_deletion(account.id, "gone@example.test")
+
     {:ok, view, _html} = live(conn, ~p"/settings/accounts")
     assert has_element?(view, "#account-#{account.id}")
+    token = socket_assign(view, :refresh_token)
+    assert is_reference(token)
 
     Repo.delete!(Accounts.get_account!(account.id))
-    send(view.pid, :refresh_accounts)
+    send(view.pid, {:refresh_accounts, token})
 
     refute has_element?(view, "#account-#{account.id}")
     assert is_nil(socket_assign(view, :refresh_timer))
+    assert is_nil(socket_assign(view, :refresh_token))
   end
 
   test "accounts index and show render settings nav with Accounts current", %{conn: conn} do
@@ -442,12 +466,6 @@ defmodule ManifoldWeb.AccountLiveTest do
     |> Map.fetch!(:socket)
     |> Map.fetch!(:assigns)
     |> Map.fetch!(key)
-  end
-
-  defp process_messages(pid) do
-    pid
-    |> Process.info(:messages)
-    |> elem(1)
   end
 
   defp purge_jobs_for_mailbox(mailbox_id) do
