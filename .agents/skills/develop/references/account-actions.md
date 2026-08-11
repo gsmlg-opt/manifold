@@ -66,12 +66,14 @@ The persisted stage order is:
 `discover` -> `drain` -> `connectors` -> `outbound` -> `mailbox_copy` ->
 `orphan_payloads` -> `objects` -> `finalize` -> `completed`.
 
-Each worker execution handles no more than 250 database work items and persists
-its cursor/work before snoozing. Attachment discovery uses pages of 248 keys so
-each page remains within the 250-item bound. Finalize repeats discovery and job
-drain, verifies every owning context and pending work table, and routes any
-remaining foreign-key ownership back to its cleanup stage instead of forcing
-deletion.
+Each stage execution selects no more than 250 primary candidates or work rows
+and persists its cursor/work before snoozing. Limit lookahead, dependent rows,
+reference and metadata queries, cascading rows, and outbox rows are additional
+database operations rather than primary batch candidates. `orphan_payloads`
+processes one delivery candidate per execution and pages at most 248 attachment
+keys at a time. Finalize repeats discovery and job drain, verifies every owning
+context and pending work table, and routes any remaining foreign-key ownership
+back to its cleanup stage instead of forcing deletion.
 
 ## Mailbox-copy and shared-delivery rule
 
@@ -120,30 +122,64 @@ purge to the durable failed state; no failure path reactivates the mailbox.
 
 ## Operations and recovery
 
-Inspect jobs at `/jobs` and filter Queue to `account_purge`. From a release-aware
-shell, list recent purge records without loading account or message content:
+Inspect jobs at `/jobs` and filter Queue to `account_purge`. Production commands
+must target the already-running main `manifold` release with `bin/manifold rpc`;
+do not use `mix run`, which would boot another application and Oban instance.
+Run these commands from the extracted release directory on a release node.
+
+List recent purge records without loading account or message content:
 
 ```bash
-devenv shell -- mix run -e 'import Ecto.Query; alias Manifold.AccountLifecycle.Schema.AccountPurge; AccountPurge |> order_by([p], desc: p.inserted_at) |> limit(20) |> select([p], map(p, [:id, :mailbox_id, :status, :stage, :error_class, :error_code, :discovered_deliveries, :purged_deliveries, :shared_retained_deliveries, :deleted_objects, :updated_at])) |> Manifold.Repo.all() |> IO.inspect(pretty: true)'
+bin/manifold rpc 'import Ecto.Query; alias Manifold.AccountLifecycle.Schema.AccountPurge; AccountPurge |> order_by([p], desc: p.inserted_at) |> limit(20) |> select([p], map(p, [:id, :mailbox_id, :status, :stage, :error_class, :error_code, :discovered_deliveries, :purged_deliveries, :shared_retained_deliveries, :deleted_objects, :updated_at])) |> Manifold.Repo.all() |> IO.inspect(pretty: true)'
 ```
 
 Inspect the dedicated queue from the same environment:
 
 ```bash
-devenv shell -- mix run -e 'Manifold.Data.ObanJobs.list_jobs(%{queue: "account_purge", limit: 50}) |> Enum.map(&Map.take(&1, [:id, :state, :queue, :args, :attempt, :max_attempts, :scheduled_at])) |> IO.inspect(pretty: true)'
+bin/manifold rpc 'Manifold.Data.ObanJobs.list_jobs(%{queue: "account_purge", limit: 50}) |> Enum.map(&Map.take(&1, [:id, :state, :queue, :args, :attempt, :max_attempts, :scheduled_at])) |> IO.inspect(pretty: true)'
 ```
 
-Retry only a purge whose durable status is `failed` (the UI retry button calls
-the same API):
+Before retrying a failed purge, locate every matching worker job by the opaque
+purge ID. Replace the example UUID inside each expression; a caller environment
+variable is not visible inside the running release node:
 
 ```bash
-MANIFOLD_PURGE_ID=00000000-0000-0000-0000-000000000000 devenv shell -- mix run -e 'IO.inspect(Manifold.AccountLifecycle.retry_deletion(System.fetch_env!("MANIFOLD_PURGE_ID")))'
+bin/manifold rpc 'import Ecto.Query; purge_id = "00000000-0000-0000-0000-000000000000"; Oban.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}) |> order_by([job], desc: job.id) |> Oban.all_jobs() |> Enum.map(&Map.take(&1, [:id, :state, :attempt, :max_attempts, :scheduled_at])) |> IO.inspect(pretty: true)'
+```
+
+If the exact prior job is `executing`, wait for it to reach a terminal state;
+do not cancel it merely to make uniqueness pass. For one exact `suspended` job,
+choose one recovery path. Either cancel that exact job safely:
+
+```bash
+bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; jobs = Oban.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}, state: :suspended) |> Oban.all_jobs(); case jobs do [%Oban.Job{id: id}] -> :ok = Oban.cancel_job(id); %Oban.Job{state: "cancelled"} = Manifold.Repo.get!(Oban.Job, id); IO.inspect(%{id: id, state: "cancelled"}); [] -> raise "no suspended purge job found"; _ -> raise "multiple suspended purge jobs found" end'
+```
+
+Or make that exact suspended job available and let the worker take it to a
+terminal state:
+
+```bash
+bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; jobs = Oban.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}, state: :suspended) |> Oban.all_jobs(); case jobs do [%Oban.Job{id: id}] -> :ok = Oban.retry_job(id); IO.inspect(%{id: id, action: :made_available}); [] -> raise "no suspended purge job found"; _ -> raise "multiple suspended purge jobs found" end'
+```
+
+After either path, verify that the purge has no job in an incomplete state. If
+the resumed job is still incomplete, wait and rerun this command:
+
+```bash
+bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; jobs = Oban.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}) |> Oban.all_jobs(); incomplete = Enum.filter(jobs, &(&1.state in Oban.Job.unique_states(:incomplete))); case {jobs, incomplete} do {[], _} -> raise "no purge job found"; {_, []} -> jobs |> Enum.map(&Map.take(&1, [:id, :state])) |> IO.inspect(pretty: true); {_, active} -> active |> Enum.map(&Map.take(&1, [:id, :state])) |> then(&raise("purge job is still incomplete: #{inspect(&1)}")) end'
+```
+
+Only then retry a purge whose durable status is `failed` (the UI retry button
+calls the same API):
+
+```bash
+bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; case Manifold.Repo.get(Manifold.AccountLifecycle.Schema.AccountPurge, purge_id) do %{status: "failed"} -> case Manifold.AccountLifecycle.retry_deletion(purge_id) do {:ok, purge} -> IO.inspect(%{purge_id: purge.id, status: purge.status, stage: purge.stage}); {:error, reason} -> raise "purge retry failed: #{inspect(reason)}" end; nil -> raise "purge not found"; purge -> raise "purge is not failed: #{purge.status}" end'
 ```
 
 Retry resumes the existing purge ID, stage, and work state. It does not create a
-second purge or reactivate the mailbox. If the prior job is still executing,
-wait for it to finish and then retry. A suspended prior job requires operator
-action before retry can persist a replacement job.
+second purge or reactivate the mailbox. Never insert a replacement purge job or
+edit purge/job status directly; use only the exact-job Oban operations above
+and `Manifold.AccountLifecycle.retry_deletion/1`.
 
 ## Configuration, scope, and rollback
 
@@ -154,9 +190,36 @@ action before retry can persist a replacement job.
   remote edge deletion is introduced.
 - Remote provider deletion and authorization revocation remain explicitly out
   of scope.
-- Rollback requires stopping the `account_purge` queue before reverting code or
-  schema. Do not reactivate mailboxes with an incomplete purge; inspect and
-  finish or deliberately recover their durable local work first.
+- Before a rollback, broadcast an all-node queue pause. In Oban 2.23.1,
+  `local_only` defaults to `false`, so this signal targets every
+  `account_purge` producer sharing the running release's Oban name and prefix:
+
+  ```bash
+  bin/manifold rpc ':ok = Oban.pause_queue(queue: :account_purge); IO.inspect(:account_purge_pause_broadcast)'
+  ```
+
+  Pausing prevents new execution but does not stop a job that is already
+  executing. Re-run this database-wide check until it reports zero jobs:
+
+  ```bash
+  bin/manifold rpc 'jobs = Oban.Job.query(queue: :account_purge, state: :executing) |> Oban.all_jobs(); case jobs do [] -> IO.inspect(%{executing: 0}); jobs -> jobs |> Enum.map(&Map.take(&1, [:id, :state, :args])) |> then(&raise("account purge jobs are still executing: #{inspect(&1)}")) end'
+  ```
+
+  Schema rollback is prohibited while any purge is `requested` or `running`
+  unless every such purge has a documented recovery disposition. This command
+  fails closed when incomplete purge records exist:
+
+  ```bash
+  bin/manifold rpc 'import Ecto.Query; alias Manifold.AccountLifecycle.Schema.AccountPurge; purges = AccountPurge |> where([purge], purge.status in ["requested", "running"]) |> select([purge], map(purge, [:id, :mailbox_id, :status, :stage, :updated_at])) |> Manifold.Repo.all(); case purges do [] -> IO.inspect(%{incomplete_purges: 0}); purges -> IO.inspect(purges, pretty: true); raise "schema rollback prohibited: incomplete account purges require recovery dispositions" end'
+  ```
+
+  Do not reactivate mailboxes or edit purge state to bypass the check. Finish
+  the purge or follow an explicitly approved local-data recovery disposition.
+  If rollback is aborted, resume the queue on all nodes:
+
+  ```bash
+  bin/manifold rpc ':ok = Oban.resume_queue(queue: :account_purge); IO.inspect(:account_purge_resume_broadcast)'
+  ```
 
 ## Validation
 
