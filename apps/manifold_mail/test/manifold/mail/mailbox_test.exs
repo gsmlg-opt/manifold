@@ -515,6 +515,22 @@ defmodule Manifold.Mail.MailboxTest do
     assert Repo.get!(MailboxEntry, entry.id).folder_id == archive.id
   end
 
+  test "restore returns mail trashed from Sent back to Sent" do
+    mailbox_id = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox_id)
+    sent = Enum.find(folders, &(&1.kind == "sent"))
+
+    %{entries: [entry]} =
+      thread_fixture(mailbox_id, sent.id, "Sent restore", DateTime.utc_now(), 1)
+
+    assert {:ok, 1} = Mail.trash(mailbox_id, [entry.id])
+    assert {:ok, 1} = Mail.restore(mailbox_id, [entry.id])
+
+    restored = Repo.get!(MailboxEntry, entry.id)
+    assert restored.folder_id == sent.id
+    assert restored.previous_folder_id == nil
+  end
+
   defp mailbox_fixture do
     now = DateTime.utc_now()
     domain_id = Ecto.UUID.generate()

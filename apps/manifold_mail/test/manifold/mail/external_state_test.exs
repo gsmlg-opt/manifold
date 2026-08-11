@@ -3,7 +3,7 @@ defmodule Manifold.Mail.ExternalStateTest do
 
   alias Manifold.Mail
   alias Manifold.Mail.Folders
-  alias Manifold.Mail.Schema.{MailboxEntry, Message, Thread}
+  alias Manifold.Mail.Schema.{Folder, MailboxEntry, Message, Thread}
   alias Manifold.Repo
 
   test "returns a temporary classified error while mailbox projection is absent" do
@@ -107,6 +107,21 @@ defmodule Manifold.Mail.ExternalStateTest do
                "SELECT raw_object_key FROM inbound_deliveries WHERE id = $1",
                [dump_uuid(delivery_id)]
              )
+  end
+
+  test "places provider messages in the Sent system folder" do
+    %{delivery_id: delivery_id, mailbox_id: mailbox_id} = projected_fixture()
+
+    assert {:ok, :applied} =
+             Mail.apply_external_state(mailbox_id, delivery_id, %{
+               folder_kind: "sent",
+               read?: true,
+               starred?: false,
+               deleted?: false
+             })
+
+    sent = Repo.get_by!(Folder, mailbox_id: mailbox_id, kind: "sent")
+    assert Repo.get_by!(MailboxEntry, inbound_delivery_id: delivery_id).folder_id == sent.id
   end
 
   defp acceptance_fixture do

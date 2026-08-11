@@ -1334,7 +1334,7 @@ defmodule Manifold.Connectors do
     }
   end
 
-  defp normalize_folder_kind(folder_kind) when folder_kind in ~w(inbox archive trash),
+  defp normalize_folder_kind(folder_kind) when folder_kind in ~w(inbox archive sent trash),
     do: folder_kind
 
   defp normalize_folder_kind(_folder_kind), do: "archive"

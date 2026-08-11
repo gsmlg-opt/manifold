@@ -8,7 +8,7 @@ defmodule Manifold.Mail.ExternalState do
   alias Manifold.Mail.Schema.MailboxEntry
   alias Manifold.Repo
 
-  @folder_kinds ~w(inbox archive trash)
+  @folder_kinds ~w(inbox archive sent trash)
 
   @type normalized_state :: %{
           required(:folder_kind) => String.t() | nil,

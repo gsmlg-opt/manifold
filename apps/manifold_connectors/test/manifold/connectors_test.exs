@@ -11,7 +11,8 @@ defmodule Manifold.ConnectorsTest do
   alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
   alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
   alias Manifold.Ingest.Schema.InboundDelivery
-  alias Manifold.Mail.Schema.MailboxEntry
+  alias Manifold.Mail
+  alias Manifold.Mail.Schema.{MailboxEntry, Message, Thread}
 
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
@@ -267,6 +268,35 @@ defmodule Manifold.ConnectorsTest do
     Repo.insert!(RemoteMessage.changeset(%RemoteMessage{}, remote_attrs(account.id, "abc", now)))
 
     assert Repo.aggregate(RemoteMessage, :count) == 2
+  end
+
+  test "remote Sent state places an imported message in Sent", %{
+    domain: domain,
+    mailbox: mailbox
+  } do
+    delivery_id = Ecto.UUID.generate()
+    insert_delivery(delivery_id, domain.id)
+    method = insert_receive_method(mailbox.id, "sent-state")
+
+    remote =
+      Repo.insert!(
+        RemoteMessage.changeset(
+          %RemoteMessage{},
+          remote_attrs(method.id, "sent-state", DateTime.utc_now(), %{
+            inbound_delivery_id: delivery_id,
+            remote_folder_kind: "sent",
+            state: "imported"
+          })
+        )
+      )
+
+    assert {:ok, folders} = Mail.list_folders(mailbox.id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    sent = Enum.find(folders, &(&1.kind == "sent"))
+    entry = insert_projected_entry(mailbox.id, delivery_id, inbox.id)
+
+    assert :ok = Connectors.apply_remote_state(remote.id)
+    assert Repo.get!(MailboxEntry, entry.id).folder_id == sent.id
   end
 
   test "polling recreates missing sync work without duplicating jobs", %{mailbox: mailbox} do
@@ -886,6 +916,44 @@ defmodule Manifold.ConnectorsTest do
           updated_at: now
         }
       ])
+  end
+
+  defp insert_projected_entry(mailbox_id, delivery_id, folder_id) do
+    now = DateTime.utc_now()
+
+    message =
+      Repo.insert!(
+        Message.changeset(%Message{}, %{
+          inbound_delivery_id: delivery_id,
+          subject: "Sent state",
+          sent_at: now,
+          parser_version: 1,
+          sanitizer_version: 1,
+          parse_state: "parsed"
+        })
+      )
+
+    thread =
+      Repo.insert!(
+        Thread.changeset(%Thread{}, %{
+          mailbox_id: mailbox_id,
+          subject_summary: "Sent state",
+          last_message_at: now,
+          message_count: 1
+        })
+      )
+
+    Repo.insert!(
+      MailboxEntry.changeset(%MailboxEntry{}, %{
+        mailbox_id: mailbox_id,
+        inbound_delivery_id: delivery_id,
+        message_id: message.id,
+        folder_id: folder_id,
+        thread_id: thread.id,
+        original_recipient: "person@example.test",
+        quarantined: false
+      })
+    )
   end
 
   defp insert_read_push_fixture(mailbox, domain_id, suffix) do

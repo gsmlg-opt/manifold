@@ -446,7 +446,7 @@ defmodule Manifold.Mail.Mailbox do
           Folder
           |> where(
             [folder],
-            folder.mailbox_id == ^mailbox_id and folder.kind in ^~w(inbox archive custom)
+            folder.mailbox_id == ^mailbox_id and folder.kind in ^~w(inbox archive sent custom)
           )
           |> select([folder], folder.id)
           |> Repo.all()
