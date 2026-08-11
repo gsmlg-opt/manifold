@@ -151,17 +151,19 @@ bin/manifold rpc 'import Ecto.Query; purge_id = "00000000-0000-0000-0000-0000000
 
 If the exact prior job is `executing`, wait for it to reach a terminal state;
 do not cancel it merely to make uniqueness pass. For one exact `suspended` job,
-choose one recovery path. Either cancel that exact job safely:
+choose one recovery path. Each mutation carries both the loaded job ID and
+`state: :suspended` into the database update; if the state changes concurrently,
+the required `{:ok, 1}` match fails closed. Either cancel that exact job safely:
 
 ```bash
-bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; jobs = Oban.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}, state: :suspended) |> Oban.all_jobs(); case jobs do [%Oban.Job{id: id}] -> :ok = Oban.cancel_job(id); %Oban.Job{state: "cancelled"} = Manifold.Repo.get!(Oban.Job, id); IO.inspect(%{id: id, state: "cancelled"}); [] -> raise "no suspended purge job found"; _ -> raise "multiple suspended purge jobs found" end'
+bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; jobs = Oban.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}, state: :suspended) |> Oban.all_jobs(); case jobs do [%Oban.Job{id: id}] -> query = Oban.Job.query(id: id, state: :suspended); {:ok, 1} = Oban.cancel_all_jobs(query); %Oban.Job{state: "cancelled"} = Manifold.Repo.get!(Oban.Job, id); IO.inspect(%{id: id, state: "cancelled"}); [] -> raise "no suspended purge job found"; _ -> raise "multiple suspended purge jobs found" end'
 ```
 
 Or make that exact suspended job available and let the worker take it to a
 terminal state:
 
 ```bash
-bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; jobs = Oban.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}, state: :suspended) |> Oban.all_jobs(); case jobs do [%Oban.Job{id: id}] -> :ok = Oban.retry_job(id); IO.inspect(%{id: id, action: :made_available}); [] -> raise "no suspended purge job found"; _ -> raise "multiple suspended purge jobs found" end'
+bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; jobs = Oban.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}, state: :suspended) |> Oban.all_jobs(); case jobs do [%Oban.Job{id: id}] -> query = Oban.Job.query(id: id, state: :suspended); {:ok, 1} = Oban.retry_all_jobs(query); IO.inspect(%{id: id, action: :made_available}); [] -> raise "no suspended purge job found"; _ -> raise "multiple suspended purge jobs found" end'
 ```
 
 Before calling the lifecycle retry API, verify that the purge has no job in an
