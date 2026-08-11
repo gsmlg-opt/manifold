@@ -3,10 +3,13 @@ defmodule Manifold.Outbound.Submission do
 
   import Ecto.Query
 
+  alias Manifold.Connectors
+  alias Manifold.Connectors.SubmissionMethod
   alias Manifold.Core.Error
   alias Manifold.Outbound.Provider
   alias Manifold.Outbound.ProviderEvents
-  alias Manifold.Outbound.Provider.Envelope
+  alias Manifold.Outbound.Provider.{Envelope, Request}
+  alias Manifold.Outbound.RfcMessage
 
   alias Manifold.Outbound.Schema.{
     OutboundEvent,
@@ -21,26 +24,8 @@ defmodule Manifold.Outbound.Submission do
   @spec submit(Ecto.UUID.t(), Keyword.t()) ::
           :ok | {:error, Error.t() | Provider.Error.t()}
   def submit(message_id, opts \\ []) do
-    provider =
-      Keyword.get(
-        opts,
-        :provider,
-        Application.get_env(
-          :manifold_outbound,
-          :provider_adapter,
-          Manifold.Outbound.Provider.Resend
-        )
-      )
-
-    provider_config =
-      Keyword.get(
-        opts,
-        :provider_config,
-        Application.get_env(:manifold_outbound, :provider_config, [])
-      )
-
     with {:ok, preparation} <- prepare_attempt(message_id),
-         result <- call_provider(preparation, provider, provider_config, opts) do
+         result <- call_provider(preparation, opts) do
       persist_result(preparation, result, opts)
     end
   rescue
@@ -62,14 +47,23 @@ defmodule Manifold.Outbound.Submission do
         |> lock("FOR UPDATE")
         |> Repo.one()
 
-      prepare_locked(message, submission)
+      recipients =
+        OutboundRecipient
+        |> where([recipient], recipient.outbound_message_id == ^message_id)
+        |> order_by([recipient], asc: recipient.kind, asc: recipient.position)
+        |> lock("FOR UPDATE")
+        |> Repo.all()
+
+      prepare_locked(message, submission, recipients)
     end)
     |> case do
-      {:ok, {:ready, message, submission}} ->
+      {:ok, {:ready, message, submission, recipients}} ->
         {:ok,
          %{
            message_id: message.id,
-           envelope: envelope(message, submission),
+           message: message,
+           submission: submission,
+           recipients: recipients,
            submission_id: submission.id
          }}
 
@@ -84,32 +78,35 @@ defmodule Manifold.Outbound.Submission do
     end
   end
 
-  defp prepare_locked(nil, _submission),
+  defp prepare_locked(nil, _submission, _recipients),
     do: {:error, Error.new(:permanent, :outbound_not_found, "outbound message not found")}
 
-  defp prepare_locked(_message, nil),
+  defp prepare_locked(_message, nil, _recipients),
     do: {:error, Error.new(:permanent, :submission_not_found, "provider submission not found")}
 
-  defp prepare_locked(%OutboundMessage{state: "accepted_by_provider"}, _submission),
+  defp prepare_locked(%OutboundMessage{state: "accepted_by_provider"}, _submission, _recipients),
     do: :already_accepted
 
-  defp prepare_locked(%OutboundMessage{state: state}, _submission)
-       when state in ["failed", "submission_uncertain"] do
+  defp prepare_locked(%OutboundMessage{state: "submission_uncertain"}, _submission, _recipients) do
+    {:error, Error.new(:permanent, :submission_uncertain, "submission is uncertain")}
+  end
+
+  defp prepare_locked(%OutboundMessage{state: "failed"}, _submission, _recipients) do
     {:error, Error.new(:permanent, :submission_not_retryable, "submission is not retryable")}
   end
 
-  defp prepare_locked(message, submission) do
+  defp prepare_locked(message, submission, recipients) do
     now = DateTime.utc_now()
 
-    if submission.attempt_count > 0 and
+    if submission.provider == "resend" and submission.attempt_count > 0 and
          DateTime.compare(now, submission.idempotency_expires_at) != :lt do
       mark_uncertain(message, submission, now)
     else
-      start_attempt(message, submission, now)
+      start_attempt(message, submission, recipients, now)
     end
   end
 
-  defp start_attempt(message, submission, now) do
+  defp start_attempt(message, submission, recipients, now) do
     with :ok <- maybe_transition(message.state, "submitting") do
       message =
         message
@@ -134,7 +131,7 @@ defmodule Manifold.Outbound.Submission do
         |> Repo.update!()
 
       insert_event!(message.id, "submission_started", %{attempt: submission.attempt_count}, now)
-      {:ready, message, submission}
+      {:ready, message, submission, recipients}
     end
   end
 
@@ -142,7 +139,7 @@ defmodule Manifold.Outbound.Submission do
     message
     |> Ecto.Changeset.change(
       state: "submission_uncertain",
-      last_error_class: "permanent",
+      last_error_class: "uncertain",
       last_error_code: "idempotency_expired",
       last_error_message: "provider acceptance is ambiguous after idempotency expiry"
     )
@@ -166,10 +163,13 @@ defmodule Manifold.Outbound.Submission do
      )}
   end
 
-  defp call_provider(:already_accepted, _provider, _config, _opts), do: :already_accepted
+  defp call_provider(:already_accepted, _opts), do: :already_accepted
 
-  defp call_provider(preparation, provider, config, opts) do
-    result = provider.submit(config, preparation.envelope)
+  defp call_provider(preparation, opts) do
+    result =
+      with {:ok, provider, config, request} <- dispatch(preparation, opts) do
+        provider.submit(config, request)
+      end
 
     if Keyword.get(opts, :fail_at) == :after_provider_accept_before_commit and
          match?({:ok, %Provider.Submission{}}, result) do
@@ -184,10 +184,197 @@ defmodule Manifold.Outbound.Submission do
     end
   end
 
+  defp dispatch(%{submission: %{provider: "resend", send_method_id: nil}} = preparation, opts) do
+    with {:ok, provider} <- provider_adapter("resend", opts) do
+      envelope = envelope(preparation.message, preparation.submission, preparation.recipients)
+
+      request = %Request{
+        provider: "resend",
+        send_method_id: nil,
+        envelope: envelope,
+        raw_message: "",
+        request_sha256: preparation.submission.request_sha256
+      }
+
+      {:ok, provider, legacy_resend_config(opts), request}
+    end
+  end
+
+  defp dispatch(
+         %{submission: %{provider: provider, send_method_id: method_id}} = preparation,
+         opts
+       )
+       when provider in ["gmail", "smtp"] and is_binary(method_id) do
+    with {:ok, method} <-
+           Connectors.checkout_send_method(
+             method_id,
+             preparation.message.sender_address,
+             Keyword.get(opts, :checkout_opts, [])
+           ),
+         :ok <- require_provider(method, provider),
+         {:ok, request} <- request(preparation, provider, method_id),
+         {:ok, adapter} <- provider_adapter(provider, opts) do
+      {:ok, adapter, provider_config(method, provider, opts), request}
+    else
+      {:error, %Provider.Error{} = error} -> {:error, error}
+      {:error, %Error{} = error} -> {:error, connector_error(error)}
+      {:error, %Ecto.Changeset{}} -> {:error, provider_error("send_method_required")}
+      :error -> {:error, provider_error("unsupported_provider")}
+    end
+  end
+
+  defp dispatch(_preparation, _opts),
+    do: {:error, provider_error("send_method_required")}
+
+  defp request(preparation, provider, method_id) do
+    envelope = envelope(preparation.message, preparation.submission, preparation.recipients)
+
+    with {:ok, raw_message} <-
+           RfcMessage.render(envelope,
+             provider: String.to_existing_atom(provider),
+             message_id: preparation.submission.provider_rfc_message_id,
+             date: preparation.message.queued_at
+           ),
+         request_sha256 <- sha256(raw_message),
+         true <- request_sha256 == preparation.submission.request_sha256 do
+      {:ok,
+       %Request{
+         provider: provider,
+         send_method_id: method_id,
+         envelope: envelope,
+         raw_message: raw_message,
+         request_sha256: request_sha256
+       }}
+    else
+      false -> {:error, provider_error("request_integrity_failed")}
+      {:error, %Error{}} -> {:error, provider_error("request_integrity_failed")}
+    end
+  end
+
+  defp require_provider(%SubmissionMethod{kind: provider}, provider), do: :ok
+
+  defp require_provider(%SubmissionMethod{}, _provider),
+    do: {:error, provider_error("send_method_provider_mismatch")}
+
+  defp provider_adapter(provider, opts) do
+    case Keyword.get(opts, :provider) do
+      adapter when is_atom(adapter) and not is_nil(adapter) ->
+        {:ok, adapter}
+
+      nil when provider == "resend" ->
+        {:ok,
+         Application.get_env(
+           :manifold_outbound,
+           :provider_adapter,
+           Manifold.Outbound.Provider.Resend
+         )}
+
+      nil ->
+        Provider.adapter(provider)
+    end
+  end
+
+  defp provider_config(%SubmissionMethod{} = method, "gmail", opts) do
+    config = if is_list(method.config), do: method.config, else: []
+    {:oauth, access_token} = method.credential
+
+    config
+    |> Keyword.merge(Keyword.get(opts, :provider_config, []))
+    |> Keyword.put(:access_token, access_token)
+  end
+
+  defp provider_config(%SubmissionMethod{} = method, "smtp", opts) do
+    opts
+    |> Keyword.get(:provider_config, [])
+    |> Keyword.put(:submission_method, method)
+  end
+
+  defp legacy_resend_config(opts) do
+    Keyword.get(
+      opts,
+      :provider_config,
+      Application.get_env(:manifold_outbound, :provider_config, [])
+    )
+  end
+
+  defp connector_error(%Error{} = error) do
+    %Provider.Error{
+      class: if(error.class == :temporary, do: :transient, else: :permanent),
+      code: Atom.to_string(error.reason),
+      message: error.message
+    }
+  end
+
+  defp provider_error(code) do
+    %Provider.Error{class: :permanent, code: code, message: "outbound submission is invalid"}
+  end
+
   defp persist_result(:already_accepted, :already_accepted, _opts), do: :ok
 
   defp persist_result(_preparation, {:injected_failure, %Error{} = error}, _opts),
     do: {:error, error}
+
+  defp persist_result(preparation, {:error, %Provider.Error{class: :uncertain} = error}, opts) do
+    now = DateTime.utc_now()
+
+    result =
+      Repo.transaction(fn ->
+        {message, submission} = lock_submission!(preparation)
+        maybe_fail(opts, :provider_error_commit)
+
+        if message.state == "submission_uncertain" do
+          :already_uncertain
+        else
+          message
+          |> Ecto.Changeset.change(
+            state: "submission_uncertain",
+            last_error_class: "uncertain",
+            last_error_code: error.code,
+            last_error_message: error.message
+          )
+          |> Repo.update!()
+
+          submission
+          |> Ecto.Changeset.change(
+            state: "uncertain",
+            last_http_status: error.http_status,
+            last_error_code: error.code,
+            last_error_message: error.message
+          )
+          |> Repo.update!()
+
+          insert_event!(message.id, "submission_uncertain", %{code: error.code}, now)
+          :transitioned
+        end
+      end)
+
+    case result do
+      {:ok, :transitioned} ->
+        :telemetry.execute(
+          [:manifold, :outbound, :submit, :stop],
+          %{attempts: 1},
+          %{outbound_message_id: preparation.message_id, outcome: :uncertain}
+        )
+
+        {:error,
+         Error.new(
+           :permanent,
+           :submission_uncertain,
+           "provider acceptance is uncertain; automatic retry is disabled"
+         )}
+
+      {:ok, :already_uncertain} ->
+        {:error,
+         Error.new(
+           :permanent,
+           :submission_uncertain,
+           "provider acceptance is uncertain; automatic retry is disabled"
+         )}
+
+      {:error, reason} ->
+        {:error, database_error(reason)}
+    end
+  end
 
   defp persist_result(preparation, {:ok, %Provider.Submission{} = provider_submission}, opts) do
     now = DateTime.utc_now()
@@ -299,13 +486,7 @@ defmodule Manifold.Outbound.Submission do
     {message, submission}
   end
 
-  defp envelope(message, submission) do
-    recipients =
-      OutboundRecipient
-      |> where([recipient], recipient.outbound_message_id == ^message.id)
-      |> order_by([recipient], asc: recipient.kind, asc: recipient.position)
-      |> Repo.all()
-
+  defp envelope(message, submission, recipients) do
     %Envelope{
       from: format_address(message.sender_name, message.sender_address),
       to: recipient_addresses(recipients, "to"),
@@ -313,6 +494,8 @@ defmodule Manifold.Outbound.Submission do
       bcc: recipient_addresses(recipients, "bcc"),
       subject: message.subject,
       text: message.text_body || "",
+      message_id: submission.provider_rfc_message_id,
+      queued_at: message.queued_at,
       in_reply_to: message.in_reply_to,
       references: message.references,
       idempotency_key: submission.idempotency_key
@@ -331,6 +514,10 @@ defmodule Manifold.Outbound.Submission do
   end
 
   defp format_address(_name, address), do: address
+
+  defp sha256(bytes) do
+    :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+  end
 
   defp maybe_transition("submitting", "submitting"), do: :ok
   defp maybe_transition(from, to), do: State.validate_transition(from, to)

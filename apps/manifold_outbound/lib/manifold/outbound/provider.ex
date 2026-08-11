@@ -10,6 +10,12 @@ defmodule Manifold.Outbound.Provider do
               {:ok, Event.t()} | {:error, Error.t()}
 
   @optional_callbacks verify_webhook: 4
+
+  @spec adapter(String.t()) :: {:ok, module()} | :error
+  def adapter("gmail"), do: {:ok, Manifold.Outbound.Provider.Gmail}
+  def adapter("smtp"), do: {:ok, Manifold.Outbound.Provider.SMTP}
+  def adapter("resend"), do: {:ok, Manifold.Outbound.Provider.Resend}
+  def adapter(_provider), do: :error
 end
 
 defmodule Manifold.Outbound.Provider.Event do
