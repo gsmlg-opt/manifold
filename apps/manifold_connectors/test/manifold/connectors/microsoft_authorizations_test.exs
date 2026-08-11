@@ -17,7 +17,8 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     ConnectorEvent,
     OAuthAuthorization,
     ReceiveMethod,
-    SendMethod
+    SendMethod,
+    SyncCursor
   }
 
   alias Manifold.Repo
@@ -43,9 +44,18 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     def identity(_access_token, _config, opts), do: Keyword.fetch!(opts, :identity)
 
     @impl true
-    def initial_cursors(_access_token, _config, opts) do
+    def initial_cursors(access_token, _config, opts) do
       if test_pid = Keyword.get(opts, :test_pid) do
         send(test_pid, :initial_cursors)
+      end
+
+      if gate = Keyword.get(opts, :cursor_gate) do
+        test_pid = Keyword.fetch!(opts, :test_pid)
+        send(test_pid, {:initial_cursors_started, self(), access_token})
+
+        receive do
+          {:release_cursors, ^gate} -> :ok
+        end
       end
 
       Keyword.get(opts, :cursors, {:ok, [%ProviderCursor{scope: "mailbox", phase: "initial"}]})
@@ -141,7 +151,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
         assert {:ok, method} =
                  complete(purpose, account, address,
                    required_scopes: scopes,
-                   scopes: scopes,
+                   scopes: access_token_scopes(scopes),
                    refresh_token: if(index == 0, do: "refresh-secret", else: nil)
                  )
 
@@ -193,7 +203,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert {:ok, %SendMethod{}} =
              complete(:send, account, address,
                required_scopes: all_scopes(),
-               scopes: all_scopes(),
+               scopes: access_token_scopes(all_scopes()),
                refresh_token: nil
              )
 
@@ -212,7 +222,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert {:ok, %SendMethod{}} =
              complete(:send, account, address,
                required_scopes: all_scopes(),
-               scopes: all_scopes(),
+               scopes: access_token_scopes(all_scopes()),
                refresh_token: "rotated-refresh"
              )
 
@@ -240,7 +250,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert {:error, %{class: :permanent, reason: :provider_identity_mismatch}} =
              complete(:send, account, address,
                required_scopes: all_scopes(),
-               scopes: all_scopes(),
+               scopes: access_token_scopes(all_scopes()),
                identity: %Identity{id: "different-subject", email_address: address}
              )
 
@@ -295,10 +305,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert {:ok, receive} = complete(:receive, account, address)
     before = authorization_snapshot(Repo.get!(OAuthAuthorization, receive.oauth_authorization_id))
 
-    for scopes <- [
-          Enum.sort([MicrosoftScopes.send(), MicrosoftScopes.offline()]),
-          Enum.sort([MicrosoftScopes.read(), MicrosoftScopes.offline()])
-        ] do
+    for scopes <- [[MicrosoftScopes.send()], [MicrosoftScopes.read()]] do
       assert {:error, %{class: :permanent, reason: :insufficient_provider_scope}} =
                complete(:send, account, address,
                  required_scopes: all_scopes(),
@@ -328,6 +335,18 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert Repo.aggregate(SendMethod, :count) == 0
   end
 
+  test "a new Microsoft grant without a refresh token creates no authorization or method", %{
+    account: account,
+    address: address
+  } do
+    assert {:error, %{class: :permanent, reason: :missing_refresh_token}} =
+             complete(:receive, account, address, refresh_token: nil)
+
+    assert Repo.aggregate(OAuthAuthorization, :count) == 0
+    assert Repo.aggregate(ReceiveMethod, :count) == 0
+    assert Repo.aggregate(SendMethod, :count) == 0
+  end
+
   test "concurrent receive and send checkout performs one refresh request", %{
     account: account,
     address: address
@@ -337,7 +356,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert {:ok, _send_method} =
              complete(:send, account, address,
                required_scopes: all_scopes(),
-               scopes: all_scopes(),
+               scopes: access_token_scopes(all_scopes()),
                refresh_token: nil
              )
 
@@ -350,7 +369,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
       access_token: "rotated-access",
       refresh_token: nil,
       expires_at: ~U[2026-08-12 04:00:00.000000Z],
-      scopes: all_scopes()
+      scopes: access_token_scopes(all_scopes())
     }
 
     checkout = fn required_scope ->
@@ -382,6 +401,38 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
            ]
 
     assert Agent.get(refresh_count, & &1) == 1
+  end
+
+  test "expired refresh accepts access-token scopes without offline_access and retains capability",
+       %{
+         account: account,
+         address: address
+       } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    refreshed = %Token{
+      access_token: "refreshed-access",
+      refresh_token: "refreshed-rotation",
+      expires_at: ~U[2026-08-12 04:00:00.000000Z],
+      scopes: [MicrosoftScopes.read()]
+    }
+
+    assert {:ok, "refreshed-access"} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: MicrosoftScopes.read(),
+               now: @refresh_now,
+               provider_opts: [refresh_result: {:ok, refreshed}]
+             )
+
+    persisted = Repo.get!(OAuthAuthorization, authorization.id)
+    assert persisted.granted_scopes == purpose_scopes(:receive)
+
+    assert {:ok, "refreshed-rotation"} =
+             Crypto.decrypt(
+               persisted.refresh_token_ciphertext,
+               "credential:#{authorization.id}:refresh"
+             )
   end
 
   test "disconnecting receive leaves a healthy send reference and token ciphertext", %{
@@ -474,6 +525,140 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
            )
   end
 
+  test "receive add keeps a rotated refresh token when initial cursors fails", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, send_method} =
+             complete(:send, account, address, scopes: access_token_scopes(all_scopes()))
+
+    authorization = Repo.get!(OAuthAuthorization, send_method.oauth_authorization_id)
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+
+    refreshed = %Token{
+      access_token: "cursor-refresh-access",
+      refresh_token: "cursor-refresh-rotation",
+      expires_at: ~U[2026-08-12 04:00:00.000000Z],
+      scopes: access_token_scopes(all_scopes())
+    }
+
+    cursor_error = %ProviderError{
+      class: :temporary,
+      code: :cursor_unavailable,
+      message: "cursor initialization failed"
+    }
+
+    assert {:error, ^cursor_error} =
+             OAuthAuthorizations.add_authorized_method(
+               "microsoft",
+               account.id,
+               :receive,
+               FakeMicrosoft,
+               [],
+               now: @refresh_now,
+               provider_opts: [
+                 refresh_result: {:ok, refreshed},
+                 cursors: {:error, cursor_error}
+               ]
+             )
+
+    persisted = Repo.get!(OAuthAuthorization, authorization.id)
+
+    assert {:ok, "cursor-refresh-access"} =
+             Crypto.decrypt(
+               persisted.access_token_ciphertext,
+               "credential:#{authorization.id}:access"
+             )
+
+    assert {:ok, "cursor-refresh-rotation"} =
+             Crypto.decrypt(
+               persisted.refresh_token_ciphertext,
+               "credential:#{authorization.id}:refresh"
+             )
+
+    assert Repo.aggregate(ReceiveMethod, :count) == 0
+    assert Repo.aggregate(SyncCursor, :count) == 0
+    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before
+  end
+
+  test "blocked cursor revalidation rejects a changed token generation", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, send_method} =
+             complete(:send, account, address, scopes: access_token_scopes(all_scopes()))
+
+    authorization = Repo.get!(OAuthAuthorization, send_method.oauth_authorization_id)
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+    gate = make_ref()
+    test_pid = self()
+
+    assert {:ok, superseding_ciphertext} =
+             Crypto.encrypt(
+               "superseding-access",
+               "credential:#{authorization.id}:access"
+             )
+
+    add_task =
+      Task.async(fn ->
+        OAuthAuthorizations.add_authorized_method(
+          "microsoft",
+          account.id,
+          :receive,
+          FakeMicrosoft,
+          [],
+          now: @now,
+          provider_opts: [cursor_gate: gate, test_pid: test_pid]
+        )
+      end)
+
+    assert_receive {:initial_cursors_started, cursor_process, "access-secret"}
+
+    mutation_task =
+      Task.async(fn ->
+        authorization.id
+        |> then(&Repo.get!(OAuthAuthorization, &1))
+        |> OAuthAuthorization.changeset(%{
+          access_token_ciphertext: superseding_ciphertext,
+          token_expires_at: ~U[2026-08-12 05:00:00.000000Z]
+        })
+        |> Repo.update!()
+      end)
+
+    mutated =
+      case Task.yield(mutation_task, 1_000) do
+        {:ok, %OAuthAuthorization{} = mutated} ->
+          mutated
+
+        nil ->
+          send(cursor_process, {:release_cursors, gate})
+          _mutation = Task.await(mutation_task, 5_000)
+          _add_result = Task.await(add_task, 5_000)
+          flunk("authorization mutation remained blocked during cursor provider I/O")
+      end
+
+    send(cursor_process, {:release_cursors, gate})
+
+    assert {:error, %{class: :permanent, reason: :stale_oauth_authorization} = error} =
+             Task.await(add_task, 5_000)
+
+    refute inspect(error) =~ "access-secret"
+    refute inspect(error) =~ "superseding-access"
+    assert mutated.lock_version > authorization.lock_version
+
+    assert {:ok, "superseding-access"} =
+             Crypto.decrypt(
+               Repo.get!(OAuthAuthorization, authorization.id).access_token_ciphertext,
+               "credential:#{authorization.id}:access"
+             )
+
+    assert Repo.aggregate(ReceiveMethod, :count) == 0
+    assert Repo.aggregate(SyncCursor, :count) == 0
+    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before
+  end
+
   test "adding Microsoft Send disables only the previously enabled send method", %{
     account: account,
     address: address
@@ -481,7 +666,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     other_send = insert_other_send!(account.id, address)
 
     assert {:ok, receive} =
-             complete(:receive, account, address, scopes: all_scopes())
+             complete(:receive, account, address, scopes: access_token_scopes(all_scopes()))
 
     assert Repo.get!(SendMethod, other_send.id).enabled
 
@@ -508,7 +693,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     other_receive = insert_other_receive!(account.id, address)
 
     assert {:ok, send_method} =
-             complete(:send, account, address, scopes: all_scopes())
+             complete(:send, account, address, scopes: access_token_scopes(all_scopes()))
 
     assert Repo.get!(ReceiveMethod, other_receive.id).enabled
 
@@ -534,7 +719,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert {:ok, send_method} =
              complete(:send, account, address,
                required_scopes: all_scopes(),
-               scopes: all_scopes(),
+               scopes: access_token_scopes(all_scopes()),
                refresh_token: nil
              )
 
@@ -558,7 +743,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
       access_token: Keyword.get(opts, :access_token, "access-secret"),
       refresh_token: Keyword.get(opts, :refresh_token, "refresh-secret"),
       expires_at: Keyword.get(opts, :expires_at, @expires_at),
-      scopes: Keyword.get(opts, :scopes, required_scopes)
+      scopes: Keyword.get(opts, :scopes, access_token_scopes(required_scopes))
     }
 
     identity =
@@ -590,6 +775,12 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
   defp all_scopes,
     do: Enum.sort([MicrosoftScopes.read(), MicrosoftScopes.send(), MicrosoftScopes.offline()])
+
+  defp access_token_scopes(scopes) do
+    scopes
+    |> Enum.reject(&(&1 == MicrosoftScopes.offline()))
+    |> Enum.sort()
+  end
 
   defp authorization_snapshot(authorization) do
     Map.take(authorization, [

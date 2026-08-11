@@ -8,6 +8,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
   alias Manifold.Accounts.Schema.Account
   alias Manifold.Connectors.Crypto
   alias Manifold.Connectors.Jobs.SyncAccount
+  alias Manifold.Connectors.MicrosoftScopes
   alias Manifold.Connectors.OAuth.Consumed
   alias Manifold.Connectors.OAuthScopes
   alias Manifold.Connectors.Provider.{Identity, SyncCursor, Token}
@@ -166,64 +167,20 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     provider_opts = Keyword.get(opts, :provider_opts, [])
 
     with {:ok, required_scope} <- method_scope(provider, purpose) do
-      Repo.transaction(fn ->
-        result =
-          with {:ok, account, account_address} <- lock_account(account_id),
-               {:ok, authorization} <- lock_account_authorization(provider, account.id),
-               {:ok, authorization_address} <- Address.parse(authorization.email_address),
-               :ok <- require_matching_address(account_address, authorization_address),
-               :ok <- validate_checkout_authorization(authorization, required_scope),
-               {:ok, access_token} <-
-                 authorized_method_access_token(
-                   purpose,
-                   authorization,
-                   required_scope,
-                   adapter,
-                   config,
-                   now,
-                   provider_opts
-                 ),
-               {:ok, cursors} <-
-                 authorized_method_cursors(
-                   purpose,
-                   adapter,
-                   access_token,
-                   config,
-                   provider_opts
-                 ),
-               :ok <- validate_cursors(purpose, cursors),
-               {:ok, method} <-
-                 upsert_method(
-                   provider,
-                   purpose,
-                   account.id,
-                   authorization,
-                   authorization.provider_subject_id,
-                   account_address.canonical,
-                   authorization.granted_scopes,
-                   now
-                 ),
-               :ok <- persist_receive_state(purpose, method, cursors, now),
-               {:ok, _event} <-
-                 insert_authorization_event(
-                   authorization.id,
-                   provider,
-                   "connected",
-                   purpose,
-                   now
-                 ) do
-            {:ok, method}
-          end
+      case purpose do
+        :receive ->
+          add_authorized_receive_method(
+            provider,
+            account_id,
+            required_scope,
+            adapter,
+            config,
+            now,
+            provider_opts
+          )
 
-        case result do
-          {:error, reason} -> Repo.rollback(reason)
-          other -> other
-        end
-      end)
-      |> case do
-        {:ok, {:ok, method}} -> {:ok, method}
-        {:ok, {:reconnect, %ProviderError{} = error}} -> {:error, error}
-        {:error, reason} -> {:error, reason}
+        :send ->
+          add_authorized_send_method(provider, account_id, required_scope, now)
       end
     end
   rescue
@@ -238,6 +195,210 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
        :unsupported_oauth_purpose,
        "OAuth purpose is not supported by provider"
      )}
+  end
+
+  defp add_authorized_send_method(provider, account_id, required_scope, now) do
+    authorized_method_transaction(fn ->
+      with {:ok, account, account_address} <- lock_account(account_id),
+           {:ok, authorization} <- lock_account_authorization(provider, account.id),
+           {:ok, authorization_address} <- Address.parse(authorization.email_address),
+           :ok <- require_matching_address(account_address, authorization_address),
+           :ok <- validate_checkout_authorization(authorization, required_scope),
+           {:ok, method} <-
+             upsert_method(
+               provider,
+               :send,
+               account.id,
+               authorization,
+               authorization.provider_subject_id,
+               account_address.canonical,
+               authorization.granted_scopes,
+               now
+             ),
+           {:ok, _event} <-
+             insert_authorization_event(
+               authorization.id,
+               provider,
+               "connected",
+               :send,
+               now
+             ) do
+        {:ok, method}
+      end
+    end)
+  end
+
+  defp add_authorized_receive_method(
+         provider,
+         account_id,
+         required_scope,
+         adapter,
+         config,
+         now,
+         provider_opts
+       ) do
+    with {:ok, snapshot} <-
+           authorized_method_snapshot(provider, account_id, required_scope),
+         {:ok, checkout} <-
+           checkout_authorized_method_access(
+             snapshot,
+             required_scope,
+             adapter,
+             config,
+             now,
+             provider_opts
+           ),
+         {:ok, cursors} <-
+           adapter.initial_cursors(checkout.access_token, config, provider_opts),
+         :ok <- validate_cursors(:receive, cursors) do
+      persist_authorized_receive_method(snapshot, checkout, cursors, required_scope, now)
+    end
+  end
+
+  defp authorized_method_snapshot(provider, account_id, required_scope) do
+    authorized_method_transaction(fn ->
+      with {:ok, account, account_address} <- lock_account(account_id),
+           {:ok, authorization} <- lock_account_authorization(provider, account.id),
+           {:ok, authorization_address} <- Address.parse(authorization.email_address),
+           :ok <- require_matching_address(account_address, authorization_address),
+           :ok <- validate_checkout_authorization(authorization, required_scope) do
+        {:ok,
+         %{
+           account_id: account.id,
+           account_address: account_address.canonical,
+           authorization_id: authorization.id,
+           provider: authorization.provider,
+           provider_subject_id: authorization.provider_subject_id,
+           email_address: authorization.email_address
+         }}
+      end
+    end)
+  end
+
+  defp checkout_authorized_method_access(
+         snapshot,
+         required_scope,
+         adapter,
+         config,
+         now,
+         provider_opts
+       ) do
+    continuation = fn access_token ->
+      with {:ok, authorization} <- lock_authorization(snapshot.authorization_id),
+           true <- same_authorization_binding?(authorization, snapshot) do
+        {:ok,
+         %{
+           access_token: access_token,
+           authorization_id: authorization.id,
+           authorization_lock_version: authorization.lock_version,
+           authorization_status: authorization.status,
+           granted_scopes: authorization.granted_scopes
+         }}
+      else
+        false -> {:error, stale_oauth_authorization()}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    checkout_access_token(snapshot.authorization_id, adapter, config,
+      required_scope: required_scope,
+      now: now,
+      provider_opts: provider_opts,
+      access_token_continuation: continuation
+    )
+  end
+
+  defp persist_authorized_receive_method(snapshot, checkout, cursors, required_scope, now) do
+    authorized_method_transaction(fn ->
+      with {:ok, account, account_address} <- lock_account(snapshot.account_id),
+           {:ok, authorization} <- lock_authorization(snapshot.authorization_id),
+           :ok <-
+             validate_authorized_method_snapshot(
+               account_address,
+               authorization,
+               snapshot,
+               checkout,
+               required_scope
+             ),
+           {:ok, method} <-
+             upsert_method(
+               snapshot.provider,
+               :receive,
+               account.id,
+               authorization,
+               authorization.provider_subject_id,
+               account_address.canonical,
+               authorization.granted_scopes,
+               now
+             ),
+           :ok <- persist_receive_state(:receive, method, cursors, now),
+           {:ok, _event} <-
+             insert_authorization_event(
+               authorization.id,
+               snapshot.provider,
+               "connected",
+               :receive,
+               now
+             ) do
+        {:ok, method}
+      end
+    end)
+  end
+
+  defp validate_authorized_method_snapshot(
+         account_address,
+         authorization,
+         snapshot,
+         checkout,
+         required_scope
+       ) do
+    with true <- account_address.canonical == snapshot.account_address,
+         true <- same_authorization_binding?(authorization, snapshot),
+         {:ok, authorization_address} <- Address.parse(authorization.email_address),
+         :ok <- require_matching_address(account_address, authorization_address),
+         :ok <- validate_checkout_authorization(authorization, required_scope),
+         true <- authorization.status == checkout.authorization_status,
+         true <- authorization.granted_scopes == checkout.granted_scopes,
+         true <- authorization.lock_version == checkout.authorization_lock_version,
+         {:ok, true} <-
+           expected_access_token_matches?(authorization,
+             expected_access_token: checkout.access_token
+           ) do
+      :ok
+    else
+      false -> {:error, stale_oauth_authorization()}
+      {:ok, false} -> {:error, stale_oauth_authorization()}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp same_authorization_binding?(authorization, snapshot) do
+    authorization.id == snapshot.authorization_id and
+      authorization.account_id == snapshot.account_id and
+      authorization.provider == snapshot.provider and
+      authorization.provider_subject_id == snapshot.provider_subject_id and
+      authorization.email_address == snapshot.email_address
+  end
+
+  defp stale_oauth_authorization do
+    CoreError.new(
+      :permanent,
+      :stale_oauth_authorization,
+      "OAuth authorization changed before method setup completed"
+    )
+  end
+
+  defp authorized_method_transaction(fun) do
+    Repo.transaction(fn ->
+      case fun.() do
+        {:ok, value} -> value
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, value} -> {:ok, value}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp checkout_locked_access_token(
@@ -560,7 +721,10 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     returned = approved_scopes(authorization.provider, token_scopes)
     required = MapSet.put(stored, required_scope)
 
-    if MapSet.subset?(required, returned) do
+    if MapSet.subset?(
+         access_token_scopes(authorization.provider, required),
+         access_token_scopes(authorization.provider, returned)
+       ) do
       {:ok, stored |> MapSet.union(returned) |> MapSet.to_list() |> Enum.sort()}
     else
       insufficient_scope(authorization.provider)
@@ -836,9 +1000,13 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
         MapSet.union(stored, required_from_consumed)
         |> MapSet.put(purpose_scope(provider, purpose))
 
-      granted = approved_scopes(provider, token_scopes)
+      returned = approved_scopes(provider, token_scopes)
+      granted = retain_durable_scopes(provider, returned, required)
 
-      if MapSet.subset?(required, granted) do
+      if MapSet.subset?(
+           access_token_scopes(provider, required),
+           access_token_scopes(provider, returned)
+         ) do
         event_type =
           if existing && not MapSet.subset?(granted, stored),
             do: "scope_upgraded",
@@ -864,6 +1032,21 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     |> Enum.filter(&OAuthScopes.approved?(provider, &1))
     |> MapSet.new()
   end
+
+  defp access_token_scopes("microsoft", scopes),
+    do: MapSet.delete(scopes, MicrosoftScopes.offline())
+
+  defp access_token_scopes(_provider, scopes), do: scopes
+
+  defp retain_durable_scopes("microsoft", returned, required) do
+    if MapSet.member?(required, MicrosoftScopes.offline()) do
+      MapSet.put(returned, MicrosoftScopes.offline())
+    else
+      returned
+    end
+  end
+
+  defp retain_durable_scopes(_provider, returned, _required), do: returned
 
   defp insufficient_scope(provider) do
     provider_name =
@@ -1366,42 +1549,6 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
        "provider returned invalid sync cursors"
      )}
   end
-
-  defp authorized_method_access_token(
-         :send,
-         _authorization,
-         _required_scope,
-         _adapter,
-         _config,
-         _now,
-         _provider_opts
-       ),
-       do: {:ok, nil}
-
-  defp authorized_method_access_token(
-         :receive,
-         authorization,
-         required_scope,
-         adapter,
-         config,
-         now,
-         provider_opts
-       ) do
-    checkout_locked_access_token(
-      authorization,
-      required_scope,
-      adapter,
-      config,
-      now,
-      provider_opts
-    )
-  end
-
-  defp authorized_method_cursors(:send, _adapter, nil, _config, _provider_opts),
-    do: {:ok, []}
-
-  defp authorized_method_cursors(:receive, adapter, access_token, config, provider_opts),
-    do: adapter.initial_cursors(access_token, config, provider_opts)
 
   defp normalize_purpose(purpose) when purpose in [:receive, :send], do: {:ok, purpose}
 
