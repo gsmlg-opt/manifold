@@ -876,6 +876,62 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert Agent.get(refresh_count, & &1) == 0
   end
 
+  test "corrupted current access ciphertext returns a generic credential error", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    {:ok, refresh_count} = Agent.start_link(fn -> 0 end)
+
+    authorization
+    |> OAuthAuthorization.changeset(%{access_token_ciphertext: "corrupted-access-secret"})
+    |> Repo.update!()
+
+    assert {:error,
+            %{
+              class: :permanent,
+              reason: :invalid_credential_envelope,
+              message: "encrypted connector credential envelope is invalid"
+            } = error} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: GmailScopes.read(),
+               now: ~U[2026-08-11 01:00:00.000000Z],
+               provider_opts: [refresh_count: refresh_count]
+             )
+
+    refute inspect(error) =~ "corrupted-access-secret"
+    assert Agent.get(refresh_count, & &1) == 0
+  end
+
+  test "corrupted refresh ciphertext returns a generic credential error before provider I/O", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    {:ok, refresh_count} = Agent.start_link(fn -> 0 end)
+
+    authorization
+    |> OAuthAuthorization.changeset(%{refresh_token_ciphertext: "corrupted-refresh-secret"})
+    |> Repo.update!()
+
+    assert {:error,
+            %{
+              class: :permanent,
+              reason: :invalid_credential_envelope,
+              message: "encrypted connector credential envelope is invalid"
+            } = error} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: GmailScopes.read(),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [refresh_count: refresh_count]
+             )
+
+    refute inspect(error) =~ "corrupted-refresh-secret"
+    assert Agent.get(refresh_count, & &1) == 0
+  end
+
   test "expired token refresh rotates access and refresh tokens atomically", %{
     account: account,
     address: address

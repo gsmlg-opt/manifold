@@ -102,6 +102,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
       |> case do
         {:ok, {:ok, access_token}} -> {:ok, access_token}
         {:ok, {:reconnect, %ProviderError{} = error}} -> {:error, error}
+        {:ok, {:error, reason}} -> {:error, reason}
         {:error, reason} -> {:error, reason}
       end
     end

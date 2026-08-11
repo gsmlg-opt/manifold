@@ -111,6 +111,13 @@ defmodule Manifold.Connectors do
       {:error, database_error(:unavailable)}
   end
 
+  @spec mark_oauth_reconnect_required(Ecto.UUID.t(), ProviderError.t(), Keyword.t()) ::
+          {:ok, Manifold.Connectors.Schema.OAuthAuthorization.t()}
+          | {:error, Error.t() | Ecto.Changeset.t()}
+  def mark_oauth_reconnect_required(authorization_id, %ProviderError{} = error, opts \\ []) do
+    GmailAuthorizations.mark_reconnect_required(authorization_id, error, opts)
+  end
+
   @spec list_receive_methods() :: [View.ReceiveMethod.t()]
   def list_receive_methods do
     ReceiveMethod

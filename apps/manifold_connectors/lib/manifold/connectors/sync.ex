@@ -133,10 +133,14 @@ defmodule Manifold.Connectors.Sync do
           {:ok, account.kind, length(messages), outcome}
         else
           {:error, {:cursor_provider_error, cursor, %ProviderError{} = error}} ->
-            {:error, "imap", error, handle_cursor_provider_error(account_id, cursor, error, now)}
+            error = normalize_provider_error(account, error)
+
+            {:error, account.kind, error,
+             handle_cursor_provider_error(account, cursor, error, now)}
 
           {:error, %ProviderError{} = error} ->
-            {:error, account.kind, error, handle_provider_error(account_id, error, now)}
+            error = normalize_provider_error(account, error)
+            {:error, account.kind, error, handle_account_provider_error(account, error, now)}
 
           {:error, %Error{} = error} ->
             {:error, account.kind, error, handle_core_error(account_id, error, now)}
@@ -158,7 +162,8 @@ defmodule Manifold.Connectors.Sync do
         {:error, "imap", error, handle_cursor_provider_error(account_id, cursor, error, now)}
 
       {:error, %ProviderError{} = error} ->
-        {:error, "imap", error, handle_provider_error(account_id, error, now)}
+        {:error, receive_method_kind(account_id), error,
+         handle_provider_error(account_id, error, now)}
 
       {:error, %Error{} = error} ->
         {:error, "unknown", error, handle_core_error(account_id, error, now)}
@@ -1093,8 +1098,35 @@ defmodule Manifold.Connectors.Sync do
     end
   end
 
+  defp handle_account_provider_error(
+         %ReceiveMethod{
+           kind: "gmail",
+           oauth_authorization_id: authorization_id
+         },
+         %ProviderError{class: :reconnect} = error,
+         now
+       )
+       when is_binary(authorization_id) do
+    case Connectors.mark_oauth_reconnect_required(authorization_id, error, now: now) do
+      {:ok, _authorization} -> {:cancel, :reconnect_required}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp handle_account_provider_error(%ReceiveMethod{id: account_id}, error, now),
+    do: handle_provider_error(account_id, error, now)
+
   defp handle_cursor_provider_error(
-         account_id,
+         %ReceiveMethod{kind: "gmail"} = account,
+         _cursor,
+         %ProviderError{class: :reconnect} = error,
+         now
+       ) do
+    handle_account_provider_error(account, error, now)
+  end
+
+  defp handle_cursor_provider_error(
+         %ReceiveMethod{id: account_id},
          %SyncCursor{scope: "folder:" <> _folder_id} = cursor,
          %ProviderError{code: :not_found},
          now
@@ -1140,8 +1172,33 @@ defmodule Manifold.Connectors.Sync do
     end
   end
 
-  defp handle_cursor_provider_error(account_id, _cursor, error, now),
+  defp handle_cursor_provider_error(%ReceiveMethod{id: account_id}, _cursor, error, now),
     do: handle_provider_error(account_id, error, now)
+
+  defp handle_cursor_provider_error(account_id, cursor, error, now),
+    do:
+      handle_cursor_provider_error(
+        %ReceiveMethod{id: account_id},
+        cursor,
+        error,
+        now
+      )
+
+  defp normalize_provider_error(
+         %ReceiveMethod{kind: "gmail"},
+         %ProviderError{class: :reconnect} = error
+       ) do
+    %{error | message: "Gmail authorization must be reconnected"}
+  end
+
+  defp normalize_provider_error(_account, error), do: error
+
+  defp receive_method_kind(account_id) do
+    case Repo.get(ReceiveMethod, account_id) do
+      %ReceiveMethod{kind: kind} -> kind
+      nil -> "unknown"
+    end
+  end
 
   defp handle_core_error(
          _account_id,
