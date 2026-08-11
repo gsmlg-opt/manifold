@@ -23,7 +23,7 @@ defmodule Manifold.Outbound.Provider.SMTP do
          {:ok, message_id} <- validated_message_id(request),
          {:ok, envelope} <- smtp_envelope(request, method),
          {:ok, settings} <- connection_settings(method),
-         {:ok, conn} <- transport.connect(settings) do
+         {:ok, conn} <- connect(transport, settings) do
       result =
         try do
           transport.submit(conn, envelope)
@@ -193,6 +193,28 @@ defmodule Manifold.Outbound.Provider.SMTP do
 
   defp normalize_code(code) when is_atom(code), do: Atom.to_string(code)
   defp normalize_code(_code), do: "smtp_error"
+
+  defp connect(transport, settings) do
+    case transport.connect(settings) do
+      {:ok, conn} -> {:ok, conn}
+      {:error, %ConnectorError{} = error} -> {:error, error}
+      {:error, reason} -> {:error, raw_connect_error(reason)}
+      _unexpected -> {:error, provider_error(:transient, "transport_error")}
+    end
+  rescue
+    _exception -> {:error, provider_error(:transient, "transport_error")}
+  catch
+    _kind, _reason -> {:error, provider_error(:transient, "transport_error")}
+  end
+
+  defp raw_connect_error({:unsupported_tls_mode, _mode}),
+    do: provider_error(:permanent, "invalid_config")
+
+  defp raw_connect_error({:invalid_config, _reason}),
+    do: provider_error(:permanent, "invalid_config")
+
+  defp raw_connect_error(:invalid_config), do: provider_error(:permanent, "invalid_config")
+  defp raw_connect_error(_reason), do: provider_error(:transient, "transport_error")
 
   defp provider_error(class, code, retry_after \\ nil) do
     message =

@@ -7,6 +7,24 @@ defmodule Manifold.Outbound.Provider.SMTPTest do
   alias Manifold.Outbound.Provider
   alias Manifold.Outbound.Provider.SMTP
 
+  defmodule RawConnectTransport do
+    @behaviour Manifold.Connectors.SMTP.Transport
+
+    @impl true
+    def connect(settings) do
+      case Map.fetch!(settings, :raw_connect_result) do
+        {:raise, message} -> raise message
+        result -> result
+      end
+    end
+
+    @impl true
+    def submit(_conn, _submission), do: raise("must not submit")
+
+    @impl true
+    def quit(_conn), do: :ok
+  end
+
   @password "smtp-password-private-sentinel"
   @message_id "<018f5f6e-3d31-7ef0-a5b6-2a3ed1647601@manifold.local>"
   @raw_message "From: Sender <sender@example.net>\r\nTo: to@example.net\r\nMessage-ID: #{@message_id}\r\n\r\nHello\r\n"
@@ -106,6 +124,30 @@ defmodule Manifold.Outbound.Provider.SMTPTest do
     refute inspect(error) =~ @password
     refute_receive :smtp_fake_submit
     refute_receive :smtp_fake_quit
+  end
+
+  test "bounds raw transport connection failures without raising or leaking details" do
+    cases = [
+      {{:error, :econnrefused}, :transient, "transport_error"},
+      {{:error, {:socket_failure, "private-connect-detail"}}, :transient, "transport_error"},
+      {{:error, {:unsupported_tls_mode, "plain"}}, :permanent, "invalid_config"},
+      {{:raise, "private-connect-exception"}, :transient, "transport_error"}
+    ]
+
+    for {raw_result, expected_class, expected_code} <- cases do
+      method =
+        method(self(), {:ok, %{response: "unused"}})
+        |> put_in([Access.key(:config), :raw_connect_result], raw_result)
+
+      assert {:error, %Provider.Error{class: ^expected_class, code: ^expected_code} = error} =
+               SMTP.submit(
+                 [submission_method: method, transport: RawConnectTransport],
+                 @request
+               )
+
+      refute inspect(error) =~ "private-connect"
+      refute inspect(error) =~ @password
+    end
   end
 
   test "ignores QUIT cleanup failures after definitive acceptance" do

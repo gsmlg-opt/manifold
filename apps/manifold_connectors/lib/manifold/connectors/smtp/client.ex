@@ -9,16 +9,16 @@ defmodule Manifold.Connectors.SMTP.Client do
 
   @connect_timeout 15_000
   @recv_timeout 30_000
+  @max_reply_line_bytes 512
+  @max_reply_lines 100
+  @max_reply_bytes 16_384
 
   # An in-memory adapter exercises a complete authenticated session without
   # adding a plaintext network mode or weakening TLS verification.
   @impl true
   def connect(%{fixture_socket: {:adapter, _module, _state} = socket} = settings) do
-    host = settings |> Map.fetch!(:host) |> normalize_host()
-    username = settings |> Map.fetch!(:username) |> normalize_text()
-    password = Map.fetch!(settings, :password)
-
-    with {:ok, host} <- require_host(host),
+    with {:ok, %{host: host, username: username, password: password}} <-
+           connection_settings(settings),
          {:ok, conn} <- read_greeting(%__MODULE__{socket: socket, buffer: ""}),
          {:ok, conn} <- ehlo(conn, host),
          {:ok, conn} <- authenticate(conn, username, password) do
@@ -28,14 +28,9 @@ defmodule Manifold.Connectors.SMTP.Client do
 
   @impl true
   def connect(settings) when is_map(settings) do
-    host = settings |> Map.fetch!(:host) |> normalize_host()
-    port = normalize_port(Map.fetch!(settings, :port))
-    tls_mode = Map.fetch!(settings, :tls_mode)
-    username = settings |> Map.fetch!(:username) |> normalize_text()
-    password = Map.fetch!(settings, :password)
-
-    with {:ok, host} <- require_host(host),
-         {:ok, port} <- require_port(port),
+    with {:ok,
+          %{host: host, port: port, tls_mode: tls_mode, username: username, password: password}} <-
+           connection_settings(settings),
          {:ok, conn} <- open_and_greet_safe(host, port, tls_mode),
          {:ok, conn} <- ehlo(conn, host),
          {:ok, conn} <- maybe_starttls(conn, host, tls_mode),
@@ -43,6 +38,8 @@ defmodule Manifold.Connectors.SMTP.Client do
       {:ok, conn}
     end
   end
+
+  def connect(_settings), do: {:error, invalid_config_error()}
 
   @impl true
   def quit(conn) do
@@ -263,19 +260,18 @@ defmodule Manifold.Connectors.SMTP.Client do
   defp format_response(code, []), do: Integer.to_string(code)
 
   defp open_and_greet_safe(host, port, tls_mode) do
-    open_and_greet(host, port, tls_mode)
+    case open_and_greet(host, port, tls_mode) do
+      {:ok, conn} -> {:ok, conn}
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> {:error, connect_error(reason)}
+      _unexpected -> {:error, connect_failed_error()}
+    end
   rescue
-    e in [ArgumentError, ErlangError, FunctionClauseError] ->
-      {:error, connect_failed_error(e)}
+    _exception ->
+      {:error, connect_failed_error()}
   catch
-    :error, :badarg ->
-      {:error, connect_failed_error(:badarg)}
-
-    :exit, :badarg ->
-      {:error, connect_failed_error(:badarg)}
-
-    :exit, {:badarg, _} = reason ->
-      {:error, connect_failed_error(reason)}
+    _kind, _reason ->
+      {:error, connect_failed_error()}
   end
 
   defp open_and_greet(host, port, tls_mode)
@@ -372,10 +368,10 @@ defmodule Manifold.Connectors.SMTP.Client do
         {:error, error}
 
       {:error, reason} ->
-        {:error, connect_failed_error(reason)}
+        {:error, connect_error(reason)}
 
       other ->
-        {:error, connect_failed_error(other)}
+        {:error, connect_error(other)}
     end
   end
 
@@ -448,39 +444,55 @@ defmodule Manifold.Connectors.SMTP.Client do
       :ok ->
         recv_reply(conn)
 
-      {:error, reason} ->
+      {:error, _reason} ->
         {:error,
          %Error{
            class: :temporary,
            code: :send_failed,
-           message: "SMTP send failed: #{inspect(reason)}"
+           message: "SMTP send failed"
          }}
     end
   end
 
-  defp recv_reply(%__MODULE__{} = conn, acc \\ [], expected_code \\ nil) do
-    case recv_line(conn) do
+  defp recv_reply(%__MODULE__{} = conn) do
+    timeout = Map.get(conn, :reply_timeout_ms, @recv_timeout)
+    deadline = System.monotonic_time(:millisecond) + timeout
+    recv_reply(conn, [], nil, 0, 0, deadline)
+  end
+
+  defp recv_reply(conn, acc, expected_code, line_count, total_bytes, deadline) do
+    case recv_line(conn, deadline) do
       {:ok, conn, line} ->
-        case parse_reply_line(line) do
-          {:final, code, text} when is_nil(expected_code) or code == expected_code ->
-            {:ok, conn, code, Enum.reverse([text | acc])}
+        line_count = line_count + 1
+        total_bytes = total_bytes + byte_size(line) + 2
 
-          {:continued, code, text} when is_nil(expected_code) or code == expected_code ->
-            recv_reply(conn, [text | acc], code)
+        if line_count > @max_reply_lines or total_bytes > @max_reply_bytes do
+          {:error, bad_reply_error()}
+        else
+          case parse_reply_line(line) do
+            {:final, code, text} when is_nil(expected_code) or code == expected_code ->
+              {:ok, conn, code, Enum.reverse([text | acc])}
 
-          _invalid_or_inconsistent ->
-            {:error, bad_reply_error()}
+            {:continued, code, text} when is_nil(expected_code) or code == expected_code ->
+              recv_reply(conn, [text | acc], code, line_count, total_bytes, deadline)
+
+            _invalid_or_inconsistent ->
+              {:error, bad_reply_error()}
+          end
         end
 
       {:error, :timeout} ->
         {:error, %Error{class: :temporary, code: :timeout, message: "SMTP receive timed out"}}
 
-      {:error, reason} ->
+      {:error, :bad_reply} ->
+        {:error, bad_reply_error()}
+
+      {:error, _reason} ->
         {:error,
          %Error{
            class: :temporary,
            code: :recv_failed,
-           message: "SMTP receive failed: #{inspect(reason)}"
+           message: "SMTP receive failed"
          }}
     end
   end
@@ -491,40 +503,68 @@ defmodule Manifold.Connectors.SMTP.Client do
 
   defp parse_reply_line(line) do
     case Regex.run(~r/^(\d{3})([ \-])(.*)$/, line) do
-      [_, code, " ", text] -> {:final, String.to_integer(code), text}
-      [_, code, "-", text] -> {:continued, String.to_integer(code), text}
-      _ -> :invalid
+      [_, code, separator, text] ->
+        code = String.to_integer(code)
+
+        if code in 200..599 do
+          if separator == " ", do: {:final, code, text}, else: {:continued, code, text}
+        else
+          :invalid
+        end
+
+      _ ->
+        :invalid
     end
   end
 
-  defp recv_line(%__MODULE__{buffer: buffer} = conn) do
+  defp recv_line(%__MODULE__{buffer: buffer} = conn, deadline) do
     case :binary.split(buffer, "\r\n") do
-      [line, rest] ->
+      [line, rest] when byte_size(line) + 2 <= @max_reply_line_bytes ->
         {:ok, %{conn | buffer: rest}, line}
 
-      [_] ->
-        case recv_data(conn.socket) do
-          {:ok, data} ->
-            recv_line(%{conn | buffer: buffer <> data})
+      [_line, _rest] ->
+        {:error, :bad_reply}
 
-          {:error, reason} ->
-            {:error, reason}
+      [_] ->
+        if byte_size(buffer) > @max_reply_line_bytes - 2 do
+          {:error, :bad_reply}
+        else
+          case remaining_timeout(deadline) do
+            0 ->
+              {:error, :timeout}
+
+            remaining ->
+              case recv_data(conn.socket, remaining) do
+                {:ok, data} when byte_size(buffer) + byte_size(data) <= @max_reply_bytes ->
+                  recv_line(%{conn | buffer: buffer <> data}, deadline)
+
+                {:ok, _data} ->
+                  {:error, :bad_reply}
+
+                {:error, reason} ->
+                  {:error, reason}
+              end
+          end
         end
     end
   end
 
-  defp recv_data({:tcp, socket}) do
-    case :gen_tcp.recv(socket, 0, @recv_timeout) do
+  defp remaining_timeout(deadline) do
+    max(deadline - System.monotonic_time(:millisecond), 0)
+  end
+
+  defp recv_data({:tcp, socket}, timeout) do
+    case :gen_tcp.recv(socket, 0, timeout) do
       {:ok, data} -> {:ok, data}
       {:error, :timeout} -> {:error, :timeout}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp recv_data({:adapter, module, state}), do: module.recv(state)
+  defp recv_data({:adapter, module, state}, timeout), do: module.recv(state, timeout)
 
-  defp recv_data(socket) do
-    case :ssl.recv(socket, 0, @recv_timeout) do
+  defp recv_data(socket, timeout) do
+    case :ssl.recv(socket, 0, timeout) do
       {:ok, data} -> {:ok, data}
       {:error, :timeout} -> {:error, :timeout}
       {:error, reason} -> {:error, reason}
@@ -561,28 +601,46 @@ defmodule Manifold.Connectors.SMTP.Client do
 
   defp normalize_port(_), do: nil
 
-  defp require_host(host) when is_binary(host) and host != "", do: {:ok, host}
+  defp connection_settings(settings) do
+    host = settings |> Map.get(:host) |> normalize_host()
+    port = settings |> Map.get(:port) |> normalize_port()
+    tls_mode = Map.get(settings, :tls_mode)
+    username = settings |> Map.get(:username) |> normalize_text()
+    password = Map.get(settings, :password)
 
-  defp require_host(_host) do
-    {:error, %Error{class: :temporary, code: :invalid_host, message: "SMTP host is invalid"}}
+    if is_binary(host) and host != "" and is_integer(port) and port > 0 and port <= 65_535 and
+         tls_mode in ["ssl", "tls", "starttls"] and is_binary(username) and username != "" and
+         is_binary(password) and password != "" do
+      {:ok, %{host: host, port: port, tls_mode: tls_mode, username: username, password: password}}
+    else
+      {:error, invalid_config_error()}
+    end
   end
 
-  defp require_port(port) when is_integer(port) and port > 0 and port <= 65_535, do: {:ok, port}
-
-  defp require_port(_port) do
-    {:error, %Error{class: :temporary, code: :invalid_port, message: "SMTP port is invalid"}}
-  end
-
-  defp connect_failed_error(reason) do
+  defp invalid_config_error do
     %Error{
-      class: :temporary,
-      code: :connect_failed,
-      message: "SMTP connect failed: #{inspect_connect_reason(reason)}"
+      class: :permanent,
+      code: :invalid_config,
+      message: "SMTP configuration is invalid"
     }
   end
 
-  defp inspect_connect_reason(%_{} = exception), do: Exception.message(exception)
-  defp inspect_connect_reason(reason), do: inspect(reason)
+  defp connect_error({:unsupported_tls_mode, _mode}), do: invalid_config_error()
+  defp connect_error({:options, _reason}), do: invalid_config_error()
+
+  defp connect_error({:tls_alert, _reason}) do
+    %Error{class: :permanent, code: :tls_failed, message: "SMTP TLS negotiation failed"}
+  end
+
+  defp connect_error(_reason), do: connect_failed_error()
+
+  defp connect_failed_error do
+    %Error{
+      class: :temporary,
+      code: :connect_failed,
+      message: "SMTP connection failed"
+    }
+  end
 
   defp ehlo_name(host) when is_binary(host) and host != "", do: host
   defp ehlo_name(_), do: "localhost"

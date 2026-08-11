@@ -11,6 +11,7 @@ defmodule Manifold.Connectors.SMTP.ClientSubmissionTest do
           closed?: false,
           fail_body?: Keyword.get(opts, :fail_body?, false),
           fail_terminator?: Keyword.get(opts, :fail_terminator?, false),
+          recv_delay_ms: Keyword.get(opts, :recv_delay_ms, 0),
           replies: Keyword.fetch!(opts, :replies),
           writes: []
         }
@@ -29,11 +30,21 @@ defmodule Manifold.Connectors.SMTP.ClientSubmissionTest do
       end)
     end
 
-    def recv(pid) do
-      Agent.get_and_update(pid, fn
-        %{replies: [reply | rest]} = state -> {{:ok, reply}, %{state | replies: rest}}
-        state -> {{:error, :closed}, state}
-      end)
+    def recv(pid), do: recv(pid, 30_000)
+
+    def recv(pid, timeout) do
+      delay = Agent.get(pid, & &1.recv_delay_ms)
+
+      if delay >= timeout do
+        {:error, :timeout}
+      else
+        Process.sleep(delay)
+
+        Agent.get_and_update(pid, fn
+          %{replies: [reply | rest]} = state -> {{:ok, reply}, %{state | replies: rest}}
+          state -> {{:error, :closed}, state}
+        end)
+      end
     end
 
     def close(pid) do
@@ -324,6 +335,194 @@ defmodule Manifold.Connectors.SMTP.ClientSubmissionTest do
     refute inspect(error) =~ "private-server"
     refute inspect(error) =~ "private-password"
     assert :ok = Task.await(server)
+  end
+
+  test "normalizes a real localhost connection refusal without leaking socket details" do
+    {:ok, listen} =
+      :gen_tcp.listen(0, [:binary, active: false, packet: :raw, reuseaddr: true])
+
+    {:ok, {_address, port}} = :inet.sockname(listen)
+    :ok = :gen_tcp.close(listen)
+
+    assert {:error, %Error{class: :temporary, code: :connect_failed} = error} =
+             Client.connect(%{
+               host: "127.0.0.1",
+               port: port,
+               tls_mode: "starttls",
+               username: "sender@example.net",
+               password: "private-password"
+             })
+
+    refute inspect(error) =~ "econnrefused"
+    refute inspect(error) =~ "private-password"
+  end
+
+  test "rejects invalid connection configuration as permanent without raising" do
+    invalid_settings = [
+      %{
+        host: "smtp.example.net",
+        port: 587,
+        tls_mode: "plain",
+        username: "sender@example.net",
+        password: "private-password"
+      },
+      %{
+        host: "",
+        port: 587,
+        tls_mode: "starttls",
+        username: "sender@example.net",
+        password: "private-password"
+      },
+      %{
+        host: "smtp.example.net",
+        port: "not-a-port",
+        tls_mode: "starttls",
+        username: "sender@example.net",
+        password: "private-password"
+      },
+      %{}
+    ]
+
+    for settings <- invalid_settings do
+      assert {:error, %Error{class: :permanent, code: :invalid_config} = error} =
+               Client.connect(settings)
+
+      refute inspect(error) =~ "private-password"
+    end
+  end
+
+  test "rejects reply codes outside the SMTP range before DATA" do
+    for invalid_code <- ["000", "199", "600", "999"] do
+      {conn, server} =
+        start_server([
+          command("MAIL FROM:<sender@example.net>", "#{invalid_code} private-invalid-code"),
+          command("QUIT", "221 bye")
+        ])
+
+      assert {:error, %Error{class: :temporary, code: :bad_reply} = error} =
+               Client.submit(conn, @submission)
+
+      refute inspect(error) =~ "private-invalid-code"
+      assert :ok = Client.quit(conn)
+      assert :ok = Task.await(server)
+    end
+  end
+
+  test "treats invalid or malformed reply codes after the terminator as uncertain" do
+    for reply <- [
+          "000 invalid\r\n",
+          "199 invalid\r\n",
+          "600 invalid\r\n",
+          "999 invalid\r\n",
+          "bad\r\n"
+        ] do
+      {:ok, socket} =
+        ScriptedSocket.start(
+          replies: [
+            "250 sender\r\n",
+            "250 recipient\r\n",
+            "250 recipient\r\n",
+            "354 data\r\n",
+            reply
+          ]
+        )
+
+      conn = %Client{socket: {:adapter, ScriptedSocket, socket}, buffer: ""}
+
+      assert {:error, %Error{class: :uncertain, code: :acceptance_unknown}} =
+               Client.submit(conn, @submission)
+    end
+  end
+
+  test "bounds SMTP reply line length, continuation count, and total size" do
+    oversized_line = "250 " <> String.duplicate("x", 507) <> "\r\n"
+
+    {:ok, oversized_socket} =
+      ScriptedSocket.start(replies: [oversized_line])
+
+    oversized_conn = %Client{
+      socket: {:adapter, ScriptedSocket, oversized_socket},
+      buffer: ""
+    }
+
+    assert {:error, %Error{class: :temporary, code: :bad_reply}} =
+             Client.submit(oversized_conn, @submission)
+
+    too_many_lines =
+      Enum.map_join(1..101, "", fn _index -> "250-continuing\r\n" end) <> "250 done\r\n"
+
+    {:ok, line_count_socket} = ScriptedSocket.start(replies: [too_many_lines])
+
+    line_count_conn = %Client{
+      socket: {:adapter, ScriptedSocket, line_count_socket},
+      buffer: ""
+    }
+
+    assert {:error, %Error{class: :temporary, code: :bad_reply}} =
+             Client.submit(line_count_conn, @submission)
+
+    oversized_reply =
+      Enum.map_join(1..33, "", fn _index ->
+        "250-" <> String.duplicate("x", 494) <> "\r\n"
+      end) <> "250 done\r\n"
+
+    {:ok, total_size_socket} = ScriptedSocket.start(replies: [oversized_reply])
+
+    total_size_conn = %Client{
+      socket: {:adapter, ScriptedSocket, total_size_socket},
+      buffer: ""
+    }
+
+    assert {:error, %Error{class: :temporary, code: :bad_reply}} =
+             Client.submit(total_size_conn, @submission)
+  end
+
+  test "uses one monotonic deadline for a multiline reply" do
+    {:ok, socket} =
+      ScriptedSocket.start(
+        recv_delay_ms: 4,
+        replies: ["250-continuing\r\n", "250 done\r\n"]
+      )
+
+    conn =
+      %Client{socket: {:adapter, ScriptedSocket, socket}, buffer: ""}
+      |> Map.put(:reply_timeout_ms, 6)
+
+    assert {:error, %Error{class: :temporary, code: :timeout}} =
+             Client.submit(conn, @submission)
+  end
+
+  test "frames newline and empty-line variants with one exact terminator" do
+    cases = [
+      {"Body", "Body"},
+      {"Body\n", "Body"},
+      {"Body\n\n", "Body\r\n"},
+      {"", ""},
+      {"\n", ""},
+      {".first\n.\n\n", "..first\r\n..\r\n"}
+    ]
+
+    for {raw_message, expected_body} <- cases do
+      {:ok, socket} =
+        ScriptedSocket.start(
+          replies: [
+            "250 sender\r\n",
+            "250 recipient\r\n",
+            "250 recipient\r\n",
+            "354 data\r\n",
+            "250 accepted\r\n"
+          ]
+        )
+
+      conn = %Client{socket: {:adapter, ScriptedSocket, socket}, buffer: ""}
+
+      assert {:ok, _result} = Client.submit(conn, %{@submission | raw_message: raw_message})
+
+      assert Enum.take(ScriptedSocket.state(socket).writes, -2) == [
+               expected_body,
+               "\r\n.\r\n"
+             ]
+    end
   end
 
   defp command(expected, reply), do: {:command, expected <> "\r\n", reply <> "\r\n"}
