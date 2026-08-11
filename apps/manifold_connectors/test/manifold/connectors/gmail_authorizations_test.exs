@@ -1,0 +1,531 @@
+defmodule Manifold.Connectors.GmailAuthorizationsTest do
+  use Manifold.DataCase, async: false
+
+  alias Manifold.Accounts
+  alias Manifold.Connectors
+  alias Manifold.Connectors.{Crypto, GmailScopes}
+  alias Manifold.Connectors.Jobs.SyncAccount
+  alias Manifold.Connectors.OAuth.Consumed
+  alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
+  alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
+
+  alias Manifold.Connectors.Schema.{
+    ConnectorEvent,
+    Credential,
+    OAuthAuthorization,
+    ReceiveMethod,
+    SendMethod,
+    SyncCursor
+  }
+
+  alias Manifold.Repo
+
+  defmodule FakeGmail do
+    @behaviour Manifold.Connectors.Provider
+
+    @impl true
+    def exchange_code(_code, _verifier, _redirect_uri, _config, opts),
+      do: Keyword.fetch!(opts, :token)
+
+    @impl true
+    def identity(_access_token, _config, opts), do: Keyword.fetch!(opts, :identity)
+
+    @impl true
+    def initial_cursors(_access_token, _config, opts),
+      do:
+        Keyword.get(opts, :cursors, {:ok, [%ProviderCursor{scope: "mailbox", phase: "initial"}]})
+
+    @impl true
+    def refresh_token(_refresh_token, _config, _opts), do: raise("not used")
+
+    @impl true
+    def sync_page(_access_token, cursor, _config, _opts), do: {:ok, %Page{cursor: cursor}}
+
+    @impl true
+    def fetch_raw(_access_token, _message_id, _config, _opts),
+      do: {:ok, %RawMessage{bytes: "Subject: test\r\n\r\nBody\r\n"}}
+  end
+
+  setup do
+    old_key = Application.get_env(:manifold_connectors, :encryption_key)
+    old_adapters = Application.get_env(:manifold_connectors, :adapters)
+    old_providers = Application.get_env(:manifold_connectors, :providers)
+
+    Application.put_env(
+      :manifold_connectors,
+      :encryption_key,
+      Base.encode64(:crypto.strong_rand_bytes(32))
+    )
+
+    Application.put_env(:manifold_connectors, :adapters, gmail: FakeGmail)
+
+    Application.put_env(:manifold_connectors, :providers,
+      gmail: [
+        client_id: "client",
+        client_secret: "secret",
+        authorization_url: "https://accounts.google.test/authorize"
+      ]
+    )
+
+    on_exit(fn ->
+      restore_env(:encryption_key, old_key)
+      restore_env(:adapters, old_adapters)
+      restore_env(:providers, old_providers)
+    end)
+
+    suffix = System.unique_integer([:positive])
+    {:ok, domain} = Accounts.create_domain(%{name: "gmail#{suffix}.test"})
+    {:ok, account} = Accounts.create_account(domain, %{local_part: "person"})
+    account = Repo.preload(account, :domain)
+
+    {:ok, account: account, address: Accounts.account_address(account)}
+  end
+
+  test "receive grant creates shared authorization and linked receive state", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, %ReceiveMethod{} = receive} = complete(:receive, account, address)
+    assert receive.oauth_authorization_id
+    assert receive.account_id == account.id
+    assert receive.provider_account_id == "google-subject-1"
+    assert receive.email_address == address
+    assert receive.granted_scopes == [GmailScopes.read()]
+
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    assert authorization.account_id == account.id
+    assert authorization.provider_subject_id == "google-subject-1"
+    assert authorization.email_address == address
+    assert authorization.granted_scopes == [GmailScopes.read()]
+    assert authorization.status == "connected"
+    refute Repo.get_by(Credential, external_account_id: receive.id)
+
+    assert {:ok, "access-secret"} =
+             Crypto.decrypt(
+               authorization.access_token_ciphertext,
+               "credential:#{authorization.id}:access"
+             )
+
+    assert {:ok, "refresh-secret"} =
+             Crypto.decrypt(
+               authorization.refresh_token_ciphertext,
+               "credential:#{authorization.id}:refresh"
+             )
+
+    assert %SyncCursor{scope: "mailbox", phase: "initial"} =
+             Repo.get_by!(SyncCursor, external_account_id: receive.id)
+
+    assert Repo.get_by!(ConnectorEvent,
+             external_account_id: receive.id,
+             event_type: "connected"
+           )
+
+    assert Repo.get_by!(Oban.Job,
+             worker: inspect(SyncAccount),
+             args: %{"external_account_id" => receive.id}
+           )
+  end
+
+  test "send-first creates only shared authorization and Gmail send method", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, %SendMethod{kind: "gmail"} = send_method} =
+             complete(:send, account, address)
+
+    assert send_method.oauth_authorization_id
+    assert send_method.account_id == account.id
+    assert send_method.email_address == address
+    assert Repo.aggregate(ReceiveMethod, :count) == 0
+    assert Repo.aggregate(SyncCursor, :count) == 0
+    assert Repo.aggregate(Oban.Job, :count) == 0
+    # ConnectorEvent is receive-method keyed today, so send-first has no legal event anchor.
+    assert Repo.aggregate(ConnectorEvent, :count) == 0
+
+    authorization = Repo.get!(OAuthAuthorization, send_method.oauth_authorization_id)
+    assert authorization.granted_scopes == [GmailScopes.send()]
+    refute Repo.get_by(Credential, external_account_id: send_method.id)
+  end
+
+  test "receive-to-send upgrade preserves refresh and adds only send state", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    before = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    assert {:ok, send_method} =
+             complete(:send, account, address,
+               access_token: "upgraded-access-secret",
+               refresh_token: nil,
+               scopes: [GmailScopes.send(), "email", GmailScopes.read(), "unapproved-scope"]
+             )
+
+    authorization = Repo.get!(OAuthAuthorization, send_method.oauth_authorization_id)
+    assert authorization.id == before.id
+    assert authorization.refresh_token_ciphertext == before.refresh_token_ciphertext
+    assert authorization.granted_scopes == Enum.sort([GmailScopes.read(), GmailScopes.send()])
+    assert Repo.get!(ReceiveMethod, receive.id).granted_scopes == [GmailScopes.read()]
+    assert Repo.aggregate(ReceiveMethod, :count) == 1
+    assert Repo.aggregate(SendMethod, :count) == 1
+    assert Repo.aggregate(SyncCursor, :count) == 1
+    assert sync_job_count(receive.id) == 1
+
+    assert {:ok, "upgraded-access-secret"} =
+             Crypto.decrypt(
+               authorization.access_token_ciphertext,
+               "credential:#{authorization.id}:access"
+             )
+
+    assert Repo.get_by!(ConnectorEvent,
+             external_account_id: receive.id,
+             event_type: "scope_upgraded"
+           )
+  end
+
+  test "send-to-receive upgrade preserves send scope and initializes receive only then", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, send_method} = complete(:send, account, address)
+    before = Repo.get!(OAuthAuthorization, send_method.oauth_authorization_id)
+    assert Repo.aggregate(SyncCursor, :count) == 0
+    assert Repo.aggregate(Oban.Job, :count) == 0
+
+    assert {:ok, receive} =
+             complete(:receive, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    assert authorization.refresh_token_ciphertext == before.refresh_token_ciphertext
+    assert authorization.granted_scopes == Enum.sort([GmailScopes.read(), GmailScopes.send()])
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+    assert Repo.aggregate(SyncCursor, :count) == 1
+    assert sync_job_count(receive.id) == 1
+  end
+
+  test "missing stored scope rejects an upgrade without partial changes", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    before = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    assert {:error, %{class: :permanent, reason: :insufficient_provider_scope}} =
+             complete(:send, account, address,
+               access_token: "rejected-access-secret",
+               refresh_token: "rejected-refresh-secret",
+               scopes: [GmailScopes.send()]
+             )
+
+    after_failure = Repo.get!(OAuthAuthorization, before.id)
+    assert after_failure.access_token_ciphertext == before.access_token_ciphertext
+    assert after_failure.refresh_token_ciphertext == before.refresh_token_ciphertext
+    assert after_failure.granted_scopes == before.granted_scopes
+    assert Repo.aggregate(SendMethod, :count) == 0
+    assert Repo.aggregate(ConnectorEvent, :count) == 1
+  end
+
+  test "canonical addresses match exactly without Gmail dot or plus normalization", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} =
+             complete(:receive, account, address,
+               identity: %Identity{
+                 id: "google-subject-1",
+                 email_address: String.upcase(address)
+               }
+             )
+
+    assert Repo.get!(OAuthAuthorization, receive.oauth_authorization_id).email_address == address
+
+    [local, domain] = String.split(address, "@", parts: 2)
+
+    assert {:error, %{class: :permanent, reason: :provider_address_mismatch}} =
+             complete(:send, account, address,
+               scopes: [GmailScopes.read(), GmailScopes.send()],
+               identity: %Identity{
+                 id: "google-subject-1",
+                 email_address: local <> "+alias@" <> domain
+               }
+             )
+
+    assert Repo.aggregate(SendMethod, :count) == 0
+  end
+
+  test "permanent subject binding survives final disconnect and permits only the same subject", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    authorization_id = receive.oauth_authorization_id
+
+    assert {:ok, disconnected} = Connectors.disconnect(receive.id)
+    assert disconnected.status == "disconnected"
+
+    disconnected_authorization = Repo.get!(OAuthAuthorization, authorization_id)
+    assert disconnected_authorization.status == "disconnected"
+    assert disconnected_authorization.provider_subject_id == "google-subject-1"
+    assert disconnected_authorization.email_address == address
+    assert is_nil(disconnected_authorization.access_token_ciphertext)
+    assert is_nil(disconnected_authorization.refresh_token_ciphertext)
+    assert is_nil(disconnected_authorization.token_expires_at)
+
+    assert {:error, %{class: :permanent, reason: :provider_identity_mismatch}} =
+             complete(:receive, account, address,
+               identity: %Identity{id: "different-subject", email_address: address}
+             )
+
+    assert {:ok, reconnected} = complete(:receive, account, address)
+    assert reconnected.id == receive.id
+    assert Repo.get!(OAuthAuthorization, authorization_id).status == "connected"
+  end
+
+  test "a provider subject cannot move accounts while distinct subjects can bind distinctly", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, _receive} = complete(:receive, account, address)
+    {:ok, other_account} = Accounts.create_account(account.domain, %{local_part: "other"})
+    other_account = Repo.preload(other_account, :domain)
+    other_address = Accounts.account_address(other_account)
+
+    assert {:error, %{class: :permanent, reason: :provider_identity_already_bound}} =
+             complete(:receive, other_account, other_address,
+               identity: %Identity{id: "google-subject-1", email_address: other_address}
+             )
+
+    assert {:ok, other_receive} =
+             complete(:receive, other_account, other_address,
+               identity: %Identity{id: "google-subject-2", email_address: other_address}
+             )
+
+    assert Repo.get!(OAuthAuthorization, other_receive.oauth_authorization_id).provider_subject_id ==
+             "google-subject-2"
+
+    assert Repo.aggregate(OAuthAuthorization, :count) == 2
+  end
+
+  test "refresh replacement is atomic and a new authorization requires refresh", %{
+    account: account,
+    address: address
+  } do
+    assert {:error, %{class: :permanent, reason: :missing_refresh_token}} =
+             complete(:send, account, address, refresh_token: nil)
+
+    assert Repo.aggregate(OAuthAuthorization, :count) == 0
+    assert Repo.aggregate(SendMethod, :count) == 0
+
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, _updated} =
+             complete(:receive, account, address,
+               access_token: "replacement-access-secret",
+               refresh_token: "replacement-refresh-secret"
+             )
+
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    assert {:ok, "replacement-refresh-secret"} =
+             Crypto.decrypt(
+               authorization.refresh_token_ciphertext,
+               "credential:#{authorization.id}:refresh"
+             )
+  end
+
+  test "completion disables methods only in the requested direction", %{
+    account: account,
+    address: address
+  } do
+    other_receive = insert_other_receive!(account.id, address)
+    other_send = insert_other_send!(account.id, address)
+
+    assert {:ok, gmail_send} = complete(:send, account, address)
+    refute Repo.get!(SendMethod, other_send.id).enabled
+    assert Repo.get!(ReceiveMethod, other_receive.id).enabled
+
+    assert {:ok, gmail_receive} =
+             complete(:receive, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    refute Repo.get!(ReceiveMethod, other_receive.id).enabled
+    assert Repo.get!(SendMethod, gmail_send.id).enabled
+    assert Repo.get!(ReceiveMethod, gmail_receive.id).enabled
+  end
+
+  test "disconnecting one direction keeps the other live and final disconnect clears only tokens",
+       %{
+         account: account,
+         address: address
+       } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, send_method} =
+             complete(:send, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    assert {:ok, disconnected_receive} = Connectors.disconnect(receive.id)
+    assert disconnected_receive.status == "disconnected"
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+
+    still_live = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    assert still_live.status == "connected"
+    assert still_live.access_token_ciphertext
+    assert still_live.refresh_token_ciphertext
+
+    assert {:ok, disconnected_send} = Connectors.disconnect_send_method(send_method.id)
+    assert disconnected_send.status == "disconnected"
+
+    final = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    assert final.status == "disconnected"
+    assert final.provider_subject_id == "google-subject-1"
+    assert final.email_address == address
+    assert is_nil(final.access_token_ciphertext)
+    assert is_nil(final.refresh_token_ciphertext)
+    assert is_nil(final.token_expires_at)
+  end
+
+  test "account deletion cascades both Gmail methods and the shared authorization", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, _send_method} =
+             complete(:send, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    # connector_accounts.mailbox_id intentionally retains its pre-existing RESTRICT FK,
+    # so explicit receive-method cleanup remains the account deletion boundary.
+    assert {:ok, _disconnected} = Connectors.disconnect(receive.id)
+    assert {:ok, _deleted} = Connectors.delete_receive_method(receive.id)
+    Repo.delete!(account)
+
+    assert Repo.aggregate(ReceiveMethod, :count) == 0
+    assert Repo.aggregate(SendMethod, :count) == 0
+    assert Repo.aggregate(OAuthAuthorization, :count) == 0
+  end
+
+  test "rejected grants do not leak or persist callback secrets", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    before = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    assert {:error, error} =
+             complete(:send, account, address,
+               code: "raw-authorization-code",
+               access_token: "raw-access-token",
+               refresh_token: "raw-refresh-token",
+               scopes: [GmailScopes.send()]
+             )
+
+    refute inspect(error) =~ "raw-authorization-code"
+    refute inspect(error) =~ "raw-access-token"
+    refute inspect(error) =~ "raw-refresh-token"
+
+    assert Repo.get!(OAuthAuthorization, before.id).access_token_ciphertext ==
+             before.access_token_ciphertext
+
+    assert Repo.aggregate(SendMethod, :count) == 0
+
+    for value <- Repo.all(ConnectorEvent) ++ Repo.all(Oban.Job) do
+      serialized = inspect(value)
+      refute serialized =~ "raw-authorization-code"
+      refute serialized =~ "raw-access-token"
+      refute serialized =~ "raw-refresh-token"
+      refute serialized =~ "verifier-secret"
+    end
+  end
+
+  defp complete(purpose, account, address, opts \\ []) do
+    purpose_scope = if purpose == :receive, do: GmailScopes.read(), else: GmailScopes.send()
+    required_scopes = Keyword.get(opts, :required_scopes, [purpose_scope])
+
+    consumed = %Consumed{
+      provider: "gmail",
+      mailbox_id: account.id,
+      purpose: purpose,
+      required_scopes: required_scopes,
+      redirect_uri: "https://mail.example.test/connectors/gmail/callback",
+      pkce_verifier: "verifier-secret"
+    }
+
+    token =
+      Keyword.get(
+        opts,
+        :token,
+        %Token{
+          access_token: Keyword.get(opts, :access_token, "access-secret"),
+          refresh_token: Keyword.get(opts, :refresh_token, "refresh-secret"),
+          expires_at: ~U[2026-08-11 02:00:00.000000Z],
+          scopes: Keyword.get(opts, :scopes, ["openid", "email", purpose_scope])
+        }
+      )
+
+    identity =
+      Keyword.get(opts, :identity, %Identity{
+        id: "google-subject-1",
+        email_address: address
+      })
+
+    Connectors.complete_authorization(
+      "gmail",
+      Keyword.get(opts, :code, "authorization-code-secret"),
+      consumed,
+      now: ~U[2026-08-11 01:00:00.000000Z],
+      provider_opts: [token: {:ok, token}, identity: {:ok, identity}]
+    )
+  end
+
+  defp insert_other_receive!(account_id, address) do
+    %ReceiveMethod{}
+    |> ReceiveMethod.changeset(%{
+      account_id: account_id,
+      kind: "imap",
+      provider_account_id: "imap:#{address}",
+      email_address: address,
+      status: "connected",
+      enabled: true,
+      sync_enabled: true,
+      granted_scopes: []
+    })
+    |> Repo.insert!()
+  end
+
+  defp insert_other_send!(account_id, address) do
+    %SendMethod{}
+    |> SendMethod.changeset(%{
+      account_id: account_id,
+      kind: "smtp",
+      email_address: address,
+      status: "connected",
+      enabled: true
+    })
+    |> Repo.insert!()
+  end
+
+  defp sync_job_count(receive_method_id) do
+    Repo.aggregate(
+      from(job in Oban.Job,
+        where:
+          job.worker == ^inspect(SyncAccount) and
+            fragment("?->>'external_account_id' = ?", job.args, ^receive_method_id)
+      ),
+      :count
+    )
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)
+  defp restore_env(key, value), do: Application.put_env(:manifold_connectors, key, value)
+end

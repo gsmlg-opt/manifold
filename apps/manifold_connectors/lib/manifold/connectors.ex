@@ -9,6 +9,7 @@ defmodule Manifold.Connectors do
   alias Manifold.Accounts
   alias Manifold.Connectors.ActivityLog
   alias Manifold.Connectors.Crypto
+  alias Manifold.Connectors.GmailAuthorizations
   alias Manifold.Connectors.IMAP.Client
   alias Manifold.Connectors.EAS.Client, as: EASClient
   alias Manifold.Connectors.SMTP.Client, as: SmtpClient
@@ -44,8 +45,21 @@ defmodule Manifold.Connectors do
   }
 
   @spec complete_authorization(String.t(), String.t(), Consumed.t(), Keyword.t()) ::
-          {:ok, ReceiveMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
-  def complete_authorization(provider, code, %Consumed{} = consumed, opts \\ []) do
+          {:ok, ReceiveMethod.t() | SendMethod.t()}
+          | {:error, Error.t() | Ecto.Changeset.t()}
+  def complete_authorization(provider, code, consumed, opts \\ [])
+
+  def complete_authorization("gmail", code, %Consumed{} = consumed, opts) do
+    with :ok <- validate_consumed("gmail", consumed),
+         {:ok, adapter, config} <- adapter_config("gmail") do
+      GmailAuthorizations.complete(code, consumed, adapter, config, opts)
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error, database_error(:unavailable)}
+  end
+
+  def complete_authorization(provider, code, %Consumed{} = consumed, opts) do
     now = Keyword.get(opts, :now, DateTime.utc_now())
 
     with :ok <- validate_consumed(provider, consumed),
@@ -405,6 +419,19 @@ defmodule Manifold.Connectors do
   @spec disconnect_send_method(Ecto.UUID.t()) ::
           {:ok, SendMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def disconnect_send_method(send_method_id) do
+    case Repo.get(SendMethod, send_method_id) do
+      %SendMethod{kind: "gmail", oauth_authorization_id: authorization_id}
+      when is_binary(authorization_id) ->
+        GmailAuthorizations.disconnect_method(:send, send_method_id)
+
+      _method ->
+        disconnect_legacy_send_method(send_method_id)
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  defp disconnect_legacy_send_method(send_method_id) do
     now = DateTime.utc_now()
 
     Multi.new()
@@ -448,8 +475,6 @@ defmodule Manifold.Connectors do
       {:ok, %{method: method}} -> {:ok, method}
       {:error, _step, reason, _changes} -> {:error, reason}
     end
-  rescue
-    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
   defp resolve_imap_account(nil, address), do: Accounts.ensure_account_for_address(address)
@@ -544,6 +569,19 @@ defmodule Manifold.Connectors do
   @spec disconnect(Ecto.UUID.t()) ::
           {:ok, ReceiveMethod.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def disconnect(account_id) do
+    case Repo.get(ReceiveMethod, account_id) do
+      %ReceiveMethod{kind: "gmail", oauth_authorization_id: authorization_id}
+      when is_binary(authorization_id) ->
+        GmailAuthorizations.disconnect_method(:receive, account_id)
+
+      _method ->
+        disconnect_legacy_receive_method(account_id)
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  defp disconnect_legacy_receive_method(account_id) do
     now = DateTime.utc_now()
 
     Multi.new()
@@ -592,8 +630,6 @@ defmodule Manifold.Connectors do
       {:ok, %{account: account}} -> {:ok, account}
       {:error, _step, reason, _changes} -> {:error, reason}
     end
-  rescue
-    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
   @spec delete_receive_method(Ecto.UUID.t()) ::

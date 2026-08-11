@@ -19,7 +19,7 @@ defmodule Manifold.ConnectorsTest do
 
   alias Manifold.Repo
 
-  defmodule FakeGmail do
+  defmodule FakeMicrosoft do
     @behaviour Manifold.Connectors.Provider
 
     @impl true
@@ -29,7 +29,7 @@ defmodule Manifold.ConnectorsTest do
          access_token: "access-secret",
          refresh_token: "refresh-secret",
          expires_at: ~U[2026-07-29 02:00:00.000000Z],
-         scopes: ["openid", "email", "https://www.googleapis.com/auth/gmail.readonly"]
+         scopes: ["Mail.Read", "offline_access"]
        }}
     end
 
@@ -47,7 +47,7 @@ defmodule Manifold.ConnectorsTest do
 
     @impl true
     def identity("access-secret", _config, _opts) do
-      {:ok, %Identity{id: "google-subject-1", email_address: "person@gmail.example"}}
+      {:ok, %Identity{id: "microsoft-subject-1", email_address: "person@microsoft.example"}}
     end
 
     @impl true
@@ -75,10 +75,10 @@ defmodule Manifold.ConnectorsTest do
       Base.encode64(:crypto.strong_rand_bytes(32))
     )
 
-    Application.put_env(:manifold_connectors, :adapters, gmail: FakeGmail)
+    Application.put_env(:manifold_connectors, :adapters, microsoft: FakeMicrosoft)
 
     Application.put_env(:manifold_connectors, :providers,
-      gmail: [
+      microsoft: [
         client_id: "client",
         client_secret: "secret",
         authorization_url: "https://accounts.google.test/authorize"
@@ -103,13 +103,13 @@ defmodule Manifold.ConnectorsTest do
     consumed = consumed(mailbox.id)
 
     assert {:ok, account} =
-             Connectors.complete_authorization("gmail", "valid-code", consumed,
+             Connectors.complete_authorization("microsoft", "valid-code", consumed,
                now: ~U[2026-07-29 01:00:00.000000Z]
              )
 
-    assert account.kind == "gmail"
-    assert account.provider_account_id == "google-subject-1"
-    assert account.email_address == "person@gmail.example"
+    assert account.kind == "microsoft"
+    assert account.provider_account_id == "microsoft-subject-1"
+    assert account.email_address == "person@microsoft.example"
     assert account.account_id == mailbox.id
     assert account.status == "connected"
 
@@ -145,7 +145,7 @@ defmodule Manifold.ConnectorsTest do
 
   test "failure before initial job rolls back the entire local connection", %{mailbox: mailbox} do
     assert {:error, %{reason: :after_credentials_before_job}} =
-             Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id),
+             Connectors.complete_authorization("microsoft", "valid-code", consumed(mailbox.id),
                fail_at: :after_credentials_before_job
              )
 
@@ -158,16 +158,16 @@ defmodule Manifold.ConnectorsTest do
 
   test "account list is a public projection without encrypted fields", %{mailbox: mailbox} do
     assert {:ok, account} =
-             Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
+             Connectors.complete_authorization("microsoft", "valid-code", consumed(mailbox.id))
 
     assert [view] = Connectors.list_accounts()
     assert view.id == account.id
-    assert view.kind == "gmail"
-    assert view.email_address == "person@gmail.example"
+    assert view.kind == "microsoft"
+    assert view.email_address == "person@microsoft.example"
     assert view.account_id == mailbox.id
     refute Map.has_key?(Map.from_struct(view), :access_token_ciphertext)
     refute Map.has_key?(Map.from_struct(view), :refresh_token_ciphertext)
-    assert Connectors.configured_providers() == ["gmail"]
+    assert Connectors.configured_providers() == ["microsoft"]
   end
 
   test "reauthorization cannot silently move an existing provider account", %{
@@ -175,13 +175,13 @@ defmodule Manifold.ConnectorsTest do
     mailbox: mailbox
   } do
     assert {:ok, account} =
-             Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
+             Connectors.complete_authorization("microsoft", "valid-code", consumed(mailbox.id))
 
     {:ok, other_mailbox} = Accounts.create_account(domain, %{local_part: "other"})
 
     assert {:error, %{class: :permanent, reason: :mailbox_reassignment_not_allowed}} =
              Connectors.complete_authorization(
-               "gmail",
+               "microsoft",
                "valid-code",
                consumed(other_mailbox.id)
              )
@@ -193,7 +193,7 @@ defmodule Manifold.ConnectorsTest do
 
   test "sync enqueue is unique and disconnect invalidates credentials", %{mailbox: mailbox} do
     assert {:ok, account} =
-             Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
+             Connectors.complete_authorization("microsoft", "valid-code", consumed(mailbox.id))
 
     assert {:ok, _job} = Connectors.enqueue_sync(account.id)
     assert {:ok, _job} = Connectors.enqueue_sync(account.id)
@@ -218,7 +218,7 @@ defmodule Manifold.ConnectorsTest do
 
   test "delete_receive_method removes the method and pending sync jobs", %{mailbox: mailbox} do
     assert {:ok, account} =
-             Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
+             Connectors.complete_authorization("microsoft", "valid-code", consumed(mailbox.id))
 
     assert {:ok, _job} = Connectors.enqueue_sync(account.id)
 
@@ -238,7 +238,7 @@ defmodule Manifold.ConnectorsTest do
 
   test "provider message IDs are case-sensitive", %{mailbox: mailbox} do
     assert {:ok, account} =
-             Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
+             Connectors.complete_authorization("microsoft", "valid-code", consumed(mailbox.id))
 
     now = DateTime.utc_now()
 
@@ -250,7 +250,7 @@ defmodule Manifold.ConnectorsTest do
 
   test "polling recreates missing sync work without duplicating jobs", %{mailbox: mailbox} do
     assert {:ok, account} =
-             Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
+             Connectors.complete_authorization("microsoft", "valid-code", consumed(mailbox.id))
 
     Repo.delete_all(Oban.Job)
 
@@ -274,7 +274,7 @@ defmodule Manifold.ConnectorsTest do
 
   test "sync_job_running? reflects incomplete SyncAccount jobs", %{mailbox: mailbox} do
     assert {:ok, account} =
-             Connectors.complete_authorization("gmail", "valid-code", consumed(mailbox.id))
+             Connectors.complete_authorization("microsoft", "valid-code", consumed(mailbox.id))
 
     # OAuth completion enqueues SyncAccount; clear so we assert from a known empty state
     Repo.delete_all(Oban.Job)
@@ -298,9 +298,9 @@ defmodule Manifold.ConnectorsTest do
 
   defp consumed(mailbox_id) do
     %Consumed{
-      provider: "gmail",
+      provider: "microsoft",
       mailbox_id: mailbox_id,
-      redirect_uri: "https://mail.example.test/connectors/gmail/callback",
+      redirect_uri: "https://mail.example.test/connectors/microsoft/callback",
       pkce_verifier: "verifier"
     }
   end
