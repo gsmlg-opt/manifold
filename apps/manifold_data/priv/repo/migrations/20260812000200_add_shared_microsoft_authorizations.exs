@@ -117,9 +117,28 @@ defmodule Manifold.Repo.Migrations.AddSharedMicrosoftAuthorizations do
     execute("""
     DO $$
     BEGIN
-      IF EXISTS (SELECT 1 FROM connector_send_methods WHERE kind = 'microsoft') THEN
+      IF EXISTS (
+        SELECT 1
+        FROM connector_send_methods AS send_method
+        WHERE send_method.kind = 'microsoft'
+        ORDER BY send_method.id
+        LIMIT 1
+      ) THEN
         RAISE EXCEPTION
           'cannot rollback shared Microsoft authorizations while Microsoft send methods exist';
+      END IF;
+
+      IF EXISTS (
+        SELECT 1
+        FROM connector_send_methods AS send_method
+        JOIN connector_oauth_authorizations AS oauth_authorization
+          ON oauth_authorization.id = send_method.oauth_authorization_id
+        WHERE oauth_authorization.provider = 'microsoft'
+        ORDER BY send_method.id
+        LIMIT 1
+      ) THEN
+        RAISE EXCEPTION
+          'cannot rollback shared Microsoft authorizations while send methods reference Microsoft authorizations';
       END IF;
     END
     $$
