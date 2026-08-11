@@ -4,6 +4,46 @@ defmodule Manifold.Connectors.SMTP.ClientSubmissionTest do
   alias Manifold.Connectors.Provider.Error
   alias Manifold.Connectors.SMTP.Client
 
+  defmodule ScriptedSocket do
+    def start(opts) do
+      Agent.start_link(fn ->
+        %{
+          closed?: false,
+          fail_body?: Keyword.get(opts, :fail_body?, false),
+          fail_terminator?: Keyword.get(opts, :fail_terminator?, false),
+          replies: Keyword.fetch!(opts, :replies),
+          writes: []
+        }
+      end)
+    end
+
+    def send(pid, data) do
+      Agent.get_and_update(pid, fn state ->
+        state = %{state | writes: state.writes ++ [data]}
+
+        cond do
+          data == "\r\n.\r\n" and state.fail_terminator? -> {{:error, :closed}, state}
+          String.starts_with?(data, "From:") and state.fail_body? -> {{:error, :closed}, state}
+          true -> {:ok, state}
+        end
+      end)
+    end
+
+    def recv(pid) do
+      Agent.get_and_update(pid, fn
+        %{replies: [reply | rest]} = state -> {{:ok, reply}, %{state | replies: rest}}
+        state -> {{:error, :closed}, state}
+      end)
+    end
+
+    def close(pid) do
+      Agent.update(pid, &%{&1 | closed?: true})
+      :ok
+    end
+
+    def state(pid), do: Agent.get(pid, & &1)
+  end
+
   @submission %{
     envelope_from: "sender@example.net",
     recipients: ["to@example.net", "hidden@example.net"],
@@ -33,6 +73,57 @@ defmodule Manifold.Connectors.SMTP.ClientSubmissionTest do
 
     assert :ok = Client.quit(conn)
     assert :ok = Task.await(server)
+  end
+
+  test "runs greeting, EHLO, authentication, submission, and QUIT as one session" do
+    {:ok, socket} =
+      ScriptedSocket.start(
+        replies: [
+          "220 fixture ready\r\n",
+          "250-fixture\r\n250 AUTH LOGIN PLAIN\r\n",
+          "334 username\r\n",
+          "334 password\r\n",
+          "235 authenticated\r\n",
+          "250 sender\r\n",
+          "250 recipient\r\n",
+          "250 recipient\r\n",
+          "354 data\r\n",
+          "250 accepted\r\n",
+          "221 bye\r\n"
+        ]
+      )
+
+    fixture_socket = {:adapter, ScriptedSocket, socket}
+
+    assert {:ok, conn} =
+             Client.connect(%{
+               host: "smtp.fixture",
+               port: 465,
+               tls_mode: "tls",
+               username: "sender@example.net",
+               password: "private-password",
+               fixture_socket: fixture_socket
+             })
+
+    assert {:ok, %{response: "250 accepted"}} = Client.submit(conn, @submission)
+    assert :ok = Client.quit(conn)
+
+    assert ScriptedSocket.state(socket).writes == [
+             "EHLO smtp.fixture\r\n",
+             "AUTH LOGIN\r\n",
+             Base.encode64("sender@example.net") <> "\r\n",
+             Base.encode64("private-password") <> "\r\n",
+             "MAIL FROM:<sender@example.net>\r\n",
+             "RCPT TO:<to@example.net>\r\n",
+             "RCPT TO:<hidden@example.net>\r\n",
+             "DATA\r\n",
+             "From: sender@example.net\r\n" <>
+               "To: to@example.net\r\n" <>
+               "Message-ID: <stable@manifold.local>\r\n\r\n" <>
+               "Hello\r\n..leading\r\n...already\r\nlast",
+             "\r\n.\r\n",
+             "QUIT\r\n"
+           ]
   end
 
   test "resets without DATA when a recipient is temporarily rejected" do
@@ -106,6 +197,93 @@ defmodule Manifold.Connectors.SMTP.ClientSubmissionTest do
               message: "SMTP may have accepted the message"
             }} = Client.submit(conn, @submission)
 
+    assert :ok = Client.quit(conn)
+    assert :ok = Task.await(server)
+  end
+
+  test "keeps a DATA body write failure definite and does not attempt the terminator" do
+    {:ok, socket} =
+      ScriptedSocket.start(
+        fail_body?: true,
+        replies: ["250 sender\r\n", "250 recipient\r\n", "250 recipient\r\n", "354 data\r\n"]
+      )
+
+    conn = %Client{socket: {:adapter, ScriptedSocket, socket}, buffer: ""}
+
+    assert {:error, %Error{class: :temporary, code: :send_failed}} =
+             Client.submit(conn, @submission)
+
+    state = ScriptedSocket.state(socket)
+    assert state.closed?
+    refute "\r\n.\r\n" in state.writes
+  end
+
+  test "treats any terminator write failure as acceptance uncertainty" do
+    {:ok, socket} =
+      ScriptedSocket.start(
+        fail_terminator?: true,
+        replies: ["250 sender\r\n", "250 recipient\r\n", "250 recipient\r\n", "354 data\r\n"]
+      )
+
+    conn = %Client{socket: {:adapter, ScriptedSocket, socket}, buffer: ""}
+
+    assert {:error, %Error{class: :uncertain, code: :acceptance_unknown}} =
+             Client.submit(conn, @submission)
+
+    assert %{
+             closed?: true,
+             writes: [
+               "MAIL FROM:<sender@example.net>\r\n",
+               "RCPT TO:<to@example.net>\r\n",
+               "RCPT TO:<hidden@example.net>\r\n",
+               "DATA\r\n",
+               body,
+               "\r\n.\r\n"
+             ]
+           } = ScriptedSocket.state(socket)
+
+    assert body ==
+             "From: sender@example.net\r\n" <>
+               "To: to@example.net\r\n" <>
+               "Message-ID: <stable@manifold.local>\r\n\r\n" <>
+               "Hello\r\n..leading\r\n...already\r\nlast"
+  end
+
+  test "rejects inconsistent multiline reply codes before DATA without exposing the reply" do
+    {conn, server} =
+      start_server([
+        command("MAIL FROM:<sender@example.net>", "250-private-first\r\n550 private-final"),
+        command("QUIT", "221 bye")
+      ])
+
+    assert {:error, %Error{class: :temporary, code: :bad_reply} = error} =
+             Client.submit(conn, @submission)
+
+    refute inspect(error) =~ "private"
+    assert :ok = Client.quit(conn)
+    assert :ok = Task.await(server)
+  end
+
+  test "treats inconsistent multiline final DATA reply as uncertain" do
+    expected_data =
+      "From: sender@example.net\r\n" <>
+        "To: to@example.net\r\n" <>
+        "Message-ID: <stable@manifold.local>\r\n\r\n" <>
+        "Hello\r\n..leading\r\n...already\r\nlast\r\n.\r\n"
+
+    {conn, server} =
+      start_server([
+        command("MAIL FROM:<sender@example.net>", "250 sender"),
+        command("RCPT TO:<to@example.net>", "250 recipient"),
+        command("RCPT TO:<hidden@example.net>", "250 recipient"),
+        command("DATA", "354 data"),
+        data(expected_data, "250-private-first\r\n550 private-final")
+      ])
+
+    assert {:error, %Error{class: :uncertain, code: :acceptance_unknown} = error} =
+             Client.submit(conn, @submission)
+
+    refute inspect(error) =~ "private"
     assert :ok = Client.quit(conn)
     assert :ok = Task.await(server)
   end

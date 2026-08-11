@@ -10,6 +10,22 @@ defmodule Manifold.Connectors.SMTP.Client do
   @connect_timeout 15_000
   @recv_timeout 30_000
 
+  # An in-memory adapter exercises a complete authenticated session without
+  # adding a plaintext network mode or weakening TLS verification.
+  @impl true
+  def connect(%{fixture_socket: {:adapter, _module, _state} = socket} = settings) do
+    host = settings |> Map.fetch!(:host) |> normalize_host()
+    username = settings |> Map.fetch!(:username) |> normalize_text()
+    password = Map.fetch!(settings, :password)
+
+    with {:ok, host} <- require_host(host),
+         {:ok, conn} <- read_greeting(%__MODULE__{socket: socket, buffer: ""}),
+         {:ok, conn} <- ehlo(conn, host),
+         {:ok, conn} <- authenticate(conn, username, password) do
+      {:ok, conn}
+    end
+  end
+
   @impl true
   def connect(settings) when is_map(settings) do
     host = settings |> Map.fetch!(:host) |> normalize_host()
@@ -102,11 +118,34 @@ defmodule Manifold.Connectors.SMTP.Client do
   end
 
   defp transmit_message(conn, raw_message) do
-    framed = frame_message(raw_message)
+    body = data_body(raw_message)
 
-    case send_data(conn.socket, framed) do
-      :ok -> receive_acceptance(conn)
-      {:error, reason} -> {:error, phase_error(:before_terminator, :send_failed, reason)}
+    case send_data(conn.socket, body) do
+      :ok ->
+        transmit_terminator(conn)
+
+      {:error, reason} ->
+        close_socket(conn.socket)
+        delete_conn()
+        {:error, phase_error(:before_terminator, :send_failed, reason)}
+    end
+  end
+
+  defp transmit_terminator(conn) do
+    case send_data(conn.socket, "\r\n.\r\n") do
+      :ok ->
+        receive_acceptance(conn)
+
+      {:error, _reason} ->
+        close_socket(conn.socket)
+        delete_conn()
+
+        {:error,
+         %Error{
+           class: :uncertain,
+           code: :acceptance_unknown,
+           message: "SMTP may have accepted the message"
+         }}
     end
   end
 
@@ -141,7 +180,7 @@ defmodule Manifold.Connectors.SMTP.Client do
     :ok
   end
 
-  defp frame_message(raw_message) do
+  defp data_body(raw_message) do
     normalized = String.replace(raw_message, ~r/\r\n|\r|\n/, "\r\n")
 
     dot_stuffed =
@@ -153,9 +192,9 @@ defmodule Manifold.Connectors.SMTP.Client do
       end)
 
     if String.ends_with?(dot_stuffed, "\r\n") do
-      dot_stuffed <> ".\r\n"
+      binary_part(dot_stuffed, 0, byte_size(dot_stuffed) - 2)
     else
-      dot_stuffed <> "\r\n.\r\n"
+      dot_stuffed
     end
   end
 
@@ -419,23 +458,18 @@ defmodule Manifold.Connectors.SMTP.Client do
     end
   end
 
-  defp recv_reply(%__MODULE__{} = conn, acc \\ []) do
+  defp recv_reply(%__MODULE__{} = conn, acc \\ [], expected_code \\ nil) do
     case recv_line(conn) do
       {:ok, conn, line} ->
         case parse_reply_line(line) do
-          {:final, code, text} ->
+          {:final, code, text} when is_nil(expected_code) or code == expected_code ->
             {:ok, conn, code, Enum.reverse([text | acc])}
 
-          {:continued, _code, text} ->
-            recv_reply(conn, [text | acc])
+          {:continued, code, text} when is_nil(expected_code) or code == expected_code ->
+            recv_reply(conn, [text | acc], code)
 
-          :invalid ->
-            {:error,
-             %Error{
-               class: :temporary,
-               code: :bad_reply,
-               message: "Unexpected SMTP reply"
-             }}
+          _invalid_or_inconsistent ->
+            {:error, bad_reply_error()}
         end
 
       {:error, :timeout} ->
@@ -449,6 +483,10 @@ defmodule Manifold.Connectors.SMTP.Client do
            message: "SMTP receive failed: #{inspect(reason)}"
          }}
     end
+  end
+
+  defp bad_reply_error do
+    %Error{class: :temporary, code: :bad_reply, message: "Unexpected SMTP reply"}
   end
 
   defp parse_reply_line(line) do
@@ -483,6 +521,8 @@ defmodule Manifold.Connectors.SMTP.Client do
     end
   end
 
+  defp recv_data({:adapter, module, state}), do: module.recv(state)
+
   defp recv_data(socket) do
     case :ssl.recv(socket, 0, @recv_timeout) do
       {:ok, data} -> {:ok, data}
@@ -491,9 +531,11 @@ defmodule Manifold.Connectors.SMTP.Client do
     end
   end
 
+  defp send_data({:adapter, module, state}, data), do: module.send(state, data)
   defp send_data({:tcp, socket}, data), do: :gen_tcp.send(socket, data)
   defp send_data(socket, data), do: :ssl.send(socket, data)
 
+  defp close_socket({:adapter, module, state}), do: module.close(state)
   defp close_socket({:tcp, socket}), do: :gen_tcp.close(socket)
   defp close_socket(socket), do: :ssl.close(socket)
 

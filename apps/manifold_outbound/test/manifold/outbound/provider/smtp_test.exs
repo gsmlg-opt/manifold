@@ -34,10 +34,11 @@ defmodule Manifold.Outbound.Provider.SMTPTest do
     assert {:ok,
             %Provider.Submission{
               provider_message_id: provider_message_id,
-              metadata: %{response: "250 queued"}
-            }} = SMTP.submit([submission_method: method, transport: Fake], @request)
+              metadata: %{smtp_status: 250}
+            } = submission} = SMTP.submit([submission_method: method, transport: Fake], @request)
 
     assert provider_message_id == stable_provider_id(@message_id)
+    refute inspect(submission) =~ "private-server-extra-response"
 
     assert_receive {:smtp_fake_connect,
                     %{

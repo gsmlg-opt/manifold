@@ -163,13 +163,13 @@ defmodule Manifold.Outbound.Provider.SMTP do
     end
   end
 
-  defp normalize_result({:ok, %{response: response}}, message_id) when is_binary(response) do
+  defp normalize_result({:ok, %{response: _response}}, message_id) do
     digest = :crypto.hash(:sha256, message_id) |> Base.url_encode64(padding: false)
 
     {:ok,
      %Submission{
        provider_message_id: "smtp-#{digest}",
-       metadata: %{response: sanitize_response(response)}
+       metadata: %{smtp_status: 250}
      }}
   end
 
@@ -193,13 +193,6 @@ defmodule Manifold.Outbound.Provider.SMTP do
 
   defp normalize_code(code) when is_atom(code), do: Atom.to_string(code)
   defp normalize_code(_code), do: "smtp_error"
-
-  defp sanitize_response(response) do
-    response
-    |> String.split(["\r\n", "\r", "\n"], parts: 2)
-    |> hd()
-    |> String.slice(0, 500)
-  end
 
   defp provider_error(class, code, retry_after \\ nil) do
     message =
