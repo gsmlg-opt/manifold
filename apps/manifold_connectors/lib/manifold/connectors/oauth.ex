@@ -14,6 +14,8 @@ defmodule Manifold.Connectors.OAuth do
   @providers ~w(gmail microsoft)
   @default_ttl_seconds 600
   @mailbox_foreign_key "connector_oauth_transactions_mailbox_id_fkey"
+  @telemetry_forbidden_fragments ~w(token password authorization_code raw_message)
+  @telemetry_code_pattern ~r/\A[a-z0-9_.:-]{1,128}\z/
 
   @type purpose :: :receive | :send
   @type purpose_input :: purpose() | String.t()
@@ -55,6 +57,13 @@ defmodule Manifold.Connectors.OAuth do
   @spec start(String.t(), Ecto.UUID.t(), String.t(), start_options()) ::
           {:ok, Authorization.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def start(provider, mailbox_id, redirect_uri, opts \\ []) do
+    start = System.monotonic_time()
+    result = do_start(provider, mailbox_id, redirect_uri, opts)
+    emit_start_stop(provider, mailbox_id, result, start)
+    result
+  end
+
+  defp do_start(provider, mailbox_id, redirect_uri, opts) do
     now = Keyword.get(opts, :now, DateTime.utc_now())
     ttl_seconds = Keyword.get(opts, :ttl_seconds, @default_ttl_seconds)
 
@@ -110,6 +119,62 @@ defmodule Manifold.Connectors.OAuth do
   rescue
     DBConnection.ConnectionError ->
       {:error, Error.new(:temporary, :database_unavailable, "OAuth database is unavailable")}
+  end
+
+  defp emit_start_stop(provider, mailbox_id, result, start) do
+    {outcome, error_code} =
+      case result do
+        {:ok, %Authorization{}} -> {:started, nil}
+        {:error, reason} -> {:error, telemetry_error_code(reason)}
+      end
+
+    safe_provider = if provider in @providers, do: provider, else: "unsupported"
+
+    metadata = %{
+      account_id: internal_id(mailbox_id),
+      provider: safe_provider,
+      method_kind: safe_provider,
+      outcome: outcome
+    }
+
+    metadata = if error_code, do: Map.put(metadata, :error_code, error_code), else: metadata
+
+    :telemetry.execute(
+      [:manifold, :connectors, :oauth, :start, :stop],
+      %{
+        duration_ms:
+          System.convert_time_unit(System.monotonic_time() - start, :native, :millisecond),
+        attempt_count: 1
+      },
+      metadata
+    )
+  end
+
+  defp internal_id(id) do
+    case Ecto.UUID.cast(id) do
+      {:ok, internal_id} -> internal_id
+      :error -> nil
+    end
+  end
+
+  defp telemetry_error_code(%Error{reason: reason}), do: telemetry_error_code(reason)
+  defp telemetry_error_code(%Ecto.Changeset{}), do: :invalid_oauth_request
+
+  defp telemetry_error_code(code) when is_atom(code) do
+    if safe_telemetry_code?(Atom.to_string(code)), do: code, else: :oauth_start_failed
+  end
+
+  defp telemetry_error_code(code) when is_binary(code) do
+    if safe_telemetry_code?(code), do: code, else: "oauth_start_failed"
+  end
+
+  defp telemetry_error_code(_reason), do: :oauth_start_failed
+
+  defp safe_telemetry_code?(code) do
+    downcased = String.downcase(code)
+
+    Regex.match?(@telemetry_code_pattern, downcased) and
+      not Enum.any?(@telemetry_forbidden_fragments, &String.contains?(downcased, &1))
   end
 
   @spec consume(String.t(), String.t(), String.t(), Keyword.t()) ::

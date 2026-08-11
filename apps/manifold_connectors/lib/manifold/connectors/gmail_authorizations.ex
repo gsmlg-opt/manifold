@@ -996,7 +996,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
         method_id: method.id,
         provider: @provider,
         method_kind: method.kind,
-        outcome: String.to_existing_atom(outcome)
+        outcome: oauth_complete_outcome(outcome)
       }
     )
   end
@@ -1018,6 +1018,9 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   defp emit_oauth_complete(consumed, unexpected_result, start) do
     emit_oauth_complete(consumed, {:error, unexpected_result}, start)
   end
+
+  defp oauth_complete_outcome("connected"), do: :connected
+  defp oauth_complete_outcome("scope_upgraded"), do: :scope_upgraded
 
   defp emit_oauth_refresh(authorization, result, start) do
     {outcome, error_code} =

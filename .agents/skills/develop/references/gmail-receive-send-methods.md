@@ -8,14 +8,16 @@
 
 ## Module ownership
 
-- `manifold_data` owns the shared authorization, receive/send method, credential,
-  provider submission, and lifecycle-event schemas and migrations.
-- `manifold_connectors` owns purpose-scoped OAuth, permanent Gmail subject/address
-  binding, encrypted token rotation, shared reconnect state, send-method checkout,
-  and SMTP credential checkout.
-- `manifold_outbound` owns deterministic text RFC rendering, queue snapshots,
-  Gmail API and SMTP adapters, attempt fencing, acceptance persistence, and
-  uncertainty semantics. It retains legacy Resend compatibility.
+- `manifold_data` owns `Manifold.Repo`, database migrations, and shared database
+  runtime configuration; it does not own domain schemas from other apps.
+- `manifold_connectors` owns its shared authorization, receive/send method,
+  credential, SMTP settings, and connector-event schemas, plus purpose-scoped
+  OAuth, permanent Gmail subject/address binding, encrypted token rotation,
+  shared reconnect state, and method checkout.
+- `manifold_outbound` owns its outbound message, recipient, provider submission,
+  and outbound-event schemas, plus deterministic text RFC rendering, queue
+  snapshots, Gmail API and SMTP adapters, attempt fencing, acceptance
+  persistence, and uncertainty semantics. It retains legacy Resend compatibility.
 - `manifold_web` owns Add receive/send method flows, incremental Gmail upgrade or
   reconnect actions, and the compose-time Add send method block.
 
@@ -82,6 +84,9 @@ submissions exist.
   outcome, normalized code, duration, and attempt count. Never add raw messages,
   bodies, headers, tokens, passwords, authorization codes, or provider error
   messages.
+- OAuth start/complete/refresh use `[:manifold, :connectors, :oauth, ..., :stop]`;
+  selection failures use `[:manifold, :outbound, :send_method, :select, :stop]`;
+  provider attempts use `[:manifold, :outbound, :submit, :stop]`.
 
 ## Configuration
 
@@ -119,13 +124,17 @@ smoke tests belong to the release verification task, not unit tests.
       authorization rows without exposing ciphertext.
 - [ ] Confirm Gmail API is enabled, consent scopes are configured, the exact HTTPS
       callback is registered, and the test identity is authorized for staging.
-- [ ] Connect receive first, upgrade send, and verify one shared authorization and
-      the exact account address; repeat send-first then receive-upgrade with a
-      different Manifold/Gmail identity.
+- [ ] Create two distinct Manifold accounts whose exact addresses match two
+      distinct Gmail identities. Connect receive for both and verify each account
+      imports only its own Gmail mailbox with no cross-account authorization or
+      message visibility.
+- [ ] Upgrade both accounts with send access, send a distinct plain-text message
+      from each, and verify each message appears only in the correct Gmail Sent
+      mailbox with the expected sender and reply headers.
+- [ ] On one identity also exercise send-first then receive-upgrade and verify the
+      account retains one shared authorization with the union of both scopes.
 - [ ] Force token expiry in a controlled test account and verify one serialized
       refresh and shared reconnect state.
-- [ ] Send a plain-text Gmail message and verify the provider copy and reply
-      headers manually; do not claim this from automated tests.
 - [ ] Send through the configured SMTP relay and verify acceptance manually.
 - [ ] Simulate ambiguous Gmail and SMTP transport outcomes and verify
       `submission_uncertain` with no automatic second request.

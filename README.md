@@ -291,17 +291,18 @@ Open Phoenix at `http://localhost:4290`; the API listens at
 The root page is the mailbox inbox; transport lifecycle details remain under
 `/deliveries`.
 
-To enable outbound delivery through Resend, set `RESEND_API_KEY` and configure
-the Resend webhook endpoint as:
+Resend configuration is retained only for legacy rows already queued with
+`provider = 'resend'` and their webhook lifecycle. If such rows exist, set
+`RESEND_API_KEY` and configure the Resend webhook endpoint as:
 
 ```text
 https://<your-manifold-host>/webhooks/providers/resend
 ```
 
 Set `RESEND_WEBHOOK_SECRET` to the endpoint signing secret. An optional
-`RESEND_API_BASE_URL` is supported for controlled testing. Without an API key,
-drafts remain usable but queued submissions fail with a classified
-`provider_not_configured` state instead of making a network request.
+`RESEND_API_BASE_URL` is supported for controlled testing. New drafts never
+select Resend: each account must have an enabled Gmail or SMTP send method before
+it can queue mail.
 
 SMTP abuse limits can be tuned with
 `MANIFOLD_SMTP_MAX_CONNECTIONS_PER_PEER`,

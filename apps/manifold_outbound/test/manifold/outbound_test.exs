@@ -130,10 +130,48 @@ defmodule Manifold.OutboundTest do
 
   test "queueing without an operational send method leaves the draft unchanged" do
     %{mailbox: mailbox} = mailbox_fixture()
-    draft = draft_fixture(mailbox.id)
+
+    {:ok, draft} =
+      Outbound.create_draft(mailbox.id, %{
+        subject: "Selection failure",
+        text_body: "send-method-selection-secret-body",
+        recipients: [%{kind: "to", address: "person@example.net"}]
+      })
+
+    handler_id = "send-method-selection-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :outbound, :send_method, :select, :stop],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:telemetry, event, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
 
     assert {:error, %{class: :permanent, reason: :send_method_required}} =
              Outbound.queue_draft(mailbox.id, draft.id)
+
+    assert_receive {:telemetry, [:manifold, :outbound, :send_method, :select, :stop],
+                    %{duration_ms: duration_ms, attempt_count: 1} = measurements,
+                    %{
+                      account_id: account_id,
+                      outbound_message_id: outbound_message_id,
+                      outcome: :error,
+                      error_code: :send_method_required
+                    } = metadata}
+
+    assert is_integer(duration_ms) and duration_ms >= 0
+    assert account_id == mailbox.id
+    assert outbound_message_id == draft.id
+
+    assert_secret_free_telemetry(measurements, metadata, [
+      "send-method-selection-secret-body"
+    ])
 
     assert Repo.get!(OutboundMessage, draft.id).state == "draft"
     assert Repo.aggregate(jobs_for(draft.id), :count) == 0
@@ -425,6 +463,34 @@ defmodule Manifold.OutboundTest do
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.encode16(case: :lower)
   end
+
+  defp assert_secret_free_telemetry(measurements, metadata, secret_values) do
+    assert Map.keys(measurements) |> Enum.sort() == [:attempt_count, :duration_ms]
+
+    forbidden_fragments =
+      ~w(token password authorization_code raw_message) ++
+        Enum.map(secret_values, &String.downcase/1)
+
+    telemetry_terms(measurements)
+    |> Enum.concat(telemetry_terms(metadata))
+    |> Enum.each(fn term ->
+      downcased = term |> to_string() |> String.downcase()
+
+      refute Enum.any?(forbidden_fragments, &String.contains?(downcased, &1)),
+             "unsafe telemetry term: #{inspect(term)}"
+    end)
+  end
+
+  defp telemetry_terms(map) when is_map(map) do
+    Enum.flat_map(map, fn {key, value} -> [key | telemetry_terms(value)] end)
+  end
+
+  defp telemetry_terms(list) when is_list(list), do: Enum.flat_map(list, &telemetry_terms/1)
+
+  defp telemetry_terms(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> telemetry_terms()
+
+  defp telemetry_terms(value), do: [value]
 
   defp jobs_for(message_id) do
     from(job in Oban.Job,

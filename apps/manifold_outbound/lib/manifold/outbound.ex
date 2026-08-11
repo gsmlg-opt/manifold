@@ -30,6 +30,8 @@ defmodule Manifold.Outbound do
 
   @recipient_kinds ~w(to cc bcc)
   @max_recipients 50
+  @telemetry_forbidden_fragments ~w(token password authorization_code raw_message)
+  @telemetry_code_pattern ~r/\A[a-z0-9_.:-]{1,128}\z/
 
   @spec create_draft(Ecto.UUID.t(), map()) ::
           {:ok, OutboundMessage.t()} | {:error, Error.t() | Ecto.Changeset.t()}
@@ -234,6 +236,7 @@ defmodule Manifold.Outbound do
   @spec queue_draft(Ecto.UUID.t(), Ecto.UUID.t(), Keyword.t()) ::
           {:ok, OutboundMessage.t()} | {:error, Error.t() | Ecto.Changeset.t()}
   def queue_draft(mailbox_id, draft_id, opts \\ []) do
+    start = System.monotonic_time()
     now = DateTime.utc_now()
 
     multi =
@@ -346,8 +349,15 @@ defmodule Manifold.Outbound do
       end)
 
     case Repo.transaction(multi) do
-      {:ok, %{queued: queued}} -> {:ok, queued}
-      {:error, _step, reason, _changes} -> {:error, reason}
+      {:ok, %{queued: queued}} ->
+        {:ok, queued}
+
+      {:error, :send_method, reason, %{draft: {%OutboundMessage{} = draft, true}}} ->
+        emit_send_method_selection_failure(draft, reason, start)
+        {:error, reason}
+
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
     end
   rescue
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
@@ -627,6 +637,43 @@ defmodule Manifold.Outbound do
 
   defp provider(_kind),
     do: {:error, error(:permanent, :send_method_required, "an enabled send method is required")}
+
+  defp emit_send_method_selection_failure(draft, reason, start) do
+    :telemetry.execute(
+      [:manifold, :outbound, :send_method, :select, :stop],
+      %{
+        duration_ms:
+          System.convert_time_unit(System.monotonic_time() - start, :native, :millisecond),
+        attempt_count: 1
+      },
+      %{
+        account_id: draft.mailbox_id,
+        outbound_message_id: draft.id,
+        outcome: :error,
+        error_code: telemetry_error_code(reason)
+      }
+    )
+  end
+
+  defp telemetry_error_code(%Error{reason: reason}), do: telemetry_error_code(reason)
+  defp telemetry_error_code(%Ecto.Changeset{}), do: :send_method_selection_failed
+
+  defp telemetry_error_code(code) when is_atom(code) do
+    if safe_telemetry_code?(Atom.to_string(code)), do: code, else: :send_method_selection_failed
+  end
+
+  defp telemetry_error_code(code) when is_binary(code) do
+    if safe_telemetry_code?(code), do: code, else: "send_method_selection_failed"
+  end
+
+  defp telemetry_error_code(_reason), do: :send_method_selection_failed
+
+  defp safe_telemetry_code?(code) do
+    downcased = String.downcase(code)
+
+    Regex.match?(@telemetry_code_pattern, downcased) and
+      not Enum.any?(@telemetry_forbidden_fragments, &String.contains?(downcased, &1))
+  end
 
   defp validate_sender(draft, method) do
     with true <- method.account_id == draft.mailbox_id,

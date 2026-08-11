@@ -145,7 +145,9 @@ Provider push notifications are deliberately not part of this milestone.
   application boundary.
 - Cursor replay cannot create duplicate local deliveries for the same provider
   identity.
-- Read-only scopes limit the effect of a compromised connector credential.
+- Read-only receive grants limit the effect of a compromised receive-only
+  connector credential. A Gmail authorization later upgraded with `gmail.send`
+  has the broader outbound capability recorded by ADR 0010.
 
 ### Negative
 

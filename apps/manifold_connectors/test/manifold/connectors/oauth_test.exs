@@ -105,6 +105,78 @@ defmodule Manifold.Connectors.OAuthTest do
     assert consumed.required_scopes == [GmailScopes.send()]
   end
 
+  test "OAuth start telemetry reports sanitized success and failure outcomes", %{
+    mailbox: mailbox
+  } do
+    handler_id = "oauth-start-telemetry-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :connectors, :oauth, :start, :stop],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:telemetry, event, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    assert {:ok, _authorization} =
+             OAuth.start(
+               "gmail",
+               mailbox.id,
+               "https://mail.example.test/connectors/gmail/callback?secret=oauth-start-secret",
+               purpose: :send
+             )
+
+    assert_receive {:telemetry, [:manifold, :connectors, :oauth, :start, :stop],
+                    %{duration_ms: duration_ms, attempt_count: 1} = measurements,
+                    %{
+                      account_id: account_id,
+                      provider: "gmail",
+                      method_kind: "gmail",
+                      outcome: :started
+                    } = metadata}
+
+    assert is_integer(duration_ms) and duration_ms >= 0
+    assert account_id == mailbox.id
+
+    assert_secret_free_telemetry(measurements, metadata, [
+      "oauth-start-secret",
+      "gmail-client",
+      "gmail-secret"
+    ])
+
+    assert {:error, %{reason: :invalid_oauth_purpose}} =
+             OAuth.start(
+               "gmail",
+               mailbox.id,
+               "https://mail.example.test/connectors/gmail/callback?secret=oauth-failure-secret",
+               purpose: :admin
+             )
+
+    assert_receive {:telemetry, [:manifold, :connectors, :oauth, :start, :stop],
+                    %{duration_ms: failure_duration, attempt_count: 1} = failure_measurements,
+                    %{
+                      account_id: failure_account_id,
+                      provider: "gmail",
+                      method_kind: "gmail",
+                      outcome: :error,
+                      error_code: :invalid_oauth_purpose
+                    } = failure_metadata}
+
+    assert is_integer(failure_duration) and failure_duration >= 0
+    assert failure_account_id == mailbox.id
+
+    assert_secret_free_telemetry(failure_measurements, failure_metadata, [
+      "oauth-failure-secret",
+      "gmail-client",
+      "gmail-secret"
+    ])
+  end
+
   test "starts and consumes an explicit Gmail receive authorization without the send scope", %{
     mailbox: mailbox
   } do
@@ -353,6 +425,34 @@ defmodule Manifold.Connectors.OAuthTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)
   defp restore_env(key, value), do: Application.put_env(:manifold_connectors, key, value)
+
+  defp assert_secret_free_telemetry(measurements, metadata, secret_values) do
+    assert Map.keys(measurements) |> Enum.sort() == [:attempt_count, :duration_ms]
+
+    forbidden_fragments =
+      ~w(token password authorization_code raw_message) ++
+        Enum.map(secret_values, &String.downcase/1)
+
+    telemetry_terms(measurements)
+    |> Enum.concat(telemetry_terms(metadata))
+    |> Enum.each(fn term ->
+      downcased = term |> to_string() |> String.downcase()
+
+      refute Enum.any?(forbidden_fragments, &String.contains?(downcased, &1)),
+             "unsafe telemetry term: #{inspect(term)}"
+    end)
+  end
+
+  defp telemetry_terms(map) when is_map(map) do
+    Enum.flat_map(map, fn {key, value} -> [key | telemetry_terms(value)] end)
+  end
+
+  defp telemetry_terms(list) when is_list(list), do: Enum.flat_map(list, &telemetry_terms/1)
+
+  defp telemetry_terms(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> telemetry_terms()
+
+  defp telemetry_terms(value), do: [value]
 
   defp authorization_scopes(url) do
     url
