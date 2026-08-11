@@ -175,6 +175,7 @@ defmodule ManifoldWeb.AccountLiveTest do
 
     refute has_element?(view, "#edit-account-#{account.id}", "Edit")
     refute has_element?(view, "#manage-account-#{account.id}", "Manage")
+    assert has_element?(view, "#delete-account-#{account.id}[phx-click*='push_focus']")
   end
 
   test "disable keeps the local account and removes only the disable action", %{conn: conn} do
@@ -268,6 +269,42 @@ defmodule ManifoldWeb.AccountLiveTest do
     assert [%Oban.Job{}] = purge_jobs(purge.id)
     assert is_reference(socket_assign(view, :refresh_timer))
     assert is_reference(socket_assign(view, :refresh_token))
+  end
+
+  test "delete dialog traps focus and closes on Escape", %{conn: conn} do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Keyboard delete", address: "keyboard@example.test"})
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts")
+
+    view
+    |> element("#delete-account-#{account.id}")
+    |> render_click()
+
+    assert has_element?(
+             view,
+             "#delete-account-dialog[phx-hook='Phoenix.FocusWrap'][phx-window-keydown='cancel-delete-account'][phx-key='Escape'][phx-mounted*='focus'][phx-mounted*='delete-account-confirmation'][phx-remove*='pop_focus']"
+           )
+
+    assert has_element?(
+             view,
+             "#delete-account-dialog-start[tabindex='0'][aria-hidden='true']"
+           )
+
+    assert has_element?(
+             view,
+             "#delete-account-dialog-end[tabindex='0'][aria-hidden='true']"
+           )
+
+    assert has_element?(view, "#delete-account-dialog #delete-account-confirmation")
+
+    view
+    |> element("#delete-account-dialog")
+    |> render_keydown(%{"key" => "Escape"})
+
+    refute has_element?(view, "#delete-account-dialog")
+    assert has_element?(view, "#delete-account-#{account.id}")
+    assert is_nil(Repo.get_by(AccountPurge, mailbox_id: account.id))
   end
 
   test "stale retry reloads requested state and starts polling", %{conn: conn} do
@@ -450,7 +487,7 @@ defmodule ManifoldWeb.AccountLiveTest do
 
     assert has_element?(
              view,
-             "##{tooltip_id}[aria-describedby='#{tooltip_id}-tooltip'] ##{action_id}[aria-label='#{label}'] svg[data-icon='#{icon}']"
+             "##{tooltip_id}.tooltip-left[aria-describedby='#{tooltip_id}-tooltip'] ##{action_id}[aria-label='#{label}'] svg[data-icon='#{icon}']"
            )
 
     assert has_element?(

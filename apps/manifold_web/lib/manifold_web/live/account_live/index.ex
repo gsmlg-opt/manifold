@@ -207,7 +207,7 @@ defmodule ManifoldWeb.AccountLive.Index do
                   <.dm_tooltip
                     id={"retry-delete-account-tooltip-#{row.account.id}"}
                     content="Retry account deletion"
-                    position="bottom"
+                    position="left"
                   >
                     <button
                       id={"retry-delete-account-#{row.account.id}"}
@@ -226,7 +226,7 @@ defmodule ManifoldWeb.AccountLive.Index do
                   <.dm_tooltip
                     id={"edit-account-tooltip-#{row.account.id}"}
                     content="Edit account"
-                    position="bottom"
+                    position="left"
                   >
                     <.link
                       id={"edit-account-#{row.account.id}"}
@@ -241,7 +241,7 @@ defmodule ManifoldWeb.AccountLive.Index do
                   <.dm_tooltip
                     id={"manage-account-tooltip-#{row.account.id}"}
                     content="Manage account"
-                    position="bottom"
+                    position="left"
                   >
                     <.link
                       id={"manage-account-#{row.account.id}"}
@@ -257,7 +257,7 @@ defmodule ManifoldWeb.AccountLive.Index do
                     :if={row.account.active}
                     id={"disable-account-tooltip-#{row.account.id}"}
                     content="Disable account"
-                    position="bottom"
+                    position="left"
                   >
                     <button
                       id={"disable-account-#{row.account.id}"}
@@ -274,15 +274,14 @@ defmodule ManifoldWeb.AccountLive.Index do
                   <.dm_tooltip
                     id={"delete-account-tooltip-#{row.account.id}"}
                     content="Delete account"
-                    position="bottom"
+                    position="left"
                     color="error"
                   >
                     <button
                       id={"delete-account-#{row.account.id}"}
                       type="button"
                       class="settings-icon-button settings-icon-button-danger"
-                      phx-click="open-delete-account"
-                      phx-value-id={row.account.id}
+                      phx-click={open_delete_dialog(row.account.id)}
                       aria-label="Delete account"
                     >
                       <.dm_mdi name="delete-outline" data-icon="delete-outline" />
@@ -298,7 +297,7 @@ defmodule ManifoldWeb.AccountLive.Index do
         </table>
       </div>
 
-      <div
+      <.focus_wrap
         :if={@delete_account}
         id="delete-account-dialog"
         class="account-delete-modal"
@@ -306,6 +305,10 @@ defmodule ManifoldWeb.AccountLive.Index do
         aria-modal="true"
         aria-labelledby="delete-account-title"
         aria-describedby="delete-account-warning"
+        phx-mounted={JS.focus(to: "#delete-account-confirmation")}
+        phx-remove={JS.pop_focus()}
+        phx-window-keydown="cancel-delete-account"
+        phx-key="Escape"
       >
         <div class="account-delete-backdrop" phx-click="cancel-delete-account"></div>
         <div class="account-delete-dialog">
@@ -349,7 +352,7 @@ defmodule ManifoldWeb.AccountLive.Index do
             </div>
           </.form>
         </div>
-      </div>
+      </.focus_wrap>
     </section>
     """
   end
@@ -484,6 +487,11 @@ defmodule ManifoldWeb.AccountLive.Index do
   defp delete_failed?(_row), do: false
 
   defp account_actions?(row), do: not deleting?(row) and not delete_failed?(row)
+
+  defp open_delete_dialog(account_id) do
+    JS.push("open-delete-account", value: %{id: account_id})
+    |> JS.push_focus()
+  end
 
   defp kind_label("gmail"), do: "Gmail"
   defp kind_label("microsoft"), do: "Microsoft Graph"
