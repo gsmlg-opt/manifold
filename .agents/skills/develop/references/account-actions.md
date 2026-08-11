@@ -68,10 +68,10 @@ The persisted stage order is:
 
 Each worker execution handles no more than 250 database work items and persists
 its cursor/work before snoozing. Attachment discovery uses pages of 248 keys so
-the same transaction can also enqueue the raw and spool candidates within the
-250-item bound. Finalize repeats discovery and job drain, verifies every owning
-context and pending work table, and routes any remaining foreign-key ownership
-back to its cleanup stage instead of forcing deletion.
+each page remains within the 250-item bound. Finalize repeats discovery and job
+drain, verifies every owning context and pending work table, and routes any
+remaining foreign-key ownership back to its cleanup stage instead of forcing
+deletion.
 
 ## Mailbox-copy and shared-delivery rule
 
@@ -83,9 +83,12 @@ coordinator rechecks ownership through Mail, Ingest, and Connectors. Any
 remaining mailbox or connector reference marks the candidate
 `shared_retained`; the shared delivery and every other account's copy remain.
 
-Only an orphaned delivery is removed. Its attachment, raw-message, and spool
-candidates are recorded in `account_purge_objects` in the same database
-transaction before external deletion starts.
+Only an orphaned delivery is removed. Attachment keys may be persisted across
+multiple transactions of at most 248 keys while the delivery remains present
+and pending. On the final attachment page, the remaining attachment candidates,
+locked orphan-delivery deletion, raw and spool outbox insertion, and candidate
+transition to `purged` commit atomically. External deletion begins later in the
+objects stage.
 
 ## Object outbox and idempotence
 
@@ -138,8 +141,9 @@ MANIFOLD_PURGE_ID=00000000-0000-0000-0000-000000000000 devenv shell -- mix run -
 ```
 
 Retry resumes the existing purge ID, stage, and work state. It does not create a
-second purge or reactivate the mailbox. A suspended or still-executing prior job
-requires operator attention before the retry can persist a replacement job.
+second purge or reactivate the mailbox. If the prior job is still executing,
+wait for it to finish and then retry. A suspended prior job requires operator
+action before retry can persist a replacement job.
 
 ## Configuration, scope, and rollback
 
@@ -166,8 +170,11 @@ requires operator attention before the retry can persist a replacement job.
 - The required full umbrella run passed 596 tests in 14 apps with 0 failures,
   then stopped before `manifold_edge` tests in its out-of-scope test setup. The
   edge helper ignored `TEST_DATABASE_URL`, selected the absent worktree socket
-  `/run/user/1000/devenv-a85b80d/postgres`, and failed to start its repository
-  with `{:error, "killed"}`. No out-of-scope edge code was changed or rerun.
+  `/run/user/1000/devenv-a85b80d/postgres`, and
+  `Ecto.Adapters.Postgres.storage_up/1` returned `{:error, "killed"}`. That
+  unhandled value caused `CaseClauseError` at
+  `apps/manifold_edge/test/test_helper.exs:32`, before repository startup or any
+  edge tests. No out-of-scope edge code was changed or rerun.
 
 ## Follow-ups
 
