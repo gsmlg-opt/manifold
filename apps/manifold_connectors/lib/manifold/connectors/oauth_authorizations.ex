@@ -1,4 +1,4 @@
-defmodule Manifold.Connectors.GmailAuthorizations do
+defmodule Manifold.Connectors.OAuthAuthorizations do
   @moduledoc false
 
   import Ecto.Query
@@ -7,9 +7,9 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   alias Manifold.Accounts
   alias Manifold.Accounts.Schema.Account
   alias Manifold.Connectors.Crypto
-  alias Manifold.Connectors.GmailScopes
   alias Manifold.Connectors.Jobs.SyncAccount
   alias Manifold.Connectors.OAuth.Consumed
+  alias Manifold.Connectors.OAuthScopes
   alias Manifold.Connectors.Provider.{Identity, SyncCursor, Token}
   alias Manifold.Connectors.Provider.Error, as: ProviderError
 
@@ -28,21 +28,25 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   alias Manifold.Core.Error, as: CoreError
   alias Manifold.Repo
 
-  @provider "gmail"
-  @approved_scopes MapSet.new([GmailScopes.read(), GmailScopes.send()])
+  @providers ~w(gmail microsoft)
   @refresh_skew_seconds 60
   @telemetry_forbidden_fragments ~w(token password authorization_code raw_message)
   @telemetry_code_pattern ~r/\A[a-z0-9_.:-]{1,128}\z/
 
-  @spec complete(String.t(), Consumed.t(), module(), keyword(), keyword()) ::
+  @spec complete(String.t(), String.t(), Consumed.t(), module(), keyword(), keyword()) ::
           {:ok, ReceiveMethod.t() | SendMethod.t()}
           | {:error, CoreError.t() | Ecto.Changeset.t()}
-  def complete(code, consumed, adapter, config, opts \\ [])
+  def complete(provider, code, consumed, adapter, config, opts \\ [])
 
-  def complete(code, %Consumed{provider: @provider} = consumed, adapter, config, opts) do
+  def complete(provider, code, %Consumed{provider: provider} = consumed, adapter, config, opts)
+      when provider in @providers do
     start = System.monotonic_time()
     now = Keyword.get(opts, :now, DateTime.utc_now())
-    provider_opts = Keyword.get(opts, :provider_opts, [])
+
+    provider_opts =
+      opts
+      |> Keyword.get(:provider_opts, [])
+      |> Keyword.put(:required_scopes, consumed.required_scopes)
 
     case capture_complete(fn ->
            with {:ok, purpose} <- normalize_purpose(consumed.purpose),
@@ -59,7 +63,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
                 {:ok, provider_address} <- Address.parse(identity.email_address),
                 {:ok, cursors} <- initial_cursors(purpose, adapter, token, config, provider_opts),
                 :ok <- validate_cursors(purpose, cursors) do
-             persist(consumed, purpose, token, identity, provider_address, cursors, now)
+             persist(provider, consumed, purpose, token, identity, provider_address, cursors, now)
            else
              {:error, %ProviderError{} = error} -> {:error, provider_error(error)}
              {:error, %CoreError{} = error} -> {:error, error}
@@ -75,7 +79,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     end
   end
 
-  def complete(_code, %Consumed{}, _adapter, _config, _opts) do
+  def complete(_provider, _code, %Consumed{}, _adapter, _config, _opts) do
     {:error, CoreError.new(:permanent, :oauth_provider_mismatch, "OAuth provider does not match")}
   end
 
@@ -113,29 +117,28 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     provider_opts = Keyword.get(opts, :provider_opts, [])
     continuation = Keyword.get(opts, :access_token_continuation, &default_continuation/1)
 
-    with :ok <- validate_required_scope(required_scope) do
-      Repo.transaction(fn ->
-        with {:ok, authorization} <- lock_authorization(authorization_id),
-             :ok <- validate_checkout_authorization(authorization, required_scope) do
-          authorization
-          |> checkout_locked_access_token(
-            required_scope,
-            adapter,
-            config,
-            now,
-            provider_opts
-          )
-          |> continue_with_access_token(continuation)
-        else
-          {:error, reason} -> Repo.rollback(reason)
-        end
-      end)
-      |> case do
-        {:ok, {:ok, result}} -> {:ok, result}
-        {:ok, {:reconnect, %ProviderError{} = error}} -> {:error, error}
-        {:ok, {:error, reason}} -> {:error, reason}
-        {:error, reason} -> {:error, reason}
+    Repo.transaction(fn ->
+      with {:ok, authorization} <- lock_authorization(authorization_id),
+           :ok <- validate_required_scope(authorization.provider, required_scope),
+           :ok <- validate_checkout_authorization(authorization, required_scope) do
+        authorization
+        |> checkout_locked_access_token(
+          required_scope,
+          adapter,
+          config,
+          now,
+          provider_opts
+        )
+        |> continue_with_access_token(continuation)
+      else
+        {:error, reason} -> Repo.rollback(reason)
       end
+    end)
+    |> case do
+      {:ok, {:ok, result}} -> {:ok, result}
+      {:ok, {:reconnect, %ProviderError{} = error}} -> {:error, error}
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:error, reason} -> {:error, reason}
     end
   rescue
     DBConnection.ConnectionError ->
@@ -143,6 +146,98 @@ defmodule Manifold.Connectors.GmailAuthorizations do
 
     error in Postgrex.Error ->
       normalize_transaction_error(error, __STACKTRACE__)
+  end
+
+  @spec add_authorized_method(
+          String.t(),
+          Ecto.UUID.t(),
+          :receive | :send,
+          module(),
+          keyword(),
+          keyword()
+        ) ::
+          {:ok, ReceiveMethod.t() | SendMethod.t()}
+          | {:error, CoreError.t() | ProviderError.t() | Ecto.Changeset.t()}
+  def add_authorized_method(provider, account_id, purpose, adapter, config, opts \\ [])
+
+  def add_authorized_method(provider, account_id, purpose, adapter, config, opts)
+      when provider in @providers and purpose in [:receive, :send] do
+    now = Keyword.get(opts, :now, DateTime.utc_now())
+    provider_opts = Keyword.get(opts, :provider_opts, [])
+
+    with {:ok, required_scope} <- method_scope(provider, purpose) do
+      Repo.transaction(fn ->
+        result =
+          with {:ok, account, account_address} <- lock_account(account_id),
+               {:ok, authorization} <- lock_account_authorization(provider, account.id),
+               {:ok, authorization_address} <- Address.parse(authorization.email_address),
+               :ok <- require_matching_address(account_address, authorization_address),
+               :ok <- validate_checkout_authorization(authorization, required_scope),
+               {:ok, access_token} <-
+                 authorized_method_access_token(
+                   purpose,
+                   authorization,
+                   required_scope,
+                   adapter,
+                   config,
+                   now,
+                   provider_opts
+                 ),
+               {:ok, cursors} <-
+                 authorized_method_cursors(
+                   purpose,
+                   adapter,
+                   access_token,
+                   config,
+                   provider_opts
+                 ),
+               :ok <- validate_cursors(purpose, cursors),
+               {:ok, method} <-
+                 upsert_method(
+                   provider,
+                   purpose,
+                   account.id,
+                   authorization,
+                   authorization.provider_subject_id,
+                   account_address.canonical,
+                   authorization.granted_scopes,
+                   now
+                 ),
+               :ok <- persist_receive_state(purpose, method, cursors, now),
+               {:ok, _event} <-
+                 insert_authorization_event(
+                   authorization.id,
+                   provider,
+                   "connected",
+                   purpose,
+                   now
+                 ) do
+            {:ok, method}
+          end
+
+        case result do
+          {:error, reason} -> Repo.rollback(reason)
+          other -> other
+        end
+      end)
+      |> case do
+        {:ok, {:ok, method}} -> {:ok, method}
+        {:ok, {:reconnect, %ProviderError{} = error}} -> {:error, error}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error()}
+    error in Postgrex.Error -> normalize_transaction_error(error, __STACKTRACE__)
+  end
+
+  def add_authorized_method(_provider, _account_id, _purpose, _adapter, _config, _opts) do
+    {:error,
+     CoreError.new(
+       :permanent,
+       :unsupported_oauth_purpose,
+       "OAuth purpose is not supported by provider"
+     )}
   end
 
   defp checkout_locked_access_token(
@@ -217,7 +312,13 @@ defmodule Manifold.Connectors.GmailAuthorizations do
              :ok <- delete_method_secrets(direction, method.id),
              {:ok, _authorization} <- maybe_disconnect_authorization(authorization, now),
              {:ok, _event} <-
-               insert_authorization_event(authorization.id, "disconnected", direction, now) do
+               insert_authorization_event(
+                 authorization.id,
+                 authorization.provider,
+                 "disconnected",
+                 direction,
+                 now
+               ) do
           disconnected
         else
           false -> Repo.rollback(method_not_found())
@@ -247,7 +348,13 @@ defmodule Manifold.Connectors.GmailAuthorizations do
              {:ok, deleted} <- Repo.delete(method),
              {:ok, _authorization} <- maybe_disconnect_authorization(authorization, now),
              {:ok, _event} <-
-               insert_authorization_event(authorization.id, "disconnected", :receive, now) do
+               insert_authorization_event(
+                 authorization.id,
+                 authorization.provider,
+                 "disconnected",
+                 :receive,
+                 now
+               ) do
           deleted
         else
           {:error, reason} -> Repo.rollback(reason)
@@ -302,7 +409,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     error = %ProviderError{
       class: :reconnect,
       code: error_code,
-      message: "Gmail authorization must be reconnected"
+      message: "OAuth authorization must be reconnected"
     }
 
     with {:ok, authorization_id} <- method_authorization_id(:send, method_id) do
@@ -311,43 +418,50 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     end
   end
 
-  defp validate_required_scope(scope) do
-    if MapSet.member?(@approved_scopes, scope), do: :ok, else: insufficient_scope()
+  defp validate_required_scope(provider, scope) do
+    if OAuthScopes.approved?(provider, scope), do: :ok, else: insufficient_scope(provider)
   end
 
   defp validate_checkout_authorization(
-         %OAuthAuthorization{provider: @provider, status: "connected"} = authorization,
+         %OAuthAuthorization{provider: provider, status: "connected"} = authorization,
          required_scope
-       ) do
+       )
+       when provider in @providers do
     if required_scope in authorization.granted_scopes do
       :ok
     else
-      insufficient_scope()
+      insufficient_scope(provider)
     end
   end
 
   defp validate_checkout_authorization(
-         %OAuthAuthorization{provider: @provider, status: "reconnect_required"},
+         %OAuthAuthorization{provider: provider, status: "reconnect_required"},
          _required_scope
-       ) do
+       )
+       when provider in @providers do
     {:error,
      CoreError.new(
        :permanent,
        :reauthorization_required,
-       "Gmail authorization must be reconnected"
+       reconnect_message(provider)
      )}
   end
 
   defp validate_checkout_authorization(
-         %OAuthAuthorization{provider: @provider, status: "disconnected"},
+         %OAuthAuthorization{provider: provider, status: "disconnected"},
          _required_scope
-       ) do
+       )
+       when provider in @providers do
     {:error, CoreError.new(:permanent, :account_disconnected, "authorization is disconnected")}
   end
 
   defp validate_checkout_authorization(_authorization, _required_scope) do
     {:error,
-     CoreError.new(:permanent, :invalid_gmail_authorization, "authorization is not Gmail")}
+     CoreError.new(
+       :permanent,
+       :invalid_oauth_authorization,
+       "authorization is not a supported OAuth authorization"
+     )}
   end
 
   defp token_current?(authorization, now) do
@@ -392,7 +506,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
             persist_refreshed_token_locked(authorization, required_scope, token)
 
           {:error, %ProviderError{class: :reconnect} = error} ->
-            error = sanitize_reconnect_error(error)
+            error = sanitize_reconnect_error(error, authorization.provider)
 
             case mark_reconnect_required_locked(authorization, error, now, []) do
               {:ok, _authorization} -> {:reconnect, error}
@@ -409,8 +523,8 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     result
   end
 
-  defp sanitize_reconnect_error(error) do
-    %{error | message: "Gmail authorization must be reconnected"}
+  defp sanitize_reconnect_error(error, provider) do
+    %{error | message: reconnect_message(provider)}
   end
 
   defp persist_refreshed_token_locked(authorization, required_scope, token) do
@@ -442,22 +556,22 @@ defmodule Manifold.Connectors.GmailAuthorizations do
 
   defp validate_refreshed_scopes(authorization, required_scope, token_scopes)
        when is_list(token_scopes) do
-    stored = approved_scopes(authorization.granted_scopes)
-    returned = approved_scopes(token_scopes)
+    stored = approved_scopes(authorization.provider, authorization.granted_scopes)
+    returned = approved_scopes(authorization.provider, token_scopes)
     required = MapSet.put(stored, required_scope)
 
     if MapSet.subset?(required, returned) do
       {:ok, stored |> MapSet.union(returned) |> MapSet.to_list() |> Enum.sort()}
     else
-      insufficient_scope()
+      insufficient_scope(authorization.provider)
     end
   end
 
-  defp validate_refreshed_scopes(_authorization, _required_scope, _token_scopes),
-    do: insufficient_scope()
+  defp validate_refreshed_scopes(authorization, _required_scope, _token_scopes),
+    do: insufficient_scope(authorization.provider)
 
   defp mark_reconnect_required_locked(authorization, provider_error, now, opts) do
-    error_attrs = reconnect_error_attrs(provider_error)
+    error_attrs = reconnect_error_attrs(authorization.provider, provider_error)
 
     with {:ok, authorization} <-
            authorization
@@ -465,11 +579,18 @@ defmodule Manifold.Connectors.GmailAuthorizations do
              Map.merge(error_attrs, %{status: "reconnect_required", disconnected_at: nil})
            )
            |> Repo.update(),
-         :ok <- disable_dependent_methods(authorization.id, error_attrs, now),
+         :ok <-
+           disable_dependent_methods(
+             authorization.provider,
+             authorization.id,
+             error_attrs,
+             now
+           ),
          :ok <- maybe_fault(opts, :after_methods_before_event),
          {:ok, _event} <-
            insert_authorization_event(
              authorization.id,
+             authorization.provider,
              "reconnect_required",
              :authorization,
              now,
@@ -561,12 +682,12 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     secure_digest_match?(left_rest, right_rest, bor(difference, bxor(left, right)))
   end
 
-  defp persist(consumed, purpose, token, identity, provider_address, cursors, now) do
+  defp persist(provider, consumed, purpose, token, identity, provider_address, cursors, now) do
     Repo.transaction(fn ->
       with {:ok, account, account_address} <- lock_account(consumed.mailbox_id),
            :ok <- require_matching_address(account_address, provider_address),
            {account_authorization, subject_authorization} <-
-             lock_authorizations(account.id, identity.id),
+             lock_authorizations(provider, account.id, identity.id),
            :ok <-
              validate_binding(
                account_authorization,
@@ -575,9 +696,16 @@ defmodule Manifold.Connectors.GmailAuthorizations do
                identity.id
              ),
            {:ok, granted_scopes, event_type} <-
-             validate_and_merge_scopes(account_authorization, consumed, purpose, token.scopes),
+             validate_and_merge_scopes(
+               provider,
+               account_authorization,
+               consumed,
+               purpose,
+               token.scopes
+             ),
            {:ok, authorization} <-
              upsert_authorization(
+               provider,
                account_authorization,
                account.id,
                identity.id,
@@ -588,6 +716,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
              ),
            {:ok, method} <-
              upsert_method(
+               provider,
                purpose,
                account.id,
                authorization,
@@ -596,10 +725,16 @@ defmodule Manifold.Connectors.GmailAuthorizations do
                granted_scopes,
                now
              ),
-           :ok <- repair_dependent_method(purpose, authorization),
+           :ok <- repair_dependent_method(provider, purpose, authorization),
            :ok <- persist_receive_state(purpose, method, cursors, now),
            {:ok, _event} <-
-             insert_authorization_event(authorization.id, event_type, purpose, now) do
+             insert_authorization_event(
+               authorization.id,
+               provider,
+               event_type,
+               purpose,
+               now
+             ) do
         {method, event_type}
       else
         {:error, reason} -> Repo.rollback(reason)
@@ -612,23 +747,17 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   end
 
   defp lock_account(account_id) do
-    account =
-      Account
-      |> where([account], account.id == ^account_id)
-      |> lock("FOR UPDATE")
-      |> Repo.one()
-
-    case account do
-      nil ->
-        {:error, CoreError.new(:permanent, :account_not_found, "account not found")}
-
-      %Account{} = account ->
+    case Accounts.active_account_for_update(Repo, account_id) do
+      {:ok, %Account{} = account} ->
         account = Repo.preload(account, :domain)
 
         case Address.parse(Accounts.account_address(account)) do
           {:ok, address} -> {:ok, account, address}
           {:error, %CoreError{} = error} -> {:error, error}
         end
+
+      {:error, %CoreError{} = error} ->
+        {:error, error}
     end
   end
 
@@ -644,11 +773,11 @@ defmodule Manifold.Connectors.GmailAuthorizations do
      )}
   end
 
-  defp lock_authorizations(account_id, subject_id) do
+  defp lock_authorizations(provider, account_id, subject_id) do
     OAuthAuthorization
     |> where(
       [authorization],
-      authorization.provider == @provider and
+      authorization.provider == ^provider and
         (authorization.account_id == ^account_id or
            authorization.provider_subject_id == ^subject_id)
     )
@@ -696,17 +825,18 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   defp validate_binding(_account_authorization, _subject_authorization, _account_id, _subject_id),
     do: :ok
 
-  defp validate_and_merge_scopes(existing, consumed, purpose, token_scopes)
+  defp validate_and_merge_scopes(provider, existing, consumed, purpose, token_scopes)
        when is_list(token_scopes) do
     required_from_consumed = MapSet.new(consumed.required_scopes)
 
-    if MapSet.subset?(required_from_consumed, @approved_scopes) do
-      stored = approved_scopes(existing && existing.granted_scopes)
+    if Enum.all?(required_from_consumed, &OAuthScopes.approved?(provider, &1)) do
+      stored = approved_scopes(provider, existing && existing.granted_scopes)
 
       required =
-        MapSet.union(stored, required_from_consumed) |> MapSet.put(purpose_scope(purpose))
+        MapSet.union(stored, required_from_consumed)
+        |> MapSet.put(purpose_scope(provider, purpose))
 
-      granted = approved_scopes(token_scopes)
+      granted = approved_scopes(provider, token_scopes)
 
       if MapSet.subset?(required, granted) do
         event_type =
@@ -716,34 +846,43 @@ defmodule Manifold.Connectors.GmailAuthorizations do
 
         {:ok, granted |> MapSet.to_list() |> Enum.sort(), event_type}
       else
-        insufficient_scope()
+        insufficient_scope(provider)
       end
     else
-      insufficient_scope()
+      insufficient_scope(provider)
     end
   end
 
-  defp validate_and_merge_scopes(_existing, _consumed, _purpose, _token_scopes),
-    do: insufficient_scope()
+  defp validate_and_merge_scopes(provider, _existing, _consumed, _purpose, _token_scopes),
+    do: insufficient_scope(provider)
 
-  defp approved_scopes(nil), do: MapSet.new()
+  defp approved_scopes(_provider, nil), do: MapSet.new()
 
-  defp approved_scopes(scopes) when is_list(scopes) do
+  defp approved_scopes(provider, scopes) when is_list(scopes) do
     scopes
     |> MapSet.new()
-    |> MapSet.intersection(@approved_scopes)
+    |> Enum.filter(&OAuthScopes.approved?(provider, &1))
+    |> MapSet.new()
   end
 
-  defp insufficient_scope do
+  defp insufficient_scope(provider) do
+    provider_name =
+      case provider do
+        "gmail" -> "Gmail"
+        "microsoft" -> "Microsoft"
+        _provider -> "provider"
+      end
+
     {:error,
      CoreError.new(
        :permanent,
        :insufficient_provider_scope,
-       "provider did not grant all required Gmail scopes"
+       "provider did not grant all required #{provider_name} scopes"
      )}
   end
 
   defp upsert_authorization(
+         provider,
          existing,
          account_id,
          subject_id,
@@ -760,7 +899,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
            encrypted_refresh(token.refresh_token, existing, authorization.id) do
       attrs = %{
         account_id: account_id,
-        provider: @provider,
+        provider: provider,
         provider_subject_id: subject_id,
         email_address: email_address,
         granted_scopes: granted_scopes,
@@ -804,6 +943,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   end
 
   defp upsert_method(
+         provider,
          :receive,
          account_id,
          authorization,
@@ -814,7 +954,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
        ) do
     existing =
       ReceiveMethod
-      |> where([method], method.account_id == ^account_id and method.kind == @provider)
+      |> where([method], method.account_id == ^account_id and method.kind == ^provider)
       |> order_by([method], asc: method.id)
       |> lock("FOR UPDATE")
       |> Repo.one()
@@ -824,7 +964,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     attrs = %{
       account_id: account_id,
       oauth_authorization_id: authorization.id,
-      kind: @provider,
+      kind: provider,
       provider_account_id: subject_id,
       email_address: email_address,
       status: "connected",
@@ -842,6 +982,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   end
 
   defp upsert_method(
+         provider,
          :send,
          account_id,
          authorization,
@@ -852,7 +993,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
        ) do
     existing =
       SendMethod
-      |> where([method], method.account_id == ^account_id and method.kind == @provider)
+      |> where([method], method.account_id == ^account_id and method.kind == ^provider)
       |> order_by([method], asc: method.id)
       |> lock("FOR UPDATE")
       |> Repo.one()
@@ -862,7 +1003,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     attrs = %{
       account_id: account_id,
       oauth_authorization_id: authorization.id,
-      kind: @provider,
+      kind: provider,
       email_address: email_address,
       status: "connected",
       enabled: true,
@@ -894,11 +1035,11 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     :ok
   end
 
-  defp repair_dependent_method(:receive, authorization) do
+  defp repair_dependent_method(provider, :receive, authorization) do
     SendMethod
     |> where(
       [method],
-      method.oauth_authorization_id == ^authorization.id and method.kind == @provider and
+      method.oauth_authorization_id == ^authorization.id and method.kind == ^provider and
         method.status == "reconnect_required"
     )
     |> lock("FOR UPDATE")
@@ -924,11 +1065,11 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     end
   end
 
-  defp repair_dependent_method(:send, authorization) do
+  defp repair_dependent_method(provider, :send, authorization) do
     ReceiveMethod
     |> where(
       [method],
-      method.oauth_authorization_id == ^authorization.id and method.kind == @provider and
+      method.oauth_authorization_id == ^authorization.id and method.kind == ^provider and
         method.status == "reconnect_required"
     )
     |> lock("FOR UPDATE")
@@ -968,7 +1109,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   defp maybe_except(query, nil), do: query
   defp maybe_except(query, except_id), do: where(query, [method], method.id != ^except_id)
 
-  defp persist_receive_state(:send, _method, nil, _now), do: :ok
+  defp persist_receive_state(:send, _method, [], _now), do: :ok
 
   defp persist_receive_state(:receive, method, cursors, now) do
     StoredCursor
@@ -1021,6 +1162,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
 
   defp insert_authorization_event(
          authorization_id,
+         provider,
          event_type,
          direction,
          now,
@@ -1032,7 +1174,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
       event_type: event_type,
       metadata:
         Map.merge(
-          %{provider: @provider, direction: Atom.to_string(direction)},
+          %{provider: provider, direction: Atom.to_string(direction)},
           extra_metadata
         ),
       occurred_at: now
@@ -1051,7 +1193,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
         account_id: consumed.mailbox_id,
         authorization_id: method.oauth_authorization_id,
         method_id: method.id,
-        provider: @provider,
+        provider: consumed.provider,
         method_kind: method.kind,
         outcome: oauth_complete_outcome(outcome)
       }
@@ -1064,8 +1206,8 @@ defmodule Manifold.Connectors.GmailAuthorizations do
       telemetry_measurements(start),
       %{
         account_id: consumed.mailbox_id,
-        provider: @provider,
-        method_kind: @provider,
+        provider: consumed.provider,
+        method_kind: consumed.provider,
         outcome: :error,
         error_code: normalized_error_code(reason)
       }
@@ -1095,8 +1237,8 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     metadata = %{
       account_id: authorization.account_id,
       authorization_id: authorization.id,
-      provider: @provider,
-      method_kind: @provider,
+      provider: authorization.provider,
+      method_kind: authorization.provider,
       outcome: outcome
     }
 
@@ -1139,19 +1281,22 @@ defmodule Manifold.Connectors.GmailAuthorizations do
       not Enum.any?(@telemetry_forbidden_fragments, &String.contains?(downcased, &1))
   end
 
-  defp reconnect_error_attrs(%ProviderError{} = error) do
+  defp reconnect_error_attrs(provider, %ProviderError{} = error) do
     %{
       last_error_class: Atom.to_string(error.class),
       last_error_code: Atom.to_string(error.code),
-      last_error_message: "Gmail authorization must be reconnected"
+      last_error_message: reconnect_message(provider)
     }
   end
 
-  defp disable_dependent_methods(authorization_id, error_attrs, now) do
+  defp reconnect_message("gmail"), do: "Gmail authorization must be reconnected"
+  defp reconnect_message("microsoft"), do: "Microsoft authorization must be reconnected"
+
+  defp disable_dependent_methods(provider, authorization_id, error_attrs, now) do
     ReceiveMethod
     |> where(
       [method],
-      method.oauth_authorization_id == ^authorization_id and method.kind == @provider and
+      method.oauth_authorization_id == ^authorization_id and method.kind == ^provider and
         method.status != "disconnected"
     )
     |> Repo.update_all(
@@ -1170,7 +1315,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     SendMethod
     |> where(
       [method],
-      method.oauth_authorization_id == ^authorization_id and method.kind == @provider and
+      method.oauth_authorization_id == ^authorization_id and method.kind == ^provider and
         method.status != "disconnected"
     )
     |> Repo.update_all(
@@ -1196,12 +1341,12 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     end
   end
 
-  defp initial_cursors(:send, _adapter, _token, _config, _provider_opts), do: {:ok, nil}
+  defp initial_cursors(:send, _adapter, _token, _config, _provider_opts), do: {:ok, []}
 
   defp initial_cursors(:receive, adapter, token, config, provider_opts),
     do: adapter.initial_cursors(token.access_token, config, provider_opts)
 
-  defp validate_cursors(:send, nil), do: :ok
+  defp validate_cursors(:send, []), do: :ok
 
   defp validate_cursors(:receive, cursors) when is_list(cursors) and cursors != [] do
     if Enum.all?(cursors, &match?(%SyncCursor{}, &1)) do
@@ -1222,14 +1367,67 @@ defmodule Manifold.Connectors.GmailAuthorizations do
      )}
   end
 
+  defp authorized_method_access_token(
+         :send,
+         _authorization,
+         _required_scope,
+         _adapter,
+         _config,
+         _now,
+         _provider_opts
+       ),
+       do: {:ok, nil}
+
+  defp authorized_method_access_token(
+         :receive,
+         authorization,
+         required_scope,
+         adapter,
+         config,
+         now,
+         provider_opts
+       ) do
+    checkout_locked_access_token(
+      authorization,
+      required_scope,
+      adapter,
+      config,
+      now,
+      provider_opts
+    )
+  end
+
+  defp authorized_method_cursors(:send, _adapter, nil, _config, _provider_opts),
+    do: {:ok, []}
+
+  defp authorized_method_cursors(:receive, adapter, access_token, config, provider_opts),
+    do: adapter.initial_cursors(access_token, config, provider_opts)
+
   defp normalize_purpose(purpose) when purpose in [:receive, :send], do: {:ok, purpose}
 
   defp normalize_purpose(_purpose) do
     {:error, CoreError.new(:permanent, :invalid_oauth_purpose, "OAuth purpose is invalid")}
   end
 
-  defp purpose_scope(:receive), do: GmailScopes.read()
-  defp purpose_scope(:send), do: GmailScopes.send()
+  defp purpose_scope(provider, purpose) do
+    {:ok, scope} = OAuthScopes.method_scope(provider, purpose)
+    scope
+  end
+
+  defp method_scope(provider, purpose) do
+    case OAuthScopes.method_scope(provider, purpose) do
+      {:ok, scope} ->
+        {:ok, scope}
+
+      :error ->
+        {:error,
+         CoreError.new(
+           :permanent,
+           :unsupported_oauth_purpose,
+           "OAuth purpose is not supported by provider"
+         )}
+    end
+  end
 
   defp method_authorization_id(:receive, method_id),
     do: do_method_authorization_id(ReceiveMethod, method_id)
@@ -1265,12 +1463,17 @@ defmodule Manifold.Connectors.GmailAuthorizations do
       nil ->
         {:error, CoreError.new(:permanent, :account_not_found, "connector method not found")}
 
-      {@provider, authorization_id} when is_binary(authorization_id) ->
+      {provider, authorization_id}
+      when provider in @providers and is_binary(authorization_id) ->
         {:ok, authorization_id}
 
       _method ->
         {:error,
-         CoreError.new(:permanent, :invalid_gmail_method, "connector method is not Gmail")}
+         CoreError.new(
+           :permanent,
+           :invalid_oauth_method,
+           "connector method is not a supported OAuth method"
+         )}
     end
   end
 
@@ -1283,12 +1486,17 @@ defmodule Manifold.Connectors.GmailAuthorizations do
       nil ->
         {:error, method_not_found()}
 
-      {@provider, authorization_id} when is_binary(authorization_id) ->
+      {provider, authorization_id}
+      when provider in @providers and is_binary(authorization_id) ->
         {:ok, authorization_id}
 
       _method ->
         {:error,
-         CoreError.new(:permanent, :invalid_gmail_method, "connector method is not Gmail")}
+         CoreError.new(
+           :permanent,
+           :invalid_oauth_method,
+           "connector method is not a supported OAuth method"
+         )}
     end
   end
 
@@ -1304,7 +1512,11 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   defp do_lock_method(
          schema,
          method_id,
-         %OAuthAuthorization{id: authorization_id, account_id: account_id}
+         %OAuthAuthorization{
+           id: authorization_id,
+           account_id: account_id,
+           provider: provider
+         }
        ) do
     schema
     |> where([method], method.id == ^method_id)
@@ -1315,7 +1527,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
         {:error, CoreError.new(:permanent, :account_not_found, "connector method not found")}
 
       %{
-        kind: @provider,
+        kind: ^provider,
         oauth_authorization_id: ^authorization_id,
         account_id: ^account_id
       } = method ->
@@ -1323,7 +1535,11 @@ defmodule Manifold.Connectors.GmailAuthorizations do
 
       _method ->
         {:error,
-         CoreError.new(:permanent, :invalid_gmail_method, "connector method is not Gmail")}
+         CoreError.new(
+           :permanent,
+           :invalid_oauth_method,
+           "connector method is not a supported OAuth method"
+         )}
     end
   end
 
@@ -1396,6 +1612,23 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   defp lock_authorization(authorization_id) do
     OAuthAuthorization
     |> where([authorization], authorization.id == ^authorization_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+    |> case do
+      %OAuthAuthorization{} = authorization ->
+        {:ok, authorization}
+
+      nil ->
+        {:error, CoreError.new(:permanent, :authorization_not_found, "authorization not found")}
+    end
+  end
+
+  defp lock_account_authorization(provider, account_id) do
+    OAuthAuthorization
+    |> where(
+      [authorization],
+      authorization.provider == ^provider and authorization.account_id == ^account_id
+    )
     |> lock("FOR UPDATE")
     |> Repo.one()
     |> case do

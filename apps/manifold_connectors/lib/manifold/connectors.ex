@@ -10,23 +10,23 @@ defmodule Manifold.Connectors do
   alias Manifold.Accounts.Schema.Account
   alias Manifold.Connectors.ActivityLog
   alias Manifold.Connectors.Crypto
-  alias Manifold.Connectors.GmailAuthorizations
   alias Manifold.Connectors.GmailScopes
   alias Manifold.Connectors.IMAP.Client
   alias Manifold.Connectors.EAS.Client, as: EASClient
   alias Manifold.Connectors.SMTP.Client, as: SmtpClient
   alias Manifold.Connectors.Jobs.{ApplyRemoteState, PushRemoteRead, SyncAccount}
   alias Manifold.Connectors.OAuth.Consumed
+  alias Manifold.Connectors.OAuthAuthorizations
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.IMAP, as: ProviderIMAP
   alias Manifold.Connectors.Provider.EAS, as: ProviderEAS
-  alias Manifold.Connectors.Provider.{Identity, Token}
   alias Manifold.Connectors.Sync
   alias Manifold.Connectors.SubmissionMethod
 
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
     Credential,
+    OAuthAuthorization,
     ReceiveMethod,
     EasSettings,
     ImapSettings,
@@ -44,57 +44,36 @@ defmodule Manifold.Connectors do
   alias Manifold.Mail.Schema.MailboxEntry
   alias Manifold.Repo
 
-  @required_scopes %{
-    "gmail" => MapSet.new(["https://www.googleapis.com/auth/gmail.readonly"]),
-    "microsoft" => MapSet.new(["Mail.Read", "offline_access"])
-  }
-
   @spec complete_authorization(String.t(), String.t(), Consumed.t(), Keyword.t()) ::
           {:ok, ReceiveMethod.t() | SendMethod.t()}
           | {:error, Error.t() | Ecto.Changeset.t()}
   def complete_authorization(provider, code, consumed, opts \\ [])
 
-  def complete_authorization("gmail", code, %Consumed{} = consumed, opts) do
+  def complete_authorization(provider, code, %Consumed{} = consumed, opts)
+      when provider in ["gmail", "microsoft"] do
     provider_opts =
       opts
       |> provider_opts()
       |> Keyword.put(:required_scopes, consumed.required_scopes)
 
-    opts = Keyword.put(opts, :provider_opts, provider_opts)
-
-    with :ok <- validate_consumed("gmail", consumed),
-         {:ok, adapter, config} <- adapter_config("gmail") do
-      GmailAuthorizations.complete(code, consumed, adapter, config, opts)
+    with :ok <- validate_consumed(provider, consumed),
+         {:ok, adapter, config} <- adapter_config(provider) do
+      OAuthAuthorizations.complete(
+        provider,
+        code,
+        consumed,
+        adapter,
+        config,
+        Keyword.put(opts, :provider_opts, provider_opts)
+      )
     end
   rescue
     DBConnection.ConnectionError ->
       {:error, database_error(:unavailable)}
   end
 
-  def complete_authorization(provider, code, %Consumed{} = consumed, opts) do
-    now = Keyword.get(opts, :now, DateTime.utc_now())
-
-    with :ok <- validate_consumed(provider, consumed),
-         {:ok, adapter, config} <- adapter_config(provider),
-         {:ok, %Token{} = token} <-
-           adapter.exchange_code(
-             code,
-             consumed.pkce_verifier,
-             consumed.redirect_uri,
-             config,
-             provider_opts(opts)
-           ),
-         :ok <- validate_granted_scopes(provider, token.scopes),
-         {:ok, %Identity{} = identity} <-
-           adapter.identity(token.access_token, config, provider_opts(opts)),
-         {:ok, cursors} <-
-           adapter.initial_cursors(token.access_token, config, provider_opts(opts)),
-         :ok <- validate_cursors(cursors) do
-      persist_authorization(provider, consumed, token, identity, cursors, now, opts)
-    else
-      {:error, %ProviderError{} = error} -> {:error, provider_error(error)}
-      {:error, %Error{} = error} -> {:error, error}
-    end
+  def complete_authorization(_provider, _code, %Consumed{}, _opts) do
+    {:error, Error.new(:permanent, :unsupported_provider, "provider is not supported")}
   rescue
     DBConnection.ConnectionError ->
       {:error, database_error(:unavailable)}
@@ -103,13 +82,31 @@ defmodule Manifold.Connectors do
   @spec checkout_oauth_access_token(Ecto.UUID.t(), Keyword.t()) ::
           {:ok, term()} | {:error, Error.t() | ProviderError.t() | Ecto.Changeset.t()}
   def checkout_oauth_access_token(authorization_id, opts \\ []) do
-    with {:ok, adapter, config} <- adapter_config("gmail") do
-      GmailAuthorizations.checkout_access_token(
+    provider =
+      OAuthAuthorization
+      |> where([authorization], authorization.id == ^authorization_id)
+      |> select([authorization], authorization.provider)
+      |> Repo.one()
+
+    with provider when provider in ["gmail", "microsoft"] <- provider,
+         {:ok, adapter, config} <- adapter_config(provider) do
+      OAuthAuthorizations.checkout_access_token(
         authorization_id,
         adapter,
         config,
         opts
       )
+    else
+      nil ->
+        {:error, Error.new(:permanent, :authorization_not_found, "authorization not found")}
+
+      _provider ->
+        {:error,
+         Error.new(
+           :permanent,
+           :invalid_oauth_authorization,
+           "authorization is not a supported OAuth authorization"
+         )}
     end
   rescue
     DBConnection.ConnectionError ->
@@ -117,24 +114,27 @@ defmodule Manifold.Connectors do
   end
 
   @spec mark_oauth_reconnect_required(Ecto.UUID.t(), ProviderError.t(), Keyword.t()) ::
-          {:ok, Manifold.Connectors.Schema.OAuthAuthorization.t()}
+          {:ok, OAuthAuthorization.t()}
           | {:error, Error.t() | Ecto.Changeset.t()}
   def mark_oauth_reconnect_required(authorization_id, %ProviderError{} = error, opts \\ []) do
-    GmailAuthorizations.mark_reconnect_required(authorization_id, error, opts)
+    OAuthAuthorizations.mark_reconnect_required(authorization_id, error, opts)
   end
 
-  @spec mark_gmail_send_reconnect_required(Ecto.UUID.t(), String.t(), atom(), Keyword.t()) ::
-          {:ok, :marked | :already_marked | :stale | :inactive,
-           Manifold.Connectors.Schema.OAuthAuthorization.t()}
+  @spec mark_oauth_send_reconnect_required(Ecto.UUID.t(), String.t(), atom(), Keyword.t()) ::
+          {:ok, :marked | :already_marked | :stale | :inactive, OAuthAuthorization.t()}
           | {:error, Error.t() | Ecto.Changeset.t()}
-  def mark_gmail_send_reconnect_required(method_id, expected_access_token, error_code, opts \\ [])
-      when is_binary(method_id) and is_binary(expected_access_token) do
-    GmailAuthorizations.mark_send_reconnect_required(
+  def mark_oauth_send_reconnect_required(method_id, expected_access_token, error_code, opts \\ []) do
+    OAuthAuthorizations.mark_send_reconnect_required(
       method_id,
       expected_access_token,
       error_code,
       opts
     )
+  end
+
+  @doc false
+  def mark_gmail_send_reconnect_required(method_id, expected_access_token, error_code, opts \\ []) do
+    mark_oauth_send_reconnect_required(method_id, expected_access_token, error_code, opts)
   end
 
   @spec list_receive_methods() :: [View.ReceiveMethod.t()]
@@ -517,7 +517,7 @@ defmodule Manifold.Connectors do
     case Repo.get_by(SendMethod, id: send_method_id, account_id: account_id) do
       %SendMethod{kind: "gmail", oauth_authorization_id: authorization_id}
       when is_binary(authorization_id) ->
-        GmailAuthorizations.disconnect_method(:send, account_id, send_method_id)
+        OAuthAuthorizations.disconnect_method(:send, account_id, send_method_id)
 
       _method ->
         disconnect_legacy_send_method(account_id, send_method_id)
@@ -815,7 +815,7 @@ defmodule Manifold.Connectors do
     case Repo.get(ReceiveMethod, account_id) do
       %ReceiveMethod{kind: "gmail", oauth_authorization_id: authorization_id}
       when is_binary(authorization_id) ->
-        GmailAuthorizations.disconnect_method(:receive, account_id)
+        OAuthAuthorizations.disconnect_method(:receive, account_id)
 
       _method ->
         disconnect_legacy_receive_method(account_id)
@@ -881,7 +881,7 @@ defmodule Manifold.Connectors do
     case Repo.get(ReceiveMethod, method_id) do
       %ReceiveMethod{kind: "gmail", oauth_authorization_id: authorization_id}
       when is_binary(authorization_id) ->
-        GmailAuthorizations.delete_receive_method(method_id)
+        OAuthAuthorizations.delete_receive_method(method_id)
 
       _method ->
         delete_legacy_receive_method(method_id)
@@ -1041,86 +1041,6 @@ defmodule Manifold.Connectors do
     |> repo.insert()
   end
 
-  defp persist_authorization(provider, consumed, token, identity, cursors, now, opts) do
-    Multi.new()
-    |> Multi.run(:mailbox_fence, fn repo, _changes ->
-      ensure_active_mailbox(repo, consumed.mailbox_id)
-    end)
-    |> Multi.run(:account, fn repo, _changes ->
-      upsert_account(repo, provider, consumed.mailbox_id, identity, token.scopes)
-    end)
-    |> Multi.run(:credential, fn repo, %{account: account} ->
-      upsert_credential(repo, account.id, token)
-    end)
-    |> Multi.run(:cursors, fn repo, %{account: account} ->
-      replace_cursors(repo, account.id, cursors, now)
-    end)
-    |> Multi.insert(:event, fn %{account: account} ->
-      ConnectorEvent.changeset(%ConnectorEvent{}, %{
-        external_account_id: account.id,
-        event_type: "connected",
-        metadata: %{provider: provider},
-        occurred_at: now
-      })
-    end)
-    |> Multi.run(:fault_boundary, fn _repo, _changes ->
-      maybe_fault(opts, :after_credentials_before_job)
-    end)
-    |> Multi.run(:job, fn repo, %{account: account} ->
-      {:ok, ensure_sync_job(repo, account.id)}
-    end)
-    |> Repo.transaction()
-    |> case do
-      {:ok, %{account: account}} -> {:ok, account}
-      {:error, _step, reason, _changes} -> {:error, reason}
-    end
-  end
-
-  defp upsert_account(repo, provider, mailbox_id, identity, scopes) do
-    existing =
-      ReceiveMethod
-      |> where(
-        [account],
-        account.kind == ^provider and account.provider_account_id == ^identity.id
-      )
-      |> lock("FOR UPDATE")
-      |> repo.one()
-
-    attrs = %{
-      account_id: mailbox_id,
-      kind: provider,
-      provider_account_id: identity.id,
-      email_address: identity.email_address,
-      status: "connected",
-      enabled: true,
-      sync_enabled: true,
-      granted_scopes: Enum.sort(scopes),
-      disconnected_at: nil,
-      last_error_class: nil,
-      last_error_code: nil,
-      last_error_message: nil
-    }
-
-    case existing do
-      nil ->
-        disable_other_methods(repo, mailbox_id)
-
-        ReceiveMethod.changeset(%ReceiveMethod{}, attrs) |> repo.insert()
-
-      %ReceiveMethod{account_id: ^mailbox_id} = account ->
-        disable_other_methods(repo, mailbox_id, except_id: account.id)
-        ReceiveMethod.changeset(account, Map.put(attrs, :enabled, true)) |> repo.update()
-
-      %ReceiveMethod{} ->
-        {:error,
-         Error.new(
-           :permanent,
-           :mailbox_reassignment_not_allowed,
-           "provider account is already bound to a different account"
-         )}
-    end
-  end
-
   defp disable_other_methods(repo, account_id, opts \\ []) do
     except_id = Keyword.get(opts, :except_id)
 
@@ -1136,45 +1056,6 @@ defmodule Manifold.Connectors do
       end
 
     repo.update_all(query, set: [enabled: false, updated_at: DateTime.utc_now()])
-  end
-
-  defp upsert_credential(repo, account_id, token) do
-    existing = repo.get_by(Credential, external_account_id: account_id)
-
-    with {:ok, encrypted_access} <-
-           Crypto.encrypt(token.access_token, credential_context(account_id, :access)),
-         {:ok, encrypted_refresh} <-
-           encrypted_refresh_token(token.refresh_token, existing, account_id) do
-      attrs = %{
-        external_account_id: account_id,
-        key_version: 1,
-        access_token_ciphertext: encrypted_access,
-        refresh_token_ciphertext: encrypted_refresh,
-        token_expires_at: token.expires_at
-      }
-
-      case existing do
-        nil -> Credential.changeset(%Credential{}, attrs) |> repo.insert()
-        credential -> Credential.changeset(credential, attrs) |> repo.update()
-      end
-    end
-  end
-
-  defp encrypted_refresh_token(refresh_token, _existing, account_id)
-       when is_binary(refresh_token) and refresh_token != "" do
-    Crypto.encrypt(refresh_token, credential_context(account_id, :refresh))
-  end
-
-  defp encrypted_refresh_token(nil, %Credential{} = existing, _account_id),
-    do: {:ok, existing.refresh_token_ciphertext}
-
-  defp encrypted_refresh_token(nil, nil, _account_id) do
-    {:error,
-     Error.new(
-       :permanent,
-       :missing_refresh_token,
-       "provider did not return a refresh token for a new connection"
-     )}
   end
 
   defp replace_cursors(repo, account_id, cursors, now) do
@@ -1228,37 +1109,6 @@ defmodule Manifold.Connectors do
     {:error, Error.new(:permanent, :oauth_provider_mismatch, "OAuth provider does not match")}
   end
 
-  defp validate_granted_scopes(provider, scopes) when is_list(scopes) do
-    granted = MapSet.new(scopes)
-    required = Map.fetch!(@required_scopes, provider)
-
-    if MapSet.subset?(required, granted) do
-      :ok
-    else
-      {:error,
-       Error.new(
-         :permanent,
-         :insufficient_provider_scope,
-         "provider did not grant all required read-only scopes"
-       )}
-    end
-  end
-
-  defp validate_cursors(cursors) when is_list(cursors) and cursors != [] do
-    if Enum.all?(cursors, &match?(%Manifold.Connectors.Provider.SyncCursor{}, &1)) do
-      :ok
-    else
-      invalid_cursors()
-    end
-  end
-
-  defp validate_cursors(_cursors), do: invalid_cursors()
-
-  defp invalid_cursors do
-    {:error,
-     Error.new(:permanent, :invalid_provider_cursors, "provider returned invalid sync cursors")}
-  end
-
   defp adapter_config(provider) when provider in ["gmail", "microsoft"] do
     key = String.to_existing_atom(provider)
     adapters = Application.get_env(:manifold_connectors, :adapters, [])
@@ -1285,15 +1135,6 @@ defmodule Manifold.Connectors do
   end
 
   defp provider_opts(opts), do: Keyword.get(opts, :provider_opts, [])
-
-  defp provider_error(%ProviderError{} = error) do
-    class = if error.class == :temporary, do: :temporary, else: :permanent
-
-    Error.new(class, error.code, error.message, %{
-      provider_class: error.class,
-      retry_after_seconds: error.retry_after_seconds
-    })
-  end
 
   defp account_view(account) do
     %View.ReceiveMethod{
@@ -2257,14 +2098,6 @@ defmodule Manifold.Connectors do
     |> case do
       {:ok, %{method: method}} -> {:ok, method}
       {:error, _step, reason, _changes} -> {:error, reason}
-    end
-  end
-
-  defp maybe_fault(opts, point) do
-    if Keyword.get(opts, :fail_at) == point do
-      {:error, Error.new(:temporary, point, "injected connector fault")}
-    else
-      {:ok, :ok}
     end
   end
 

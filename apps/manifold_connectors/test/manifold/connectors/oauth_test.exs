@@ -1,6 +1,8 @@
 defmodule Manifold.Connectors.OAuthTest do
   use Manifold.DataCase, async: false
 
+  @microsoft_redirect "https://mail.example.test/connectors/microsoft/callback"
+
   alias Manifold.Accounts
   alias Manifold.Connectors.Crypto
   alias Manifold.Connectors.GmailScopes
@@ -230,18 +232,52 @@ defmodule Manifold.Connectors.OAuthTest do
     assert consumed.required_scopes == required_scopes
   end
 
-  test "rejects unsupported Microsoft send purpose without creating a transaction", %{
+  test "Microsoft receive and send starts snapshot least-privilege purpose scopes", %{
     mailbox: mailbox
   } do
-    assert {:error, %{class: :permanent, reason: :unsupported_oauth_purpose}} =
-             OAuth.start(
-               "microsoft",
-               mailbox.id,
-               "https://mail.example.test/connectors/microsoft/callback",
+    assert {:ok, receive} =
+             OAuth.start("microsoft", mailbox.id, @microsoft_redirect, purpose: :receive)
+
+    assert MapSet.new(authorization_scopes(receive.url)) ==
+             MapSet.new(~w(openid profile offline_access User.Read Mail.Read))
+
+    assert {:ok, send} =
+             OAuth.start("microsoft", mailbox.id, @microsoft_redirect, purpose: :send)
+
+    assert MapSet.new(authorization_scopes(send.url)) ==
+             MapSet.new(~w(openid profile offline_access User.Read Mail.Send))
+
+    refute String.contains?(send.url, "Mail.ReadWrite")
+  end
+
+  test "Microsoft incremental consent unions the existing grant in both directions", %{
+    mailbox: mailbox
+  } do
+    receive_only =
+      insert_microsoft_authorization!(mailbox.id, ~w(Mail.Read offline_access))
+
+    assert {:ok, send} =
+             OAuth.start("microsoft", receive_only.account_id, @microsoft_redirect,
                purpose: :send
              )
 
-    assert Repo.aggregate(OAuthTransaction, :count) == 0
+    assert MapSet.subset?(
+             MapSet.new(~w(Mail.Read Mail.Send offline_access)),
+             MapSet.new(authorization_scopes(send.url))
+           )
+
+    Repo.delete!(receive_only)
+    send_only = insert_microsoft_authorization!(mailbox.id, ~w(Mail.Send offline_access))
+
+    assert {:ok, receive} =
+             OAuth.start("microsoft", send_only.account_id, @microsoft_redirect,
+               purpose: :receive
+             )
+
+    assert MapSet.subset?(
+             MapSet.new(~w(Mail.Read Mail.Send offline_access)),
+             MapSet.new(authorization_scopes(receive.url))
+           )
   end
 
   test "keeps Microsoft receive scopes compatible by default", %{mailbox: mailbox} do
@@ -471,6 +507,22 @@ defmodule Manifold.Connectors.OAuthTest do
       provider_subject_id: "google-sub-#{System.unique_integer([:positive])}",
       email_address: "person@gmail.com",
       granted_scopes: granted_scopes,
+      status: "connected",
+      key_version: 1,
+      access_token_ciphertext: <<1, 2, 3>>,
+      refresh_token_ciphertext: <<4, 5, 6>>
+    })
+    |> Repo.insert!()
+  end
+
+  defp insert_microsoft_authorization!(account_id, scopes) do
+    %OAuthAuthorization{}
+    |> OAuthAuthorization.changeset(%{
+      account_id: account_id,
+      provider: "microsoft",
+      provider_subject_id: "graph-sub-#{System.unique_integer([:positive])}",
+      email_address: "person@oauth.test",
+      granted_scopes: scopes,
       status: "connected",
       key_version: 1,
       access_token_ciphertext: <<1, 2, 3>>,

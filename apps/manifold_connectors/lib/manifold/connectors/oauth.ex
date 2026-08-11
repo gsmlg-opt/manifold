@@ -6,7 +6,7 @@ defmodule Manifold.Connectors.OAuth do
   import Ecto.Query
 
   alias Manifold.Connectors.Crypto
-  alias Manifold.Connectors.GmailScopes
+  alias Manifold.Connectors.OAuthScopes
   alias Manifold.Connectors.Schema.{OAuthAuthorization, OAuthTransaction}
   alias Manifold.Core.Error
   alias Manifold.Repo
@@ -50,9 +50,6 @@ defmodule Manifold.Connectors.OAuth do
   Starts an OAuth authorization and snapshots its required provider scopes.
 
   The string purpose values `"receive"` and `"send"` are accepted for compatibility.
-
-  OAuth completion in Task 3 must merge and revalidate granted scopes while holding the
-  shared authorization lock; this start-time snapshot is not a concurrency guarantee.
   """
   @spec start(String.t(), Ecto.UUID.t(), String.t(), start_options()) ::
           {:ok, Authorization.t()} | {:error, Error.t() | Ecto.Changeset.t()}
@@ -282,36 +279,37 @@ defmodule Manifold.Connectors.OAuth do
     Keyword.fetch!(config, :authorization_url) <> "?" <> URI.encode_query(query)
   end
 
-  defp required_scopes("gmail", :receive), do: {:ok, [GmailScopes.read()]}
-  defp required_scopes("gmail", :send), do: {:ok, [GmailScopes.send()]}
-  defp required_scopes("microsoft", :receive), do: {:ok, ["Mail.Read", "offline_access"]}
+  defp required_scopes(provider, purpose) do
+    case OAuthScopes.purpose(provider, purpose) do
+      {:ok, scopes} ->
+        {:ok, scopes}
 
-  defp required_scopes("microsoft", :send) do
-    {:error,
-     oauth_error(:unsupported_oauth_purpose, "OAuth purpose is not supported by provider")}
+      :error ->
+        {:error,
+         oauth_error(
+           :unsupported_oauth_purpose,
+           "OAuth purpose is not supported by provider"
+         )}
+    end
   end
 
-  defp identity_scopes("gmail"), do: ["openid", "email"]
-  defp identity_scopes("microsoft"), do: ["openid", "profile", "User.Read"]
+  defp identity_scopes(provider), do: OAuthScopes.identity(provider)
 
-  defp expanded_required_scopes("gmail", mailbox_id, purpose_scopes) do
+  defp expanded_required_scopes(provider, mailbox_id, purpose_scopes) do
     existing_scopes =
       OAuthAuthorization
       |> where(
         [authorization],
-        authorization.account_id == ^mailbox_id and authorization.provider == "gmail"
+        authorization.account_id == ^mailbox_id and authorization.provider == ^provider
       )
       |> select([authorization], authorization.granted_scopes)
       |> Repo.one()
       |> List.wrap()
       |> List.flatten()
-      |> Enum.filter(&(&1 in [GmailScopes.read(), GmailScopes.send()]))
+      |> Enum.filter(&OAuthScopes.approved?(provider, &1))
 
     normalize_scopes(existing_scopes ++ purpose_scopes)
   end
-
-  defp expanded_required_scopes("microsoft", _mailbox_id, purpose_scopes),
-    do: normalize_scopes(purpose_scopes)
 
   defp normalize_purpose(purpose) when purpose in [:receive, "receive"], do: {:ok, :receive}
   defp normalize_purpose(purpose) when purpose in [:send, "send"], do: {:ok, :send}

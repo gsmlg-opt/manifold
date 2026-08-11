@@ -602,13 +602,13 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     }
 
     assert function_exported?(
-             Manifold.Connectors.GmailAuthorizations,
+             Manifold.Connectors.OAuthAuthorizations,
              :mark_reconnect_required,
              2
            )
 
     assert {:ok, authorization} =
-             Manifold.Connectors.GmailAuthorizations.mark_reconnect_required(before.id, error)
+             Manifold.Connectors.OAuthAuthorizations.mark_reconnect_required(before.id, error)
 
     assert authorization.status == "reconnect_required"
     assert authorization.last_error_class == "reconnect"
@@ -768,7 +768,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     }
 
     assert {:error, %{reason: :after_methods_before_event}} =
-             Manifold.Connectors.GmailAuthorizations.mark_reconnect_required(
+             Manifold.Connectors.OAuthAuthorizations.mark_reconnect_required(
                authorization.id,
                error,
                fail_at: :after_methods_before_event
@@ -790,7 +790,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert {:ok, receive} = complete(:receive, account, address)
 
     assert {:ok, _authorization} =
-             Manifold.Connectors.GmailAuthorizations.mark_reconnect_required(
+             Manifold.Connectors.OAuthAuthorizations.mark_reconnect_required(
                receive.oauth_authorization_id,
                reconnect_error()
              )
@@ -813,7 +813,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert {:ok, send_method} = complete(:send, account, address)
 
     assert {:ok, _authorization} =
-             Manifold.Connectors.GmailAuthorizations.mark_reconnect_required(
+             Manifold.Connectors.OAuthAuthorizations.mark_reconnect_required(
                send_method.oauth_authorization_id,
                reconnect_error()
              )
@@ -840,7 +840,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
              )
 
     assert {:ok, _authorization} =
-             Manifold.Connectors.GmailAuthorizations.mark_reconnect_required(
+             Manifold.Connectors.OAuthAuthorizations.mark_reconnect_required(
                receive.oauth_authorization_id,
                reconnect_error()
              )
@@ -873,7 +873,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
              )
 
     assert {:ok, _authorization} =
-             Manifold.Connectors.GmailAuthorizations.mark_reconnect_required(
+             Manifold.Connectors.OAuthAuthorizations.mark_reconnect_required(
                receive.oauth_authorization_id,
                reconnect_error()
              )
@@ -1512,10 +1512,12 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
         Keyword.get(opts, :provider_opts, [])
       )
 
-    Connectors.complete_authorization(
+    Manifold.Connectors.OAuthAuthorizations.complete(
       "gmail",
       Keyword.get(opts, :code, "authorization-code-secret"),
       consumed,
+      FakeGmail,
+      [],
       now: ~U[2026-08-11 01:00:00.000000Z],
       provider_opts: provider_opts
     )
