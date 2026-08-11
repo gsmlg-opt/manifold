@@ -4,7 +4,7 @@ defmodule Manifold.Mail.Schema.Folder do
   use Manifold.Mail.Schema
   import Ecto.Changeset
 
-  @kinds ~w(inbox archive trash custom)
+  @kinds ~w(inbox archive sent trash custom)
 
   schema "mailbox_folders" do
     field(:mailbox_id, :binary_id)

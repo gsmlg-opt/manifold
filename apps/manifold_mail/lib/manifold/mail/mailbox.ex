@@ -47,7 +47,7 @@ defmodule Manifold.Mail.Mailbox do
           [folder],
           asc:
             fragment(
-              "CASE ? WHEN 'inbox' THEN 0 WHEN 'archive' THEN 1 WHEN 'trash' THEN 2 ELSE 3 END",
+              "CASE ? WHEN 'inbox' THEN 0 WHEN 'archive' THEN 1 WHEN 'sent' THEN 2 WHEN 'trash' THEN 3 ELSE 4 END",
               folder.kind
             ),
           asc: folder.name

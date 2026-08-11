@@ -14,6 +14,55 @@ defmodule Manifold.Mail.MailboxTest do
 
   alias Manifold.Repo
 
+  test "ensures one ordered Sent system folder for a new mailbox" do
+    mailbox_id = mailbox_fixture()
+
+    assert {:ok, folders} = Mail.list_folders(mailbox_id)
+
+    assert Enum.map(folders, &{&1.kind, &1.name}) == [
+             {"inbox", "Inbox"},
+             {"archive", "Archive"},
+             {"sent", "Sent"},
+             {"trash", "Trash"}
+           ]
+
+    assert {:ok, _folders} = Mail.list_folders(mailbox_id)
+
+    assert Repo.aggregate(
+             from(folder in Folder,
+               where: folder.mailbox_id == ^mailbox_id and folder.kind == "sent"
+             ),
+             :count
+           ) == 1
+  end
+
+  test "preserves a custom Sent folder and its entries while reserving system Sent" do
+    mailbox_id = mailbox_fixture()
+
+    custom =
+      %Folder{}
+      |> Folder.changeset(%{mailbox_id: mailbox_id, kind: "custom", name: "Sent"})
+      |> Repo.insert!()
+
+    %{entry: entry} =
+      projected_message_fixture(
+        mailbox_id,
+        custom.id,
+        nil,
+        "Custom Sent message",
+        DateTime.utc_now()
+      )
+
+    assert {:ok, folders} = Mail.list_folders(mailbox_id)
+    system_sent = Enum.find(folders, &(&1.kind == "sent"))
+    renamed = Repo.get!(Folder, custom.id)
+
+    assert renamed.name == "Sent (custom #{custom.id})"
+    assert renamed.normalized_name == String.downcase(renamed.name)
+    assert Repo.get!(MailboxEntry, entry.id).folder_id == renamed.id
+    assert system_sent.name == "Sent"
+  end
+
   test "paginates distinct conversations without a message-row cap" do
     mailbox_id = mailbox_fixture()
     assert {:ok, folders} = Mail.list_folders(mailbox_id)
