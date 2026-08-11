@@ -2,8 +2,10 @@ defmodule Manifold.Outbound.SubmissionTest do
   use Manifold.DataCase, async: true
 
   alias Manifold.Accounts
+  alias Manifold.Connectors
   alias Manifold.Connectors.Schema.SendMethod
   alias Manifold.Outbound
+  alias Manifold.Outbound.LegacyResendFixture
   alias Manifold.Outbound.Provider
   alias Manifold.Outbound.Schema.{OutboundEvent, OutboundMessage, ProviderSubmission}
   alias Manifold.Repo
@@ -244,41 +246,26 @@ defmodule Manifold.Outbound.SubmissionTest do
     {:ok, mailbox} =
       Accounts.create_account(domain, %{local_part: "inbox", name: "Local Inbox"})
 
-    insert_send_method!(mailbox.id, "inbox@#{domain.normalized_domain}")
-
-    {:ok, draft} =
-      Outbound.create_draft(mailbox.id, %{
+    %{message: queued, method: method, submission: submission} =
+      LegacyResendFixture.queue!(mailbox.id, "inbox@#{domain.normalized_domain}", %{
         subject: "Ready",
         text_body: "Body",
         recipients: [%{kind: "to", address: "person@example.net"}]
       })
 
-    {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
-    make_legacy_resend_submission!(queued.id)
+    assert Repo.get(SendMethod, method.id) == nil
+
+    assert {:error, %{reason: :send_method_required}} =
+             Connectors.checkout_send_method(method.id, queued.sender_address)
+
+    assert %{
+             send_method_id: nil,
+             provider: "resend",
+             provider_rfc_message_id: nil,
+             idempotency_expires_at: %DateTime{}
+           } = submission
+
+    assert submission.request_sha256 == LegacyResendFixture.request_sha256(queued)
     queued
-  end
-
-  defp insert_send_method!(account_id, address) do
-    %SendMethod{}
-    |> SendMethod.changeset(%{
-      account_id: account_id,
-      kind: "smtp",
-      email_address: address,
-      status: "connected",
-      enabled: true
-    })
-    |> Repo.insert!()
-  end
-
-  defp make_legacy_resend_submission!(message_id) do
-    ProviderSubmission
-    |> Repo.get_by!(outbound_message_id: message_id)
-    |> Ecto.Changeset.change(
-      send_method_id: nil,
-      provider: "resend",
-      provider_rfc_message_id: nil,
-      idempotency_expires_at: DateTime.add(DateTime.utc_now(), 24, :hour)
-    )
-    |> Repo.update!()
   end
 end

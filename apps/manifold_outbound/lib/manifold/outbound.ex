@@ -277,7 +277,8 @@ defmodule Manifold.Outbound do
       |> Multi.run(:send_method, fn _repo, %{draft: {draft, queue?}} ->
         if queue? do
           with {:ok, method} <- Connectors.enabled_send_method(draft.mailbox_id),
-               :ok <- validate_sender(draft, method) do
+               :ok <- validate_sender(draft, method),
+               :ok <- after_send_method_selected(opts, method) do
             {:ok, method}
           end
         else
@@ -627,6 +628,17 @@ defmodule Manifold.Outbound do
 
   defp provider(_kind),
     do: {:error, error(:permanent, :send_method_required, "an enabled send method is required")}
+
+  defp after_send_method_selected(opts, method) do
+    case Keyword.get(opts, :after_send_method_selected) do
+      callback when is_function(callback, 1) ->
+        callback.(method)
+        :ok
+
+      _missing ->
+        :ok
+    end
+  end
 
   defp validate_sender(draft, method) do
     with true <- method.account_id == draft.mailbox_id,

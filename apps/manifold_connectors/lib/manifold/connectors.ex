@@ -376,6 +376,7 @@ defmodule Manifold.Connectors do
       method.account_id == ^account_id and method.enabled == true and
         method.status == "connected"
     )
+    |> lock("FOR UPDATE")
     |> Repo.one()
     |> case do
       %SendMethod{} = method -> {:ok, submission_method(method)}

@@ -120,6 +120,23 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
     assert other_id == other_gmail.id
   end
 
+  test "enabled_send_method locks the selected row", %{account: account} do
+    gmail = insert_gmail_method!(account, "sender-subject")
+
+    queries =
+      repo_queries_during(fn ->
+        assert {:ok, %SubmissionMethod{id: method_id}} =
+                 Connectors.enabled_send_method(account.id)
+
+        assert method_id == gmail.id
+      end)
+
+    assert Enum.any?(queries, fn query ->
+             String.contains?(query, ~s(FROM "connector_send_methods")) and
+               String.contains?(query, "FOR UPDATE")
+           end)
+  end
+
   test "Gmail checkout is isolated by method and returns only gmail.send material", %{
     account: account,
     other_account: other_account
