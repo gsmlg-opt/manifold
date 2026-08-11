@@ -443,6 +443,123 @@ defmodule Manifold.Outbound.SubmissionTest do
              method.id
   end
 
+  test "Gmail and SMTP submission telemetry identifies the method without leaking message data" do
+    handler_id = "submission-telemetry-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :outbound, :submit, :stop],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:telemetry, event, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    for kind <- ["gmail", "smtp"] do
+      %{message: message, method: method, account: account} = queued_operational_fixture(kind)
+
+      assert :ok =
+               Outbound.submit_message(message.id,
+                 provider: TestProvider,
+                 provider_config: [
+                   test_pid: self(),
+                   authorization_code: "raw-authorization-code",
+                   password: "raw-provider-password",
+                   result:
+                     {:ok,
+                      %Provider.Submission{
+                        provider_message_id: "telemetry-provider-#{kind}",
+                        metadata: %{}
+                      }}
+                 ]
+               )
+
+      assert_receive {:provider_submit, _, _}
+
+      assert_receive {:telemetry, [:manifold, :outbound, :submit, :stop],
+                      %{duration_ms: duration_ms, attempt_count: 1} = measurements,
+                      %{
+                        account_id: account_id,
+                        outbound_message_id: message_id,
+                        submission_id: submission_id,
+                        send_method_id: method_id,
+                        provider: provider,
+                        method_kind: method_kind,
+                        adapter: adapter,
+                        outcome: :accepted
+                      } = metadata}
+
+      assert is_integer(duration_ms) and duration_ms >= 0
+      assert account_id == account.id
+      assert message_id == message.id
+      assert is_binary(submission_id)
+      assert method_id == method.id
+      assert provider == kind
+      assert method_kind == kind
+      assert adapter == kind
+
+      assert_secret_free_telemetry(measurements, metadata, [
+        "Stable body",
+        "raw-authorization-code",
+        "raw-provider-password",
+        "gmail-access-token",
+        "smtp-secret"
+      ])
+    end
+  end
+
+  test "submission error telemetry carries only a normalized error code" do
+    %{message: message, method: method} = queued_operational_fixture("smtp")
+    handler_id = "submission-error-telemetry-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :outbound, :submit, :stop],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:telemetry, event, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    error = %Provider.Error{
+      class: :transient,
+      code: "raw_provider_password",
+      message: "raw-provider-password and telemetry-test-body-secret"
+    }
+
+    assert {:error, ^error} =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: {:error, error}]
+             )
+
+    assert_receive {:provider_submit, _, _}
+
+    assert_receive {:telemetry, [:manifold, :outbound, :submit, :stop], measurements,
+                    %{
+                      outbound_message_id: message_id,
+                      send_method_id: method_id,
+                      outcome: :retryable,
+                      error_code: "provider_error"
+                    } = metadata}
+
+    assert message_id == message.id
+    assert method_id == method.id
+
+    assert_secret_free_telemetry(measurements, metadata, [
+      "raw-provider-password",
+      "telemetry-test-body-secret"
+    ])
+  end
+
   test "does not reroute a queued submission when its snapshot is disabled" do
     %{message: message, method: snapshot, account: account, address: address} =
       queued_operational_fixture("smtp")
@@ -879,6 +996,34 @@ defmodule Manifold.Outbound.SubmissionTest do
   defp sha256(bytes) do
     :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
   end
+
+  defp assert_secret_free_telemetry(measurements, metadata, secret_values) do
+    assert Map.keys(measurements) |> Enum.sort() == [:attempt_count, :duration_ms]
+
+    forbidden_fragments =
+      ~w(token password authorization_code raw_message) ++
+        Enum.map(secret_values, &String.downcase/1)
+
+    telemetry_terms(measurements)
+    |> Enum.concat(telemetry_terms(metadata))
+    |> Enum.each(fn term ->
+      downcased = term |> to_string() |> String.downcase()
+
+      refute Enum.any?(forbidden_fragments, &String.contains?(downcased, &1)),
+             "unsafe telemetry term: #{inspect(term)}"
+    end)
+  end
+
+  defp telemetry_terms(map) when is_map(map) do
+    Enum.flat_map(map, fn {key, value} -> [key | telemetry_terms(value)] end)
+  end
+
+  defp telemetry_terms(list) when is_list(list), do: Enum.flat_map(list, &telemetry_terms/1)
+
+  defp telemetry_terms(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> telemetry_terms()
+
+  defp telemetry_terms(value), do: [value]
 
   defp expire_authorization!(authorization_id) do
     Repo.get!(OAuthAuthorization, authorization_id)

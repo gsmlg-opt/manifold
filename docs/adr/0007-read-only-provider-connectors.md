@@ -1,6 +1,6 @@
 # ADR 0007: Read-Only Provider Mailbox Connectors
 
-- **Status:** Accepted and implemented
+- **Status:** Accepted and implemented; outbound provider sending superseded by ADR 0010
 - **Date:** 2026-07-29
 
 ## Context
@@ -41,7 +41,7 @@ The Web application uses only the public Connectors context.
 
 ### Provider boundary
 
-Implement a normalized provider behaviour for:
+Implement a normalized receive-provider behaviour for:
 
 - OAuth code exchange and token refresh.
 - Provider account identity.
@@ -49,16 +49,18 @@ Implement a normalized provider behaviour for:
 - One bounded synchronization page.
 - Exact raw RFC message retrieval.
 
-The first adapters are Gmail and Microsoft Graph. They request read-only scopes:
+The first receive adapters are Gmail and Microsoft Graph. Receive synchronization
+requests read-only scopes:
 
 ```text
 Gmail:     openid email https://www.googleapis.com/auth/gmail.readonly
 Microsoft: openid profile offline_access User.Read Mail.Read
 ```
 
-The connector does not request Gmail modify/send scopes or Microsoft
-`Mail.ReadWrite`/`Mail.Send`. It does not mutate provider mailboxes or send
-through either provider.
+The receive path does not request Gmail modify scopes or Microsoft
+`Mail.ReadWrite`/`Mail.Send`. Gmail send authorization and submission are a later,
+separate outbound concern recorded by ADR 0010; Microsoft provider send remains
+out of scope.
 
 ### OAuth and secrets
 
@@ -173,9 +175,10 @@ providers.
 
 ### Add provider send at the same boundary
 
-Rejected. Read synchronization and outbound submission have different scopes,
-idempotency, and failure semantics. Outbound remains owned by
-`manifold_outbound` and managed provider adapters. Manifold never performs
+Rejected and retained by ADR 0010. Read synchronization and outbound submission
+have different scopes, idempotency, and failure semantics. Shared Gmail OAuth
+credentials are owned by `manifold_connectors`, while rendering, queueing, and
+Gmail API submission remain owned by `manifold_outbound`. Manifold never performs
 direct recipient-MX delivery.
 
 ### Depend on push notifications

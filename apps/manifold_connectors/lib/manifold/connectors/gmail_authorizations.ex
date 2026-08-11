@@ -31,6 +31,8 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   @provider "gmail"
   @approved_scopes MapSet.new([GmailScopes.read(), GmailScopes.send()])
   @refresh_skew_seconds 60
+  @telemetry_forbidden_fragments ~w(token password authorization_code raw_message)
+  @telemetry_code_pattern ~r/\A[a-z0-9_.:-]{1,128}\z/
 
   @spec complete(String.t(), Consumed.t(), module(), keyword(), keyword()) ::
           {:ok, ReceiveMethod.t() | SendMethod.t()}
@@ -38,28 +40,33 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   def complete(code, consumed, adapter, config, opts \\ [])
 
   def complete(code, %Consumed{provider: @provider} = consumed, adapter, config, opts) do
+    start = System.monotonic_time()
     now = Keyword.get(opts, :now, DateTime.utc_now())
     provider_opts = Keyword.get(opts, :provider_opts, [])
 
-    with {:ok, purpose} <- normalize_purpose(consumed.purpose),
-         {:ok, %Token{} = token} <-
-           adapter.exchange_code(
-             code,
-             consumed.pkce_verifier,
-             consumed.redirect_uri,
-             config,
-             provider_opts
-           ),
-         {:ok, %Identity{} = identity} <-
-           adapter.identity(token.access_token, config, provider_opts),
-         {:ok, provider_address} <- Address.parse(identity.email_address),
-         {:ok, cursors} <- initial_cursors(purpose, adapter, token, config, provider_opts),
-         :ok <- validate_cursors(purpose, cursors) do
-      persist(consumed, purpose, token, identity, provider_address, cursors, now)
-    else
-      {:error, %ProviderError{} = error} -> {:error, provider_error(error)}
-      {:error, %CoreError{} = error} -> {:error, error}
-    end
+    result =
+      with {:ok, purpose} <- normalize_purpose(consumed.purpose),
+           {:ok, %Token{} = token} <-
+             adapter.exchange_code(
+               code,
+               consumed.pkce_verifier,
+               consumed.redirect_uri,
+               config,
+               provider_opts
+             ),
+           {:ok, %Identity{} = identity} <-
+             adapter.identity(token.access_token, config, provider_opts),
+           {:ok, provider_address} <- Address.parse(identity.email_address),
+           {:ok, cursors} <- initial_cursors(purpose, adapter, token, config, provider_opts),
+           :ok <- validate_cursors(purpose, cursors) do
+        persist(consumed, purpose, token, identity, provider_address, cursors, now)
+      else
+        {:error, %ProviderError{} = error} -> {:error, provider_error(error)}
+        {:error, %CoreError{} = error} -> {:error, error}
+      end
+
+    emit_oauth_complete(consumed, result, start)
+    public_complete_result(result)
   rescue
     DBConnection.ConnectionError ->
       {:error, database_error()}
@@ -320,32 +327,39 @@ defmodule Manifold.Connectors.GmailAuthorizations do
          now,
          provider_opts
        ) do
-    with {:ok, refresh_token} <-
-           Crypto.decrypt(
-             authorization.refresh_token_ciphertext,
-             credential_context(authorization.id, :refresh)
-           ) do
-      refresh_opts =
-        provider_opts
-        |> Keyword.put(:required_scopes, authorization.granted_scopes)
-        |> Keyword.put(:now, now)
+    start = System.monotonic_time()
 
-      case adapter.refresh_token(refresh_token, config, refresh_opts) do
-        {:ok, %Token{} = token} ->
-          persist_refreshed_token_locked(authorization, required_scope, token)
+    result =
+      with {:ok, refresh_token} <-
+             Crypto.decrypt(
+               authorization.refresh_token_ciphertext,
+               credential_context(authorization.id, :refresh)
+             ) do
+        refresh_opts =
+          provider_opts
+          |> Keyword.put(:required_scopes, authorization.granted_scopes)
+          |> Keyword.put(:now, now)
 
-        {:error, %ProviderError{class: :reconnect} = error} ->
-          error = sanitize_reconnect_error(error)
+        case adapter.refresh_token(refresh_token, config, refresh_opts) do
+          {:ok, %Token{} = token} ->
+            persist_refreshed_token_locked(authorization, required_scope, token)
 
-          case mark_reconnect_required_locked(authorization, error, now, []) do
-            {:ok, _authorization} -> {:reconnect, error}
-            {:error, reason} -> Repo.rollback(reason)
-          end
+          {:error, %ProviderError{class: :reconnect} = error} ->
+            error = sanitize_reconnect_error(error)
 
-        {:error, %ProviderError{} = error} ->
-          Repo.rollback(error)
+            case mark_reconnect_required_locked(authorization, error, now, []) do
+              {:ok, _authorization} -> {:reconnect, error}
+              {:error, reason} -> Repo.rollback(reason)
+            end
+
+          {:error, %ProviderError{} = error} ->
+            emit_oauth_refresh(authorization, {:error, error}, start)
+            Repo.rollback(error)
+        end
       end
-    end
+
+    emit_oauth_refresh(authorization, result, start)
+    result
   end
 
   defp sanitize_reconnect_error(error) do
@@ -529,13 +543,13 @@ defmodule Manifold.Connectors.GmailAuthorizations do
            :ok <- persist_receive_state(purpose, method, cursors, now),
            {:ok, _event} <-
              insert_authorization_event(authorization.id, event_type, purpose, now) do
-        method
+        {method, event_type}
       else
         {:error, reason} -> Repo.rollback(reason)
       end
     end)
     |> case do
-      {:ok, method} -> {:ok, method}
+      {:ok, {method, event_type}} -> {:ok, method, event_type}
       {:error, reason} -> {:error, normalize_constraint_error(reason)}
     end
   end
@@ -967,6 +981,102 @@ defmodule Manifold.Connectors.GmailAuthorizations do
       occurred_at: now
     })
     |> Repo.insert()
+  end
+
+  defp public_complete_result({:ok, method, _outcome}), do: {:ok, method}
+  defp public_complete_result(result), do: result
+
+  defp emit_oauth_complete(consumed, {:ok, method, outcome}, start) do
+    :telemetry.execute(
+      [:manifold, :connectors, :oauth, :complete, :stop],
+      telemetry_measurements(start),
+      %{
+        account_id: consumed.mailbox_id,
+        authorization_id: method.oauth_authorization_id,
+        method_id: method.id,
+        provider: @provider,
+        method_kind: method.kind,
+        outcome: String.to_existing_atom(outcome)
+      }
+    )
+  end
+
+  defp emit_oauth_complete(consumed, {:error, reason}, start) do
+    :telemetry.execute(
+      [:manifold, :connectors, :oauth, :complete, :stop],
+      telemetry_measurements(start),
+      %{
+        account_id: consumed.mailbox_id,
+        provider: @provider,
+        method_kind: @provider,
+        outcome: :error,
+        error_code: normalized_error_code(reason)
+      }
+    )
+  end
+
+  defp emit_oauth_complete(consumed, unexpected_result, start) do
+    emit_oauth_complete(consumed, {:error, unexpected_result}, start)
+  end
+
+  defp emit_oauth_refresh(authorization, result, start) do
+    {outcome, error_code} =
+      case result do
+        {:ok, _access_token} ->
+          {:refreshed, nil}
+
+        {:reconnect, %ProviderError{} = error} ->
+          {:reconnect_required, normalized_error_code(error)}
+
+        {:error, reason} ->
+          {:error, normalized_error_code(reason)}
+      end
+
+    metadata = %{
+      account_id: authorization.account_id,
+      authorization_id: authorization.id,
+      provider: @provider,
+      method_kind: @provider,
+      outcome: outcome
+    }
+
+    metadata = if error_code, do: Map.put(metadata, :error_code, error_code), else: metadata
+
+    :telemetry.execute(
+      [:manifold, :connectors, :oauth, :refresh, :stop],
+      telemetry_measurements(start),
+      metadata
+    )
+  end
+
+  defp telemetry_measurements(start) do
+    %{
+      duration_ms:
+        System.convert_time_unit(System.monotonic_time() - start, :native, :millisecond),
+      attempt_count: 1
+    }
+  end
+
+  defp normalized_error_code(%CoreError{reason: reason}), do: telemetry_error_code(reason)
+  defp normalized_error_code(%ProviderError{code: code}), do: telemetry_error_code(code)
+  defp normalized_error_code(%Ecto.Changeset{}), do: :invalid_connector_state
+  defp normalized_error_code(_reason), do: :connector_operation_failed
+
+  defp telemetry_error_code(code) when is_atom(code) do
+    if safe_telemetry_code?(Atom.to_string(code)), do: code, else: :connector_operation_failed
+  end
+
+  defp telemetry_error_code(code) when is_binary(code) do
+    if safe_telemetry_code?(code), do: code, else: "connector_operation_failed"
+  end
+
+  defp telemetry_error_code(_code), do: :connector_operation_failed
+
+  defp safe_telemetry_code?(code) do
+    downcased = String.downcase(code)
+
+    Regex.match?(@telemetry_code_pattern, downcased) and
+      not Enum.any?(@telemetry_forbidden_fragments, &String.contains?(downcased, &1))
   end
 
   defp reconnect_error_attrs(%ProviderError{} = error) do

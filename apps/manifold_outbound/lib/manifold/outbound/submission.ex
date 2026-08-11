@@ -22,19 +22,36 @@ defmodule Manifold.Outbound.Submission do
   alias Manifold.Outbound.State
   alias Manifold.Repo
 
+  @telemetry_forbidden_fragments ~w(token password authorization_code raw_message)
+  @telemetry_code_pattern ~r/\A[a-z0-9_.:-]{1,128}\z/
+
   @spec submit(Ecto.UUID.t(), Keyword.t()) ::
           :ok | {:error, Error.t() | Provider.Error.t()}
   def submit(message_id, opts \\ []) do
-    with {:ok, preparation} <- prepare_attempt(message_id),
-         result <- call_provider(preparation, opts) do
-      persist_result(preparation, result, opts)
+    start = System.monotonic_time()
+
+    case prepare_attempt(message_id, start) do
+      {:ok, :already_accepted} ->
+        :ok
+
+      {:ok, preparation} ->
+        result =
+          preparation
+          |> call_provider(opts)
+          |> then(&persist_result(preparation, &1, opts))
+
+        emit_submit_stop(preparation, result, start)
+        result
+
+      {:error, reason} ->
+        {:error, reason}
     end
   rescue
     DBConnection.ConnectionError ->
       {:error, Error.new(:temporary, :database_unavailable, "outbound database is unavailable")}
   end
 
-  defp prepare_attempt(message_id) do
+  defp prepare_attempt(message_id, start) do
     Repo.transaction(fn ->
       message =
         OutboundMessage
@@ -69,8 +86,8 @@ defmodule Manifold.Outbound.Submission do
            attempt_count: submission.attempt_count
          }}
 
-      {:ok, {:marked_uncertain, error, outbound_message_id}} ->
-        emit_uncertain(outbound_message_id)
+      {:ok, {:marked_uncertain, error, message, submission}} ->
+        emit_submit_stop(telemetry_context(message, submission), {:error, error}, start)
         {:error, error}
 
       {:ok, :already_accepted} ->
@@ -183,7 +200,8 @@ defmodule Manifold.Outbound.Submission do
     insert_event!(message.id, "submission_uncertain", %{code: code}, now)
 
     {:marked_uncertain,
-     Error.new(:permanent, :submission_uncertain, "submission was not retried"), message.id}
+     Error.new(:permanent, :submission_uncertain, "submission was not retried"), message,
+     submission}
   end
 
   defp call_provider(:already_accepted, _opts), do: :already_accepted
@@ -433,12 +451,6 @@ defmodule Manifold.Outbound.Submission do
 
     case result do
       {:ok, :transitioned} ->
-        :telemetry.execute(
-          [:manifold, :outbound, :submit, :stop],
-          %{attempts: 1},
-          %{outbound_message_id: preparation.message_id, outcome: :uncertain}
-        )
-
         {:error,
          Error.new(
            :permanent,
@@ -503,12 +515,6 @@ defmodule Manifold.Outbound.Submission do
 
     case result do
       {:ok, :accepted} ->
-        :telemetry.execute(
-          [:manifold, :outbound, :submit, :stop],
-          %{attempts: 1},
-          %{outbound_message_id: preparation.message_id, outcome: :accepted}
-        )
-
         :ok
 
       {:ok, {:terminal, "accepted_by_provider"}} ->
@@ -627,12 +633,77 @@ defmodule Manifold.Outbound.Submission do
   defp stale_result(_stale),
     do: {:error, Error.new(:temporary, :stale_submission_result, "stale submission result")}
 
-  defp emit_uncertain(outbound_message_id) do
+  defp emit_submit_stop(preparation, result, start) do
+    {outcome, error_code} = submit_outcome(result)
+
+    metadata = %{
+      account_id: preparation.message.mailbox_id,
+      outbound_message_id: preparation.message_id,
+      submission_id: preparation.submission_id,
+      send_method_id: preparation.submission.send_method_id,
+      provider: preparation.submission.provider,
+      method_kind: preparation.submission.provider,
+      adapter: preparation.submission.provider,
+      outcome: outcome
+    }
+
+    metadata = if error_code, do: Map.put(metadata, :error_code, error_code), else: metadata
+
     :telemetry.execute(
       [:manifold, :outbound, :submit, :stop],
-      %{attempts: 1},
-      %{outbound_message_id: outbound_message_id, outcome: :uncertain}
+      %{
+        duration_ms:
+          System.convert_time_unit(System.monotonic_time() - start, :native, :millisecond),
+        attempt_count: preparation.attempt_count
+      },
+      metadata
     )
+  end
+
+  defp submit_outcome(:ok), do: {:accepted, nil}
+
+  defp submit_outcome({:error, %Provider.Error{class: :transient, code: code}}),
+    do: {:retryable, telemetry_error_code(code)}
+
+  defp submit_outcome({:error, %Provider.Error{class: :uncertain, code: code}}),
+    do: {:uncertain, telemetry_error_code(code)}
+
+  defp submit_outcome({:error, %Provider.Error{code: code}}),
+    do: {:failed, telemetry_error_code(code)}
+
+  defp submit_outcome({:error, %Error{reason: :submission_uncertain}}),
+    do: {:uncertain, :submission_uncertain}
+
+  defp submit_outcome({:error, %Error{reason: reason}}),
+    do: {:error, telemetry_error_code(reason)}
+
+  defp submit_outcome(_result), do: {:error, :submission_failed}
+
+  defp telemetry_error_code(code) when is_atom(code) do
+    if safe_telemetry_code?(Atom.to_string(code)), do: code, else: :provider_error
+  end
+
+  defp telemetry_error_code(code) when is_binary(code) do
+    if safe_telemetry_code?(code), do: code, else: "provider_error"
+  end
+
+  defp telemetry_error_code(_code), do: :provider_error
+
+  defp safe_telemetry_code?(code) do
+    downcased = String.downcase(code)
+
+    Regex.match?(@telemetry_code_pattern, downcased) and
+      not Enum.any?(@telemetry_forbidden_fragments, &String.contains?(downcased, &1))
+  end
+
+  defp telemetry_context(message, submission) do
+    %{
+      message_id: message.id,
+      message: message,
+      submission: submission,
+      submission_id: submission.id,
+      attempt_count: submission.attempt_count
+    }
   end
 
   defp envelope(message, submission, recipients) do

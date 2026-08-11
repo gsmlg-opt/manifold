@@ -206,6 +206,113 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert is_nil(scope_event.external_account_id)
   end
 
+  test "OAuth upgrade and token refresh telemetry is useful and secret-free", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    attach_telemetry([
+      [:manifold, :connectors, :oauth, :complete, :stop],
+      [:manifold, :connectors, :oauth, :refresh, :stop]
+    ])
+
+    assert {:ok, send_method} =
+             complete(:send, account, address,
+               code: "raw-authorization-code",
+               access_token: "raw-upgraded-access-token",
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    assert_receive {:telemetry, [:manifold, :connectors, :oauth, :complete, :stop],
+                    %{duration_ms: duration_ms, attempt_count: 1} = measurements,
+                    %{
+                      account_id: account_id,
+                      authorization_id: authorization_id,
+                      method_id: method_id,
+                      provider: "gmail",
+                      method_kind: "gmail",
+                      outcome: :scope_upgraded
+                    } = metadata}
+
+    assert is_integer(duration_ms) and duration_ms >= 0
+    assert account_id == account.id
+    assert authorization_id == authorization.id
+    assert method_id == send_method.id
+
+    assert_secret_free_telemetry(measurements, metadata, [
+      "raw-authorization-code",
+      "raw-upgraded-access-token",
+      "refresh-secret"
+    ])
+
+    refreshed = %Token{
+      access_token: "raw-refreshed-access-token",
+      refresh_token: "raw-refreshed-refresh-token",
+      expires_at: ~U[2026-08-11 04:00:00.000000Z],
+      scopes: [GmailScopes.read(), GmailScopes.send()]
+    }
+
+    assert {:ok, "raw-refreshed-access-token"} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: GmailScopes.send(),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [refresh_result: {:ok, refreshed}]
+             )
+
+    assert_receive {:telemetry, [:manifold, :connectors, :oauth, :refresh, :stop],
+                    %{duration_ms: refresh_duration, attempt_count: 1} = refresh_measurements,
+                    %{
+                      account_id: refresh_account_id,
+                      authorization_id: refresh_authorization_id,
+                      provider: "gmail",
+                      method_kind: "gmail",
+                      outcome: :refreshed
+                    } = refresh_metadata}
+
+    assert is_integer(refresh_duration) and refresh_duration >= 0
+    assert refresh_account_id == account.id
+    assert refresh_authorization_id == authorization.id
+
+    assert_secret_free_telemetry(refresh_measurements, refresh_metadata, [
+      "raw-refreshed-access-token",
+      "raw-refreshed-refresh-token",
+      "refresh-secret"
+    ])
+
+    reconnect_error = %ProviderError{
+      class: :reconnect,
+      code: :invalid_grant,
+      message: "raw-refresh-token-secret must not escape"
+    }
+
+    assert {:error, %ProviderError{code: :invalid_grant}} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: GmailScopes.send(),
+               now: ~U[2026-08-11 05:00:00.000000Z],
+               provider_opts: [refresh_result: {:error, reconnect_error}]
+             )
+
+    assert_receive {:telemetry, [:manifold, :connectors, :oauth, :refresh, :stop],
+                    %{duration_ms: reconnect_duration, attempt_count: 1} = reconnect_measurements,
+                    %{
+                      authorization_id: reconnect_authorization_id,
+                      outcome: :reconnect_required,
+                      error_code: :invalid_grant
+                    } = reconnect_metadata}
+
+    assert is_integer(reconnect_duration) and reconnect_duration >= 0
+    assert reconnect_authorization_id == authorization.id
+
+    assert_secret_free_telemetry(reconnect_measurements, reconnect_metadata, [
+      "raw-refresh-token-secret",
+      "raw-refreshed-access-token",
+      "raw-refreshed-refresh-token"
+    ])
+  end
+
   test "send-to-receive upgrade preserves send scope and initializes receive only then", %{
     account: account,
     address: address
@@ -1450,6 +1557,51 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
       :telemetry.detach(handler_id)
     end
   end
+
+  defp attach_telemetry(events) do
+    handler_id = "gmail-telemetry-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach_many(
+        handler_id,
+        events,
+        fn event, measurements, metadata, pid ->
+          send(pid, {:telemetry, event, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp assert_secret_free_telemetry(measurements, metadata, secret_values) do
+    assert Map.keys(measurements) |> Enum.sort() == [:attempt_count, :duration_ms]
+
+    forbidden_fragments =
+      ~w(token password authorization_code raw_message) ++
+        Enum.map(secret_values, &String.downcase/1)
+
+    telemetry_terms(measurements)
+    |> Enum.concat(telemetry_terms(metadata))
+    |> Enum.each(fn term ->
+      downcased = term |> to_string() |> String.downcase()
+
+      refute Enum.any?(forbidden_fragments, &String.contains?(downcased, &1)),
+             "unsafe telemetry term: #{inspect(term)}"
+    end)
+  end
+
+  defp telemetry_terms(map) when is_map(map) do
+    Enum.flat_map(map, fn {key, value} -> [key | telemetry_terms(value)] end)
+  end
+
+  defp telemetry_terms(list) when is_list(list), do: Enum.flat_map(list, &telemetry_terms/1)
+
+  defp telemetry_terms(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> telemetry_terms()
+
+  defp telemetry_terms(value), do: [value]
 
   defp received_repo_queries(handler_id, queries \\ []) do
     receive do
