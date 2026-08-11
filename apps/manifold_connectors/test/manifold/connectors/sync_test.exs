@@ -86,6 +86,9 @@ defmodule Manifold.Connectors.SyncTest do
              cursor: %{cursor | phase: "incremental", committed_cursor: "101"}
            }}
 
+        fun when is_function(fun, 1) ->
+          fun.(cursor)
+
         result ->
           result
       end
@@ -562,6 +565,37 @@ defmodule Manifold.Connectors.SyncTest do
     assert Repo.get!(SyncCursor, cursor.id).committed_cursor == "100"
     assert_gmail_reconnect_required(authorization.id, account.id, send_method.id)
     refute_reconnect_secret("raw-fetch-secret")
+  end
+
+  test "a reconnect race makes the stale checkpoint cancel without restoring connected", %{
+    account: account,
+    cursor: cursor
+  } do
+    send_method = insert_gmail_send_method!(account)
+    authorization = Repo.get!(OAuthAuthorization, account.oauth_authorization_id)
+
+    Process.put(:sync_page_result, fn provider_cursor ->
+      assert {:ok, _authorization} =
+               Connectors.mark_oauth_reconnect_required(
+                 authorization.id,
+                 %Error{
+                   class: :reconnect,
+                   code: :invalid_grant,
+                   message: "raw-checkpoint-race-secret must never escape"
+                 },
+                 expected_access_token: "initial-access"
+               )
+
+      {:ok,
+       %Page{
+         cursor: %{provider_cursor | committed_cursor: "101"}
+       }}
+    end)
+
+    assert {:cancel, :reconnect_required} = Connectors.sync_account(account.id)
+    assert Repo.get!(SyncCursor, cursor.id).committed_cursor == "100"
+    assert_gmail_reconnect_required(authorization.id, account.id, send_method.id)
+    refute_reconnect_secret("raw-checkpoint-race-secret")
   end
 
   test "retry-after leaves the cursor unchanged and snoozes", %{

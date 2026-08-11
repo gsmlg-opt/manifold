@@ -136,11 +136,13 @@ defmodule Manifold.Connectors.Sync do
             error = normalize_provider_error(account, error)
 
             {:error, account.kind, error,
-             handle_cursor_provider_error(account, cursor, error, now)}
+             handle_cursor_provider_error(account, cursor, error, now, auth)}
 
           {:error, %ProviderError{} = error} ->
             error = normalize_provider_error(account, error)
-            {:error, account.kind, error, handle_account_provider_error(account, error, now)}
+
+            {:error, account.kind, error,
+             handle_account_provider_error(account, error, now, auth)}
 
           {:error, %Error{} = error} ->
             {:error, account.kind, error, handle_core_error(account_id, error, now)}
@@ -891,6 +893,14 @@ defmodule Manifold.Connectors.Sync do
 
       more?
     end)
+  rescue
+    Ecto.StaleEntryError ->
+      {:error,
+       Error.new(
+         :temporary,
+         :connector_lifecycle_changed,
+         "connector lifecycle changed during synchronization"
+       )}
   end
 
   defp insert_discovered_cursors(_account_id, [], _now), do: :ok
@@ -1104,32 +1114,40 @@ defmodule Manifold.Connectors.Sync do
            oauth_authorization_id: authorization_id
          },
          %ProviderError{class: :reconnect} = error,
-         now
+         now,
+         expected_access_token
        )
-       when is_binary(authorization_id) do
-    case Connectors.mark_oauth_reconnect_required(authorization_id, error, now: now) do
-      {:ok, _authorization} -> {:cancel, :reconnect_required}
+       when is_binary(authorization_id) and is_binary(expected_access_token) do
+    case Connectors.mark_oauth_reconnect_required(authorization_id, error,
+           now: now,
+           expected_access_token: expected_access_token
+         ) do
+      {:ok, %{status: "reconnect_required"}} -> {:cancel, :reconnect_required}
+      {:ok, %{status: "disconnected"}} -> {:cancel, :account_disconnected}
+      {:ok, %{status: "connected"}} -> {:snooze, 1}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp handle_account_provider_error(%ReceiveMethod{id: account_id}, error, now),
+  defp handle_account_provider_error(%ReceiveMethod{id: account_id}, error, now, _auth),
     do: handle_provider_error(account_id, error, now)
 
   defp handle_cursor_provider_error(
          %ReceiveMethod{kind: "gmail"} = account,
          _cursor,
          %ProviderError{class: :reconnect} = error,
-         now
+         now,
+         expected_access_token
        ) do
-    handle_account_provider_error(account, error, now)
+    handle_account_provider_error(account, error, now, expected_access_token)
   end
 
   defp handle_cursor_provider_error(
          %ReceiveMethod{id: account_id},
          %SyncCursor{scope: "folder:" <> _folder_id} = cursor,
          %ProviderError{code: :not_found},
-         now
+         now,
+         _auth
        ) do
     Repo.transaction(fn ->
       Repo.delete_all(from(stored in SyncCursor, where: stored.id == ^cursor.id))
@@ -1172,8 +1190,14 @@ defmodule Manifold.Connectors.Sync do
     end
   end
 
-  defp handle_cursor_provider_error(%ReceiveMethod{id: account_id}, _cursor, error, now),
-    do: handle_provider_error(account_id, error, now)
+  defp handle_cursor_provider_error(
+         %ReceiveMethod{id: account_id},
+         _cursor,
+         error,
+         now,
+         _auth
+       ),
+       do: handle_provider_error(account_id, error, now)
 
   defp handle_cursor_provider_error(account_id, cursor, error, now),
     do:
@@ -1181,7 +1205,8 @@ defmodule Manifold.Connectors.Sync do
         %ReceiveMethod{id: account_id},
         cursor,
         error,
-        now
+        now,
+        nil
       )
 
   defp normalize_provider_error(
@@ -1207,6 +1232,19 @@ defmodule Manifold.Connectors.Sync do
        )
        when reason in [:account_disconnected, :sync_disabled, :account_not_found] do
     {:cancel, reason}
+  end
+
+  defp handle_core_error(
+         account_id,
+         %Error{reason: :connector_lifecycle_changed},
+         _now
+       ) do
+    case Repo.get(ReceiveMethod, account_id) do
+      %ReceiveMethod{status: "reconnect_required"} -> {:cancel, :reconnect_required}
+      %ReceiveMethod{status: "disconnected"} -> {:cancel, :account_disconnected}
+      %ReceiveMethod{} -> {:snooze, 1}
+      nil -> {:cancel, :account_not_found}
+    end
   end
 
   defp handle_core_error(account_id, %Error{class: :permanent} = error, now) do

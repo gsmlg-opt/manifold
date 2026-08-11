@@ -2,6 +2,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   @moduledoc false
 
   import Ecto.Query
+  import Bitwise, only: [bor: 2, bxor: 2]
 
   alias Manifold.Accounts
   alias Manifold.Accounts.Schema.Account
@@ -181,7 +182,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
     Repo.transaction(fn ->
       with {:ok, authorization} <- lock_authorization(authorization_id),
            {:ok, authorization} <-
-             mark_reconnect_required_locked(authorization, provider_error, now, opts) do
+             maybe_mark_reconnect_required_locked(authorization, provider_error, now, opts) do
         authorization
       else
         {:error, reason} -> Repo.rollback(reason)
@@ -358,6 +359,75 @@ defmodule Manifold.Connectors.GmailAuthorizations do
            ) do
       {:ok, authorization}
     end
+  end
+
+  defp maybe_mark_reconnect_required_locked(authorization, provider_error, now, opts) do
+    with {:ok, applicable?} <- reconnect_applicable?(authorization, opts) do
+      if applicable? do
+        mark_reconnect_required_locked(authorization, provider_error, now, opts)
+      else
+        {:ok, authorization}
+      end
+    end
+  end
+
+  defp reconnect_applicable?(%OAuthAuthorization{status: "connected"} = authorization, opts) do
+    if live_dependent_methods?(authorization.id) do
+      expected_access_token_matches?(authorization, opts)
+    else
+      {:ok, false}
+    end
+  end
+
+  defp reconnect_applicable?(_authorization, _opts), do: {:ok, false}
+
+  defp live_dependent_methods?(authorization_id) do
+    receive_live? =
+      ReceiveMethod
+      |> where(
+        [method],
+        method.oauth_authorization_id == ^authorization_id and method.status != "disconnected"
+      )
+      |> Repo.exists?()
+
+    send_live? =
+      SendMethod
+      |> where(
+        [method],
+        method.oauth_authorization_id == ^authorization_id and method.status != "disconnected"
+      )
+      |> Repo.exists?()
+
+    receive_live? or send_live?
+  end
+
+  defp expected_access_token_matches?(authorization, opts) do
+    case Keyword.fetch(opts, :expected_access_token) do
+      :error ->
+        {:ok, true}
+
+      {:ok, expected_access_token} when is_binary(expected_access_token) ->
+        with {:ok, current_access_token} <- decrypt_access_token(authorization) do
+          {:ok, secure_token_match?(current_access_token, expected_access_token)}
+        end
+
+      {:ok, _invalid} ->
+        {:ok, false}
+    end
+  end
+
+  defp secure_token_match?(left, right) do
+    secure_digest_match?(:crypto.hash(:sha256, left), :crypto.hash(:sha256, right), 0)
+  end
+
+  defp secure_digest_match?(<<>>, <<>>, difference), do: difference == 0
+
+  defp secure_digest_match?(
+         <<left, left_rest::binary>>,
+         <<right, right_rest::binary>>,
+         difference
+       ) do
+    secure_digest_match?(left_rest, right_rest, bor(difference, bxor(left, right)))
   end
 
   defp persist(consumed, purpose, token, identity, provider_address, cursors, now) do
@@ -863,7 +933,8 @@ defmodule Manifold.Connectors.GmailAuthorizations do
         last_error_code: error_attrs.last_error_code,
         last_error_message: error_attrs.last_error_message,
         updated_at: now
-      ]
+      ],
+      inc: [lock_version: 1]
     )
 
     SendMethod
@@ -880,7 +951,8 @@ defmodule Manifold.Connectors.GmailAuthorizations do
         last_error_code: error_attrs.last_error_code,
         last_error_message: error_attrs.last_error_message,
         updated_at: now
-      ]
+      ],
+      inc: [lock_version: 1]
     )
 
     :ok

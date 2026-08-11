@@ -470,6 +470,120 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     refute Enum.any?(Repo.all(Oban.Job), &(inspect(&1) =~ "raw-refresh-secret"))
   end
 
+  test "reconnect propagation makes pre-mark receive changesets stale", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    stale_receive = Repo.get!(ReceiveMethod, receive.id)
+
+    stale_checkpoint =
+      ReceiveMethod.changeset(stale_receive, %{
+        status: "connected",
+        last_synced_at: ~U[2026-08-11 03:00:00.000000Z],
+        last_error_class: nil,
+        last_error_code: nil,
+        last_error_message: nil
+      })
+
+    assert {:ok, _authorization} =
+             Connectors.mark_oauth_reconnect_required(
+               receive.oauth_authorization_id,
+               reconnect_error(),
+               expected_access_token: "access-secret"
+             )
+
+    assert_raise Ecto.StaleEntryError, fn -> Repo.update(stale_checkpoint) end
+
+    persisted = Repo.get!(ReceiveMethod, receive.id)
+    assert persisted.status == "reconnect_required"
+    assert persisted.last_error_code == "invalid_grant"
+  end
+
+  test "stale reconnect after final disconnect leaves the authorization disconnected", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, send_method} =
+             complete(:send, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    assert {:ok, _receive} = Connectors.disconnect(receive.id)
+    assert {:ok, _send} = Connectors.disconnect_send_method(send_method.id)
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+
+    assert {:ok, authorization} =
+             Connectors.mark_oauth_reconnect_required(
+               receive.oauth_authorization_id,
+               %ProviderError{
+                 class: :reconnect,
+                 code: :invalid_grant,
+                 message: "raw-old-token-secret must never escape"
+               },
+               expected_access_token: "access-secret"
+             )
+
+    assert authorization.status == "disconnected"
+    assert is_nil(authorization.access_token_ciphertext)
+    assert is_nil(authorization.refresh_token_ciphertext)
+    assert Repo.get!(ReceiveMethod, receive.id).status == "disconnected"
+    assert Repo.get!(SendMethod, send_method.id).status == "disconnected"
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before
+    refute inspect(authorization) =~ "raw-old-token-secret"
+  end
+
+  test "stale old-token reconnect after reauthorization leaves the new generation healthy", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, send_method} =
+             complete(:send, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    assert {:ok, _reauthorized} =
+             complete(:receive, account, address,
+               access_token: "new-generation-access",
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    events_before = Repo.aggregate(ConnectorEvent, :count)
+
+    assert {:ok, authorization} =
+             Connectors.mark_oauth_reconnect_required(
+               receive.oauth_authorization_id,
+               %ProviderError{
+                 class: :reconnect,
+                 code: :invalid_grant,
+                 message: "raw-stale-generation-secret must never escape"
+               },
+               expected_access_token: "access-secret"
+             )
+
+    assert authorization.status == "connected"
+    assert Repo.get!(ReceiveMethod, receive.id).status == "connected"
+    assert Repo.get!(ReceiveMethod, receive.id).enabled
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+    assert Repo.get!(SendMethod, send_method.id).enabled
+    assert Repo.aggregate(ConnectorEvent, :count) == events_before
+
+    assert {:ok, "new-generation-access"} =
+             Crypto.decrypt(
+               authorization.access_token_ciphertext,
+               "credential:#{authorization.id}:access"
+             )
+
+    refute inspect(authorization) =~ "raw-stale-generation-secret"
+  end
+
   test "mark_reconnect_required rolls back authorization and methods atomically", %{
     account: account,
     address: address
