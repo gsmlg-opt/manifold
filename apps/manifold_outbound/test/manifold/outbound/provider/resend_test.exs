@@ -50,11 +50,20 @@ defmodule Manifold.Outbound.Provider.ResendTest do
       Req.Test.json(conn, %{"id" => "resend-message-1"})
     end)
 
+    request = %Provider.Request{
+      provider: "resend",
+      send_method_id: "018f5f6e-3d31-7ef0-a5b6-2a3ed1647602",
+      envelope: @envelope,
+      raw_message: "stable rendered bytes",
+      request_sha256:
+        :crypto.hash(:sha256, "stable rendered bytes") |> Base.encode16(case: :lower)
+    }
+
     assert {:ok,
             %Provider.Submission{
               provider_message_id: "resend-message-1",
               metadata: %{}
-            }} = Resend.submit(@config, @envelope)
+            }} = Resend.submit(@config, request)
   end
 
   test "classifies retryable provider and transport failures" do

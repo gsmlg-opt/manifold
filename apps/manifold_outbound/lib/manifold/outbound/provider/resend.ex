@@ -5,7 +5,7 @@ defmodule Manifold.Outbound.Provider.Resend do
 
   @behaviour Manifold.Outbound.Provider
 
-  alias Manifold.Outbound.Provider.{Envelope, Error, Event, Submission}
+  alias Manifold.Outbound.Provider.{Envelope, Error, Event, Request, Submission}
 
   @default_base_url "https://api.resend.com"
   @timestamp_tolerance_seconds 300
@@ -21,6 +21,9 @@ defmodule Manifold.Outbound.Provider.Resend do
   }
 
   @impl true
+  def submit(config, %Request{envelope: envelope}), do: submit(config, envelope)
+
+  # Temporary compatibility for legacy Resend submissions until dispatch uses Request.
   def submit(config, %Envelope{} = envelope) do
     case Keyword.get(config, :api_key) do
       api_key when is_binary(api_key) and api_key != "" ->

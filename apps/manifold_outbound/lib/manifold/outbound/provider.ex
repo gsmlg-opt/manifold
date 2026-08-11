@@ -3,9 +3,9 @@ defmodule Manifold.Outbound.Provider do
   Managed outbound provider boundary.
   """
 
-  alias Manifold.Outbound.Provider.{Envelope, Error, Event, Submission}
+  alias Manifold.Outbound.Provider.{Error, Event, Request, Submission}
 
-  @callback submit(keyword(), Envelope.t()) :: {:ok, Submission.t()} | {:error, Error.t()}
+  @callback submit(keyword(), Request.t()) :: {:ok, Submission.t()} | {:error, Error.t()}
   @callback verify_webhook(keyword(), map(), binary(), Keyword.t()) ::
               {:ok, Event.t()} | {:error, Error.t()}
 
@@ -41,7 +41,7 @@ defmodule Manifold.Outbound.Provider.Envelope do
   @moduledoc false
 
   @enforce_keys [:from, :to, :cc, :bcc, :subject, :text, :idempotency_key]
-  defstruct [:in_reply_to, references: []] ++ @enforce_keys
+  defstruct [:message_id, :queued_at, :in_reply_to, references: []] ++ @enforce_keys
 
   @type t :: %__MODULE__{
           from: String.t(),
@@ -50,9 +50,26 @@ defmodule Manifold.Outbound.Provider.Envelope do
           bcc: [String.t()],
           subject: String.t(),
           text: String.t(),
+          message_id: String.t() | nil,
+          queued_at: DateTime.t() | nil,
           in_reply_to: String.t() | nil,
           references: [String.t()],
           idempotency_key: String.t()
+        }
+end
+
+defmodule Manifold.Outbound.Provider.Request do
+  @moduledoc false
+
+  @enforce_keys [:provider, :send_method_id, :envelope, :raw_message, :request_sha256]
+  defstruct @enforce_keys
+
+  @type t :: %__MODULE__{
+          provider: String.t(),
+          send_method_id: Ecto.UUID.t(),
+          envelope: Manifold.Outbound.Provider.Envelope.t(),
+          raw_message: binary(),
+          request_sha256: String.t()
         }
 end
 
