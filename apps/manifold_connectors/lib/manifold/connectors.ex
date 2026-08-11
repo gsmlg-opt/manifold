@@ -2099,7 +2099,8 @@ defmodule Manifold.Connectors do
          method.account_id == snapshot.account_id and
          method.email_address == snapshot.email_address and
          method.status == snapshot.status and
-         method.enabled == snapshot.enabled do
+         method.enabled == snapshot.enabled and
+         method.lock_version == snapshot.lock_version do
       :ok
     else
       {:error, send_method_required()}

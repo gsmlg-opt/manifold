@@ -121,13 +121,10 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
          {:ok, client_id} <- fetch_config(config, :client_id),
          {:ok, client_secret} <- fetch_config(config, :client_secret) do
       requested_scopes =
-        opts
-        |> Keyword.get(
-          :required_scopes,
-          String.split(Keyword.get(config, :scopes, @default_scopes))
-        )
-        |> Enum.uniq()
-        |> Enum.sort()
+        case Keyword.fetch(opts, :required_scopes) do
+          {:ok, scopes} -> scopes |> Enum.uniq() |> Enum.sort()
+          :error -> config |> Keyword.get(:scopes, @default_scopes) |> String.split()
+        end
 
       form =
         [

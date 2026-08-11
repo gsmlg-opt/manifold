@@ -469,6 +469,42 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
              )
   end
 
+  test "Microsoft token exchange preserves configured fallback scope order" do
+    configured_scopes = "openid profile offline_access User.Read Mail.Read"
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      form = Plug.Conn.Query.decode(body)
+
+      assert form["scope"] == configured_scopes
+
+      Req.Test.json(conn, %{
+        "access_token" => "legacy-fallback-access-token",
+        "refresh_token" => "legacy-fallback-refresh-token",
+        "expires_in" => 3_600
+      })
+    end)
+
+    config = [
+      client_id: "legacy-fallback-client",
+      client_secret: "legacy-fallback-secret",
+      token_url: "https://login.microsoft.test/organizations/oauth2/v2.0/token",
+      scopes: configured_scopes,
+      req_options: [plug: {Req.Test, __MODULE__}]
+    ]
+
+    assert {:ok, %Token{scopes: scopes}} =
+             MicrosoftGraph.exchange_code(
+               "legacy-authorization-code",
+               "legacy-pkce-verifier",
+               "https://mail.example.test/connectors/microsoft/callback",
+               config,
+               now: @now
+             )
+
+    assert scopes == String.split(configured_scopes)
+  end
+
   test "an incremental response without refresh_token retains existing ciphertext", %{
     account: account,
     address: address

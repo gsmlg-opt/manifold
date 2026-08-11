@@ -325,6 +325,47 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
     refute inspect(error) =~ sentinel
   end
 
+  test "disconnecting and re-adding a method after queue snapshot fails revalidation", %{
+    account: account
+  } do
+    sentinel = "aba-token-sentinel-#{System.unique_integer([:positive])}"
+
+    microsoft =
+      insert_microsoft_method!(account, "microsoft-subject",
+        access_token: sentinel,
+        scopes: [MicrosoftScopes.read(), MicrosoftScopes.send()]
+      )
+
+    insert_microsoft_receive!(account, microsoft.oauth_authorization_id, "microsoft-subject")
+
+    assert {:error, %CoreError{reason: :send_method_required} = error} =
+             Connectors.checkout_send_method(
+               microsoft.id,
+               Accounts.account_address(account),
+               after_oauth_checkout: fn ->
+                 assert {:ok, disconnected} =
+                          Connectors.disconnect_send_method(account.id, microsoft.id)
+
+                 assert disconnected.status == "disconnected"
+                 assert disconnected.lock_version > microsoft.lock_version
+
+                 assert {:ok, readded} =
+                          Connectors.add_authorized_oauth_method(
+                            account.id,
+                            "microsoft",
+                            :send
+                          )
+
+                 assert readded.id == microsoft.id
+                 assert readded.status == microsoft.status
+                 assert readded.enabled == microsoft.enabled
+                 assert readded.lock_version > disconnected.lock_version
+               end
+             )
+
+    refute inspect(error) =~ sentinel
+  end
+
   test "a revoked authorization prevents unsent work from checking out a token", %{
     account: account
   } do
@@ -689,6 +730,22 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
       email_address: address,
       status: Keyword.get(opts, :status, "connected"),
       enabled: Keyword.get(opts, :enabled, true)
+    })
+    |> Repo.insert!()
+  end
+
+  defp insert_microsoft_receive!(account, authorization_id, subject) do
+    %ReceiveMethod{}
+    |> ReceiveMethod.changeset(%{
+      account_id: account.id,
+      oauth_authorization_id: authorization_id,
+      kind: "microsoft",
+      provider_account_id: subject,
+      email_address: Accounts.account_address(account),
+      status: "connected",
+      enabled: true,
+      sync_enabled: true,
+      granted_scopes: [MicrosoftScopes.read()]
     })
     |> Repo.insert!()
   end
