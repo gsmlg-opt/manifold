@@ -5,20 +5,23 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
+  alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
   alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
+  alias Manifold.Connectors.Schema.{OAuthAuthorization, OAuthTransaction}
+  alias Manifold.Repo
 
   defmodule GmailProvider do
     @behaviour Manifold.Connectors.Provider
 
     @impl true
-    def exchange_code("valid-code", _verifier, _redirect_uri, _config, _opts) do
+    def exchange_code("valid-code", _verifier, _redirect_uri, _config, opts) do
       {:ok,
        %Token{
          access_token: "gmail-access-token",
          refresh_token: "gmail-refresh-token",
          expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
-         scopes: ["openid", "email", "https://www.googleapis.com/auth/gmail.readonly"]
+         scopes: Enum.uniq(["openid", "email"] ++ Keyword.fetch!(opts, :required_scopes))
        }}
     end
 
@@ -97,7 +100,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     {:ok, account} =
       Accounts.create_account(%{
         name: "Person",
-        address: "person@external-web-#{System.unique_integer([:positive])}.test"
+        address: "person@gmail.example"
       })
 
     {:ok, account: account}
@@ -139,6 +142,127 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert method.account_id == account.id
     assert method.kind == "gmail"
     assert method.enabled
+  end
+
+  test "receive and send pickers preserve their OAuth purpose", %{conn: conn, account: account} do
+    {:ok, receive_view, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/receive_methods/new")
+
+    receive_view |> element("button[phx-value-kind='gmail']") |> render_click()
+
+    assert has_element?(
+             receive_view,
+             ~s|a[href*="/connectors/gmail/start?account_id=#{account.id}&purpose=receive"]|
+           )
+
+    {:ok, send_view, html} = live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
+    assert html =~ "Choose send method"
+
+    send_view |> element("#send-method-gmail") |> render_click()
+
+    assert has_element?(
+             send_view,
+             ~s|a[href*="/connectors/gmail/start?account_id=#{account.id}&purpose=send"]|
+           )
+  end
+
+  test "Gmail send callback creates the bound account method", %{conn: conn, account: account} do
+    callback_conn = connect_gmail(conn, account.id, "send")
+
+    assert redirected_to(callback_conn, 302) == "/settings/accounts/#{account.id}"
+
+    assert Phoenix.Flash.get(callback_conn.assigns.flash, :info) ==
+             "Gmail send method connected."
+
+    assert [%{account_id: account_id, kind: "gmail", enabled: true}] =
+             Connectors.list_send_methods_for_account(account.id)
+
+    assert account_id == account.id
+    assert Connectors.list_receive_methods_for_account(account.id) == []
+  end
+
+  test "receive-only Gmail access offers an incremental send upgrade", %{
+    conn: conn,
+    account: account
+  } do
+    connect_gmail(conn, account.id, "receive")
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts/#{account.id}")
+
+    assert has_element?(view, "#upgrade-gmail-access", "Upgrade Gmail access")
+
+    assert has_element?(
+             view,
+             ~s|#upgrade-gmail-access[href*="account_id=#{account.id}&purpose=send"]|
+           )
+  end
+
+  test "reconnect-required shared Gmail access renders one reconnect action", %{
+    conn: conn,
+    account: account
+  } do
+    connect_gmail(conn, account.id, "receive")
+    connect_gmail(conn, account.id, "send")
+    authorization = Repo.get_by!(OAuthAuthorization, account_id: account.id, provider: "gmail")
+
+    assert {:ok, _authorization} =
+             Connectors.mark_oauth_reconnect_required(
+               authorization.id,
+               %ProviderError{
+                 class: :reconnect,
+                 code: :invalid_grant,
+                 message: "provider detail must not be shown"
+               }
+             )
+
+    {:ok, view, html} = live(conn, ~p"/settings/accounts/#{account.id}")
+
+    assert html =~ "both receive and send are paused"
+    assert length(Regex.scan(~r/id="reconnect-gmail"/, html)) == 1
+
+    assert has_element?(
+             view,
+             ~s|#reconnect-gmail[href*="account_id=#{account.id}&purpose=receive"]|,
+             "Reconnect Gmail"
+           )
+  end
+
+  test "Gmail authorization cannot cross-bind its subject to another account", %{
+    conn: conn,
+    account: account
+  } do
+    connect_gmail(conn, account.id, "receive")
+
+    {:ok, other} =
+      Accounts.create_account(%{name: "Other", address: "other@gmail.example"})
+
+    callback_conn = connect_gmail(conn, other.id, "send")
+
+    assert redirected_to(callback_conn, 302) == "/settings/accounts/#{other.id}"
+
+    assert Phoenix.Flash.get(callback_conn.assigns.flash, :error) ==
+             "The Gmail account could not be connected."
+
+    assert Connectors.list_send_methods_for_account(other.id) == []
+    assert Repo.aggregate(OAuthAuthorization, :count) == 1
+  end
+
+  test "OAuth start rejects unsupported purposes without creating a transaction", %{
+    conn: conn,
+    account: account
+  } do
+    response =
+      get(conn, "/connectors/gmail/start", %{
+        "account_id" => account.id,
+        "purpose" => "delete"
+      })
+
+    assert redirected_to(response, 302) == "/settings/accounts"
+
+    assert Phoenix.Flash.get(response.assigns.flash, :error) ==
+             "The account connection could not be started."
+
+    assert Repo.aggregate(OAuthTransaction, :count) == 0
   end
 
   test "account show can add IMAP receive method", %{conn: conn, account: account} do
@@ -317,8 +441,13 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert Connectors.list_receive_methods_for_account(account.id) == []
   end
 
-  defp connect_gmail(conn, account_id) do
-    start_conn = get(conn, "/connectors/gmail/start", %{"account_id" => account_id})
+  defp connect_gmail(conn, account_id, purpose \\ "receive") do
+    start_conn =
+      get(conn, "/connectors/gmail/start", %{
+        "account_id" => account_id,
+        "purpose" => purpose
+      })
+
     authorization_url = redirected_to(start_conn, 302)
 
     state =

@@ -9,8 +9,9 @@ defmodule ManifoldWeb.ConnectorOAuthController do
   def start(conn, %{"provider" => provider} = params) when provider in @providers do
     account_id = Map.get(params, "account_id") || Map.get(params, "mailbox_id")
 
-    if is_binary(account_id) and account_id != "" do
-      case OAuth.start(provider, account_id, callback_url(provider)) do
+    with true <- is_binary(account_id) and account_id != "",
+         {:ok, purpose} <- purpose(params) do
+      case OAuth.start(provider, account_id, callback_url(provider), purpose: purpose) do
         {:ok, authorization} ->
           redirect(conn, external: authorization.url)
 
@@ -18,7 +19,7 @@ defmodule ManifoldWeb.ConnectorOAuthController do
           connector_error(conn, "The #{provider_name(provider)} connection could not be started.")
       end
     else
-      connector_error(conn, "The account connection could not be started.")
+      _invalid -> connector_error(conn, "The account connection could not be started.")
     end
   end
 
@@ -55,21 +56,39 @@ defmodule ManifoldWeb.ConnectorOAuthController do
 
   defp complete_authorization(conn, provider, code, consumed) do
     case Connectors.complete_authorization(provider, code, consumed) do
-      {:ok, method} ->
+      {:ok, _method} ->
         conn
-        |> put_flash(:info, "#{provider_name(provider)} receive method connected.")
-        |> redirect(to: ~p"/settings/accounts/#{method.account_id}")
+        |> put_flash(
+          :info,
+          "#{provider_name(provider)} #{purpose_name(consumed.purpose)} method connected."
+        )
+        |> redirect(to: ~p"/settings/accounts/#{consumed.mailbox_id}")
 
       {:error, _reason} ->
-        connector_error(conn, "The #{provider_name(provider)} account could not be connected.")
+        connector_error(
+          conn,
+          "The #{provider_name(provider)} account could not be connected.",
+          consumed.mailbox_id
+        )
     end
   end
 
-  defp connector_error(conn, message) do
+  defp connector_error(conn, message, account_id \\ nil) do
     conn
     |> put_flash(:error, message)
-    |> redirect(to: ~p"/settings/accounts")
+    |> redirect(to: error_path(account_id))
   end
+
+  defp purpose(%{"purpose" => "receive"}), do: {:ok, :receive}
+  defp purpose(%{"purpose" => "send"}), do: {:ok, :send}
+  defp purpose(params) when not is_map_key(params, "purpose"), do: {:ok, :receive}
+  defp purpose(_params), do: :error
+
+  defp purpose_name(:receive), do: "receive"
+  defp purpose_name(:send), do: "send"
+
+  defp error_path(nil), do: ~p"/settings/accounts"
+  defp error_path(account_id), do: ~p"/settings/accounts/#{account_id}"
 
   defp callback_url(provider), do: url(~p"/connectors/#{provider}/callback")
 

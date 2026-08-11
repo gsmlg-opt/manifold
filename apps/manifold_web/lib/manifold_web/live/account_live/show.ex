@@ -115,6 +115,24 @@ defmodule ManifoldWeb.AccountLive.Show do
         <div class="settings-heading-actions">
           <.link navigate={~p"/settings/accounts"} class="settings-action">Back</.link>
           <.link
+            :if={gmail_reconnect?(@methods, @send_methods)}
+            id="reconnect-gmail"
+            href={
+              ~p"/connectors/gmail/start?account_id=#{@account.id}&purpose=#{gmail_reconnect_purpose(@methods)}"
+            }
+            class="settings-action settings-action-primary"
+          >
+            Reconnect Gmail
+          </.link>
+          <.link
+            :if={gmail_upgrade?(@methods, @send_methods)}
+            id="upgrade-gmail-access"
+            href={~p"/connectors/gmail/start?account_id=#{@account.id}&purpose=send"}
+            class="settings-action settings-action-primary"
+          >
+            Upgrade Gmail access
+          </.link>
+          <.link
             id="add-receive-method"
             navigate={~p"/settings/accounts/#{@account.id}/receive_methods/new"}
             class="settings-action settings-action-primary"
@@ -130,6 +148,10 @@ defmodule ManifoldWeb.AccountLive.Show do
           </.link>
         </div>
       </div>
+
+      <p :if={gmail_reconnect?(@methods, @send_methods)} class="settings-error">
+        Reconnect the shared Gmail authorization; both receive and send are paused.
+      </p>
 
       <h2>Receive methods</h2>
       <div class="table-scroll">
@@ -304,7 +326,25 @@ defmodule ManifoldWeb.AccountLive.Show do
   defp kind_label(kind), do: kind
 
   defp send_kind_label("smtp"), do: "SMTP"
+  defp send_kind_label("gmail"), do: "Gmail"
   defp send_kind_label(kind), do: kind
+
+  defp gmail_upgrade?(methods, send_methods) do
+    Enum.any?(methods, &(&1.kind == "gmail" and &1.status != "disconnected")) and
+      not Enum.any?(send_methods, &(&1.kind == "gmail" and &1.status != "disconnected")) and
+      not gmail_reconnect?(methods, send_methods)
+  end
+
+  defp gmail_reconnect?(methods, send_methods) do
+    Enum.any?(
+      methods ++ send_methods,
+      &(&1.kind == "gmail" and &1.status == "reconnect_required")
+    )
+  end
+
+  defp gmail_reconnect_purpose(methods) do
+    if Enum.any?(methods, &(&1.kind == "gmail")), do: "receive", else: "send"
+  end
 
   defp format_datetime(nil), do: "Not yet"
   defp format_datetime(datetime), do: ManifoldWeb.Formatting.datetime_utc(datetime)

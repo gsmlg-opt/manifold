@@ -87,6 +87,11 @@ defmodule ManifoldWeb.AccountLiveTest do
       |> render_click()
       |> follow_redirect(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
 
+    assert html =~ "Choose send method"
+    assert html =~ "Gmail"
+    assert html =~ "SMTP"
+
+    html = new_view |> element("#send-method-smtp") |> render_click()
     assert html =~ "SMTP settings"
 
     html =
@@ -113,6 +118,23 @@ defmodule ManifoldWeb.AccountLiveTest do
     [method] = Connectors.list_send_methods_for_account(account.id)
     assert method.kind == "smtp"
     assert method.enabled
+  end
+
+  test "add send keeps unconfigured Gmail visible but disabled", %{conn: conn} do
+    previous_providers = Application.get_env(:manifold_connectors, :providers)
+    Application.put_env(:manifold_connectors, :providers, [])
+
+    on_exit(fn -> restore_smtp_env(:providers, previous_providers) end)
+
+    {:ok, account} =
+      Accounts.create_account(%{name: "No OAuth", address: "no-oauth@example.test"})
+
+    {:ok, view, html} = live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
+
+    assert html =~ "Choose send method"
+    assert has_element?(view, "#send-method-gmail[disabled]")
+    assert has_element?(view, "#send-method-gmail", "Provider not configured")
+    assert has_element?(view, "#send-method-smtp")
   end
 
   test "accounts index shows created account", %{conn: conn} do
