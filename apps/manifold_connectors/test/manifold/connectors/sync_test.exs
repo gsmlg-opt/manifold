@@ -20,6 +20,7 @@ defmodule Manifold.Connectors.SyncTest do
 
   alias Manifold.Connectors.Schema.{
     Credential,
+    OAuthAuthorization,
     ReceiveMethod,
     RemoteMessage,
     SyncCursor
@@ -62,8 +63,8 @@ defmodule Manifold.Connectors.SyncTest do
     end
 
     @impl true
-    def identity("initial-access", _config, _opts) do
-      {:ok, %Identity{id: "sync-account", email_address: "person@gmail.example"}}
+    def identity("initial-access", _config, opts) do
+      {:ok, %Identity{id: "sync-account", email_address: Keyword.fetch!(opts, :identity_address)}}
     end
 
     @impl true
@@ -139,6 +140,8 @@ defmodule Manifold.Connectors.SyncTest do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "sync#{suffix}.test"})
     {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "person"})
+    mailbox = Repo.preload(mailbox, :domain)
+    address = Accounts.account_address(mailbox)
 
     assert {:ok, account} =
              Connectors.complete_authorization(
@@ -151,7 +154,7 @@ defmodule Manifold.Connectors.SyncTest do
                  pkce_verifier: "verifier"
                },
                now: DateTime.utc_now(),
-               provider_opts: [now: DateTime.utc_now()]
+               provider_opts: [now: DateTime.utc_now(), identity_address: address]
              )
 
     cursor = Repo.get_by!(SyncCursor, external_account_id: account.id)
@@ -444,22 +447,26 @@ defmodule Manifold.Connectors.SyncTest do
   test "rotated refresh token commits before the provider page", %{
     account: account
   } do
-    credential = Repo.get_by!(Credential, external_account_id: account.id)
+    authorization = Repo.get!(OAuthAuthorization, account.oauth_authorization_id)
 
-    credential
-    |> Credential.changeset(%{token_expires_at: DateTime.add(DateTime.utc_now(), -60, :second)})
+    authorization
+    |> OAuthAuthorization.changeset(%{
+      token_expires_at: DateTime.add(DateTime.utc_now(), -60, :second)
+    })
     |> Repo.update!()
 
     assert :ok = Connectors.sync_account(account.id)
     assert_receive {:sync_access_token, "refreshed-access"}
 
-    updated = Repo.get!(Credential, credential.id)
+    updated = Repo.get!(OAuthAuthorization, authorization.id)
 
     assert {:ok, "rotated-refresh"} =
              Crypto.decrypt(
                updated.refresh_token_ciphertext,
-               "credential:#{account.id}:refresh"
+               "credential:#{authorization.id}:refresh"
              )
+
+    refute Repo.get_by(Credential, external_account_id: account.id)
   end
 
   test "retry-after leaves the cursor unchanged and snoozes", %{

@@ -42,7 +42,23 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
         Keyword.get(opts, :cursors, {:ok, [%ProviderCursor{scope: "mailbox", phase: "initial"}]})
 
     @impl true
-    def refresh_token(_refresh_token, _config, _opts), do: raise("not used")
+    def refresh_token(refresh_token, _config, opts) do
+      if counter = Keyword.get(opts, :refresh_count) do
+        Agent.update(counter, &(&1 + 1))
+      end
+
+      if test_pid = Keyword.get(opts, :test_pid) do
+        send(test_pid, {:refresh_token, refresh_token})
+      end
+
+      if gate = Keyword.get(opts, :refresh_gate) do
+        receive do
+          {:release_refresh, ^gate} -> :ok
+        end
+      end
+
+      Keyword.fetch!(opts, :refresh_result)
+    end
 
     @impl true
     def sync_page(_access_token, cursor, _config, _opts), do: {:ok, %Page{cursor: cursor}}
@@ -824,6 +840,253 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
 
     assert_receive {:exchange_required_scopes, [scope]}
     assert scope == GmailScopes.send()
+  end
+
+  test "current access token is checked out without provider refresh", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    {:ok, refresh_count} = Agent.start_link(fn -> 0 end)
+
+    assert {:ok, "access-secret"} =
+             Connectors.checkout_oauth_access_token(receive.oauth_authorization_id,
+               required_scope: GmailScopes.read(),
+               now: ~U[2026-08-11 01:00:00.000000Z],
+               provider_opts: [refresh_count: refresh_count]
+             )
+
+    assert Agent.get(refresh_count, & &1) == 0
+  end
+
+  test "missing trusted scope fails before provider refresh", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    {:ok, refresh_count} = Agent.start_link(fn -> 0 end)
+
+    assert {:error, %{class: :permanent, reason: :insufficient_provider_scope}} =
+             Connectors.checkout_oauth_access_token(receive.oauth_authorization_id,
+               required_scope: GmailScopes.send(),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [refresh_count: refresh_count]
+             )
+
+    assert Agent.get(refresh_count, & &1) == 0
+  end
+
+  test "expired token refresh rotates access and refresh tokens atomically", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    refreshed = %Token{
+      access_token: "new-access",
+      refresh_token: "rotated-refresh",
+      expires_at: ~U[2026-08-11 04:00:00.000000Z],
+      scopes: [GmailScopes.read()]
+    }
+
+    queries =
+      repo_queries_during(fn ->
+        assert {:ok, "new-access"} =
+                 Connectors.checkout_oauth_access_token(authorization.id,
+                   required_scope: GmailScopes.read(),
+                   now: ~U[2026-08-11 03:00:00.000000Z],
+                   provider_opts: [test_pid: self(), refresh_result: {:ok, refreshed}]
+                 )
+      end)
+
+    assert_receive {:refresh_token, "refresh-secret"}
+    assert is_integer(authorization_lock_index(queries))
+    persisted = Repo.get!(OAuthAuthorization, authorization.id)
+    assert persisted.token_expires_at == refreshed.expires_at
+    assert persisted.granted_scopes == [GmailScopes.read()]
+
+    assert {:ok, "new-access"} =
+             Crypto.decrypt(
+               persisted.access_token_ciphertext,
+               "credential:#{authorization.id}:access"
+             )
+
+    assert {:ok, "rotated-refresh"} =
+             Crypto.decrypt(
+               persisted.refresh_token_ciphertext,
+               "credential:#{authorization.id}:refresh"
+             )
+  end
+
+  test "refresh omission preserves the stored refresh token", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    refreshed = %Token{
+      access_token: "new-access",
+      refresh_token: nil,
+      expires_at: ~U[2026-08-11 04:00:00.000000Z],
+      scopes: [GmailScopes.read()]
+    }
+
+    assert {:ok, "new-access"} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: GmailScopes.read(),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [refresh_result: {:ok, refreshed}]
+             )
+
+    persisted = Repo.get!(OAuthAuthorization, authorization.id)
+    assert persisted.refresh_token_ciphertext == authorization.refresh_token_ciphertext
+  end
+
+  test "refresh rejects returned scopes that omit the stored authorization union", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, _send_method} =
+             complete(:send, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    refreshed = %Token{
+      access_token: "rejected-access",
+      refresh_token: "rejected-refresh",
+      expires_at: ~U[2026-08-11 04:00:00.000000Z],
+      scopes: [GmailScopes.read()]
+    }
+
+    assert {:error, %{class: :permanent, reason: :insufficient_provider_scope}} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: GmailScopes.read(),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [refresh_result: {:ok, refreshed}]
+             )
+
+    persisted = Repo.get!(OAuthAuthorization, authorization.id)
+    assert persisted.access_token_ciphertext == authorization.access_token_ciphertext
+    assert persisted.refresh_token_ciphertext == authorization.refresh_token_ciphertext
+  end
+
+  test "two concurrent callers share one serialized refresh", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    {:ok, refresh_count} = Agent.start_link(fn -> 0 end)
+    gate = make_ref()
+    test_pid = self()
+
+    refreshed = %Token{
+      access_token: "new-access",
+      refresh_token: nil,
+      expires_at: ~U[2026-08-11 04:00:00.000000Z],
+      scopes: [GmailScopes.read()]
+    }
+
+    opts = [
+      required_scope: GmailScopes.read(),
+      now: ~U[2026-08-11 03:00:00.000000Z],
+      provider_opts: [
+        refresh_count: refresh_count,
+        refresh_gate: gate,
+        refresh_result: {:ok, refreshed},
+        test_pid: test_pid
+      ]
+    ]
+
+    callers =
+      for _ <- 1..2 do
+        Task.async(fn ->
+          send(test_pid, {:checkout_ready, self()})
+
+          receive do
+            :checkout ->
+              Connectors.checkout_oauth_access_token(receive.oauth_authorization_id, opts)
+          end
+        end)
+      end
+
+    caller_pids =
+      for _ <- 1..2 do
+        assert_receive {:checkout_ready, caller_pid}
+        caller_pid
+      end
+
+    Enum.each(caller_pids, &send(&1, :checkout))
+    assert_receive {:refresh_token, "refresh-secret"}
+    refute_receive {:refresh_token, _}, 100
+    send(hd(callers).pid, {:release_refresh, gate})
+    send(List.last(callers).pid, {:release_refresh, gate})
+
+    assert Enum.map(callers, &Task.await(&1, 5_000)) == [
+             {:ok, "new-access"},
+             {:ok, "new-access"}
+           ]
+
+    assert Agent.get(refresh_count, & &1) == 1
+  end
+
+  test "refresh invalid_grant atomically requires reconnect for both Gmail methods", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    assert {:ok, send_method} =
+             complete(:send, account, address,
+               refresh_token: nil,
+               scopes: [GmailScopes.read(), GmailScopes.send()]
+             )
+
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    error = %ProviderError{
+      class: :reconnect,
+      code: :invalid_grant,
+      message: "raw-refresh-secret must never escape"
+    }
+
+    assert {:error,
+            %ProviderError{
+              class: :reconnect,
+              code: :invalid_grant,
+              message: "Gmail authorization must be reconnected"
+            } = returned_error} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: GmailScopes.send(),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [refresh_result: {:error, error}]
+             )
+
+    refute inspect(returned_error) =~ "raw-refresh-secret"
+
+    persisted = Repo.get!(OAuthAuthorization, authorization.id)
+    assert persisted.status == "reconnect_required"
+    assert persisted.last_error_code == "invalid_grant"
+
+    receive = Repo.get!(ReceiveMethod, receive.id)
+    assert receive.status == "reconnect_required"
+    refute receive.enabled
+    refute receive.sync_enabled
+
+    send_method = Repo.get!(SendMethod, send_method.id)
+    assert send_method.status == "reconnect_required"
+    refute send_method.enabled
+
+    assert Repo.get_by!(ConnectorEvent,
+             oauth_authorization_id: authorization.id,
+             event_type: "reconnect_required"
+           )
   end
 
   defp complete(purpose, account, address, opts \\ []) do

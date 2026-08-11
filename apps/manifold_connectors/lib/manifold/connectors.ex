@@ -95,6 +95,22 @@ defmodule Manifold.Connectors do
       {:error, database_error(:unavailable)}
   end
 
+  @spec checkout_oauth_access_token(Ecto.UUID.t(), Keyword.t()) ::
+          {:ok, String.t()} | {:error, Error.t() | ProviderError.t() | Ecto.Changeset.t()}
+  def checkout_oauth_access_token(authorization_id, opts \\ []) do
+    with {:ok, adapter, config} <- adapter_config("gmail") do
+      GmailAuthorizations.checkout_access_token(
+        authorization_id,
+        adapter,
+        config,
+        opts
+      )
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error, database_error(:unavailable)}
+  end
+
   @spec list_receive_methods() :: [View.ReceiveMethod.t()]
   def list_receive_methods do
     ReceiveMethod

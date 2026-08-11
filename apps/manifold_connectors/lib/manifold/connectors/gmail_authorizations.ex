@@ -29,6 +29,7 @@ defmodule Manifold.Connectors.GmailAuthorizations do
 
   @provider "gmail"
   @approved_scopes MapSet.new([GmailScopes.read(), GmailScopes.send()])
+  @refresh_skew_seconds 60
 
   @spec complete(String.t(), Consumed.t(), module(), keyword(), keyword()) ::
           {:ok, ReceiveMethod.t() | SendMethod.t()}
@@ -68,6 +69,48 @@ defmodule Manifold.Connectors.GmailAuthorizations do
 
   def complete(_code, %Consumed{}, _adapter, _config, _opts) do
     {:error, CoreError.new(:permanent, :oauth_provider_mismatch, "OAuth provider does not match")}
+  end
+
+  @spec checkout_access_token(Ecto.UUID.t(), module(), keyword(), keyword()) ::
+          {:ok, String.t()}
+          | {:error, CoreError.t() | ProviderError.t() | Ecto.Changeset.t()}
+  def checkout_access_token(authorization_id, adapter, config, opts \\ []) do
+    required_scope = Keyword.get(opts, :required_scope)
+    now = Keyword.get(opts, :now, DateTime.utc_now())
+    provider_opts = Keyword.get(opts, :provider_opts, [])
+
+    with :ok <- validate_required_scope(required_scope) do
+      Repo.transaction(fn ->
+        with {:ok, authorization} <- lock_authorization(authorization_id),
+             :ok <- validate_checkout_authorization(authorization, required_scope) do
+          if token_current?(authorization, now) do
+            decrypt_access_token(authorization)
+          else
+            refresh_access_token_locked(
+              authorization,
+              required_scope,
+              adapter,
+              config,
+              now,
+              provider_opts
+            )
+          end
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> case do
+        {:ok, {:ok, access_token}} -> {:ok, access_token}
+        {:ok, {:reconnect, %ProviderError{} = error}} -> {:error, error}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error, database_error()}
+
+    error in Postgrex.Error ->
+      normalize_transaction_error(error, __STACKTRACE__)
   end
 
   @spec disconnect_method(:receive | :send, Ecto.UUID.t()) ::
@@ -133,29 +176,11 @@ defmodule Manifold.Connectors.GmailAuthorizations do
           {:ok, OAuthAuthorization.t()} | {:error, CoreError.t() | Ecto.Changeset.t()}
   def mark_reconnect_required(authorization_id, %ProviderError{} = provider_error, opts \\ []) do
     now = Keyword.get(opts, :now, DateTime.utc_now())
-    error_attrs = reconnect_error_attrs(provider_error)
 
     Repo.transaction(fn ->
       with {:ok, authorization} <- lock_authorization(authorization_id),
            {:ok, authorization} <-
-             authorization
-             |> OAuthAuthorization.changeset(
-               Map.merge(error_attrs, %{status: "reconnect_required", disconnected_at: nil})
-             )
-             |> Repo.update(),
-           :ok <- disable_dependent_methods(authorization.id, error_attrs, now),
-           :ok <- maybe_fault(opts, :after_methods_before_event),
-           {:ok, _event} <-
-             insert_authorization_event(
-               authorization.id,
-               "reconnect_required",
-               :authorization,
-               now,
-               %{
-                 error_class: error_attrs.last_error_class,
-                 error_code: error_attrs.last_error_code
-               }
-             ) do
+             mark_reconnect_required_locked(authorization, provider_error, now, opts) do
         authorization
       else
         {:error, reason} -> Repo.rollback(reason)
@@ -168,6 +193,170 @@ defmodule Manifold.Connectors.GmailAuthorizations do
   rescue
     DBConnection.ConnectionError -> {:error, database_error()}
     error in Postgrex.Error -> normalize_transaction_error(error, __STACKTRACE__)
+  end
+
+  defp validate_required_scope(scope) do
+    if MapSet.member?(@approved_scopes, scope), do: :ok, else: insufficient_scope()
+  end
+
+  defp validate_checkout_authorization(
+         %OAuthAuthorization{provider: @provider, status: "connected"} = authorization,
+         required_scope
+       ) do
+    if required_scope in authorization.granted_scopes do
+      :ok
+    else
+      insufficient_scope()
+    end
+  end
+
+  defp validate_checkout_authorization(
+         %OAuthAuthorization{provider: @provider, status: "reconnect_required"},
+         _required_scope
+       ) do
+    {:error,
+     CoreError.new(
+       :permanent,
+       :reauthorization_required,
+       "Gmail authorization must be reconnected"
+     )}
+  end
+
+  defp validate_checkout_authorization(
+         %OAuthAuthorization{provider: @provider, status: "disconnected"},
+         _required_scope
+       ) do
+    {:error, CoreError.new(:permanent, :account_disconnected, "authorization is disconnected")}
+  end
+
+  defp validate_checkout_authorization(_authorization, _required_scope) do
+    {:error,
+     CoreError.new(:permanent, :invalid_gmail_authorization, "authorization is not Gmail")}
+  end
+
+  defp token_current?(authorization, now) do
+    is_binary(authorization.access_token_ciphertext) and
+      match?(%DateTime{}, authorization.token_expires_at) and
+      DateTime.compare(
+        authorization.token_expires_at,
+        DateTime.add(now, @refresh_skew_seconds, :second)
+      ) == :gt
+  end
+
+  defp decrypt_access_token(authorization) do
+    Crypto.decrypt(
+      authorization.access_token_ciphertext,
+      credential_context(authorization.id, :access)
+    )
+  end
+
+  defp refresh_access_token_locked(
+         authorization,
+         required_scope,
+         adapter,
+         config,
+         now,
+         provider_opts
+       ) do
+    with {:ok, refresh_token} <-
+           Crypto.decrypt(
+             authorization.refresh_token_ciphertext,
+             credential_context(authorization.id, :refresh)
+           ) do
+      refresh_opts =
+        provider_opts
+        |> Keyword.put(:required_scopes, authorization.granted_scopes)
+        |> Keyword.put(:now, now)
+
+      case adapter.refresh_token(refresh_token, config, refresh_opts) do
+        {:ok, %Token{} = token} ->
+          persist_refreshed_token_locked(authorization, required_scope, token)
+
+        {:error, %ProviderError{class: :reconnect} = error} ->
+          error = sanitize_reconnect_error(error)
+
+          case mark_reconnect_required_locked(authorization, error, now, []) do
+            {:ok, _authorization} -> {:reconnect, error}
+            {:error, reason} -> Repo.rollback(reason)
+          end
+
+        {:error, %ProviderError{} = error} ->
+          Repo.rollback(error)
+      end
+    end
+  end
+
+  defp sanitize_reconnect_error(error) do
+    %{error | message: "Gmail authorization must be reconnected"}
+  end
+
+  defp persist_refreshed_token_locked(authorization, required_scope, token) do
+    with {:ok, granted_scopes} <-
+           validate_refreshed_scopes(authorization, required_scope, token.scopes),
+         {:ok, encrypted_access} <-
+           Crypto.encrypt(token.access_token, credential_context(authorization.id, :access)),
+         {:ok, encrypted_refresh} <-
+           encrypted_refresh(token.refresh_token, authorization, authorization.id),
+         {:ok, _authorization} <-
+           authorization
+           |> OAuthAuthorization.changeset(%{
+             access_token_ciphertext: encrypted_access,
+             refresh_token_ciphertext: encrypted_refresh,
+             token_expires_at: token.expires_at,
+             granted_scopes: granted_scopes,
+             status: "connected",
+             last_error_class: nil,
+             last_error_code: nil,
+             last_error_message: nil,
+             disconnected_at: nil
+           })
+           |> Repo.update() do
+      {:ok, token.access_token}
+    else
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp validate_refreshed_scopes(authorization, required_scope, token_scopes)
+       when is_list(token_scopes) do
+    stored = approved_scopes(authorization.granted_scopes)
+    returned = approved_scopes(token_scopes)
+    required = MapSet.put(stored, required_scope)
+
+    if MapSet.subset?(required, returned) do
+      {:ok, stored |> MapSet.union(returned) |> MapSet.to_list() |> Enum.sort()}
+    else
+      insufficient_scope()
+    end
+  end
+
+  defp validate_refreshed_scopes(_authorization, _required_scope, _token_scopes),
+    do: insufficient_scope()
+
+  defp mark_reconnect_required_locked(authorization, provider_error, now, opts) do
+    error_attrs = reconnect_error_attrs(provider_error)
+
+    with {:ok, authorization} <-
+           authorization
+           |> OAuthAuthorization.changeset(
+             Map.merge(error_attrs, %{status: "reconnect_required", disconnected_at: nil})
+           )
+           |> Repo.update(),
+         :ok <- disable_dependent_methods(authorization.id, error_attrs, now),
+         :ok <- maybe_fault(opts, :after_methods_before_event),
+         {:ok, _event} <-
+           insert_authorization_event(
+             authorization.id,
+             "reconnect_required",
+             :authorization,
+             now,
+             %{
+               error_class: error_attrs.last_error_class,
+               error_code: error_attrs.last_error_code
+             }
+           ) do
+      {:ok, authorization}
+    end
   end
 
   defp persist(consumed, purpose, token, identity, provider_address, cursors, now) do

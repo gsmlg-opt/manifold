@@ -4,7 +4,8 @@ defmodule Manifold.Connectors.Sync do
   import Ecto.Query
 
   alias Manifold.Accounts
-  alias Manifold.Connectors.Crypto
+  alias Manifold.Connectors
+  alias Manifold.Connectors.{Crypto, GmailScopes}
   alias Manifold.Connectors.Jobs.ApplyRemoteState
   alias Manifold.Connectors.Provider
   alias Manifold.Connectors.Provider.Error, as: ProviderError
@@ -372,6 +373,32 @@ defmodule Manifold.Connectors.Sync do
       {:error, _} = error ->
         error
     end
+  end
+
+  defp auth_material(
+         %ReceiveMethod{kind: "gmail", oauth_authorization_id: authorization_id},
+         _adapter,
+         _config,
+         now,
+         provider_opts
+       )
+       when is_binary(authorization_id) do
+    Connectors.checkout_oauth_access_token(authorization_id,
+      required_scope: GmailScopes.read(),
+      now: now,
+      provider_opts: provider_opts
+    )
+  end
+
+  defp auth_material(
+         %ReceiveMethod{kind: "gmail"},
+         _adapter,
+         _config,
+         _now,
+         _provider_opts
+       ) do
+    {:error,
+     Error.new(:permanent, :credential_missing, "Gmail authorization is missing for account")}
   end
 
   defp auth_material(account, adapter, config, now, opts),
