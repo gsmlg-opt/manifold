@@ -18,7 +18,8 @@ config :manifold_data, Oban,
     security: 2,
     outbound: 5,
     cloud_ingress: 2,
-    connectors: 2
+    connectors: 2,
+    account_purge: 1
   ],
   plugins: [
     {Oban.Plugins.Pruner, max_age: 86_400},

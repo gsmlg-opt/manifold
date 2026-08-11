@@ -4,6 +4,7 @@ defmodule Manifold.Mail.Projector do
   import Ecto.Query
 
   alias Manifold.Core.Error
+  alias Manifold.Mail, as: MailContext
   alias Manifold.Mail.HtmlSanitizer
   alias Manifold.Mail.Folders
   alias Manifold.Mail.Charset
@@ -73,16 +74,14 @@ defmodule Manifold.Mail.Projector do
   defp project_new(source, versions, opts) do
     with {:ok, raw} <- read_raw(source, opts),
          {:ok, parsed, parse_state, parse_error} <- parse_or_fallback(raw, opts),
-         {:ok, stored_attachments} <- store_attachments(parsed.attachments, opts),
-         :ok <- maybe_fault(opts, :after_blob_storage_before_commit),
-         {:ok, message} <-
-           commit_projection(
+         {:ok, message, stored_attachments} <-
+           publish_projection(
              source,
              parsed,
              parse_state,
              parse_error,
-             stored_attachments,
-             versions
+             versions,
+             opts
            ),
          {:ok, projection} <- result(message) do
       :telemetry.execute(
@@ -235,6 +234,20 @@ defmodule Manifold.Mail.Projector do
     end
   end
 
+  defp attachment_object_keys(attachments) do
+    attachments
+    |> Enum.reduce_while({:ok, []}, fn attachment, {:ok, keys} ->
+      case BlobStore.build_key(attachment.sha256) do
+        {:ok, key} -> {:cont, {:ok, [key | keys]}}
+        {:error, reason} -> {:halt, {:error, storage_error(reason)}}
+      end
+    end)
+    |> case do
+      {:ok, keys} -> {:ok, keys |> Enum.uniq() |> Enum.sort()}
+      {:error, %Error{}} = failure -> failure
+    end
+  end
+
   defp store_attachment(attachment, opts) do
     blob_store_opts = Keyword.get(opts, :blob_store_opts, [])
 
@@ -279,6 +292,42 @@ defmodule Manifold.Mail.Projector do
     end
   end
 
+  defp publish_projection(
+         source,
+         parsed,
+         parse_state,
+         parse_error,
+         versions,
+         opts
+       ) do
+    result =
+      Repo.transaction(fn ->
+        with {:ok, object_keys} <- attachment_object_keys(parsed.attachments),
+             :ok <- MailContext.lock_blob_object_keys(Repo, object_keys),
+             {:ok, stored_attachments} <- store_attachments(parsed.attachments, opts),
+             :ok <- maybe_fault(opts, :after_blob_storage_before_commit) do
+          message =
+            commit_projection(
+              source,
+              parsed,
+              parse_state,
+              parse_error,
+              stored_attachments,
+              versions
+            )
+
+          {message, stored_attachments}
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+
+    normalize_projection_transaction(result)
+  rescue
+    DBConnection.ConnectionError ->
+      {:error, error(:temporary, :database_unavailable, "mail database is unavailable")}
+  end
+
   defp commit_projection(
          source,
          parsed,
@@ -287,46 +336,38 @@ defmodule Manifold.Mail.Projector do
          stored_attachments,
          versions
        ) do
-    result =
-      Repo.transaction(fn ->
-        advisory_lock("delivery:" <> source.inbound_delivery_id)
+    advisory_lock("delivery:" <> source.inbound_delivery_id)
 
-        case Repo.get_by(Message, inbound_delivery_id: source.inbound_delivery_id) do
-          %Message{} = existing ->
-            if projection_current?(existing, versions) do
-              existing
-            else
-              lock_delivery_mailboxes(source.inbound_delivery_id)
+    case Repo.get_by(Message, inbound_delivery_id: source.inbound_delivery_id) do
+      %Message{} = existing ->
+        if projection_current?(existing, versions) do
+          existing
+        else
+          lock_delivery_mailboxes(source.inbound_delivery_id)
 
-              replace_projection(
-                existing,
-                source,
-                parsed,
-                parse_state,
-                parse_error,
-                stored_attachments,
-                versions
-              )
-            end
-
-          nil ->
-            lock_delivery_mailboxes(source.inbound_delivery_id)
-
-            persist_projection(
-              source,
-              parsed,
-              parse_state,
-              parse_error,
-              stored_attachments,
-              versions
-            )
+          replace_projection(
+            existing,
+            source,
+            parsed,
+            parse_state,
+            parse_error,
+            stored_attachments,
+            versions
+          )
         end
-      end)
 
-    normalize_projection_transaction(result)
-  rescue
-    DBConnection.ConnectionError ->
-      {:error, error(:temporary, :database_unavailable, "mail database is unavailable")}
+      nil ->
+        lock_delivery_mailboxes(source.inbound_delivery_id)
+
+        persist_projection(
+          source,
+          parsed,
+          parse_state,
+          parse_error,
+          stored_attachments,
+          versions
+        )
+    end
   end
 
   defp persist_projection(
@@ -648,7 +689,9 @@ defmodule Manifold.Mail.Projector do
     )
   end
 
-  defp normalize_projection_transaction({:ok, %Message{} = message}), do: {:ok, message}
+  defp normalize_projection_transaction({:ok, {%Message{} = message, stored_attachments}}),
+    do: {:ok, message, stored_attachments}
+
   defp normalize_projection_transaction({:error, %Error{} = error}), do: {:error, error}
 
   defp normalize_projection_transaction({:error, %Ecto.Changeset{} = changeset}) do
@@ -746,7 +789,17 @@ defmodule Manifold.Mail.Projector do
     if Keyword.get(opts, :fail_at) == point do
       {:error, error(:temporary, point, "injected projection failure")}
     else
-      :ok
+      case Keyword.get(opts, point) do
+        callback when is_function(callback, 0) ->
+          case callback.() do
+            :ok -> :ok
+            {:error, %Error{}} = failure -> failure
+            {:error, reason} -> {:error, storage_error(reason)}
+          end
+
+        nil ->
+          :ok
+      end
     end
   end
 

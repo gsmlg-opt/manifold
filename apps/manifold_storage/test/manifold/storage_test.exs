@@ -3,6 +3,7 @@ defmodule Manifold.StorageTest do
 
   alias Manifold.Storage.RawStore
   alias Manifold.Storage.RawStore.Local
+  alias Manifold.Storage.BlobStore
   alias Manifold.Storage.Spool
   alias Manifold.Storage.Spool.Manifest
 
@@ -98,6 +99,28 @@ defmodule Manifold.StorageTest do
 
     assert :ok = Spool.cleanup_ready_bundle(bundle.path)
     refute File.exists?(Path.join([tmp_dir, "quarantine", "cleanup-cleanup-1"]))
+  end
+
+  @tag :tmp_dir
+  test "ready bundle removal is idempotent", %{tmp_dir: tmp_dir} do
+    assert {:ok, bundle} =
+             Spool.write_bundle("raw", attrs(), root: tmp_dir, ingest_id: "remove-ready-1")
+
+    assert :ok = Spool.remove_ready_bundle(bundle.path)
+    assert :ok = Spool.remove_ready_bundle(bundle.path)
+    refute File.exists?(bundle.path)
+  end
+
+  @tag :tmp_dir
+  test "ready bundle cleanup is idempotent and still rejects unsafe paths", %{tmp_dir: tmp_dir} do
+    assert {:ok, bundle} =
+             Spool.write_bundle("raw", attrs(), root: tmp_dir, ingest_id: "cleanup-ready-1")
+
+    assert :ok = Spool.cleanup_ready_bundle(bundle.path)
+    assert :ok = Spool.cleanup_ready_bundle(bundle.path)
+
+    unsafe_path = Path.join([tmp_dir, "ready", "..", "outside-ready"])
+    assert {:error, :invalid_ready_bundle_path} = Spool.cleanup_ready_bundle(unsafe_path)
   end
 
   @tag :tmp_dir
@@ -369,9 +392,47 @@ defmodule Manifold.StorageTest do
       assert {:ok, %{size: 3, sha256: sha256}} = RawStore.put_from_path(key, source)
       assert sha256 == Manifest.sha256("raw")
       assert {:error, :invalid_key} = RawStore.put_from_path("../bad", source)
+      assert :ok = RawStore.delete(key)
+      assert :ok = RawStore.delete(key)
+      assert {:error, :invalid_key} = RawStore.delete("../bad")
     after
       Application.put_env(:manifold_storage, :raw_store_dir, previous)
     end
+  end
+
+  @tag :tmp_dir
+  test "public local blob deletion is idempotent and syncs only a real removal", %{
+    tmp_dir: tmp_dir
+  } do
+    content = "attachment bytes"
+    source = Path.join(tmp_dir, "attachment.bin")
+    root = Path.join(tmp_dir, "blob-store")
+    test_pid = self()
+
+    File.write!(source, content)
+    assert {:ok, key} = content |> Manifest.sha256() |> BlobStore.build_key()
+
+    assert {:ok, _stat} =
+             BlobStore.put_from_path(key, source,
+               root: root,
+               expected_size: byte_size(content)
+             )
+
+    delete_opts = [
+      root: root,
+      dir_sync_fun: fn path ->
+        send(test_pid, {:directory_synced, path})
+        :ok
+      end
+    ]
+
+    assert :ok = BlobStore.delete(key, delete_opts)
+    assert_receive {:directory_synced, directory}
+    assert directory == Path.dirname(Path.join(root, key))
+
+    assert :ok = BlobStore.delete(key, delete_opts)
+    refute_receive {:directory_synced, _path}
+    assert {:error, :invalid_key} = BlobStore.delete("../bad", root: root)
   end
 
   @tag :tmp_dir

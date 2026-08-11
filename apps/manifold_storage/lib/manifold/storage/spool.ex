@@ -182,6 +182,7 @@ defmodule Manifold.Storage.Spool do
   def remove_ready_bundle(path) do
     case File.rm_rf(path) do
       {:ok, _files} -> :ok
+      {:error, :enoent, ^path} -> :ok
       {:error, reason, _file} -> {:error, reason}
     end
   end

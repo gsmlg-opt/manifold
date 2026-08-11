@@ -106,6 +106,24 @@ defmodule Manifold.IngestTest do
     assert Repo.aggregate(Oban.Job, :count) == 0
   end
 
+  test "frozen routes cannot accept mail after their mailbox is disabled" do
+    %{mailbox: mailbox, route: route} = route_fixture()
+    bundle = edge_bundle!("stale-route", [route])
+    edge_bundle = edge_bundle!("stale-edge-route", [route])
+
+    assert {:ok, _mailbox} = Accounts.disable_account(mailbox.id)
+
+    assert {:error, %{class: :permanent, reason: :mailbox_not_active}} =
+             Ingest.accept(bundle, [route])
+
+    assert {:error, %{class: :permanent, reason: :mailbox_not_active}} =
+             Ingest.accept_edge("edge-primary", "stale-edge", edge_bundle, [route])
+
+    assert Repo.aggregate(InboundDelivery, :count) == 0
+    assert Repo.aggregate(DeliveryRecipient, :count) == 0
+    assert Repo.aggregate(CloudIngressIdentity, :count) == 0
+  end
+
   test "edge acceptance records provenance in the acceptance transaction" do
     %{route: route} = route_fixture()
     bundle = edge_bundle!("edge-first", [route])
@@ -327,6 +345,21 @@ defmodule Manifold.IngestTest do
     assert Repo.aggregate(InboundDelivery, :count) == 0
   end
 
+  test "external import rechecks mailbox activity immediately before persistence" do
+    %{domain: domain, mailbox: mailbox} = route_fixture()
+    source = external_source(domain, mailbox, "gmail-message-stale")
+
+    before_persist = fn ->
+      assert {:ok, _mailbox} = Accounts.disable_account(mailbox.id)
+    end
+
+    assert {:error, %{class: :permanent, reason: :mailbox_not_active}} =
+             Ingest.import_external(raw_message(), source, before_persist: before_persist)
+
+    assert Repo.aggregate(InboundDelivery, :count) == 0
+    assert Repo.aggregate(ExternalIngressIdentity, :count) == 0
+  end
+
   test "external acceptance failure leaves a ready orphan and no logical acceptance" do
     %{domain: domain, mailbox: mailbox} = route_fixture()
     source = external_source(domain, mailbox, "gmail-message-rollback")
@@ -380,6 +413,298 @@ defmodule Manifold.IngestTest do
     assert delivery.raw_storage_state == "archived"
     assert String.starts_with?(delivery.raw_object_key, "raw/#{domain.id}/")
     assert Repo.aggregate(DeliveryRecipient, :count) == 0
+  end
+
+  test "account delivery ownership APIs include external imports and delete their links" do
+    %{domain: domain, mailbox: mailbox} = route_fixture()
+    source = external_source(domain, mailbox, "gmail-message-cleanup")
+
+    assert {:ok, receipt} = Ingest.import_external(raw_message(), source)
+    delivery_id = receipt.inbound_delivery_id
+
+    assert %{ids: [^delivery_id], done?: true} =
+             Ingest.list_account_delivery_ids(mailbox.id, nil, 250)
+
+    assert Ingest.delivery_owned?(delivery_id)
+    assert Ingest.account_data_remaining?(mailbox.id)
+
+    assert %{deleted: 1, done?: true} =
+             Ingest.delete_mailbox_links_batch(mailbox.id, 250)
+
+    refute Ingest.delivery_owned?(delivery_id)
+    refute Ingest.account_data_remaining?(mailbox.id)
+  end
+
+  test "account delivery listing unions, deduplicates, orders, and pages ownership sources" do
+    %{domain: domain, mailbox: mailbox, route: route} = route_fixture()
+    assert {:ok, smtp_delivery} = accept_delivery([route])
+
+    ExternalIngressIdentity.changeset(%ExternalIngressIdentity{}, %{
+      provider: "gmail",
+      source_id: Ecto.UUID.generate(),
+      external_message_id: "duplicate-owner",
+      inbound_delivery_id: smtp_delivery.id,
+      mailbox_id: mailbox.id,
+      raw_size: smtp_delivery.raw_size,
+      raw_sha256: smtp_delivery.raw_sha256,
+      target_sha256: String.duplicate("0", 64)
+    })
+    |> Repo.insert!()
+
+    source = external_source(domain, mailbox, "gmail-message-page")
+    assert {:ok, external_receipt} = Ingest.import_external(raw_message(), source)
+
+    expected_ids = Enum.sort([smtp_delivery.id, external_receipt.inbound_delivery_id])
+
+    assert %{ids: ^expected_ids, done?: true} =
+             Ingest.list_account_delivery_ids(mailbox.id, nil, 10)
+
+    assert [first_id, second_id] = expected_ids
+
+    assert %{ids: [^first_id], done?: false} =
+             Ingest.list_account_delivery_ids(mailbox.id, nil, 1)
+
+    assert %{ids: [^second_id], done?: true} =
+             Ingest.list_account_delivery_ids(mailbox.id, first_id, 1)
+  end
+
+  test "mailbox link deletion is bounded and drains one ownership table per call" do
+    %{domain: domain, mailbox: mailbox, route: route} = route_fixture()
+
+    for _index <- 1..3 do
+      assert {:ok, _smtp_delivery} = accept_delivery([route])
+    end
+
+    for index <- 1..3 do
+      assert {:ok, _external_receipt} =
+               Ingest.import_external(
+                 raw_message(),
+                 external_source(domain, mailbox, "gmail-message-drain-#{index}")
+               )
+    end
+
+    assert %{deleted: 2, done?: false} = Ingest.delete_mailbox_links_batch(mailbox.id, 2)
+
+    assert Repo.aggregate(ExternalIngressIdentity, :count) == 1
+    assert Repo.aggregate(DeliveryRecipient, :count) == 3
+
+    assert %{deleted: 1, done?: false} = Ingest.delete_mailbox_links_batch(mailbox.id, 2)
+
+    assert Repo.aggregate(ExternalIngressIdentity, :count) == 0
+    assert Repo.aggregate(DeliveryRecipient, :count) == 3
+
+    assert %{deleted: 2, done?: false} = Ingest.delete_mailbox_links_batch(mailbox.id, 2)
+    assert Repo.aggregate(DeliveryRecipient, :count) == 1
+
+    assert %{deleted: 1, done?: true} = Ingest.delete_mailbox_links_batch(mailbox.id, 2)
+    assert Repo.aggregate(DeliveryRecipient, :count) == 0
+  end
+
+  test "mailbox link deletion preserves shared delivery ownership" do
+    %{domain: domain, mailbox: first_mailbox, route: first_route} = route_fixture()
+    {:ok, second_mailbox} = Accounts.create_account(domain, %{local_part: "shared"})
+
+    second_route = %{
+      first_route
+      | original_recipient: "shared@#{domain.normalized_domain}",
+        canonical_recipient: "shared@#{domain.normalized_domain}",
+        mailbox_ids: [second_mailbox.id]
+    }
+
+    assert {:ok, delivery} = accept_delivery([first_route, second_route])
+
+    assert %{deleted: 1, done?: true} =
+             Ingest.delete_mailbox_links_batch(first_mailbox.id, 250)
+
+    assert Ingest.delivery_owned?(delivery.id)
+    refute Ingest.account_data_remaining?(first_mailbox.id)
+
+    assert %{ids: [delivery_id], done?: true} =
+             Ingest.list_account_delivery_ids(second_mailbox.id, nil, 250)
+
+    assert delivery_id == delivery.id
+  end
+
+  test "orphan delivery deletion returns object candidates and removes cloud provenance" do
+    %{mailbox: mailbox, route: route} = route_fixture()
+    bundle = edge_bundle!("orphan-edge", [route])
+
+    assert {:ok, receipt} =
+             Ingest.accept_edge("edge-primary", "orphan-edge", bundle, [route])
+
+    delivery = Repo.get!(InboundDelivery, receipt.inbound_delivery_id)
+    raw_object_key = "raw/orphan/#{delivery.id}.eml"
+
+    delivery
+    |> Ecto.Changeset.change(raw_object_key: raw_object_key)
+    |> Repo.update!()
+
+    assert Ingest.raw_object_referenced?(raw_object_key)
+    assert Ingest.spool_path_referenced?(delivery.spool_bundle_path)
+    assert %{deleted: 1, done?: true} = Ingest.delete_mailbox_links_batch(mailbox.id, 250)
+
+    {result, queries} =
+      capture_repo_queries(fn -> Ingest.delete_orphan_delivery(Repo, delivery.id) end)
+
+    assert {:ok,
+            %{
+              raw_object_key: ^raw_object_key,
+              spool_bundle_path: spool_bundle_path
+            }} = result
+
+    assert Enum.any?(queries, &transaction_boundary_query?/1)
+
+    assert spool_bundle_path == delivery.spool_bundle_path
+    refute Repo.get(InboundDelivery, delivery.id)
+    refute Repo.get_by(CloudIngressIdentity, inbound_delivery_id: delivery.id)
+    refute Ingest.raw_object_referenced?(raw_object_key)
+    refute Ingest.spool_path_referenced?(delivery.spool_bundle_path)
+  end
+
+  test "orphan delivery deletion rejects deliveries with any mailbox owner" do
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+
+    assert {:error, %{class: :permanent, reason: :delivery_still_owned}} =
+             Ingest.delete_orphan_delivery(Repo, delivery.id)
+
+    assert Repo.get!(InboundDelivery, delivery.id)
+  end
+
+  test "orphan delivery deletion rolls back cloud provenance when delivery deletion fails" do
+    %{mailbox: mailbox, route: route} = route_fixture()
+    bundle = edge_bundle!("orphan-rollback", [route])
+
+    assert {:ok, receipt} =
+             Ingest.accept_edge("edge-primary", "orphan-rollback", bundle, [route])
+
+    assert %{deleted: 1, done?: true} = Ingest.delete_mailbox_links_batch(mailbox.id, 250)
+    insert_restricting_remote_message(mailbox.id, receipt.inbound_delivery_id)
+
+    result =
+      try do
+        Ingest.delete_orphan_delivery(Repo, receipt.inbound_delivery_id)
+      rescue
+        Ecto.ConstraintError -> :raised_constraint_error
+      end
+
+    assert {:error, %{class: :temporary, reason: :delivery_delete_failed}} = result
+    assert Repo.get_by!(CloudIngressIdentity, inbound_delivery_id: receipt.inbound_delivery_id)
+    assert Repo.get!(InboundDelivery, receipt.inbound_delivery_id)
+  end
+
+  test "cleanup reference probes use dedicated inbound delivery indexes" do
+    expected_indexes = [
+      "inbound_deliveries_raw_object_key_index",
+      "inbound_deliveries_spool_bundle_path_index"
+    ]
+
+    indexes =
+      Repo.query!(
+        """
+        SELECT indexname, indexdef
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND tablename = 'inbound_deliveries'
+          AND indexname = ANY($1)
+        ORDER BY indexname
+        """,
+        [expected_indexes]
+      ).rows
+
+    assert Enum.map(indexes, &hd/1) == expected_indexes
+    assert Enum.at(indexes, 0) |> Enum.at(1) =~ "WHERE (raw_object_key IS NOT NULL)"
+
+    Repo.query!("SET LOCAL enable_seqscan = off")
+
+    raw_plan = reference_query_plan("raw_object_key", "raw/missing.eml")
+    spool_plan = reference_query_plan("spool_bundle_path", "/spool/missing")
+
+    assert raw_plan =~ "inbound_deliveries_raw_object_key_index"
+    assert spool_plan =~ "inbound_deliveries_spool_bundle_path_index"
+  end
+
+  test "cleanup indexes are built concurrently outside migration locks" do
+    migration_path =
+      Path.expand(
+        "../../../manifold_data/priv/repo/migrations/20260811000100_add_ingest_cleanup_indexes.exs",
+        __DIR__
+      )
+
+    Code.require_file(migration_path)
+    migration = Manifold.Repo.Migrations.AddIngestCleanupIndexes
+
+    assert [disable_ddl_transaction: true, disable_migration_lock: true] =
+             apply(migration, :__migration__, [])
+
+    source = File.read!(migration_path)
+    assert length(Regex.scan(~r/concurrently:\s*true/, source)) == 2
+  end
+
+  test "delivery job cancellation is bounded and preserves unrelated work" do
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+    %{route: other_route} = route_fixture()
+    assert {:ok, other_delivery} = accept_delivery([other_route])
+
+    ProjectInboundMail.new(%{"inbound_delivery_id" => delivery.id}) |> Repo.insert!()
+
+    suspended =
+      EvaluateInboundSecurity.new(%{"inbound_delivery_id" => delivery.id}) |> Repo.insert!()
+
+    {1, nil} =
+      Oban.Job
+      |> where([job], job.id == ^suspended.id)
+      |> Repo.update_all(set: [state: "suspended"])
+
+    unrelated =
+      ProjectInboundMail.new(%{"inbound_delivery_id" => other_delivery.id}) |> Repo.insert!()
+
+    malformed = ArchiveRawEmail.new(%{"delivery_id" => delivery.id}) |> Repo.insert!()
+
+    assert {:snooze, 5} = Ingest.cancel_delivery_jobs([delivery.id], 2)
+    assert target_job_state_counts(delivery.id) == %{"cancelled" => 2, "suspended" => 1}
+
+    assert {:snooze, 5} = Ingest.cancel_delivery_jobs([delivery.id], 2)
+    assert target_job_state_counts(delivery.id) == %{"cancelled" => 3}
+
+    assert %{cancelled: 0, done?: true} = Ingest.cancel_delivery_jobs([delivery.id], 2)
+
+    assert Repo.get!(Oban.Job, unrelated.id).state == "available"
+    assert Repo.get!(Oban.Job, malformed.id).state == "available"
+  end
+
+  test "executing delivery jobs require follow-up drain checks" do
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+
+    %{route: route} = route_fixture()
+    assert {:ok, delivery} = accept_delivery([route])
+
+    first =
+      Oban.Job
+      |> where([job], job.worker == ^inspect(ArchiveRawEmail))
+      |> where(
+        [job],
+        fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery.id)
+      )
+      |> Repo.one!()
+
+    second = ProjectInboundMail.new(%{"inbound_delivery_id" => delivery.id}) |> Repo.insert!()
+
+    {2, nil} =
+      Oban.Job
+      |> where([job], job.id in [^first.id, ^second.id])
+      |> Repo.update_all(set: [state: "executing"])
+
+    assert {:snooze, 5} = Ingest.cancel_delivery_jobs([delivery.id], 1)
+    assert target_job_state_counts(delivery.id) == %{"cancelled" => 1, "executing" => 1}
+
+    assert {:snooze, 5} = Ingest.cancel_delivery_jobs([delivery.id], 1)
+    assert target_job_state_counts(delivery.id) == %{"cancelled" => 2}
+
+    assert %{cancelled: 0, done?: true} = Ingest.cancel_delivery_jobs([delivery.id], 1)
   end
 
   test "acceptance rejects empty frozen routes before writing database state" do
@@ -979,4 +1304,101 @@ defmodule Manifold.IngestTest do
   end
 
   defp raw_message, do: "Subject: hello\r\n\r\nBody\r\n"
+
+  defp capture_repo_queries(fun) do
+    event = Keyword.fetch!(Repo.config(), :telemetry_prefix) ++ [:query]
+    handler_id = {__MODULE__, self(), make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn _event, _measurements, metadata, pid -> send(pid, {:repo_query, metadata.query}) end,
+        self()
+      )
+
+    try do
+      result = fun.()
+      {result, collect_repo_queries([])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp collect_repo_queries(queries) do
+    receive do
+      {:repo_query, query} -> collect_repo_queries([query | queries])
+    after
+      0 -> Enum.reverse(queries)
+    end
+  end
+
+  defp transaction_boundary_query?(query) do
+    query in ["begin", "commit"] or String.starts_with?(query, "SAVEPOINT") or
+      String.starts_with?(query, "RELEASE SAVEPOINT")
+  end
+
+  defp insert_restricting_remote_message(mailbox_id, delivery_id) do
+    account_id = Ecto.UUID.generate()
+    now = DateTime.utc_now()
+
+    Repo.query!(
+      """
+      INSERT INTO connector_accounts (
+        id, mailbox_id, provider, provider_account_id, email_address, status,
+        enabled, sync_enabled, granted_scopes, lock_version, inserted_at, updated_at
+      ) VALUES ($1, $2, 'gmail', $3, 'cleanup@example.test', 'connected',
+                false, true, ARRAY[]::text[], 1, $4, $4)
+      """,
+      [
+        Ecto.UUID.dump!(account_id),
+        Ecto.UUID.dump!(mailbox_id),
+        "cleanup:#{account_id}",
+        now
+      ]
+    )
+
+    Repo.query!(
+      """
+      INSERT INTO connector_remote_messages (
+        id, external_account_id, provider_message_id, inbound_delivery_id,
+        remote_labels, remote_read, remote_starred, remote_deleted, state,
+        lock_version, inserted_at, updated_at
+      ) VALUES ($1, $2, $3, $4, ARRAY[]::text[], false, false, false,
+                'imported', 1, $5, $5)
+      """,
+      [
+        Ecto.UUID.dump!(Ecto.UUID.generate()),
+        Ecto.UUID.dump!(account_id),
+        "cleanup:#{delivery_id}",
+        Ecto.UUID.dump!(delivery_id),
+        now
+      ]
+    )
+  end
+
+  defp reference_query_plan(column, value) do
+    %{rows: rows} =
+      Repo.query!(
+        "EXPLAIN SELECT 1 FROM inbound_deliveries WHERE #{column} = $1 LIMIT 1",
+        [value]
+      )
+
+    rows |> List.flatten() |> Enum.join("\n")
+  end
+
+  defp target_job_state_counts(delivery_id) do
+    workers = Enum.map([ArchiveRawEmail, ProjectInboundMail, EvaluateInboundSecurity], &inspect/1)
+
+    Oban.Job
+    |> where([job], job.worker in ^workers)
+    |> where(
+      [job],
+      fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery_id)
+    )
+    |> group_by([job], job.state)
+    |> select([job], {job.state, count(job.id)})
+    |> Repo.all()
+    |> Map.new()
+  end
 end

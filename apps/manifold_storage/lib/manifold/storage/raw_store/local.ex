@@ -50,7 +50,11 @@ defmodule Manifold.Storage.RawStore.Local do
   @impl true
   def delete(%{root: root}, key, _opts) do
     with :ok <- validate_key(key) do
-      File.rm(Path.join(root, key))
+      case File.rm(Path.join(root, key)) do
+        :ok -> :ok
+        {:error, :enoent} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 

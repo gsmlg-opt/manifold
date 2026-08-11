@@ -54,10 +54,12 @@ defmodule Manifold.Storage.BlobStore.Local do
   @impl true
   def delete(%{root: root}, key, opts) do
     with {:ok, _digest} <- BlobStore.digest_from_key(key),
-         path = Path.join(root, key),
-         :ok <- File.rm(path),
-         :ok <- Filesystem.sync_directory(Path.dirname(path), opts) do
-      :ok
+         path = Path.join(root, key) do
+      case File.rm(path) do
+        :ok -> Filesystem.sync_directory(Path.dirname(path), opts)
+        {:error, :enoent} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 

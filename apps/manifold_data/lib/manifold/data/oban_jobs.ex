@@ -19,7 +19,7 @@ defmodule Manifold.Data.ObanJobs do
   @spec states() :: [String.t()]
   def states, do: @states
 
-  @default_queues ~w(archive mail_parse security outbound cloud_ingress connectors)
+  @default_queues ~w(archive mail_parse security outbound cloud_ingress connectors account_purge)
 
   @spec queues() :: [String.t()]
   def queues do

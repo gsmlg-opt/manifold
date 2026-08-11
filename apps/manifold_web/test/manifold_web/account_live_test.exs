@@ -1,10 +1,19 @@
 defmodule ManifoldWeb.AccountLiveTest do
   use ManifoldWeb.ConnCase, async: false
 
+  import Ecto.Query
   import Phoenix.LiveViewTest
 
+  alias Manifold.AccountLifecycle.Jobs.PurgeAccount
+  alias Manifold.AccountLifecycle.Schema.AccountPurge
   alias Manifold.Accounts
   alias Manifold.Connectors
+  alias Manifold.Repo
+
+  setup do
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    :ok
+  end
 
   test "create account from name and address", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/settings/accounts/new")
@@ -126,6 +135,315 @@ defmodule ManifoldWeb.AccountLiveTest do
     assert html =~ ~p"/settings/accounts/#{account.id}/edit"
   end
 
+  test "accounts index renders accessible icon-only account actions", %{conn: conn} do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Action account", address: "actions@example.test"})
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts")
+
+    assert_icon_action(
+      view,
+      account.id,
+      "edit-account",
+      "Edit account",
+      "pencil-outline"
+    )
+
+    assert_icon_action(
+      view,
+      account.id,
+      "manage-account",
+      "Manage account",
+      "cog-outline"
+    )
+
+    assert_icon_action(
+      view,
+      account.id,
+      "disable-account",
+      "Disable account",
+      "account-off-outline"
+    )
+
+    assert_icon_action(
+      view,
+      account.id,
+      "delete-account",
+      "Delete account",
+      "delete-outline"
+    )
+
+    refute has_element?(view, "#edit-account-#{account.id}", "Edit")
+    refute has_element?(view, "#manage-account-#{account.id}", "Manage")
+    assert has_element?(view, "#delete-account-#{account.id}[phx-click*='push_focus']")
+  end
+
+  test "disable keeps the local account and removes only the disable action", %{conn: conn} do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Disabled account", address: "disabled@example.test"})
+
+    {:ok, method} = Connectors.create_placeholder_receive_method(account.id, "pop3")
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts")
+
+    view
+    |> element("#disable-account-#{account.id}")
+    |> render_click()
+
+    assert has_element?(view, "#account-#{account.id}", "Disabled")
+    refute has_element?(view, "#disable-account-#{account.id}")
+    assert has_element?(view, "#edit-account-#{account.id}")
+    assert has_element?(view, "#manage-account-#{account.id}")
+    assert has_element?(view, "#delete-account-#{account.id}")
+    assert Accounts.get_account!(account.id).active == false
+
+    assert Enum.any?(
+             Connectors.list_receive_methods_for_account(account.id),
+             &(&1.id == method.id)
+           )
+
+    assert is_nil(socket_assign(view, :refresh_timer))
+    assert is_nil(socket_assign(view, :refresh_token))
+  end
+
+  test "delete requires the exact fresh address and queues local-only deletion", %{conn: conn} do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Archive Relay", address: "delete@example.test"})
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts")
+
+    view
+    |> element("#delete-account-#{account.id}")
+    |> render_click()
+
+    assert has_element?(
+             view,
+             "#delete-account-dialog[role='dialog'][aria-modal='true'][aria-labelledby='delete-account-title'][aria-describedby='delete-account-warning']"
+           )
+
+    assert has_element?(view, "#delete-account-title", "Delete account?")
+    assert has_element?(view, ".account-delete-identity strong", "Archive Relay")
+    assert has_element?(view, ".account-delete-identity span", "delete@example.test")
+
+    assert has_element?(
+             view,
+             "#delete-account-warning",
+             "permanently deletes this account's local methods"
+           )
+
+    assert has_element?(
+             view,
+             "#delete-account-warning",
+             "Mail and accounts held by the remote provider are not deleted"
+           )
+
+    assert {:ok, _updated} =
+             Accounts.update_account(account, %{
+               name: "Archive Relay",
+               address: "renamed@example.test"
+             })
+
+    view
+    |> form("#delete-account-form", confirmation: "delete@example.test")
+    |> render_submit()
+
+    assert has_element?(view, "#delete-account-error[role='alert']", "address does not match")
+    assert has_element?(view, ".account-delete-identity strong", "Archive Relay")
+    assert has_element?(view, ".account-delete-identity span", "renamed@example.test")
+    assert is_nil(Repo.get_by(AccountPurge, mailbox_id: account.id))
+    assert purge_jobs_for_mailbox(account.id) == []
+
+    view
+    |> form("#delete-account-form", confirmation: "renamed@example.test")
+    |> render_change()
+
+    assert has_element?(view, "#confirm-delete-account:not([disabled])")
+
+    view
+    |> form("#delete-account-form", confirmation: "renamed@example.test")
+    |> render_submit()
+
+    purge = Repo.get_by!(AccountPurge, mailbox_id: account.id)
+    assert has_element?(view, "#account-#{account.id} [aria-live='polite']", "Deleting...")
+    refute has_element?(view, "#account-#{account.id} .account-actions")
+    assert render(view) =~ "Account deletion queued."
+    assert [%Oban.Job{}] = purge_jobs(purge.id)
+    assert is_reference(socket_assign(view, :refresh_timer))
+    assert is_reference(socket_assign(view, :refresh_token))
+  end
+
+  test "delete dialog traps focus and closes on Escape", %{conn: conn} do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Keyboard delete", address: "keyboard@example.test"})
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts")
+
+    view
+    |> element("#delete-account-#{account.id}")
+    |> render_click()
+
+    assert has_element?(
+             view,
+             "#delete-account-dialog[phx-hook='Phoenix.FocusWrap'][phx-window-keydown='cancel-delete-account'][phx-key='Escape'][phx-mounted*='focus'][phx-mounted*='delete-account-confirmation'][phx-remove*='pop_focus']"
+           )
+
+    assert has_element?(
+             view,
+             "#delete-account-dialog-start[tabindex='0'][aria-hidden='true']"
+           )
+
+    assert has_element?(
+             view,
+             "#delete-account-dialog-end[tabindex='0'][aria-hidden='true']"
+           )
+
+    assert has_element?(view, "#delete-account-dialog #delete-account-confirmation")
+
+    view
+    |> element("#delete-account-dialog")
+    |> render_keydown(%{"key" => "Escape"})
+
+    refute has_element?(view, "#delete-account-dialog")
+    assert has_element?(view, "#delete-account-#{account.id}")
+    assert is_nil(Repo.get_by(AccountPurge, mailbox_id: account.id))
+  end
+
+  test "stale retry reloads requested state and starts polling", %{conn: conn} do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Stale retry", address: "stale-retry@example.test"})
+
+    {:ok, purge} =
+      Manifold.AccountLifecycle.request_deletion(account.id, "stale-retry@example.test")
+
+    discard_purge_jobs(purge.id)
+
+    purge
+    |> AccountPurge.changeset(%{status: "failed"})
+    |> Repo.update!()
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts")
+    assert has_element?(view, "#retry-delete-account-#{account.id}")
+    assert is_nil(socket_assign(view, :refresh_timer))
+    assert is_nil(socket_assign(view, :refresh_token))
+
+    assert {:ok, _requested} = Manifold.AccountLifecycle.retry_deletion(purge.id)
+
+    view
+    |> element("#retry-delete-account-#{account.id}")
+    |> render_click()
+
+    assert has_element?(view, "#account-#{account.id} [aria-live='polite']", "Deleting...")
+    assert is_reference(socket_assign(view, :refresh_timer))
+    assert is_reference(socket_assign(view, :refresh_token))
+  end
+
+  test "event reload cancels polling when no account is deleting", %{conn: conn} do
+    {:ok, deleting_account} =
+      Accounts.create_account(%{name: "Deleting", address: "deleting@example.test"})
+
+    {:ok, active_account} =
+      Accounts.create_account(%{name: "Still active", address: "active@example.test"})
+
+    {:ok, purge} =
+      Manifold.AccountLifecycle.request_deletion(
+        deleting_account.id,
+        "deleting@example.test"
+      )
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts")
+    timer = socket_assign(view, :refresh_timer)
+    token = socket_assign(view, :refresh_token)
+    assert is_reference(timer)
+    assert is_reference(token)
+
+    discard_purge_jobs(purge.id)
+
+    purge
+    |> AccountPurge.changeset(%{status: "failed"})
+    |> Repo.update!()
+
+    view
+    |> element("#disable-account-#{active_account.id}")
+    |> render_click()
+
+    assert has_element?(view, "#account-#{deleting_account.id}", "Delete failed")
+    assert is_nil(socket_assign(view, :refresh_timer))
+    assert is_nil(socket_assign(view, :refresh_token))
+    assert Process.read_timer(timer) == false
+
+    purge
+    |> AccountPurge.changeset(%{status: "requested"})
+    |> Repo.update!()
+
+    send(view.pid, {:refresh_accounts, token})
+
+    assert has_element?(view, "#account-#{deleting_account.id}", "Delete failed")
+    assert is_nil(socket_assign(view, :refresh_timer))
+    assert is_nil(socket_assign(view, :refresh_token))
+  end
+
+  test "failed deletion exposes an accessible retry action without polling", %{conn: conn} do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Failed account", address: "failed@example.test"})
+
+    {:ok, purge} =
+      Manifold.AccountLifecycle.request_deletion(account.id, "failed@example.test")
+
+    discard_purge_jobs(purge.id)
+
+    purge
+    |> AccountPurge.changeset(%{
+      status: "failed",
+      error_class: "temporary",
+      error_code: "storage_unavailable",
+      error_message: "Local cleanup could not finish"
+    })
+    |> Repo.update!()
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts")
+
+    assert has_element?(view, "#account-#{account.id}", "Delete failed")
+
+    assert_icon_action(
+      view,
+      account.id,
+      "retry-delete-account",
+      "Retry account deletion",
+      "restart"
+    )
+
+    assert is_nil(socket_assign(view, :refresh_timer))
+    assert is_nil(socket_assign(view, :refresh_token))
+
+    view
+    |> element("#retry-delete-account-#{account.id}")
+    |> render_click()
+
+    assert has_element?(view, "#account-#{account.id} [aria-live='polite']", "Deleting...")
+    refute has_element?(view, "#retry-delete-account-#{account.id}")
+    assert is_reference(socket_assign(view, :refresh_timer))
+    assert is_reference(socket_assign(view, :refresh_token))
+  end
+
+  test "refresh removes an account row after purge completion deletes the mailbox", %{conn: conn} do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Gone account", address: "gone@example.test"})
+
+    assert {:ok, _purge} =
+             Manifold.AccountLifecycle.request_deletion(account.id, "gone@example.test")
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts")
+    assert has_element?(view, "#account-#{account.id}")
+    token = socket_assign(view, :refresh_token)
+    assert is_reference(token)
+
+    Repo.delete!(Accounts.get_account!(account.id))
+    send(view.pid, {:refresh_accounts, token})
+
+    refute has_element?(view, "#account-#{account.id}")
+    assert is_nil(socket_assign(view, :refresh_timer))
+    assert is_nil(socket_assign(view, :refresh_token))
+  end
+
   test "accounts index and show render settings nav with Accounts current", %{conn: conn} do
     {:ok, account} =
       Accounts.create_account(%{name: "Nav", address: "nav@example.test"})
@@ -162,4 +480,55 @@ defmodule ManifoldWeb.AccountLiveTest do
 
   defp restore_smtp_env(key, nil), do: Application.delete_env(:manifold_connectors, key)
   defp restore_smtp_env(key, value), do: Application.put_env(:manifold_connectors, key, value)
+
+  defp assert_icon_action(view, account_id, action, label, icon) do
+    tooltip_id = "#{action}-tooltip-#{account_id}"
+    action_id = "#{action}-#{account_id}"
+
+    assert has_element?(
+             view,
+             "##{tooltip_id}.tooltip-left[aria-describedby='#{tooltip_id}-tooltip'] ##{action_id}[aria-label='#{label}'] svg[data-icon='#{icon}']"
+           )
+
+    assert has_element?(
+             view,
+             "##{tooltip_id} .tooltip-content[role='tooltip']",
+             label
+           )
+  end
+
+  defp socket_assign(view, key) do
+    view.pid
+    |> :sys.get_state()
+    |> Map.fetch!(:socket)
+    |> Map.fetch!(:assigns)
+    |> Map.fetch!(key)
+  end
+
+  defp purge_jobs_for_mailbox(mailbox_id) do
+    case Repo.get_by(AccountPurge, mailbox_id: mailbox_id) do
+      nil -> []
+      purge -> purge_jobs(purge.id)
+    end
+  end
+
+  defp purge_jobs(purge_id) do
+    PurgeAccount
+    |> purge_job_query(purge_id)
+    |> Repo.all()
+  end
+
+  defp discard_purge_jobs(purge_id) do
+    PurgeAccount
+    |> purge_job_query(purge_id)
+    |> Repo.update_all(set: [state: "discarded"])
+  end
+
+  defp purge_job_query(worker, purge_id) do
+    from(job in Oban.Job,
+      where:
+        job.worker == ^inspect(worker) and
+          fragment("?->>'purge_id'", job.args) == ^purge_id
+    )
+  end
 end
