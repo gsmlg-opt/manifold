@@ -13,6 +13,7 @@ defmodule Manifold.Outbound.Provider do
 
   @spec adapter(String.t()) :: {:ok, module()} | :error
   def adapter("gmail"), do: {:ok, Manifold.Outbound.Provider.Gmail}
+  def adapter("microsoft"), do: {:ok, Manifold.Outbound.Provider.MicrosoftGraph}
   def adapter("smtp"), do: {:ok, Manifold.Outbound.Provider.SMTP}
   def adapter("resend"), do: {:ok, Manifold.Outbound.Provider.Resend}
   def adapter(_provider), do: :error
@@ -86,7 +87,7 @@ defmodule Manifold.Outbound.Provider.Submission do
   defstruct @enforce_keys
 
   @type t :: %__MODULE__{
-          provider_message_id: String.t(),
+          provider_message_id: String.t() | nil,
           metadata: map()
         }
 end
