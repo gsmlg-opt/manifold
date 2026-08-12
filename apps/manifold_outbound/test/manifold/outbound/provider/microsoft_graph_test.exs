@@ -309,6 +309,26 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     end
   end
 
+  test "Req.Test bounds oversized Graph error classification to the retained prefix" do
+    for {status, graph_code, placement, expected_code} <- oversized_graph_cases() do
+      secret = "req-#{placement}-#{graph_code}-private-sentinel"
+      body = oversized_graph_error_body(graph_code, placement, secret)
+
+      Req.Test.expect(MicrosoftGraph, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.send_resp(status, body)
+      end)
+
+      assert {:error,
+              %Provider.Error{
+                class: :permanent,
+                code: ^expected_code,
+                http_status: ^status
+              }} = secure_submit(@config, secret)
+    end
+  end
+
   test "classifies invalid MIME, recipient, parameter, and other definite 4xx responses" do
     cases = [
       {400, "ErrorInvalidMimeContent"},
@@ -606,6 +626,39 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     end)
   end
 
+  @tag :tmp_dir
+  test "production transport bounds oversized Graph error classification to the retained prefix",
+       %{tmp_dir: tmp_dir} do
+    cases = oversized_graph_cases()
+
+    responses =
+      Enum.map(cases, fn {status, graph_code, placement, _expected_code} ->
+        secret = "production-#{placement}-#{graph_code}-private-sentinel"
+
+        {status, [{"content-type", "application/json"}],
+         oversized_graph_error_body(graph_code, placement, secret)}
+      end)
+
+    with_graph_tls_server(tmp_dir, responses, fn base_url ->
+      config = [
+        access_token: @access_token,
+        base_url: base_url,
+        req_options: [receive_timeout: 2_000, connect_options: [timeout: 2_000]]
+      ]
+
+      for {status, graph_code, placement, expected_code} <- cases do
+        secret = "production-#{placement}-#{graph_code}-private-sentinel"
+
+        assert {:error,
+                %Provider.Error{
+                  class: :permanent,
+                  code: ^expected_code,
+                  http_status: ^status
+                }} = secure_submit(config, secret)
+      end
+    end)
+  end
+
   defp expect_graph_error(status, code, secret, opts \\ []) do
     expect_graph_body(
       status,
@@ -757,6 +810,52 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     File.write!(path, :public_key.pem_encode(entries))
   end
 
+  defp oversized_graph_cases do
+    [
+      {403, "Authorization_RequestDenied", :before_limit, "insufficient_scope"},
+      {400, "InvalidAuthenticationToken", :before_limit, "reconnect_required"},
+      {403, "TenantPolicyRejected", :before_limit, "policy_rejected"},
+      {403, "Authorization_RequestDenied", :after_limit, "request_rejected"}
+    ]
+  end
+
+  defp oversized_graph_error_body(graph_code, :before_limit, secret) do
+    body =
+      IO.iodata_to_binary([
+        ~s({"error":{"code":),
+        JSON.encode!(graph_code),
+        ~s(,"message":),
+        JSON.encode!(secret <> String.duplicate("x", 64 * 1024 + 1)),
+        "}}"
+      ])
+
+    assert byte_size(body) > 64 * 1024
+    assert {code_offset, _length} = :binary.match(body, ~s("code":"#{graph_code}"))
+    assert code_offset < 64 * 1024
+    body
+  end
+
+  defp oversized_graph_error_body(graph_code, :after_limit, secret) do
+    message =
+      secret <>
+        ~s( embedded message text {"code":"#{graph_code}"} ) <>
+        String.duplicate("x", 64 * 1024 + 1)
+
+    body =
+      IO.iodata_to_binary([
+        ~s({"error":{"message":),
+        JSON.encode!(message),
+        ~s(,"code":),
+        JSON.encode!(graph_code),
+        "}}"
+      ])
+
+    assert byte_size(body) > 64 * 1024
+    assert {code_offset, _length} = :binary.match(body, ~s("code":"#{graph_code}"))
+    assert code_offset >= 64 * 1024
+    body
+  end
+
   defp oversized_body(secret), do: secret <> String.duplicate("x", 64 * 1024 + 1)
 
   defp serve_graph_tls_response(listener, {status, headers, body}) do
@@ -817,6 +916,8 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
   end
 
   defp status_reason(202), do: "Accepted"
+  defp status_reason(400), do: "Bad Request"
+  defp status_reason(403), do: "Forbidden"
   defp status_reason(429), do: "Too Many Requests"
   defp status_reason(503), do: "Service Unavailable"
 

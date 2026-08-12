@@ -31,6 +31,15 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
     "insufficientpermissions",
     "insufficientscope"
   ]
+  @policy_rejection_codes [
+    "erroraccessdenied",
+    "mailboxaccessdenied",
+    "tenantpolicyrejected"
+  ]
+  @bounded_error_codes @authentication_codes ++
+                         @insufficient_scope_codes ++
+                         @policy_rejection_codes
+  @graph_error_code_token ~r/(?<!\\)"(?:code|error)"\s*:\s*"([A-Za-z0-9_.:-]{1,128})"/
 
   @impl true
   def submit(config, %Request{raw_message: raw_message}) when is_list(config) do
@@ -248,25 +257,43 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
   end
 
   defp mint_response(response) do
-    raw_body = response.body |> Enum.reverse() |> IO.iodata_to_binary()
+    retained_body = response.body |> Enum.reverse() |> IO.iodata_to_binary()
 
-    %Req.Response{
-      status: response.status,
-      headers: Req.Fields.new(response.headers),
-      body: decode_body(raw_body),
-      private: %{manifold_raw_body_size: response.raw_body_size}
-    }
+    normalize_response(
+      %Req.Response{
+        status: response.status,
+        headers: Req.Fields.new(response.headers),
+        body: retained_body
+      },
+      retained_body,
+      response.raw_body_size
+    )
   end
 
   defp normalize_req_response(%Req.Response{body: body} = response) when is_binary(body) do
-    %{
-      response
-      | body: decode_body(body),
-        private: Map.put(response.private, :manifold_raw_body_size, byte_size(body))
-    }
+    normalize_response(response, body, byte_size(body))
   end
 
   defp normalize_req_response(%Req.Response{} = response), do: response
+
+  defp normalize_response(response, body, raw_body_size) do
+    retained_body = binary_part(body, 0, min(byte_size(body), @max_response_body_bytes))
+
+    private =
+      response.private
+      |> Map.put(:manifold_raw_body_size, raw_body_size)
+      |> Map.put(:manifold_graph_error_codes, bounded_graph_error_codes(retained_body))
+
+    %{response | body: decode_body(retained_body), private: private}
+  end
+
+  defp bounded_graph_error_codes(body) do
+    @graph_error_code_token
+    |> Regex.scan(body, capture: :all_but_first)
+    |> Enum.map(fn [code] -> canonical_code(code) end)
+    |> Enum.filter(&(&1 in @bounded_error_codes))
+    |> Enum.uniq()
+  end
 
   defp decode_body(""), do: ""
 
@@ -467,7 +494,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
   end
 
   defp classify_response(%Req.Response{status: status, body: body} = response) do
-    codes = graph_error_codes(body)
+    codes = graph_error_codes(body) ++ Map.get(response.private, :manifold_graph_error_codes, [])
 
     cond do
       status == 429 ->
