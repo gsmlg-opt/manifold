@@ -305,6 +305,38 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
     end
   end
 
+  test "generic OAuth send revocation marks Microsoft authorization and both methods", %{
+    account: account
+  } do
+    microsoft =
+      insert_microsoft_method!(account, "microsoft-shared-subject",
+        scopes: [MicrosoftScopes.read(), MicrosoftScopes.send()]
+      )
+
+    receive =
+      insert_microsoft_receive!(
+        account,
+        microsoft.oauth_authorization_id,
+        "microsoft-shared-subject"
+      )
+
+    assert {:ok, :marked, %OAuthAuthorization{status: "reconnect_required"}} =
+             Connectors.mark_oauth_send_reconnect_required(
+               microsoft.id,
+               "microsoft-access-token",
+               :invalid_grant
+             )
+
+    persisted_send = Repo.get!(SendMethod, microsoft.id)
+    assert persisted_send.status == "reconnect_required"
+    refute persisted_send.enabled
+
+    persisted_receive = Repo.get!(ReceiveMethod, receive.id)
+    assert persisted_receive.status == "reconnect_required"
+    refute persisted_receive.enabled
+    refute persisted_receive.sync_enabled
+  end
+
   test "method changes after queue snapshot fail revalidation", %{account: account} do
     sentinel = "snapshot-token-sentinel-#{System.unique_integer([:positive])}"
 

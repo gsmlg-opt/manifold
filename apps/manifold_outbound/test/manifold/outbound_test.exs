@@ -687,7 +687,7 @@ defmodule Manifold.OutboundTest do
     assert submission.request_sha256 == sha256(expected_raw)
   end
 
-  test "queueing snapshots exact Microsoft MIME without copying it into the job" do
+  test "new Microsoft queueing snapshots exact MIME and never falls back to Resend" do
     %{mailbox: mailbox, address: address} = mailbox_fixture()
     method = send_method_fixture(mailbox.id, address, "microsoft")
 
@@ -708,6 +708,7 @@ defmodule Manifold.OutboundTest do
     assert submission.send_method_id == method.id
     assert submission.canonical_sender_address == queued.canonical_sender_address
     assert submission.render_version == 1
+    assert submission.idempotency_expires_at == nil
     assert submission.request_payload == nil
     request_payload = explicit_request_payload(submission.id)
     assert sha256(request_payload) == submission.request_sha256

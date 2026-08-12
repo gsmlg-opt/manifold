@@ -39,6 +39,8 @@ defmodule Manifold.Connectors.SyncTest do
   alias Manifold.Ingest.Schema.{DeliveryRecipient, InboundDelivery}
   alias Manifold.Ingest
   alias Manifold.Mail.Schema.{MailboxEntry, Message}
+  alias Manifold.Outbound
+  alias Manifold.Outbound.Schema.{OutboundMessage, ProviderSubmission}
   alias Manifold.Repo
 
   @moduletag :tmp_dir
@@ -165,6 +167,21 @@ defmodule Manifold.Connectors.SyncTest do
         result ->
           result
       end
+    end
+  end
+
+  defmodule AcceptingOutboundProvider do
+    @behaviour Manifold.Outbound.Provider
+
+    @impl true
+    def submit(config, request) do
+      send(Keyword.fetch!(config, :test_pid), {:microsoft_sent_request, request})
+
+      {:ok,
+       %Manifold.Outbound.Provider.Submission{
+         provider_message_id: nil,
+         metadata: %{"request_id" => "sent-correlation"}
+       }}
     end
   end
 
@@ -552,6 +569,182 @@ defmodule Manifold.Connectors.SyncTest do
     assert :ok = Connectors.sync_account(microsoft.id)
     assert_receive {:sync_access_token, "initial-access"}
     refute Repo.get_by(Credential, external_account_id: microsoft.id)
+  end
+
+  test "Microsoft Sent converges through receive sync and remains separate from send acceptance",
+       %{
+         account: account,
+         cursor: cursor,
+         mailbox: mailbox
+       } do
+    previous_providers = Application.get_env(:manifold_connectors, :providers, [])
+
+    Application.put_env(
+      :manifold_connectors,
+      :providers,
+      Keyword.put(previous_providers, :microsoft, base_url: "https://graph.microsoft.test/v1.0")
+    )
+
+    on_exit(fn ->
+      Application.put_env(:manifold_connectors, :providers, previous_providers)
+    end)
+
+    authorization = Repo.get!(OAuthAuthorization, account.oauth_authorization_id)
+
+    authorization
+    |> OAuthAuthorization.changeset(%{
+      provider: "microsoft",
+      granted_scopes: [
+        MicrosoftScopes.read(),
+        MicrosoftScopes.send(),
+        MicrosoftScopes.offline()
+      ]
+    })
+    |> Repo.update!()
+
+    Repo.delete!(cursor)
+    Repo.delete!(account)
+
+    send_method =
+      %SendMethod{}
+      |> SendMethod.changeset(%{
+        account_id: mailbox.id,
+        oauth_authorization_id: authorization.id,
+        kind: "microsoft",
+        email_address: Accounts.account_address(mailbox),
+        status: "connected",
+        enabled: true
+      })
+      |> Repo.insert!()
+
+    {:ok, draft} =
+      Outbound.create_draft(mailbox.id, %{
+        subject: "Sent convergence",
+        text_body: "Sent convergence body",
+        recipients: [%{kind: "to", address: "person@example.net"}]
+      })
+
+    assert {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
+
+    assert :ok =
+             Outbound.submit_message(queued.id,
+               provider: AcceptingOutboundProvider,
+               provider_config: [test_pid: self()]
+             )
+
+    assert_receive {:microsoft_sent_request, submitted_request}
+    assert submitted_request.send_method_id == send_method.id
+    assert Repo.get!(OutboundMessage, queued.id).state == "accepted_by_provider"
+
+    outbound_submission =
+      Repo.get_by!(ProviderSubmission, outbound_message_id: queued.id)
+
+    assert outbound_submission.state == "accepted"
+    assert outbound_submission.provider_message_id == nil
+    assert Repo.aggregate(InboundDelivery, :count) == 0
+    assert Repo.aggregate(Message, :count) == 0
+
+    receive_method =
+      %ReceiveMethod{}
+      |> ReceiveMethod.changeset(%{
+        account_id: mailbox.id,
+        oauth_authorization_id: authorization.id,
+        kind: "microsoft",
+        provider_account_id: "sent-convergence-account",
+        email_address: Accounts.account_address(mailbox),
+        status: "connected",
+        enabled: true,
+        sync_enabled: true,
+        granted_scopes: [MicrosoftScopes.read()]
+      })
+      |> Repo.insert!()
+
+    insert_sync_cursor!(receive_method.id, %{
+      scope: "folders",
+      committed_cursor: "https://graph.microsoft.test/folders/delta",
+      last_completed_at: DateTime.utc_now(),
+      metadata: %{
+        "folder_mapping_version" => 1,
+        "folder_kinds_by_id" => %{
+          "folder-inbox" => "inbox",
+          "folder-deleted" => "trash",
+          "folder-sent" => "sent"
+        }
+      }
+    })
+
+    sent_cursor =
+      insert_sync_cursor!(receive_method.id, %{
+        scope: "folder:folder-sent",
+        committed_cursor: "https://graph.microsoft.test/messages/sent-delta",
+        metadata: %{"folder_mapping_version" => 1, "folder_kind" => "sent"}
+      })
+
+    provider_message_id = "graph-sent-immutable-id"
+
+    Process.put(
+      {:raw_result, provider_message_id},
+      {:ok,
+       %RawMessage{
+         bytes: submitted_request.raw_message,
+         received_at: queued.queued_at,
+         labels: [],
+         read?: true,
+         starred?: false
+       }}
+    )
+
+    Process.put(:sent_convergence_page, 0)
+
+    Process.put(:sync_page_result, fn provider_cursor ->
+      page = Process.get(:sent_convergence_page, 0) + 1
+      Process.put(:sent_convergence_page, page)
+
+      next = %{
+        provider_cursor
+        | page_cursor: if(page == 1, do: "sent-page-2", else: nil),
+          committed_cursor: "https://graph.microsoft.test/messages/sent-delta-#{page}"
+      }
+
+      remote = %{
+        remote_message(provider_message_id)
+        | folder_kind: "sent",
+          labels: [],
+          read?: true,
+          starred?: false
+      }
+
+      {:ok, %Page{messages: [remote], cursor: next}}
+    end)
+
+    assert {:snooze, 1} = Connectors.sync_account(receive_method.id)
+    assert :ok = Connectors.sync_account(receive_method.id)
+
+    mapping =
+      Repo.get_by!(RemoteMessage,
+        external_account_id: receive_method.id,
+        provider_message_id: provider_message_id
+      )
+
+    assert mapping.remote_folder_kind == "sent"
+    assert Repo.aggregate(InboundDelivery, :count) == 1
+    assert Repo.aggregate(RemoteMessage, :count) == 1
+
+    assert :ok = Ingest.archive_delivery(mapping.inbound_delivery_id)
+    assert :ok = Ingest.project_delivery(mapping.inbound_delivery_id)
+    assert :ok = Connectors.apply_remote_state(mapping.id)
+    assert :ok = Connectors.apply_remote_state(mapping.id)
+
+    assert Repo.aggregate(Message, :count) == 1
+
+    entry = Repo.get_by!(MailboxEntry, inbound_delivery_id: mapping.inbound_delivery_id)
+    sent = Manifold.Mail.Folders.get_system(mailbox.id, "sent")
+    assert entry.folder_id == sent.id
+
+    assert Repo.get!(OutboundMessage, queued.id).state == "accepted_by_provider"
+    assert Repo.get!(ProviderSubmission, outbound_submission.id).state == "accepted"
+    assert mapping.inbound_delivery_id != queued.id
+    assert Repo.get!(SyncCursor, sent_cursor.id).committed_cursor =~ "sent-delta-2"
   end
 
   test "Microsoft selected-lane sync repairs upgraded folder mappings without raw fetches", %{

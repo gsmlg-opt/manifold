@@ -3,10 +3,11 @@ defmodule Manifold.Outbound.SubmissionTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
-  alias Manifold.Connectors.{Crypto, GmailScopes}
+  alias Manifold.Connectors.{Crypto, GmailScopes, MicrosoftScopes}
 
   alias Manifold.Connectors.Schema.{
     OAuthAuthorization,
+    ReceiveMethod,
     SendCredential,
     SendMethod,
     SmtpSettings
@@ -583,6 +584,365 @@ defmodule Manifold.Outbound.SubmissionTest do
     assert persisted.provider_metadata == %{"thread_id" => "thread-1"}
   end
 
+  test "Microsoft retries the persisted snapshot and accepts a bodyless 202" do
+    %{message: message, method: method} = queued_operational_fixture("microsoft")
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+    persisted_payload = explicit_request_payload(submission.id)
+
+    message
+    |> Ecto.Changeset.change(
+      sender_name: "Changed Sender",
+      subject: "Changed after queue",
+      text_body: "Changed body",
+      in_reply_to: "<changed@example.test>",
+      references: ["<changed@example.test>"]
+    )
+    |> Repo.update!()
+
+    transient =
+      {:error,
+       %Provider.Error{
+         class: :transient,
+         code: "rate_limited",
+         message: "retry later",
+         http_status: 429,
+         retry_after: 5
+       }}
+
+    assert {:error, %Provider.Error{class: :transient, code: "rate_limited"}} =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: transient]
+             )
+
+    assert_receive {:provider_submit, first_request, first_config}
+    assert first_request.provider == "microsoft"
+    assert first_request.send_method_id == method.id
+    assert first_request.raw_message == persisted_payload
+    assert first_request.request_sha256 == submission.request_sha256
+    assert Keyword.fetch!(first_config, :access_token) == "microsoft-access-token"
+
+    assert Repo.get!(OutboundMessage, message.id).state == "queued"
+
+    assert Repo.get_by!(ProviderSubmission, outbound_message_id: message.id).state ==
+             "pending"
+
+    accepted =
+      {:ok,
+       %Provider.Submission{
+         provider_message_id: nil,
+         metadata: %{"request_id" => "graph-correlation-1"}
+       }}
+
+    assert :ok =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: accepted]
+             )
+
+    assert_receive {:provider_submit, second_request, _second_config}
+    assert second_request == first_request
+
+    persisted = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+    assert persisted.state == "accepted"
+    assert persisted.provider_message_id == nil
+    assert persisted.provider_metadata == %{"request_id" => "graph-correlation-1"}
+  end
+
+  test "empty provider IDs skip reconciliation without confusing correlation metadata" do
+    %{message: message} = queued_operational_fixture("microsoft")
+
+    accepted =
+      {:ok,
+       %Provider.Submission{
+         provider_message_id: "",
+         metadata: %{"client_request_id" => "graph-client-correlation"}
+       }}
+
+    assert :ok =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: accepted]
+             )
+
+    assert_receive {:provider_submit, _, _}
+    persisted = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+    assert persisted.provider_message_id == ""
+    assert persisted.provider_metadata == %{"client_request_id" => "graph-client-correlation"}
+  end
+
+  test "bodyless Microsoft 202 stores nil provider ID and sanitized correlation metadata" do
+    %{message: message} = queued_operational_fixture("microsoft")
+
+    expected_payload =
+      message.id
+      |> then(&Repo.get_by!(ProviderSubmission, outbound_message_id: &1))
+      |> then(&explicit_request_payload(&1.id))
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      assert Base.decode64!(body) == expected_payload
+
+      conn
+      |> Plug.Conn.put_resp_header("request-id", "graph-request-202")
+      |> Plug.Conn.put_resp_header("client-request-id", "graph-client-202")
+      |> Plug.Conn.put_status(202)
+      |> Plug.Conn.send_resp(202, "")
+    end)
+
+    assert :ok =
+             Outbound.submit_message(message.id,
+               provider_config: [
+                 base_url: "https://graph.microsoft.test/v1.0",
+                 req_options: [plug: {Req.Test, __MODULE__}]
+               ]
+             )
+
+    persisted = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+    assert persisted.provider_message_id == nil
+
+    assert persisted.provider_metadata == %{
+             "client_request_id" => "graph-client-202",
+             "request_id" => "graph-request-202"
+           }
+  end
+
+  test "unknown Microsoft transport loss becomes terminal uncertainty without another call" do
+    %{message: message} = queued_operational_fixture("microsoft")
+
+    Req.Test.expect(__MODULE__, fn conn -> Req.Test.transport_error(conn, :timeout) end)
+
+    assert {:error, %{class: :permanent, reason: :submission_uncertain}} =
+             Outbound.submit_message(message.id,
+               provider_config: [
+                 base_url: "https://graph.microsoft.test/v1.0",
+                 req_options: [plug: {Req.Test, __MODULE__}]
+               ]
+             )
+
+    assert Repo.get!(OutboundMessage, message.id).state == "submission_uncertain"
+
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+    assert submission.state == "uncertain"
+    assert submission.last_error_code == "acceptance_unknown"
+
+    assert Repo.aggregate(
+             from(event in OutboundEvent,
+               where:
+                 event.outbound_message_id == ^message.id and
+                   event.event_type == "submission_uncertain"
+             ),
+             :count
+           ) == 1
+
+    assert {:error, %{class: :permanent, reason: :submission_uncertain}} =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: :unused]
+             )
+
+    refute_receive {:provider_submit, _, _}
+  end
+
+  test "payload integrity is validated before attempt state or credential checkout" do
+    %{message: message, method: method} = queued_operational_fixture("microsoft")
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+
+    authorization = Repo.get!(OAuthAuthorization, method.oauth_authorization_id)
+
+    authorization
+    |> Ecto.Changeset.change(access_token_ciphertext: <<1, 2, 3>>)
+    |> Repo.update!()
+
+    reinsert_submission!(submission, request_sha256: String.duplicate("0", 64))
+
+    assert {:error, %Provider.Error{class: :permanent, code: "request_integrity_failed"}} =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: :unused]
+             )
+
+    refute_receive {:provider_submit, _, _}
+    assert Repo.get!(OutboundMessage, message.id).state == "queued"
+
+    persisted = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+    assert persisted.state == "pending"
+    assert persisted.attempt_count == 0
+
+    %{message: sender_message, method: sender_method} =
+      queued_operational_fixture("microsoft")
+
+    sender_authorization = Repo.get!(OAuthAuthorization, sender_method.oauth_authorization_id)
+
+    sender_authorization
+    |> Ecto.Changeset.change(access_token_ciphertext: <<4, 5, 6>>)
+    |> Repo.update!()
+
+    sender_message
+    |> Ecto.Changeset.change(canonical_sender_address: "other@example.test")
+    |> Repo.update!()
+
+    assert {:error, %Provider.Error{class: :permanent, code: "request_integrity_failed"}} =
+             Outbound.submit_message(sender_message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: :unused]
+             )
+
+    assert Repo.get_by!(ProviderSubmission, outbound_message_id: sender_message.id).attempt_count ==
+             0
+
+    %{message: legacy_microsoft} = insert_legacy_method_submission!("microsoft")
+
+    assert {:error, %Provider.Error{class: :permanent, code: "request_integrity_failed"}} =
+             Outbound.submit_message(legacy_microsoft.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: :unused]
+             )
+
+    refute_receive {:provider_submit, _, _}
+  end
+
+  test "legacy Gmail and SMTP payloads backfill once under the submission lock" do
+    for provider <- ["gmail", "smtp"] do
+      %{message: message, submission: legacy} = insert_legacy_method_submission!(provider)
+      assert explicit_request_payload(legacy.id) == nil
+      assert legacy.render_version == nil
+
+      accepted =
+        {:ok,
+         %Provider.Submission{
+           provider_message_id: "legacy-#{provider}",
+           metadata: %{}
+         }}
+
+      assert :ok =
+               Outbound.submit_message(message.id,
+                 provider: TestProvider,
+                 provider_config: [test_pid: self(), result: accepted]
+               )
+
+      assert_receive {:provider_submit, request, _config}
+      assert sha256(request.raw_message) == legacy.request_sha256
+      assert explicit_request_payload(legacy.id) == request.raw_message
+      assert Repo.get!(ProviderSubmission, legacy.id).render_version == 1
+    end
+
+    %{message: mismatch_message, submission: mismatch} =
+      insert_legacy_method_submission!("smtp", request_sha256: String.duplicate("0", 64))
+
+    assert {:error, %Provider.Error{class: :permanent, code: "request_integrity_failed"}} =
+             Outbound.submit_message(mismatch_message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: :unused]
+             )
+
+    refute_receive {:provider_submit, _, _}
+    assert explicit_request_payload(mismatch.id) == nil
+    assert Repo.get!(ProviderSubmission, mismatch.id).attempt_count == 0
+  end
+
+  test "interrupted Microsoft submission becomes uncertain before dispatch" do
+    %{message: message} = queued_operational_fixture("microsoft")
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+
+    message |> Ecto.Changeset.change(state: "submitting") |> Repo.update!()
+
+    submission
+    |> Ecto.Changeset.change(state: "submitting", attempt_count: 1)
+    |> Repo.update!()
+
+    assert {:error, %{class: :permanent, reason: :submission_uncertain}} =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: :unused]
+             )
+
+    refute_receive {:provider_submit, _, _}
+    assert Repo.get!(OutboundMessage, message.id).state == "submission_uncertain"
+    assert Repo.get!(ProviderSubmission, submission.id).state == "uncertain"
+  end
+
+  test "Microsoft send revocation marks its shared authorization and both methods" do
+    %{message: message, method: method, account: account, address: address} =
+      queued_operational_fixture("microsoft",
+        scopes: [MicrosoftScopes.read(), MicrosoftScopes.send()]
+      )
+
+    receive_method = insert_microsoft_receive!(account, method.oauth_authorization_id, address)
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      conn
+      |> Plug.Conn.put_status(401)
+      |> Req.Test.json(%{"error" => %{"code" => "InvalidAuthenticationToken"}})
+    end)
+
+    assert {:error, %Provider.Error{class: :permanent, code: "reconnect_required"}} =
+             Outbound.submit_message(message.id,
+               provider_config: [
+                 base_url: "https://graph.microsoft.test/v1.0",
+                 req_options: [plug: {Req.Test, __MODULE__}]
+               ]
+             )
+
+    authorization = Repo.get!(OAuthAuthorization, method.oauth_authorization_id)
+    assert authorization.status == "reconnect_required"
+
+    persisted_send = Repo.get!(SendMethod, method.id)
+    assert persisted_send.status == "reconnect_required"
+    refute persisted_send.enabled
+
+    persisted_receive = Repo.get!(ReceiveMethod, receive_method.id)
+    assert persisted_receive.status == "reconnect_required"
+    refute persisted_receive.enabled
+    refute persisted_receive.sync_enabled
+  end
+
+  test "a stale Microsoft rejection retries with the rotated authorization" do
+    %{message: message, method: method} = queued_operational_fixture("microsoft")
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      authorization = Repo.get!(OAuthAuthorization, method.oauth_authorization_id)
+
+      {:ok, replacement} =
+        Crypto.encrypt("rotated-microsoft-token", "credential:#{authorization.id}:access")
+
+      authorization
+      |> OAuthAuthorization.changeset(%{
+        access_token_ciphertext: replacement,
+        token_expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second)
+      })
+      |> Repo.update!()
+
+      conn
+      |> Plug.Conn.put_status(401)
+      |> Req.Test.json(%{"error" => %{"code" => "InvalidAuthenticationToken"}})
+    end)
+
+    config = [
+      base_url: "https://graph.microsoft.test/v1.0",
+      req_options: [plug: {Req.Test, __MODULE__}]
+    ]
+
+    assert {:error, %Provider.Error{class: :transient, code: "stale_access_token"}} =
+             Outbound.submit_message(message.id, provider_config: config)
+
+    assert Repo.get!(OAuthAuthorization, method.oauth_authorization_id).status == "connected"
+    assert Repo.get!(SendMethod, method.id).status == "connected"
+    assert Repo.get!(OutboundMessage, message.id).state == "queued"
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      assert Plug.Conn.get_req_header(conn, "authorization") == [
+               "Bearer rotated-microsoft-token"
+             ]
+
+      conn |> Plug.Conn.put_status(202) |> Plug.Conn.send_resp(202, "")
+    end)
+
+    assert :ok = Outbound.submit_message(message.id, provider_config: config)
+    assert Repo.get!(OutboundMessage, message.id).state == "accepted_by_provider"
+    assert Repo.get_by!(ProviderSubmission, outbound_message_id: message.id).attempt_count == 2
+  end
+
   test "SMTP dispatch checks out password settings for the snapshotted method" do
     %{message: message, method: method} = queued_operational_fixture("smtp")
 
@@ -1081,7 +1441,7 @@ defmodule Manifold.Outbound.SubmissionTest do
         reconnect_opts: [fail_at: :after_methods_before_event]
       )
 
-    assert {:error, %{class: :temporary, reason: :gmail_reconnect_lifecycle_failed}} = result
+    assert {:error, %{class: :temporary, reason: :oauth_reconnect_lifecycle_failed}} = result
 
     refute inspect(result) =~ "gmail-access-token"
     assert Repo.get!(OutboundMessage, first_message.id).state == "submitting"
@@ -1322,15 +1682,11 @@ defmodule Manifold.Outbound.SubmissionTest do
     address = "sender@#{domain.normalized_domain}"
 
     method =
-      %SendMethod{}
-      |> SendMethod.changeset(%{
-        account_id: account.id,
-        kind: provider,
-        email_address: address,
-        status: "connected",
-        enabled: true
-      })
-      |> Repo.insert!()
+      case provider do
+        "gmail" -> insert_gmail_method!(account, address)
+        "smtp" -> insert_smtp_method!(account, address)
+        "microsoft" -> insert_microsoft_method!(account, address)
+      end
 
     {:ok, draft} =
       Outbound.create_draft(account.id, %{
@@ -1389,7 +1745,7 @@ defmodule Manifold.Outbound.SubmissionTest do
     end
   end
 
-  defp queued_operational_fixture(kind) do
+  defp queued_operational_fixture(kind, opts \\ []) do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "dispatch#{suffix}.test"})
     {:ok, account} = Accounts.create_account(domain, %{local_part: "sender", name: "Sender"})
@@ -1399,6 +1755,7 @@ defmodule Manifold.Outbound.SubmissionTest do
       case kind do
         "gmail" -> insert_gmail_method!(account, address)
         "smtp" -> insert_smtp_method!(account, address)
+        "microsoft" -> insert_microsoft_method!(account, address, opts)
       end
 
     {:ok, draft} =
@@ -1443,6 +1800,59 @@ defmodule Manifold.Outbound.SubmissionTest do
       email_address: address,
       status: "connected",
       enabled: true
+    })
+    |> Repo.insert!()
+  end
+
+  defp insert_microsoft_method!(account, address, opts \\ []) do
+    authorization_id = Ecto.UUID.generate()
+
+    {:ok, access} =
+      Crypto.encrypt("microsoft-access-token", "credential:#{authorization_id}:access")
+
+    {:ok, refresh} =
+      Crypto.encrypt("microsoft-refresh-token", "credential:#{authorization_id}:refresh")
+
+    authorization =
+      %OAuthAuthorization{id: authorization_id}
+      |> OAuthAuthorization.changeset(%{
+        account_id: account.id,
+        provider: "microsoft",
+        provider_subject_id: "subject-#{authorization_id}",
+        email_address: address,
+        granted_scopes: Keyword.get(opts, :scopes, [MicrosoftScopes.send()]),
+        status: "connected",
+        key_version: 1,
+        access_token_ciphertext: access,
+        refresh_token_ciphertext: refresh,
+        token_expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second)
+      })
+      |> Repo.insert!()
+
+    %SendMethod{}
+    |> SendMethod.changeset(%{
+      account_id: account.id,
+      oauth_authorization_id: authorization.id,
+      kind: "microsoft",
+      email_address: address,
+      status: "connected",
+      enabled: true
+    })
+    |> Repo.insert!()
+  end
+
+  defp insert_microsoft_receive!(account, authorization_id, address) do
+    %ReceiveMethod{}
+    |> ReceiveMethod.changeset(%{
+      account_id: account.id,
+      oauth_authorization_id: authorization_id,
+      kind: "microsoft",
+      provider_account_id: "receive-#{authorization_id}",
+      email_address: address,
+      status: "connected",
+      enabled: true,
+      sync_enabled: true,
+      granted_scopes: [MicrosoftScopes.read()]
     })
     |> Repo.insert!()
   end

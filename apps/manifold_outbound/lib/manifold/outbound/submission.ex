@@ -37,7 +37,7 @@ defmodule Manifold.Outbound.Submission do
     database_unavailable
     domain_policy
     ehlo_failed
-    gmail_reconnect_lifecycle_failed
+    oauth_reconnect_lifecycle_failed
     insufficient_scope
     insufficient_provider_scope
     interrupted_submission
@@ -155,6 +155,7 @@ defmodule Manifold.Outbound.Submission do
       submission =
         ProviderSubmission
         |> where([submission], submission.outbound_message_id == ^message_id)
+        |> select_merge([submission], %{request_payload: submission.request_payload})
         |> lock("FOR UPDATE")
         |> Repo.one()
 
@@ -189,6 +190,9 @@ defmodule Manifold.Outbound.Submission do
       {:ok, {:error, %Error{} = error}} ->
         {:error, error}
 
+      {:ok, {:error, %Provider.Error{} = error}} ->
+        {:error, error}
+
       {:error, reason} ->
         {:error, database_error(reason)}
     end
@@ -216,7 +220,7 @@ defmodule Manifold.Outbound.Submission do
          %{provider: provider} = submission,
          _recipients
        )
-       when provider in ["gmail", "smtp"] do
+       when provider in ["gmail", "smtp", "microsoft"] do
     mark_uncertain(
       message,
       submission,
@@ -229,18 +233,92 @@ defmodule Manifold.Outbound.Submission do
   defp prepare_locked(message, submission, recipients) do
     now = DateTime.utc_now()
 
-    if submission.provider == "resend" and submission.attempt_count > 0 and
-         DateTime.compare(now, submission.idempotency_expires_at) != :lt do
-      mark_uncertain(
-        message,
-        submission,
-        now,
-        "idempotency_expired",
-        "provider acceptance is ambiguous after idempotency expiry"
-      )
-    else
-      start_attempt(message, submission, recipients, now)
+    with {:ok, submission} <- ensure_request_payload(message, submission, recipients) do
+      if submission.provider == "resend" and submission.attempt_count > 0 and
+           DateTime.compare(now, submission.idempotency_expires_at) != :lt do
+        mark_uncertain(
+          message,
+          submission,
+          now,
+          "idempotency_expired",
+          "provider acceptance is ambiguous after idempotency expiry"
+        )
+      else
+        start_attempt(message, submission, recipients, now)
+      end
     end
+  end
+
+  defp ensure_request_payload(_message, %{provider: "resend"} = submission, _recipients),
+    do: {:ok, submission}
+
+  defp ensure_request_payload(message, submission, recipients) do
+    payload_valid? =
+      is_binary(submission.request_payload) and submission.request_payload != "" and
+        is_integer(submission.render_version) and submission.render_version > 0 and
+        sha256(submission.request_payload) == submission.request_sha256
+
+    sender_valid? =
+      submission.canonical_sender_address == message.canonical_sender_address
+
+    legacy_payload_missing? =
+      submission.provider in ["gmail", "smtp"] and
+        is_nil(submission.request_payload) and is_nil(submission.render_version)
+
+    cond do
+      payload_valid? and sender_valid? ->
+        {:ok, submission}
+
+      legacy_payload_missing? ->
+        backfill_legacy_payload(message, submission, recipients)
+
+      true ->
+        {:error, provider_error("request_integrity_failed")}
+    end
+  end
+
+  defp backfill_legacy_payload(message, submission, recipients) do
+    envelope = envelope(message, submission, recipients)
+
+    with {:ok, raw_message} <-
+           RfcMessage.render(envelope,
+             provider: String.to_existing_atom(submission.provider),
+             message_id: submission.provider_rfc_message_id,
+             date: message.queued_at
+           ),
+         true <- sha256(raw_message) == submission.request_sha256,
+         {1, nil} <- persist_legacy_payload(submission.id, raw_message),
+         %ProviderSubmission{} = reloaded <- reload_request_payload(submission.id),
+         true <- reloaded.request_payload == raw_message,
+         true <- reloaded.render_version == 1,
+         true <- reloaded.canonical_sender_address == message.canonical_sender_address,
+         true <- sha256(reloaded.request_payload) == reloaded.request_sha256 do
+      {:ok, reloaded}
+    else
+      _mismatch_or_failure -> {:error, provider_error("request_integrity_failed")}
+    end
+  end
+
+  defp persist_legacy_payload(submission_id, raw_message) do
+    "provider_submissions"
+    |> where(
+      [submission],
+      field(submission, :id) == type(^submission_id, :binary_id) and
+        is_nil(field(submission, :request_payload)) and
+        is_nil(field(submission, :render_version))
+    )
+    |> Repo.update_all(
+      [set: [request_payload: raw_message, render_version: 1]],
+      log: false,
+      telemetry_event: nil
+    )
+  end
+
+  defp reload_request_payload(submission_id) do
+    ProviderSubmission
+    |> where([submission], submission.id == ^submission_id)
+    |> select_merge([submission], %{request_payload: submission.request_payload})
+    |> Repo.one(log: false, telemetry_event: nil)
   end
 
   defp start_attempt(message, submission, recipients, now) do
@@ -303,7 +381,7 @@ defmodule Manifold.Outbound.Submission do
     result =
       with {:ok, provider, config, request, method} <- dispatch(preparation, opts) do
         provider.submit(config, request)
-        |> maybe_mark_gmail_reconnect(method, opts)
+        |> maybe_mark_oauth_reconnect(method, opts)
       end
 
     maybe_before_persist(opts, preparation, result)
@@ -341,7 +419,7 @@ defmodule Manifold.Outbound.Submission do
          %{submission: %{provider: provider, send_method_id: method_id}} = preparation,
          opts
        )
-       when provider in ["gmail", "smtp"] and is_binary(method_id) do
+       when provider in ["gmail", "smtp", "microsoft"] and is_binary(method_id) do
     with {:ok, request} <- request(preparation, provider, method_id),
          {:ok, method} <-
            Connectors.checkout_send_method(
@@ -366,27 +444,16 @@ defmodule Manifold.Outbound.Submission do
 
   defp request(preparation, provider, method_id) do
     envelope = envelope(preparation.message, preparation.submission, preparation.recipients)
+    raw_message = preparation.submission.request_payload
 
-    with {:ok, raw_message} <-
-           RfcMessage.render(envelope,
-             provider: String.to_existing_atom(provider),
-             message_id: preparation.submission.provider_rfc_message_id,
-             date: preparation.message.queued_at
-           ),
-         request_sha256 <- sha256(raw_message),
-         true <- request_sha256 == preparation.submission.request_sha256 do
-      {:ok,
-       %Request{
-         provider: provider,
-         send_method_id: method_id,
-         envelope: envelope,
-         raw_message: raw_message,
-         request_sha256: request_sha256
-       }}
-    else
-      false -> {:error, provider_error("request_integrity_failed")}
-      {:error, %Error{}} -> {:error, provider_error("request_integrity_failed")}
-    end
+    {:ok,
+     %Request{
+       provider: provider,
+       send_method_id: method_id,
+       envelope: envelope,
+       raw_message: raw_message,
+       request_sha256: preparation.submission.request_sha256
+     }}
   end
 
   defp require_provider(%SubmissionMethod{kind: provider}, provider), do: :ok
@@ -412,7 +479,8 @@ defmodule Manifold.Outbound.Submission do
     end
   end
 
-  defp provider_config(%SubmissionMethod{} = method, "gmail", opts) do
+  defp provider_config(%SubmissionMethod{} = method, provider, opts)
+       when provider in ["gmail", "microsoft"] do
     config = if is_list(method.config), do: method.config, else: []
     {:oauth, access_token} = method.credential
 
@@ -463,16 +531,21 @@ defmodule Manifold.Outbound.Submission do
   defp connector_error_code(code) when is_binary(code), do: code
   defp connector_error_code(_code), do: "connector_error"
 
-  defp maybe_mark_gmail_reconnect(
+  defp maybe_mark_oauth_reconnect(
          {:error, %Provider.Error{class: :permanent, code: code} = error} = result,
-         %SubmissionMethod{id: method_id, kind: "gmail", credential: {:oauth, access_token}},
+         %SubmissionMethod{
+           id: method_id,
+           kind: provider,
+           credential: {:oauth, access_token}
+         },
          opts
        )
-       when code in ["reconnect_required", "insufficient_scope"] do
-    case Connectors.mark_gmail_send_reconnect_required(
+       when provider in ["gmail", "microsoft"] and
+              code in ["reconnect_required", "insufficient_scope"] do
+    case Connectors.mark_oauth_send_reconnect_required(
            method_id,
            access_token,
-           gmail_reconnect_error_code(code),
+           oauth_reconnect_error_code(code),
            Keyword.get(opts, :reconnect_opts, [])
          ) do
       {:ok, outcome, _authorization} when outcome in [:marked, :already_marked, :inactive] ->
@@ -484,7 +557,7 @@ defmodule Manifold.Outbound.Submission do
            error
            | class: :transient,
              code: "stale_access_token",
-             message: "Gmail access token was replaced; retry with the current authorization",
+             message: "OAuth access token was replaced; retry with the current authorization",
              retry_after: nil
          }}
 
@@ -493,16 +566,16 @@ defmodule Manifold.Outbound.Submission do
     end
   end
 
-  defp maybe_mark_gmail_reconnect(result, _method, _opts), do: result
+  defp maybe_mark_oauth_reconnect(result, _method, _opts), do: result
 
-  defp gmail_reconnect_error_code("reconnect_required"), do: :invalid_grant
-  defp gmail_reconnect_error_code("insufficient_scope"), do: :insufficient_scope
+  defp oauth_reconnect_error_code("reconnect_required"), do: :invalid_grant
+  defp oauth_reconnect_error_code("insufficient_scope"), do: :insufficient_scope
 
   defp reconnect_lifecycle_error do
     Error.new(
       :temporary,
-      :gmail_reconnect_lifecycle_failed,
-      "Gmail reconnect state could not be persisted"
+      :oauth_reconnect_lifecycle_failed,
+      "OAuth reconnect state could not be persisted"
     )
   end
 
@@ -610,7 +683,7 @@ defmodule Manifold.Outbound.Submission do
               now
             )
 
-            ProviderEvents.reconcile_pending(
+            maybe_reconcile_pending(
               submission.provider,
               provider_submission.provider_message_id,
               message.id,
@@ -692,6 +765,13 @@ defmodule Manifold.Outbound.Submission do
       {:error, reason} -> {:error, database_error(reason)}
     end
   end
+
+  defp maybe_reconcile_pending(provider, provider_message_id, message_id, now)
+       when is_binary(provider_message_id) and provider_message_id != "" do
+    ProviderEvents.reconcile_pending(provider, provider_message_id, message_id, now)
+  end
+
+  defp maybe_reconcile_pending(_provider, _missing_or_invalid_id, _message_id, _now), do: :ok
 
   defp lock_submission!(preparation) do
     message =
