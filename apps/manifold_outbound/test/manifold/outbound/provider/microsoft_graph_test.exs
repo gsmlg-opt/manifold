@@ -30,7 +30,10 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
   }
   @provider_telemetry_events [
     [:manifold, :outbound, :provider, :microsoft_graph, :stop],
-    [:manifold, :outbound, :submit, :stop]
+    [:manifold, :outbound, :submit, :stop],
+    [:finch, :request, :start],
+    [:finch, :request, :stop],
+    [:finch, :request, :exception]
   ]
 
   setup context do
@@ -384,6 +387,134 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     refute_received {:redirect_request, _authorization}
   end
 
+  test "rejects untrusted or malformed Microsoft endpoints before exposing request secrets" do
+    invalid_base_urls = [
+      "http://graph.microsoft.invalid/v1.0",
+      "https://169.254.169.254:1/latest/meta-data",
+      "https://graph.microsoft.com.attacker.test/v1.0",
+      "https://graph.microsoft.invalid:444/v1.0",
+      "https://attacker@graph.microsoft.invalid/v1.0",
+      "https://graph.microsoft.invalid/v1.0?next=https://attacker.test",
+      "https://graph.microsoft.invalid/v1.0#attacker",
+      "https://graph.microsoft.invalid/v1.0/%2e%2e/beta",
+      "https://graph.microsoft.invalid/v1.0//beta",
+      "not a URI"
+    ]
+
+    for base_url <- invalid_base_urls do
+      config = [access_token: @access_token, base_url: base_url]
+
+      assert {:error,
+              %Provider.Error{
+                class: :permanent,
+                code: "invalid_config",
+                message: "Microsoft Graph endpoint is invalid"
+              }} = secure_submit(config, "endpoint-private-sentinel")
+    end
+  end
+
+  test "permits a non-production HTTPS authority only through the owned Req.Test plug" do
+    Req.Test.expect(MicrosoftGraph, fn conn ->
+      assert conn.host == "graph.microsoft.test"
+      assert conn.request_path == "/v1.0/me/sendMail"
+      Plug.Conn.send_resp(conn, 202, "")
+    end)
+
+    config = Keyword.put(@config, :base_url, "https://graph.microsoft.test/v1.0")
+
+    assert {:ok, %Provider.Submission{provider_message_id: nil}} =
+             secure_submit(config, "test-endpoint-private-sentinel")
+  end
+
+  test "rejects invalid timeout options safely before transport" do
+    invalid_options = [
+      [:not_a_keyword],
+      [receive_timeout: -1],
+      [receive_timeout: 0],
+      [receive_timeout: "5000"],
+      [receive_timeout: :infinity],
+      [receive_timeout: 120_001],
+      [pool_timeout: -1],
+      [pool_timeout: 0],
+      [pool_timeout: "5000"],
+      [pool_timeout: :infinity],
+      [pool_timeout: 120_001],
+      [connect_options: [timeout: -1]],
+      [connect_options: [timeout: 0]],
+      [connect_options: [timeout: "5000"]],
+      [connect_options: [timeout: :infinity]],
+      [connect_options: [timeout: 120_001]],
+      [connect_options: "5000"]
+    ]
+
+    for req_options <- invalid_options do
+      config = Keyword.put(@config, :req_options, req_options)
+
+      assert {:error,
+              %Provider.Error{
+                class: :permanent,
+                code: "invalid_config",
+                message: "Microsoft Graph transport options are invalid"
+              }} = secure_submit(config, "timeout-private-sentinel")
+    end
+  end
+
+  test "rejects non-keyword configuration lists without raising" do
+    config = [{:access_token, @access_token}, :not_a_keyword]
+
+    assert {:error,
+            %Provider.Error{
+              class: :permanent,
+              code: "invalid_config",
+              message: "Microsoft Graph transport options are invalid"
+            }} = secure_submit(config, "config-private-sentinel")
+  end
+
+  test "production transport does not emit bearer or MIME bytes in Finch telemetry" do
+    handler_id = {__MODULE__, self(), make_ref()}
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach_many(
+        handler_id,
+        [
+          [:finch, :request, :start],
+          [:finch, :request, :stop],
+          [:finch, :request, :exception]
+        ],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:finch_transport_telemetry, event, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    config = [
+      access_token: @access_token,
+      base_url: "https://graph.microsoft.invalid/v1.0",
+      req_options: [receive_timeout: 100, connect_options: [timeout: 100]]
+    ]
+
+    log =
+      try do
+        capture_log(fn ->
+          assert {:error, %Provider.Error{class: :transient, code: "transport_error"}} =
+                   MicrosoftGraph.submit(config, @request)
+        end)
+      after
+        :telemetry.detach(handler_id)
+      end
+
+    telemetry = drain_finch_telemetry([])
+
+    assert telemetry == []
+
+    for inspected <- [log, inspect(telemetry)] do
+      refute inspected =~ @access_token
+      refute inspected =~ @raw_message
+      refute inspected =~ Base.encode64(@raw_message)
+    end
+  end
+
   defp expect_graph_error(status, code, secret, opts \\ []) do
     expect_graph_body(
       status,
@@ -455,6 +586,15 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     receive do
       {:graph_provider_telemetry, ^ref, event, measurements, metadata} ->
         drain_telemetry(ref, [{event, measurements, metadata} | entries])
+    after
+      0 -> Enum.reverse(entries)
+    end
+  end
+
+  defp drain_finch_telemetry(entries) do
+    receive do
+      {:finch_transport_telemetry, event, measurements, metadata} ->
+        drain_finch_telemetry([{event, measurements, metadata} | entries])
     after
       0 -> Enum.reverse(entries)
     end
