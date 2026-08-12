@@ -39,8 +39,18 @@ defmodule Manifold.Outbound.SubmissionTest do
 
     assert changeset.valid?
     submission = Ecto.Changeset.apply_changes(changeset)
-    refute inspect(submission) =~ sentinel
-    refute inspect(submission) =~ "private-recipient"
+
+    for inspected <- [
+          inspect(submission),
+          inspect(%{submission: submission}),
+          inspect(changeset),
+          inspect(%{changeset: changeset})
+        ] do
+      refute inspected =~ sentinel
+      refute inspected =~ "private-recipient"
+    end
+
+    assert inspect(changeset) =~ "**redacted**"
   end
 
   test "new method-backed snapshots reject missing payload and nonpositive render version" do
@@ -51,13 +61,8 @@ defmodule Manifold.Outbound.SubmissionTest do
              errors_on(method_submission_changeset(render_version: 0))
   end
 
-  test "legacy method-backed rows remain readable with nil payload and render version" do
-    %{message: message} = queued_operational_fixture("gmail")
-
-    message.id
-    |> then(&Repo.get_by!(ProviderSubmission, outbound_message_id: &1))
-    |> Ecto.Changeset.change(request_payload: nil, render_version: nil)
-    |> Repo.update!()
+  test "legacy method-backed rows remain readable and default reads omit MIME payloads" do
+    %{message: message, submission: legacy} = insert_legacy_method_submission!("gmail")
 
     assert %ProviderSubmission{
              canonical_sender_address: canonical_sender_address,
@@ -66,6 +71,85 @@ defmodule Manifold.Outbound.SubmissionTest do
            } = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
 
     assert canonical_sender_address == message.canonical_sender_address
+
+    %{message: current_message} = queued_operational_fixture("gmail")
+    current = Repo.get_by!(ProviderSubmission, outbound_message_id: current_message.id)
+
+    assert current.request_payload == nil
+    assert explicit_request_payload(current.id) =~ "Stable body"
+    assert explicit_request_payload(legacy.id) == nil
+  end
+
+  test "database freezes provider snapshot fields after insertion" do
+    %{message: message} = queued_operational_fixture("gmail")
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+
+    mutations = [
+      {"outbound_message_id", Ecto.UUID.generate() |> Ecto.UUID.dump!()},
+      {"send_method_id", Ecto.UUID.generate() |> Ecto.UUID.dump!()},
+      {"provider", "smtp"},
+      {"canonical_sender_address", "other@example.test"},
+      {"idempotency_key", Ecto.UUID.generate()},
+      {"request_sha256", String.duplicate("0", 64)},
+      {"request_payload", "From: other@example.test\r\n\r\nChanged\r\n"},
+      {"render_version", 2},
+      {"provider_rfc_message_id", "<other@manifold.local>"}
+    ]
+
+    for {column, value} <- mutations do
+      assert_snapshot_mutation_rejected(submission.id, column, value)
+    end
+
+    assert {1, nil} =
+             ProviderSubmission
+             |> where([candidate], candidate.id == ^submission.id)
+             |> Repo.update_all(set: [state: "submitting"])
+
+    assert Repo.get!(ProviderSubmission, submission.id).state == "submitting"
+  end
+
+  test "database permits one verified Gmail or SMTP legacy payload fill only" do
+    for provider <- ["gmail", "smtp"] do
+      payload = "From: sender@example.test\r\n\r\n#{provider} legacy body\r\n"
+
+      %{submission: legacy} =
+        insert_legacy_method_submission!(provider, request_sha256: sha256(payload))
+
+      assert {1, nil} =
+               "provider_submissions"
+               |> where([candidate], field(candidate, :id) == type(^legacy.id, :binary_id))
+               |> Repo.update_all(set: [request_payload: payload, render_version: 1])
+
+      assert explicit_request_payload(legacy.id) == payload
+      assert Repo.get!(ProviderSubmission, legacy.id).render_version == 1
+
+      assert_snapshot_mutation_rejected(
+        legacy.id,
+        "request_payload",
+        payload <> "changed"
+      )
+    end
+  end
+
+  test "database forbids the legacy payload-fill exception for Microsoft" do
+    %{submission: legacy} = insert_legacy_method_submission!("microsoft")
+
+    assert_snapshot_mutation_rejected(
+      legacy.id,
+      "request_payload",
+      "From: sender@example.test\r\n\r\nMicrosoft legacy body\r\n",
+      also_set_render_version: 1
+    )
+  end
+
+  test "provider submission changeset is insertion-only" do
+    %{message: message} = queued_operational_fixture("gmail")
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+
+    changeset = ProviderSubmission.changeset(submission, %{state: "submitting"})
+
+    refute changeset.valid?
+    assert %{base: [_ | _]} = errors_on(changeset)
   end
 
   test "legacy Resend snapshots retain their idempotency window without method payload fields" do
@@ -770,9 +854,7 @@ defmodule Manifold.Outbound.SubmissionTest do
     |> Ecto.Changeset.change(password_ciphertext: <<1, 2, 3>>)
     |> Repo.update!()
 
-    tampered
-    |> Ecto.Changeset.change(request_sha256: String.duplicate("0", 64))
-    |> Repo.update!()
+    reinsert_submission!(tampered, request_sha256: String.duplicate("0", 64))
 
     assert {:error, %Provider.Error{class: :permanent, code: "request_integrity_failed"}} =
              Outbound.submit_message(tampered_message.id,
@@ -824,7 +906,8 @@ defmodule Manifold.Outbound.SubmissionTest do
     %{message: tampered_message, method: tampered_method} = queued_operational_fixture("gmail")
     expire_authorization!(tampered_method.oauth_authorization_id)
     tampered = Repo.get_by!(ProviderSubmission, outbound_message_id: tampered_message.id)
-    tampered |> Ecto.Changeset.change(request_sha256: String.duplicate("0", 64)) |> Repo.update!()
+
+    reinsert_submission!(tampered, request_sha256: String.duplicate("0", 64))
 
     assert {:error, %Provider.Error{code: "request_integrity_failed"}} =
              Outbound.submit_message(tampered_message.id,
@@ -849,17 +932,9 @@ defmodule Manifold.Outbound.SubmissionTest do
     %{message: message} = queued_operational_fixture("gmail")
     submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
 
-    assert_raise Ecto.ConstraintError, fn ->
-      submission |> Ecto.Changeset.change(provider: "smtp") |> Repo.update!()
-    end
-
-    assert_raise Ecto.ConstraintError, fn ->
-      submission |> Ecto.Changeset.change(send_method_id: nil) |> Repo.update!()
-    end
-
-    assert_raise Ecto.ConstraintError, fn ->
-      submission |> Ecto.Changeset.change(provider: "unknown") |> Repo.update!()
-    end
+    assert_snapshot_mutation_rejected(submission.id, "provider", "smtp")
+    assert_snapshot_mutation_rejected(submission.id, "send_method_id", nil)
+    assert_snapshot_mutation_rejected(submission.id, "provider", "unknown")
   end
 
   test "Gmail API reconnect marks the current token generation and retries a stale token" do
@@ -1129,12 +1204,57 @@ defmodule Manifold.Outbound.SubmissionTest do
     {:ok, mailbox} =
       Accounts.create_account(domain, %{local_part: "inbox", name: "Local Inbox"})
 
-    %{message: queued, method: method, submission: submission} =
-      LegacyResendFixture.queue!(mailbox.id, "inbox@#{domain.normalized_domain}", %{
+    address = "inbox@#{domain.normalized_domain}"
+
+    method =
+      %SendMethod{}
+      |> SendMethod.changeset(%{
+        account_id: mailbox.id,
+        kind: "smtp",
+        email_address: address,
+        status: "connected",
+        enabled: true
+      })
+      |> Repo.insert!()
+
+    {:ok, draft} =
+      Outbound.create_draft(mailbox.id, %{
         subject: "Ready",
         text_body: "Body",
         recipients: [%{kind: "to", address: "person@example.net"}]
       })
+
+    {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
+    current = Repo.get_by!(ProviderSubmission, outbound_message_id: queued.id)
+    Repo.delete!(current)
+    Repo.delete!(method)
+
+    now = DateTime.utc_now()
+    request_sha256 = LegacyResendFixture.request_sha256(queued)
+
+    {1, nil} =
+      Repo.insert_all(ProviderSubmission, [
+        %{
+          id: current.id,
+          outbound_message_id: queued.id,
+          send_method_id: nil,
+          provider: "resend",
+          canonical_sender_address: queued.canonical_sender_address,
+          idempotency_key: current.idempotency_key,
+          request_sha256: request_sha256,
+          request_payload: nil,
+          render_version: nil,
+          state: "pending",
+          attempt_count: 0,
+          provider_rfc_message_id: nil,
+          idempotency_expires_at: DateTime.add(now, 24, :hour),
+          provider_metadata: %{},
+          inserted_at: now,
+          updated_at: now
+        }
+      ])
+
+    submission = Repo.get!(ProviderSubmission, current.id)
 
     assert Repo.get(SendMethod, method.id) == nil
 
@@ -1148,7 +1268,7 @@ defmodule Manifold.Outbound.SubmissionTest do
              idempotency_expires_at: %DateTime{}
            } = submission
 
-    assert submission.request_sha256 == LegacyResendFixture.request_sha256(queued)
+    assert submission.request_sha256 == request_sha256
     queued
   end
 
@@ -1173,6 +1293,100 @@ defmodule Manifold.Outbound.SubmissionTest do
 
   defp errors_on(changeset) do
     Ecto.Changeset.traverse_errors(changeset, fn {message, _opts} -> message end)
+  end
+
+  defp explicit_request_payload(submission_id) do
+    ProviderSubmission
+    |> where([submission], submission.id == ^submission_id)
+    |> select([submission], submission.request_payload)
+    |> Repo.one!()
+  end
+
+  defp reinsert_submission!(submission, attrs) do
+    row =
+      submission
+      |> Map.from_struct()
+      |> Map.take(ProviderSubmission.__schema__(:fields))
+      |> Map.put(:request_payload, explicit_request_payload(submission.id))
+      |> Map.merge(Map.new(attrs))
+
+    Repo.delete!(submission)
+    assert {1, nil} = Repo.insert_all(ProviderSubmission, [row])
+    Repo.get!(ProviderSubmission, submission.id)
+  end
+
+  defp insert_legacy_method_submission!(provider, opts \\ []) do
+    suffix = System.unique_integer([:positive])
+    {:ok, domain} = Accounts.create_domain(%{name: "legacy-#{provider}-#{suffix}.test"})
+    {:ok, account} = Accounts.create_account(domain, %{local_part: "sender", name: "Sender"})
+    address = "sender@#{domain.normalized_domain}"
+
+    method =
+      %SendMethod{}
+      |> SendMethod.changeset(%{
+        account_id: account.id,
+        kind: provider,
+        email_address: address,
+        status: "connected",
+        enabled: true
+      })
+      |> Repo.insert!()
+
+    {:ok, draft} =
+      Outbound.create_draft(account.id, %{
+        subject: "Legacy #{provider}",
+        text_body: "Legacy body",
+        recipients: [%{kind: "to", address: "person@example.net"}]
+      })
+
+    {:ok, message} = Outbound.queue_draft(account.id, draft.id)
+    current = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+    Repo.delete!(current)
+    now = DateTime.utc_now()
+
+    row = %{
+      id: current.id,
+      outbound_message_id: message.id,
+      send_method_id: method.id,
+      provider: provider,
+      canonical_sender_address: message.canonical_sender_address,
+      idempotency_key: current.idempotency_key,
+      request_sha256: Keyword.get(opts, :request_sha256, current.request_sha256),
+      request_payload: nil,
+      render_version: nil,
+      state: "pending",
+      attempt_count: 0,
+      provider_rfc_message_id: current.provider_rfc_message_id,
+      idempotency_expires_at: nil,
+      provider_metadata: %{},
+      inserted_at: now,
+      updated_at: now
+    }
+
+    assert {1, nil} = Repo.insert_all(ProviderSubmission, [row])
+
+    %{
+      message: message,
+      method: method,
+      submission: Repo.get!(ProviderSubmission, current.id)
+    }
+  end
+
+  defp assert_snapshot_mutation_rejected(submission_id, column, value, opts \\ []) do
+    render_version_sql =
+      if Keyword.get(opts, :also_set_render_version), do: ", render_version = 1", else: ""
+
+    assert_raise Postgrex.Error, ~r/provider submission snapshot is immutable/, fn ->
+      Repo.transaction(
+        fn ->
+          Repo.query!(
+            "UPDATE provider_submissions SET #{column} = $1#{render_version_sql} WHERE id = $2",
+            [value, Ecto.UUID.dump!(submission_id)]
+          )
+        end,
+        mode: :savepoint
+      )
+    end
   end
 
   defp queued_operational_fixture(kind) do

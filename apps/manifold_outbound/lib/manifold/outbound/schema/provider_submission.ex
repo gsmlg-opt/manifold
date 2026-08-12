@@ -4,20 +4,40 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
   use Manifold.Outbound.Schema
   import Ecto.Changeset
 
-  @derive {Inspect, except: [:request_payload]}
   schema "provider_submissions" do
-    field(:outbound_message_id, :binary_id)
-    field(:send_method_id, :binary_id)
-    field(:provider, :string)
-    field(:canonical_sender_address, :string)
-    field(:idempotency_key, :string)
-    field(:request_sha256, :string)
-    field(:request_payload, :binary)
-    field(:render_version, :integer)
+    field(:outbound_message_id, :binary_id,
+      writable: :insert,
+      on_writable_violation: :raise
+    )
+
+    field(:send_method_id, :binary_id, writable: :insert, on_writable_violation: :raise)
+    field(:provider, :string, writable: :insert, on_writable_violation: :raise)
+
+    field(:canonical_sender_address, :string,
+      writable: :insert,
+      on_writable_violation: :raise
+    )
+
+    field(:idempotency_key, :string, writable: :insert, on_writable_violation: :raise)
+    field(:request_sha256, :string, writable: :insert, on_writable_violation: :raise)
+
+    field(:request_payload, :binary,
+      redact: true,
+      load_in_query: false,
+      writable: :insert,
+      on_writable_violation: :raise
+    )
+
+    field(:render_version, :integer, writable: :insert, on_writable_violation: :raise)
     field(:state, :string, default: "pending")
     field(:attempt_count, :integer, default: 0)
     field(:provider_message_id, :string)
-    field(:provider_rfc_message_id, :string)
+
+    field(:provider_rfc_message_id, :string,
+      writable: :insert,
+      on_writable_violation: :raise
+    )
+
     field(:first_attempt_at, :utc_datetime_usec)
     field(:last_attempt_at, :utc_datetime_usec)
     field(:accepted_at, :utc_datetime_usec)
@@ -31,7 +51,7 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
   end
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
-  def changeset(submission, attrs) do
+  def changeset(%__MODULE__{__meta__: %{state: :built}} = submission, attrs) do
     submission
     |> cast(attrs, [
       :outbound_message_id,
@@ -85,6 +105,12 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
     |> check_constraint(:render_version,
       name: :provider_submissions_render_version_positive
     )
+  end
+
+  def changeset(%__MODULE__{} = submission, _attrs) do
+    submission
+    |> change()
+    |> add_error(:base, "provider submission insertion changeset cannot update a snapshot")
   end
 
   defp validate_provider_shape(changeset) do

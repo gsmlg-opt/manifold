@@ -1,6 +1,8 @@
 defmodule Manifold.OutboundTest do
   use Manifold.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias Manifold.Accounts
   alias Manifold.Connectors.Schema.SendMethod
   alias Manifold.Outbound
@@ -93,7 +95,7 @@ defmodule Manifold.OutboundTest do
              provider: "gmail",
              canonical_sender_address: canonical_sender_address,
              render_version: 1,
-             request_payload: request_payload,
+             request_payload: nil,
              state: "pending",
              idempotency_key: idempotency_key,
              request_sha256: request_sha256,
@@ -105,9 +107,9 @@ defmodule Manifold.OutboundTest do
     assert canonical_sender_address == queued.canonical_sender_address
     assert provider_rfc_message_id == "<#{queued.id}@manifold.local>"
     assert byte_size(idempotency_key) > 0
-    assert is_binary(request_payload)
-
     expected_raw = expected_raw(queued, "gmail", idempotency_key)
+    request_payload = explicit_request_payload(outbound_message_id)
+    assert is_binary(request_payload)
     assert expected_raw =~ "Bcc: hidden@example.net\r\n"
     assert request_payload == expected_raw
     assert request_sha256 == sha256(expected_raw)
@@ -677,7 +679,8 @@ defmodule Manifold.OutboundTest do
     assert submission.provider == "smtp"
     assert submission.canonical_sender_address == queued.canonical_sender_address
     assert submission.render_version == 1
-    assert submission.request_payload == expected_raw
+    assert submission.request_payload == nil
+    assert explicit_request_payload(submission.id) == expected_raw
     assert submission.provider_rfc_message_id == "<#{queued.id}@manifold.local>"
     assert submission.idempotency_expires_at == nil
     refute expected_raw =~ "Bcc:"
@@ -705,9 +708,10 @@ defmodule Manifold.OutboundTest do
     assert submission.send_method_id == method.id
     assert submission.canonical_sender_address == queued.canonical_sender_address
     assert submission.render_version == 1
-    assert is_binary(submission.request_payload)
-    assert sha256(submission.request_payload) == submission.request_sha256
-    assert submission.request_payload =~ "Bcc: blind@example.net\r\n"
+    assert submission.request_payload == nil
+    request_payload = explicit_request_payload(submission.id)
+    assert sha256(request_payload) == submission.request_sha256
+    assert request_payload =~ "Bcc: blind@example.net\r\n"
     assert submission.provider_rfc_message_id == "<#{queued.id}@manifold.local>"
 
     assert [%Oban.Job{args: args}] = Repo.all(jobs_for(queued.id))
@@ -720,6 +724,81 @@ defmodule Manifold.OutboundTest do
 
     refute inspect(queued_event) =~ "blind@example.net"
     refute inspect(queued_event) =~ "Private body"
+  end
+
+  test "provider snapshot insertion emits neither MIME query telemetry nor debug logs" do
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
+    send_method_fixture(mailbox.id, address, "microsoft")
+    secret_body = "telemetry-private-body-#{System.unique_integer([:positive])}"
+    secret_bcc = "telemetry-private-bcc@example.net"
+
+    {:ok, draft} =
+      Outbound.create_draft(mailbox.id, %{
+        subject: "Telemetry-safe snapshot",
+        text_body: secret_body,
+        recipients: [
+          %{kind: "to", address: "person@example.net"},
+          %{kind: "bcc", address: secret_bcc}
+        ]
+      })
+
+    handler_id = {__MODULE__, self(), make_ref()}
+    event = Keyword.fetch!(Repo.config(), :telemetry_prefix) ++ [:query]
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        event,
+        fn _event, _measurements, metadata, pid -> send(pid, {:repo_metadata, metadata}) end,
+        self()
+      )
+
+    log =
+      try do
+        capture_log([level: :debug], fn ->
+          assert {:ok, _queued} = Outbound.queue_draft(mailbox.id, draft.id)
+        end)
+      after
+        :telemetry.detach(handler_id)
+      end
+
+    metadata = collect_repo_metadata([])
+
+    provider_insert_metadata =
+      Enum.filter(metadata, fn entry ->
+        String.contains?(entry.query, ~s(INSERT INTO "provider_submissions"))
+      end)
+
+    assert provider_insert_metadata == []
+
+    for inspected <- [log | Enum.map(provider_insert_metadata, &inspect/1)] do
+      refute inspected =~ secret_body
+      refute inspected =~ secret_bcc
+    end
+
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: draft.id)
+    assert explicit_request_payload(submission.id) =~ secret_body
+  end
+
+  test "provider payload migration uses staged validation and an immutable snapshot trigger" do
+    migration_path =
+      Path.expand(
+        "../../../manifold_data/priv/repo/migrations/20260812000300_add_microsoft_provider_payloads.exs",
+        __DIR__
+      )
+
+    migration = Manifold.Repo.Migrations.AddMicrosoftProviderPayloads
+    unless Code.ensure_loaded?(migration), do: Code.require_file(migration_path)
+
+    assert apply(migration, :__migration__, [])[:disable_ddl_transaction]
+
+    source = File.read!(migration_path)
+    assert source =~ "@backfill_batch_size 500"
+    assert source =~ ~S(LIMIT #{@backfill_batch_size})
+    assert source =~ "NOT VALID"
+    assert source =~ "VALIDATE CONSTRAINT"
+    assert source =~ "provider_submissions_snapshot_immutable"
+    assert source =~ "CREATE TRIGGER provider_submissions_freeze_snapshot"
   end
 
   test "queueing rejects a draft sender that differs from the selected method" do
@@ -1055,6 +1134,14 @@ defmodule Manifold.OutboundTest do
     end
   end
 
+  defp collect_repo_metadata(metadata) do
+    receive do
+      {:repo_metadata, entry} -> collect_repo_metadata([entry | metadata])
+    after
+      0 -> Enum.reverse(metadata)
+    end
+  end
+
   defp send_method_fixture(account_id, address, kind) do
     %SendMethod{}
     |> SendMethod.changeset(%{
@@ -1145,6 +1232,17 @@ defmodule Manifold.OutboundTest do
     from(submission in ProviderSubmission,
       where: submission.outbound_message_id == ^message_id
     )
+  end
+
+  defp explicit_request_payload(submission_or_message_id) do
+    ProviderSubmission
+    |> where(
+      [submission],
+      submission.id == ^submission_or_message_id or
+        submission.outbound_message_id == ^submission_or_message_id
+    )
+    |> select([submission], submission.request_payload)
+    |> Repo.one!()
   end
 end
 

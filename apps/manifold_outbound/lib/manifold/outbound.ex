@@ -342,7 +342,7 @@ defmodule Manifold.Outbound do
         if queue? do
           rendered
           |> submission_changeset(queued)
-          |> repo.insert()
+          |> repo.insert(log: false, telemetry_event: nil)
         else
           {:ok, repo.get_by(ProviderSubmission, outbound_message_id: queued.id)}
         end
