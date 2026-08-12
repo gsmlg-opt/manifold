@@ -189,8 +189,8 @@ defmodule Manifold.Outbound do
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
   end
 
-  @spec list_sent(Ecto.UUID.t()) :: [View.SentSummary.t()]
-  def list_sent(mailbox_id) do
+  @spec list_send_activity(Ecto.UUID.t()) :: [View.SendActivitySummary.t()]
+  def list_send_activity(mailbox_id) do
     messages =
       OutboundMessage
       |> where([message], message.mailbox_id == ^mailbox_id and message.state != "draft")
@@ -209,7 +209,7 @@ defmodule Manifold.Outbound do
       |> Enum.group_by(& &1.outbound_message_id)
 
     Enum.map(messages, fn message ->
-      %View.SentSummary{
+      %View.SendActivitySummary{
         id: message.id,
         subject: message.subject || "(No subject)",
         state: message.state,
@@ -223,9 +223,9 @@ defmodule Manifold.Outbound do
     end)
   end
 
-  @spec get_sent(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, View.SentDetail.t()} | {:error, Error.t()}
-  def get_sent(mailbox_id, outbound_message_id) do
+  @spec get_send_activity(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, View.SendActivityDetail.t()} | {:error, Error.t()}
+  def get_send_activity(mailbox_id, outbound_message_id) do
     message =
       OutboundMessage
       |> where(
@@ -246,10 +246,15 @@ defmodule Manifold.Outbound do
           |> order_by([event], asc: event.occurred_at, asc: event.id)
           |> Repo.all()
 
-        {:ok, sent_detail_view(message, submission, events)}
+        {:ok, send_activity_detail_view(message, submission, events)}
 
       nil ->
-        {:error, error(:permanent, :sent_not_found, "sent message not found in mailbox")}
+        {:error,
+         error(
+           :permanent,
+           :send_activity_not_found,
+           "send activity not found in mailbox"
+         )}
     end
   rescue
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
@@ -574,8 +579,8 @@ defmodule Manifold.Outbound do
     }
   end
 
-  defp sent_detail_view(message, submission, events) do
-    %View.SentDetail{
+  defp send_activity_detail_view(message, submission, events) do
+    %View.SendActivityDetail{
       id: message.id,
       state: message.state,
       sender_address: message.sender_address,

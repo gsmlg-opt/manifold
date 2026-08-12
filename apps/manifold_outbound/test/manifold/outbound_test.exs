@@ -5,10 +5,12 @@ defmodule Manifold.OutboundTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors.Schema.SendMethod
+  alias Manifold.Core.Error
   alias Manifold.Outbound
   alias Manifold.Outbound.Jobs.SubmitOutbound
   alias Manifold.Outbound.Provider.Envelope
   alias Manifold.Outbound.RfcMessage
+  alias Manifold.Outbound.View
 
   alias Manifold.Outbound.Schema.{
     OutboundEvent,
@@ -928,23 +930,51 @@ defmodule Manifold.OutboundTest do
              Outbound.delete_draft(other_mailbox.id, second.id)
   end
 
-  test "sent list excludes drafts and remains mailbox scoped" do
+  test "send activity lists every non-draft lifecycle state within one mailbox" do
     %{mailbox: mailbox, address: address} = mailbox_fixture()
     %{mailbox: other_mailbox, address: other_address} = mailbox_fixture()
     send_method_fixture(mailbox.id, address, "gmail")
     send_method_fixture(other_mailbox.id, other_address, "smtp")
     draft = draft_fixture(mailbox.id)
     queued = draft_fixture(mailbox.id)
+    accepted = draft_fixture(mailbox.id)
+    failed = draft_fixture(mailbox.id)
+    uncertain = draft_fixture(mailbox.id)
     other_queued = draft_fixture(other_mailbox.id)
 
     assert {:ok, queued} = Outbound.queue_draft(mailbox.id, queued.id)
+    assert {:ok, accepted} = Outbound.queue_draft(mailbox.id, accepted.id)
+    assert {:ok, failed} = Outbound.queue_draft(mailbox.id, failed.id)
+    assert {:ok, uncertain} = Outbound.queue_draft(mailbox.id, uncertain.id)
     assert {:ok, _other} = Outbound.queue_draft(other_mailbox.id, other_queued.id)
 
-    assert [summary] = Outbound.list_sent(mailbox.id)
-    assert summary.id == queued.id
-    assert summary.state == "queued"
-    assert summary.recipients == ["person@example.net"]
-    refute summary.id == draft.id
+    accepted
+    |> Ecto.Changeset.change(state: "accepted_by_provider", accepted_at: DateTime.utc_now())
+    |> Repo.update!()
+
+    failed
+    |> Ecto.Changeset.change(state: "failed")
+    |> Repo.update!()
+
+    uncertain
+    |> Ecto.Changeset.change(state: "submission_uncertain")
+    |> Repo.update!()
+
+    activity = Outbound.list_send_activity(mailbox.id)
+
+    assert Enum.all?(activity, &match?(%View.SendActivitySummary{}, &1))
+
+    assert MapSet.new(Enum.map(activity, &{&1.id, &1.state})) ==
+             MapSet.new([
+               {queued.id, "queued"},
+               {accepted.id, "accepted_by_provider"},
+               {failed.id, "failed"},
+               {uncertain.id, "submission_uncertain"}
+             ])
+
+    assert Enum.all?(activity, &(&1.recipients == ["person@example.net"]))
+    refute Enum.any?(activity, &(&1.id == draft.id))
+    refute Enum.any?(activity, &(&1.id == other_queued.id))
   end
 
   test "loads mailbox-scoped draft details through a public projection" do
@@ -966,14 +996,16 @@ defmodule Manifold.OutboundTest do
              Outbound.get_draft(other_mailbox.id, draft.id)
   end
 
-  test "loads sent detail with recipient, submission, and audit projections" do
+  test "loads send activity detail with recipient, submission, and audit projections" do
     %{mailbox: mailbox, address: address} = mailbox_fixture()
     %{mailbox: other_mailbox} = mailbox_fixture()
     send_method_fixture(mailbox.id, address, "gmail")
     draft = draft_fixture(mailbox.id)
     assert {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
 
-    assert {:ok, detail} = Outbound.get_sent(mailbox.id, queued.id)
+    assert {:ok, %View.SendActivityDetail{} = detail} =
+             Outbound.get_send_activity(mailbox.id, queued.id)
+
     assert detail.id == queued.id
     assert detail.state == "queued"
     assert detail.subject == "Ready"
@@ -982,11 +1014,11 @@ defmodule Manifold.OutboundTest do
     assert detail.submission.state == "pending"
     assert Enum.map(detail.events, & &1.event_type) == ["draft_created", "queued"]
 
-    assert {:error, %{reason: :sent_not_found}} =
-             Outbound.get_sent(other_mailbox.id, queued.id)
+    assert {:error, %Error{reason: :send_activity_not_found}} =
+             Outbound.get_send_activity(other_mailbox.id, queued.id)
 
-    assert {:error, %{reason: :sent_not_found}} =
-             Outbound.get_sent(mailbox.id, draft_fixture(mailbox.id).id)
+    assert {:error, %Error{reason: :send_activity_not_found}} =
+             Outbound.get_send_activity(mailbox.id, draft_fixture(mailbox.id).id)
   end
 
   defp draft_fixture(mailbox_id, opts \\ []) do

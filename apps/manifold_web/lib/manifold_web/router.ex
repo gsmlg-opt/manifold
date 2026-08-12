@@ -20,14 +20,22 @@ defmodule ManifoldWeb.Router do
     get("/connectors/:provider/start", ConnectorOAuthController, :start)
     get("/connectors/:provider/callback", ConnectorOAuthController, :callback)
     get("/settings", SettingsRedirectController, :redirect_general)
+    get("/mail/:mailbox_id/sent", SentRedirectController, :index)
+    get("/mail/:mailbox_id/sent/:outbound_message_id", SentRedirectController, :show)
 
     live_session :local_instance do
       live("/", MailLive.Index, :home)
       live("/mail", MailLive.Index, :home)
       live("/mail/:mailbox_id/drafts", MailLive.Index, :drafts)
       live("/mail/:mailbox_id/drafts/:draft_id/edit", MailLive.Index, :draft_edit)
-      live("/mail/:mailbox_id/sent", MailLive.Index, :sent)
-      live("/mail/:mailbox_id/sent/:outbound_message_id", MailLive.Index, :sent_detail)
+      live("/mail/:mailbox_id/send-activity", MailLive.Index, :send_activity)
+
+      live(
+        "/mail/:mailbox_id/send-activity/:outbound_message_id",
+        MailLive.Index,
+        :send_activity_detail
+      )
+
       live("/mail/:mailbox_id/folders/:folder_id", MailLive.Index, :folder)
 
       live(

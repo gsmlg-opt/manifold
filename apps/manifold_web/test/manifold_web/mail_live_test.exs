@@ -9,6 +9,7 @@ defmodule ManifoldWeb.MailLiveTest do
   alias Manifold.Connectors.Jobs.SyncAccount
   alias Manifold.Mail
   alias Manifold.Mail.Schema.{MailboxEntry, Message, Thread}
+  alias Manifold.Outbound
   alias Manifold.Repo
 
   setup do
@@ -45,6 +46,61 @@ defmodule ManifoldWeb.MailLiveTest do
     assert html =~ "Add account"
     assert html =~ "Connect an email account"
     assert html =~ ~p"/settings/accounts"
+  end
+
+  test "Sent navigation is the single projected folder link and excludes outbound activity", %{
+    conn: conn
+  } do
+    mailbox = mailbox_fixture()
+    assert {:ok, folders} = Mail.list_folders(mailbox.id)
+    inbox = Enum.find(folders, &(&1.kind == "inbox"))
+    sent = Enum.find(folders, &(&1.kind == "sent"))
+
+    projected =
+      projected_thread(mailbox, sent.id, "Projected Sent conversation", DateTime.utc_now())
+
+    address = "#{mailbox.local_part}@#{mailbox.domain.normalized_domain}"
+
+    assert {:ok, _method} =
+             Connectors.create_smtp_send_method(%{
+               account_id: mailbox.id,
+               email_address: address,
+               host: "smtp.example.test",
+               port: 465,
+               tls_mode: "tls",
+               username: address,
+               password: "secret",
+               skip_test: true
+             })
+
+    assert {:ok, draft} =
+             Outbound.create_draft(mailbox.id, %{
+               subject: "Outbound activity only",
+               text_body: "Not a projected Sent conversation",
+               recipients: [%{kind: "to", address: "person@example.net"}]
+             })
+
+    assert {:ok, _queued} = Outbound.queue_draft(mailbox.id, draft.id)
+
+    assert {:ok, view, html} = live(conn, "/mail/#{mailbox.id}/folders/#{inbox.id}")
+    assert length(Regex.scan(~r/>\s*Sent\s*</, html)) == 1
+
+    sent_path = "/mail/#{mailbox.id}/folders/#{sent.id}"
+    activity_path = "/mail/#{mailbox.id}/send-activity"
+
+    assert has_element?(view, "a.folder-link[href='#{sent_path}']", "Sent")
+    assert has_element?(view, "a.folder-link[href='#{activity_path}']", "Send activity")
+
+    view
+    |> element("a.folder-link[href='#{sent_path}']")
+    |> render_click()
+
+    assert_redirect(view, sent_path)
+
+    assert {:ok, sent_view, sent_html} = live(recycle(conn), sent_path)
+    assert sent_html =~ projected.message.subject
+    refute sent_html =~ "Outbound activity only"
+    assert has_element?(sent_view, ".conversation-row", "Projected Sent conversation")
   end
 
   test "folder header shows total count, unread filter, and sync/compose actions", %{conn: conn} do

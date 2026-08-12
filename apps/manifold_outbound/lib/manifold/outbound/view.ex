@@ -61,7 +61,7 @@ defmodule Manifold.Outbound.View.DraftSummary do
         }
 end
 
-defmodule Manifold.Outbound.View.SentSummary do
+defmodule Manifold.Outbound.View.SendActivitySummary do
   @moduledoc false
 
   @enforce_keys [:id, :subject, :state, :recipients, :queued_at, :updated_at]
@@ -102,7 +102,7 @@ defmodule Manifold.Outbound.View.Event do
   @type t :: %__MODULE__{}
 end
 
-defmodule Manifold.Outbound.View.SentDetail do
+defmodule Manifold.Outbound.View.SendActivityDetail do
   @moduledoc false
 
   @enforce_keys [

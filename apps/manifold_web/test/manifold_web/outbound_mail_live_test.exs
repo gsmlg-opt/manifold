@@ -3,7 +3,9 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
+  alias Manifold.Connectors.Schema.SendMethod
   alias Manifold.Ingest.Schema.InboundDelivery
+  alias Manifold.Mail
   alias Manifold.Mail.Schema.{MailboxEntry, Message, MessageAddress}
   alias Manifold.Outbound
   alias Manifold.Repo
@@ -62,10 +64,65 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
     |> form("#outbound-draft-form", draft_params)
     |> render_submit()
 
-    assert [sent] = Outbound.list_sent(mailbox.id)
-    assert sent.state == "queued"
-    assert_live_redirect(view, ~p"/mail/#{mailbox.id}/sent/#{sent.id}")
+    assert [activity] = Outbound.list_send_activity(mailbox.id)
+    assert activity.state == "queued"
+
+    activity_path = "/mail/#{mailbox.id}/send-activity/#{activity.id}"
+    assert_live_redirect(view, activity_path)
     assert Outbound.list_drafts(mailbox.id) == []
+
+    assert {:ok, activity_list, list_html} =
+             live(recycle(conn), "/mail/#{mailbox.id}/send-activity")
+
+    assert list_html =~ "Persisted draft"
+    assert list_html =~ "Queued"
+    assert has_element?(activity_list, "section[aria-label='Send activity'] h1", "Send activity")
+
+    assert {:ok, activity_detail, detail_html} = live(recycle(conn), activity_path)
+    assert detail_html =~ "Persisted draft"
+    assert detail_html =~ "Queued"
+
+    assert has_element?(
+             activity_detail,
+             "article[aria-label='Send activity detail']",
+             "Persisted draft"
+           )
+  end
+
+  test "send-only Microsoft acceptance stays out of projected Sent", %{conn: conn} do
+    mailbox = mailbox_fixture()
+    add_microsoft_send_method(mailbox)
+    assert Connectors.list_receive_methods_for_account(mailbox.id) == []
+
+    assert {:ok, folders} = Mail.list_folders(mailbox.id)
+    sent_folder = Enum.find(folders, &(&1.kind == "sent"))
+
+    assert {:ok, draft} =
+             Outbound.create_draft(mailbox.id, %{
+               subject: "Accepted by Microsoft only",
+               text_body: "Waiting for authoritative projection",
+               recipients: [%{kind: "to", address: "person@example.net"}]
+             })
+
+    assert {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
+
+    queued
+    |> Ecto.Changeset.change(state: "accepted_by_provider", accepted_at: DateTime.utc_now())
+    |> Repo.update!()
+
+    assert {:ok, activity_view, activity_html} =
+             live(conn, "/mail/#{mailbox.id}/send-activity/#{queued.id}")
+
+    assert activity_html =~ "Accepted by Microsoft only"
+    assert has_element?(activity_view, ".delivery-status", "Provider accepted")
+
+    assert {:ok, %{items: []}} = Mail.list_conversations(mailbox.id, sent_folder.id)
+
+    assert {:ok, sent_view, sent_html} =
+             live(recycle(conn), "/mail/#{mailbox.id}/folders/#{sent_folder.id}")
+
+    refute sent_html =~ "Accepted by Microsoft only"
+    assert has_element?(sent_view, ".empty-folder", "No messages in this folder")
   end
 
   test "draft routes are mailbox scoped", %{conn: conn} do
@@ -97,7 +154,7 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
 
     assert html =~ "invalid-address"
     assert [_draft] = Outbound.list_drafts(mailbox.id)
-    assert Outbound.list_sent(mailbox.id) == []
+    assert Outbound.list_send_activity(mailbox.id) == []
   end
 
   test "missing send method preserves the saved draft and links account setup", %{conn: conn} do
@@ -182,6 +239,20 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
                password: "secret",
                skip_test: true
              })
+  end
+
+  defp add_microsoft_send_method(mailbox) do
+    address = "#{mailbox.local_part}@#{mailbox.domain.normalized_domain}"
+
+    %SendMethod{}
+    |> SendMethod.changeset(%{
+      account_id: mailbox.id,
+      kind: "microsoft",
+      email_address: address,
+      status: "connected",
+      enabled: true
+    })
+    |> Repo.insert!()
   end
 
   defp reply_source_fixture(mailbox) do

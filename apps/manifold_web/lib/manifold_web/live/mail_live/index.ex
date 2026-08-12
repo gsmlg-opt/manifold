@@ -28,11 +28,11 @@ defmodule ManifoldWeb.MailLive.Index do
        conversation: nil,
        mail_view: :folder,
        drafts: [],
-       sent_items: [],
+       send_activity_items: [],
        draft: nil,
        draft_params: nil,
        send_method_required: false,
-       sent_detail: nil,
+       send_activity_detail: nil,
        query: "",
        unread_only: false,
        after_cursor: nil,
@@ -68,11 +68,11 @@ defmodule ManifoldWeb.MailLive.Index do
            conversation: nil,
            mail_view: :folder,
            drafts: [],
-           sent_items: [],
+           send_activity_items: [],
            draft: nil,
            draft_params: nil,
            send_method_required: false,
-           sent_detail: nil,
+           send_activity_detail: nil,
            query: "",
            unread_only: false,
            after_cursor: nil
@@ -98,11 +98,11 @@ defmodule ManifoldWeb.MailLive.Index do
             conversation: loaded.conversation,
             mail_view: loaded.mail_view,
             drafts: loaded.drafts,
-            sent_items: loaded.sent_items,
+            send_activity_items: loaded.send_activity_items,
             draft: loaded.draft,
             draft_params: draft_form_params(loaded.draft),
             send_method_required: false,
-            sent_detail: loaded.sent_detail,
+            send_activity_detail: loaded.send_activity_detail,
             query: loaded.query,
             unread_only: loaded.unread_only,
             after_cursor: loaded.after_cursor,
@@ -238,7 +238,9 @@ defmodule ManifoldWeb.MailLive.Index do
             {:noreply,
              socket
              |> put_flash(:info, "Message queued for delivery.")
-             |> push_navigate(to: ~p"/mail/#{socket.assigns.mailbox.id}/sent/#{queued.id}")}
+             |> push_navigate(
+               to: ~p"/mail/#{socket.assigns.mailbox.id}/send-activity/#{queued.id}"
+             )}
 
           {:error, %Error{reason: :send_method_required}} ->
             {:noreply,
@@ -449,9 +451,9 @@ defmodule ManifoldWeb.MailLive.Index do
          page: page,
          conversation: conversation,
          drafts: Outbound.list_drafts(mailbox.id),
-         sent_items: [],
+         send_activity_items: [],
          draft: nil,
-         sent_detail: nil,
+         send_activity_detail: nil,
          query: query,
          unread_only: unread_only,
          after_cursor: after_cursor,
@@ -489,23 +491,23 @@ defmodule ManifoldWeb.MailLive.Index do
     end
   end
 
-  defp load_view(mailbox, :sent, _params) do
+  defp load_view(mailbox, :send_activity, _params) do
     with {:ok, folders} <- Mail.list_folders(mailbox.id) do
       {:ok,
-       outbound_view(:sent, folders,
-         sent_items: Outbound.list_sent(mailbox.id),
-         page_title: "Sent"
+       outbound_view(:send_activity, folders,
+         send_activity_items: Outbound.list_send_activity(mailbox.id),
+         page_title: "Send activity"
        )}
     end
   end
 
-  defp load_view(mailbox, :sent_detail, %{"outbound_message_id" => message_id}) do
+  defp load_view(mailbox, :send_activity_detail, %{"outbound_message_id" => message_id}) do
     with {:ok, folders} <- Mail.list_folders(mailbox.id),
-         {:ok, detail} <- Outbound.get_sent(mailbox.id, message_id) do
+         {:ok, detail} <- Outbound.get_send_activity(mailbox.id, message_id) do
       {:ok,
-       outbound_view(:sent_detail, folders,
-         sent_items: Outbound.list_sent(mailbox.id),
-         sent_detail: detail,
+       outbound_view(:send_activity_detail, folders,
+         send_activity_items: Outbound.list_send_activity(mailbox.id),
+         send_activity_detail: detail,
          page_title: detail.subject
        )}
     end
@@ -520,9 +522,9 @@ defmodule ManifoldWeb.MailLive.Index do
         page: %{items: [], next_cursor: nil},
         conversation: nil,
         drafts: [],
-        sent_items: [],
+        send_activity_items: [],
         draft: nil,
-        sent_detail: nil,
+        send_activity_detail: nil,
         query: "",
         unread_only: false,
         after_cursor: nil,
@@ -728,9 +730,14 @@ defmodule ManifoldWeb.MailLive.Index do
   defp reload_outbound(socket) do
     params =
       case socket.assigns.mail_view do
-        :draft_edit -> %{"draft_id" => socket.assigns.draft.id}
-        :sent_detail -> %{"outbound_message_id" => socket.assigns.sent_detail.id}
-        _other -> %{}
+        :draft_edit ->
+          %{"draft_id" => socket.assigns.draft.id}
+
+        :send_activity_detail ->
+          %{"outbound_message_id" => socket.assigns.send_activity_detail.id}
+
+        _other ->
+          %{}
       end
 
     case load_view(socket.assigns.mailbox, socket.assigns.live_action, params) do
@@ -738,9 +745,9 @@ defmodule ManifoldWeb.MailLive.Index do
         assign(socket,
           folders: loaded.folders,
           drafts: loaded.drafts,
-          sent_items: loaded.sent_items,
+          send_activity_items: loaded.send_activity_items,
           draft: loaded.draft,
-          sent_detail: loaded.sent_detail
+          send_activity_detail: loaded.send_activity_detail
         )
 
       {:error, _reason} ->
@@ -885,7 +892,7 @@ defmodule ManifoldWeb.MailLive.Index do
     <section class={[
       "webmail",
       @conversation && "reader-open",
-      @mail_view in [:draft_edit, :sent_detail] && "reader-open",
+      @mail_view in [:draft_edit, :send_activity_detail] && "reader-open",
       @mail_view == :draft_edit && "compose-open"
     ]}>
       <aside class="mail-folders" aria-label="Mailbox folders">
@@ -941,11 +948,14 @@ defmodule ManifoldWeb.MailLive.Index do
             <span :if={length(@drafts) > 0} class="folder-count">{length(@drafts)}</span>
           </.link>
           <.link
-            navigate={~p"/mail/#{@mailbox.id}/sent"}
-            class={["folder-link", @mail_view in [:sent, :sent_detail] && "is-current"]}
+            navigate={~p"/mail/#{@mailbox.id}/send-activity"}
+            class={[
+              "folder-link",
+              @mail_view in [:send_activity, :send_activity_detail] && "is-current"
+            ]}
           >
             <.dm_mdi name="send-outline" class="folder-icon" />
-            <span>Sent</span>
+            <span>Send activity</span>
           </.link>
           <.link
             :for={folder <- @folders}
@@ -954,9 +964,12 @@ defmodule ManifoldWeb.MailLive.Index do
           >
             <.dm_mdi
               name={
-                %{"inbox" => "inbox", "archive" => "archive", "trash" => "trash-can-outline"}[
-                  folder.kind
-                ] || "folder-outline"
+                %{
+                  "inbox" => "inbox",
+                  "archive" => "archive",
+                  "sent" => "send-outline",
+                  "trash" => "trash-can-outline"
+                }[folder.kind] || "folder-outline"
               }
               class="folder-icon"
             />
@@ -1155,27 +1168,27 @@ defmodule ManifoldWeb.MailLive.Index do
       </section>
 
       <section
-        :if={@mailbox && @mail_view in [:sent, :sent_detail]}
+        :if={@mailbox && @mail_view in [:send_activity, :send_activity_detail]}
         class="conversation-list outbound-list"
-        aria-label="Sent messages"
+        aria-label="Send activity"
       >
         <header class="conversation-list-header">
           <div>
-            <h1>Sent</h1>
+            <h1>Send activity</h1>
             <span class="mailbox-address">{mailbox_label(@mailbox)}</span>
           </div>
         </header>
-        <div :if={@sent_items == []} class="empty-folder">
+        <div :if={@send_activity_items == []} class="empty-folder">
           <.dm_mdi name="send-outline" class="empty-icon" />
-          <p>No sent messages</p>
+          <p>No send activity</p>
         </div>
         <nav class="conversation-items">
           <.link
-            :for={item <- @sent_items}
-            navigate={~p"/mail/#{@mailbox.id}/sent/#{item.id}"}
+            :for={item <- @send_activity_items}
+            navigate={~p"/mail/#{@mailbox.id}/send-activity/#{item.id}"}
             class={[
               "conversation-row",
-              @sent_detail && item.id == @sent_detail.id && "is-selected"
+              @send_activity_detail && item.id == @send_activity_detail.id && "is-selected"
             ]}
           >
             <div class="conversation-primary">
@@ -1275,42 +1288,42 @@ defmodule ManifoldWeb.MailLive.Index do
       </article>
 
       <article
-        :if={@mailbox && @mail_view == :sent_detail && @sent_detail}
+        :if={@mailbox && @mail_view == :send_activity_detail && @send_activity_detail}
         class="mail-reader sent-reader"
-        aria-label="Sent message"
+        aria-label="Send activity detail"
       >
         <header class="reader-header">
           <.link
-            navigate={~p"/mail/#{@mailbox.id}/sent"}
+            navigate={~p"/mail/#{@mailbox.id}/send-activity"}
             class="reader-back"
-            aria-label="Back to sent messages"
+            aria-label="Back to Send activity"
           >
             <.dm_mdi name="arrow-left" class="mail-icon" />
           </.link>
-          <h2>{@sent_detail.subject}</h2>
-          <span class={["delivery-status", "state-#{@sent_detail.state}"]}>
-            {outbound_state_label(@sent_detail.state)}
+          <h2>{@send_activity_detail.subject}</h2>
+          <span class={["delivery-status", "state-#{@send_activity_detail.state}"]}>
+            {outbound_state_label(@send_activity_detail.state)}
           </span>
         </header>
         <div class="sent-message">
           <dl class="sent-envelope">
             <div>
-              <dt>From</dt><dd>{@sent_detail.sender_address}</dd>
+              <dt>From</dt><dd>{@send_activity_detail.sender_address}</dd>
             </div>
-            <div :for={{kind, recipients} <- grouped_recipients(@sent_detail.recipients)}>
+            <div :for={{kind, recipients} <- grouped_recipients(@send_activity_detail.recipients)}>
               <dt>{String.upcase(kind)}</dt>
               <dd>{Enum.map_join(recipients, ", ", & &1.address)}</dd>
             </div>
           </dl>
-          <pre class="sent-body">{@sent_detail.text_body || ""}</pre>
+          <pre class="sent-body">{@send_activity_detail.text_body || ""}</pre>
           <section class="delivery-timeline" aria-label="Delivery status">
             <h3>Delivery status</h3>
-            <div :for={recipient <- @sent_detail.recipients} class="recipient-status">
+            <div :for={recipient <- @send_activity_detail.recipients} class="recipient-status">
               <span>{recipient.address}</span>
               <strong>{outbound_state_label(recipient.delivery_state)}</strong>
             </div>
             <ol>
-              <li :for={event <- @sent_detail.events}>
+              <li :for={event <- @send_activity_detail.events}>
                 <.datetime value={event.occurred_at} />
                 <span>{outbound_event_label(event.event_type)}</span>
               </li>
@@ -1442,7 +1455,7 @@ defmodule ManifoldWeb.MailLive.Index do
         :if={
           @mailbox &&
             ((@mail_view == :folder && is_nil(@conversation)) ||
-               @mail_view in [:drafts, :sent])
+               @mail_view in [:drafts, :send_activity])
         }
         class="reader-placeholder"
       >
@@ -1450,7 +1463,7 @@ defmodule ManifoldWeb.MailLive.Index do
         <p>
           {case @mail_view do
             :drafts -> "Select a draft to edit it"
-            :sent -> "Select a sent message"
+            :send_activity -> "Select an activity record"
             _folder -> "Select a conversation to read it"
           end}
         </p>
