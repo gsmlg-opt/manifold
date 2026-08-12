@@ -6,7 +6,14 @@ defmodule Manifold.Connectors.MicrosoftFolderMapping do
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.FolderMapping
   alias Manifold.Connectors.RemoteStateJobs
-  alias Manifold.Connectors.Schema.{ReceiveMethod, RemoteMessage, SyncCursor}
+
+  alias Manifold.Connectors.Schema.{
+    OAuthAuthorization,
+    ReceiveMethod,
+    RemoteMessage,
+    SyncCursor
+  }
+
   alias Manifold.Core.Error
   alias Manifold.Repo
 
@@ -40,9 +47,11 @@ defmodule Manifold.Connectors.MicrosoftFolderMapping do
           if current?(folders_cursor, cursors) do
             {:ok, selected_cursor, 0, 0, :current}
           else
-            with {:ok, %FolderMapping{version: @mapping_version} = mapping} <-
+            with {:ok, snapshot} <-
+                   lifecycle_snapshot(receive_method, selected_cursor.id, cursors),
+                 {:ok, %FolderMapping{version: @mapping_version} = mapping} <-
                    adapter.resolve_folder_mapping(access_token, config, opts) do
-              reconcile(receive_method, selected_cursor.id, mapping)
+              reconcile(receive_method, selected_cursor.id, mapping, snapshot)
             else
               {:ok, %FolderMapping{}} -> {:error, invalid_mapping_error()}
               {:error, reason} -> {:error, reason}
@@ -95,13 +104,15 @@ defmodule Manifold.Connectors.MicrosoftFolderMapping do
     _error in Postgrex.Error -> {:error, database_error()}
   end
 
-  defp reconcile(receive_method, selected_cursor_id, mapping) do
+  defp reconcile(receive_method, selected_cursor_id, mapping, snapshot) do
     Repo.transaction(fn ->
+      authorization = lock_authorization(snapshot.authorization.id)
       cursors = lock_cursors(receive_method.id)
 
       with {:ok, folders_cursor} <- folders_cursor(cursors),
            {:ok, _selected_cursor} <- selected_cursor(cursors, selected_cursor_id),
-           {:ok, _locked_method} <- lock_active_method(receive_method.id) do
+           {:ok, locked_method} <- lock_active_method(receive_method.id),
+           :ok <- validate_lifecycle_snapshot(authorization, locked_method, cursors, snapshot) do
         if current?(folders_cursor, cursors) do
           {Repo.get!(SyncCursor, selected_cursor_id), 0, 0, :current}
         else
@@ -134,12 +145,33 @@ defmodule Manifold.Connectors.MicrosoftFolderMapping do
     {:ok, cursors}
   end
 
+  defp lifecycle_snapshot(receive_method, selected_cursor_id, cursors) do
+    with {:ok, _selected_cursor} <- selected_cursor(cursors, selected_cursor_id),
+         {:ok, method} <- active_method(receive_method.id),
+         :ok <- validate_input_method(receive_method, method),
+         {:ok, authorization} <- active_authorization(method) do
+      {:ok,
+       %{
+         authorization: authorization_snapshot(authorization),
+         method: method_snapshot(method),
+         cursors: Enum.map(cursors, &cursor_snapshot/1)
+       }}
+    end
+  end
+
   defp lock_cursors(receive_method_id) do
     SyncCursor
     |> where([cursor], cursor.external_account_id == ^receive_method_id)
     |> order_by([cursor], asc: cursor.id)
     |> lock("FOR UPDATE")
     |> Repo.all()
+  end
+
+  defp lock_authorization(authorization_id) do
+    OAuthAuthorization
+    |> where([authorization], authorization.id == ^authorization_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
   end
 
   defp folders_cursor(cursors) do
@@ -157,12 +189,20 @@ defmodule Manifold.Connectors.MicrosoftFolderMapping do
   end
 
   defp lock_active_method(receive_method_id) do
-    method =
-      ReceiveMethod
-      |> where([receive_method], receive_method.id == ^receive_method_id)
-      |> lock("FOR UPDATE")
-      |> Repo.one()
+    ReceiveMethod
+    |> where([receive_method], receive_method.id == ^receive_method_id)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+    |> validate_active_method()
+  end
 
+  defp active_method(receive_method_id) do
+    receive_method_id
+    |> then(&Repo.get(ReceiveMethod, &1))
+    |> validate_active_method()
+  end
+
+  defp validate_active_method(method) do
     case method do
       %ReceiveMethod{
         kind: "microsoft",
@@ -176,6 +216,83 @@ defmodule Manifold.Connectors.MicrosoftFolderMapping do
       _changed_or_missing ->
         {:error, lifecycle_changed_error()}
     end
+  end
+
+  defp active_authorization(%ReceiveMethod{oauth_authorization_id: authorization_id} = method)
+       when is_binary(authorization_id) do
+    case Repo.get(OAuthAuthorization, authorization_id) do
+      %OAuthAuthorization{
+        id: ^authorization_id,
+        account_id: account_id,
+        provider: "microsoft",
+        status: "connected"
+      } = authorization
+      when account_id == method.account_id ->
+        {:ok, authorization}
+
+      _changed_or_missing ->
+        {:error, lifecycle_changed_error()}
+    end
+  end
+
+  defp active_authorization(_method), do: {:error, lifecycle_changed_error()}
+
+  defp validate_input_method(receive_method, current_method) do
+    if method_snapshot(receive_method) == method_snapshot(current_method) do
+      :ok
+    else
+      {:error, lifecycle_changed_error()}
+    end
+  end
+
+  defp validate_lifecycle_snapshot(authorization, method, cursors, snapshot) do
+    if authorization_snapshot(authorization) == snapshot.authorization and
+         method_snapshot(method) == snapshot.method and
+         Enum.map(cursors, &cursor_snapshot/1) == snapshot.cursors do
+      :ok
+    else
+      {:error, lifecycle_changed_error()}
+    end
+  end
+
+  defp authorization_snapshot(%OAuthAuthorization{} = authorization) do
+    Map.take(authorization, [
+      :id,
+      :account_id,
+      :provider,
+      :provider_subject_id,
+      :email_address,
+      :status,
+      :lock_version
+    ])
+  end
+
+  defp authorization_snapshot(_authorization), do: nil
+
+  defp method_snapshot(%ReceiveMethod{} = method) do
+    Map.take(method, [
+      :id,
+      :account_id,
+      :oauth_authorization_id,
+      :kind,
+      :provider_account_id,
+      :email_address,
+      :status,
+      :enabled,
+      :sync_enabled,
+      :lock_version
+    ])
+  end
+
+  defp cursor_snapshot(%SyncCursor{} = cursor) do
+    Map.take(cursor, [
+      :id,
+      :external_account_id,
+      :scope,
+      :metadata,
+      :generation,
+      :lock_version
+    ])
   end
 
   defp current?(folders_cursor, cursors) do

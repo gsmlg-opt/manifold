@@ -3,7 +3,14 @@ defmodule Manifold.Connectors.SyncTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
-  alias Manifold.Connectors.{Crypto, MicrosoftFolderMapping, MicrosoftScopes}
+
+  alias Manifold.Connectors.{
+    Crypto,
+    MicrosoftFolderMapping,
+    MicrosoftScopes,
+    RemoteStateJobs
+  }
+
   alias Manifold.Connectors.Jobs.{ApplyRemoteState, PollAccounts, SyncAccount}
   alias Manifold.Connectors.OAuth.Consumed
 
@@ -43,13 +50,14 @@ defmodule Manifold.Connectors.SyncTest do
     def exchange_code("valid-code", "verifier", _redirect_uri, _config, opts) do
       now = Keyword.get(opts, :now, DateTime.utc_now())
 
-      {:ok,
-       %Token{
-         access_token: "initial-access",
-         refresh_token: "initial-refresh",
-         expires_at: DateTime.add(now, 3_600, :second),
-         scopes: ["openid", "email", "https://www.googleapis.com/auth/gmail.readonly"]
-       }}
+      Keyword.get(opts, :exchange_result) ||
+        {:ok,
+         %Token{
+           access_token: "initial-access",
+           refresh_token: "initial-refresh",
+           expires_at: DateTime.add(now, 3_600, :second),
+           scopes: ["openid", "email", "https://www.googleapis.com/auth/gmail.readonly"]
+         }}
     end
 
     @impl true
@@ -68,7 +76,13 @@ defmodule Manifold.Connectors.SyncTest do
 
     @impl true
     def identity("initial-access", _config, opts) do
-      {:ok, %Identity{id: "sync-account", email_address: Keyword.fetch!(opts, :identity_address)}}
+      Keyword.get(opts, :identity_result) ||
+        {:ok,
+         %Identity{id: "sync-account", email_address: Keyword.fetch!(opts, :identity_address)}}
+    end
+
+    def identity(_access_token, _config, opts) do
+      Keyword.fetch!(opts, :identity_result)
     end
 
     @impl true
@@ -77,25 +91,43 @@ defmodule Manifold.Connectors.SyncTest do
     end
 
     @impl true
-    def resolve_folder_mapping(access_token, _config, _opts) do
-      Process.put(:folder_mapping_count, Process.get(:folder_mapping_count, 0) + 1)
-      send(self(), {:folder_mapping_access_token, access_token})
+    def resolve_folder_mapping(access_token, _config, opts) do
+      case Keyword.get(opts, :folder_mapping_gate) do
+        nil ->
+          Process.put(:folder_mapping_count, Process.get(:folder_mapping_count, 0) + 1)
+          send(self(), {:folder_mapping_access_token, access_token})
 
-      Process.get(:folder_mapping_result) ||
-        {:ok,
-         %FolderMapping{
-           version: 1,
-           kinds_by_id: %{
-             "folder-inbox" => "inbox",
-             "folder-deleted" => "trash",
-             "folder-sent" => "sent"
-           }
-         }}
+          Process.get(:folder_mapping_result) ||
+            {:ok,
+             %FolderMapping{
+               version: 1,
+               kinds_by_id: %{
+                 "folder-inbox" => "inbox",
+                 "folder-deleted" => "trash",
+                 "folder-sent" => "sent"
+               }
+             }}
+
+        gate ->
+          test_pid = Keyword.fetch!(opts, :test_pid)
+          send(test_pid, {:folder_mapping_started, self(), gate, access_token})
+
+          receive do
+            {:release_folder_mapping, ^gate, %FolderMapping{} = mapping} -> {:ok, mapping}
+          end
+      end
     end
 
     @impl true
-    def sync_page(access_token, cursor, _config, _opts) do
+    def sync_page(access_token, cursor, _config, opts) do
       send(self(), {:sync_access_token, access_token})
+
+      if test_pid = Keyword.get(opts, :test_pid) do
+        send(
+          test_pid,
+          {:sync_page_called, Keyword.get(opts, :folder_mapping_gate), access_token, cursor}
+        )
+      end
 
       case Process.get(:sync_page_result) do
         nil ->
@@ -136,6 +168,8 @@ defmodule Manifold.Connectors.SyncTest do
   end
 
   setup %{tmp_dir: tmp_dir} do
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+
     old_key = Application.get_env(:manifold_connectors, :encryption_key)
     old_adapters = Application.get_env(:manifold_connectors, :adapters)
     old_providers = Application.get_env(:manifold_connectors, :providers)
@@ -607,6 +641,55 @@ defmodule Manifold.Connectors.SyncTest do
     assert Process.get(:raw_fetch_count) == 0
   end
 
+  test "Microsoft repair queues one successor behind an executing remote-state job", %{
+    account: account,
+    cursor: cursor,
+    mailbox: mailbox
+  } do
+    fixture = upgraded_microsoft_fixture!(account, cursor, mailbox)
+    remote = fixture.remotes.inbox
+
+    executing =
+      remote.id
+      |> then(&ApplyRemoteState.new(%{"remote_message_id" => &1}))
+      |> Repo.insert!()
+
+    {1, nil} =
+      Oban.Job
+      |> where([job], job.id == ^executing.id)
+      |> Repo.update_all(set: [state: "executing"])
+
+    assert {:ok, %SyncCursor{}} =
+             MicrosoftFolderMapping.ensure_current(
+               Repo.get!(ReceiveMethod, fixture.account.id),
+               fixture.selected,
+               "initial-access",
+               FakeProvider,
+               [],
+               []
+             )
+
+    assert Repo.get!(Oban.Job, executing.id).state == "executing"
+
+    assert [%Oban.Job{} = successor] = queued_remote_state_jobs(remote.id)
+    assert successor.id != executing.id
+
+    assert %Oban.Job{id: successor_id} = RemoteStateJobs.ensure(remote.id)
+    assert successor_id == successor.id
+    assert [^successor] = queued_remote_state_jobs(remote.id)
+
+    archive = Manifold.Mail.Folders.get_system(mailbox.id, "archive")
+    inbox = Manifold.Mail.Folders.get_system(mailbox.id, "inbox")
+
+    assert Repo.get_by!(MailboxEntry, inbound_delivery_id: remote.inbound_delivery_id).folder_id ==
+             archive.id
+
+    assert :ok = ApplyRemoteState.perform(successor)
+
+    assert Repo.get_by!(MailboxEntry, inbound_delivery_id: remote.inbound_delivery_id).folder_id ==
+             inbox.id
+  end
+
   test "Microsoft reset metadata forces mapping resolution before the selected page", %{
     account: account,
     cursor: cursor
@@ -682,6 +765,128 @@ defmodule Manifold.Connectors.SyncTest do
     refute_receive {:sync_access_token, "initial-access"}
     assert Repo.get!(SyncCursor, cursor.id).committed_cursor == cursor.committed_cursor
     assert Repo.get!(ReceiveMethod, microsoft.id).last_error_code == "rate_limited"
+  end
+
+  test "Microsoft reconnect fences an in-flight mapping result before the provider page", %{
+    account: account,
+    cursor: cursor,
+    mailbox: mailbox
+  } do
+    microsoft = convert_to_microsoft!(account)
+    authorization = Repo.get!(OAuthAuthorization, microsoft.oauth_authorization_id)
+
+    stale_cursor =
+      cursor
+      |> Repo.reload!()
+      |> SyncCursor.changeset(%{
+        metadata: %{
+          "folder_kinds_by_id" => %{"folder-inbox" => "archive"},
+          "folder_mapping_refresh_required" => true
+        }
+      })
+      |> Repo.update!()
+
+    stale_gate = make_ref()
+    test_pid = self()
+
+    stale_sync =
+      Task.async(fn ->
+        Connectors.sync_account(microsoft.id,
+          provider_opts: [test_pid: test_pid, folder_mapping_gate: stale_gate]
+        )
+      end)
+
+    assert_receive {:folder_mapping_started, resolver_pid, ^stale_gate, "initial-access"}, 5_000
+
+    assert {:ok, _authorization} =
+             Connectors.mark_oauth_reconnect_required(
+               authorization.id,
+               %Error{
+                 class: :reconnect,
+                 code: :invalid_grant,
+                 message: "provider reconnect required"
+               }
+             )
+
+    required_scopes = Enum.sort([MicrosoftScopes.read(), MicrosoftScopes.offline()])
+
+    consumed = %Consumed{
+      provider: "microsoft",
+      mailbox_id: mailbox.id,
+      purpose: :receive,
+      required_scopes: required_scopes,
+      redirect_uri: "https://mail.example.test/connectors/microsoft/callback",
+      pkce_verifier: "verifier"
+    }
+
+    reconnect_token = %Token{
+      access_token: "reconnected-access",
+      refresh_token: "reconnected-refresh",
+      expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
+      scopes: [MicrosoftScopes.read()]
+    }
+
+    reconnect_identity = %Identity{
+      id: "sync-account",
+      email_address: Accounts.account_address(mailbox)
+    }
+
+    assert {:ok, %ReceiveMethod{id: method_id, status: "connected"}} =
+             Connectors.complete_authorization(
+               "microsoft",
+               "valid-code",
+               consumed,
+               provider_opts: [
+                 exchange_result: {:ok, reconnect_token},
+                 identity_result: {:ok, reconnect_identity}
+               ]
+             )
+
+    assert method_id == microsoft.id
+
+    invalidated = Repo.get!(SyncCursor, stale_cursor.id)
+    assert invalidated.metadata["folder_mapping_refresh_required"]
+    refute Map.has_key?(invalidated.metadata, "folder_mapping_version")
+
+    stale_mapping = %FolderMapping{
+      version: 1,
+      kinds_by_id: %{"folder-inbox" => "archive"}
+    }
+
+    send(resolver_pid, {:release_folder_mapping, stale_gate, stale_mapping})
+
+    assert {:snooze, 1} = Task.await(stale_sync, 5_000)
+    refute_receive {:sync_page_called, ^stale_gate, _access_token, _cursor}, 100
+
+    after_stale = Repo.get!(SyncCursor, stale_cursor.id)
+    assert after_stale.metadata["folder_mapping_refresh_required"]
+    refute Map.has_key?(after_stale.metadata, "folder_mapping_version")
+
+    fresh_gate = make_ref()
+
+    fresh_sync =
+      Task.async(fn ->
+        Connectors.sync_account(microsoft.id,
+          provider_opts: [test_pid: test_pid, folder_mapping_gate: fresh_gate]
+        )
+      end)
+
+    assert_receive {:folder_mapping_started, fresh_resolver_pid, ^fresh_gate,
+                    "reconnected-access"},
+                   5_000
+
+    fresh_mapping = %FolderMapping{
+      version: 1,
+      kinds_by_id: %{"folder-inbox" => "inbox"}
+    }
+
+    send(fresh_resolver_pid, {:release_folder_mapping, fresh_gate, fresh_mapping})
+
+    assert_receive {:sync_page_called, ^fresh_gate, "reconnected-access", page_cursor}, 5_000
+    assert page_cursor.metadata["folder_mapping_version"] == 1
+    assert page_cursor.metadata["folder_kinds_by_id"] == %{"folder-inbox" => "inbox"}
+    refute Map.has_key?(page_cursor.metadata, "folder_mapping_refresh_required")
+    assert :ok = Task.await(fresh_sync, 5_000)
   end
 
   test "Microsoft reconnect errors pause the shared authorization and both methods", %{
@@ -1340,6 +1545,18 @@ defmodule Manifold.Connectors.SyncTest do
     |> Repo.aggregate(:count)
   end
 
+  defp queued_remote_state_jobs(remote_message_id) do
+    Oban.Job
+    |> where([job], job.worker == ^inspect(ApplyRemoteState))
+    |> where([job], job.state in ~w(available scheduled retryable suspended))
+    |> where(
+      [job],
+      fragment("?->>'remote_message_id' = ?", job.args, ^remote_message_id)
+    )
+    |> order_by([job], asc: job.id)
+    |> Repo.all()
+  end
+
   defp attach_folder_mapping_stop do
     handler_id = "microsoft-folder-mapping-stop-#{System.unique_integer([:positive])}"
     test_pid = self()
@@ -1492,4 +1709,114 @@ defmodule Manifold.Connectors.SyncTest do
 
   defp restore_env(app, key, nil), do: Application.delete_env(app, key)
   defp restore_env(app, key, value), do: Application.put_env(app, key, value)
+end
+
+defmodule Manifold.Connectors.RemoteStateJobsConcurrencyTest do
+  use ExUnit.Case, async: false
+
+  import Ecto.Query
+
+  alias Ecto.Adapters.SQL.Sandbox
+  alias Manifold.Connectors.Jobs.ApplyRemoteState
+  alias Manifold.Connectors.RemoteStateJobs
+  alias Manifold.Repo
+
+  setup do
+    :ok = Sandbox.checkout(Repo, sandbox: false)
+
+    oban_opts =
+      :manifold_data
+      |> Application.fetch_env!(Oban)
+      |> Keyword.put(:testing, :disabled)
+      |> Keyword.put(:queues, [])
+      |> Keyword.put(:plugins, [])
+      |> Keyword.put(:peer, {Oban.Peers.Isolated, leader?: false})
+      |> Keyword.put(:stage_interval, :infinity)
+
+    start_supervised!({Oban, oban_opts})
+
+    remote_message_id = Ecto.UUID.generate()
+
+    on_exit(fn ->
+      :ok = Sandbox.checkout(Repo, sandbox: false)
+
+      try do
+        delete_remote_state_jobs(remote_message_id)
+      after
+        Sandbox.checkin(Repo)
+      end
+    end)
+
+    {:ok, remote_message_id: remote_message_id}
+  end
+
+  test "concurrent ensures persist one queued job", %{remote_message_id: remote_message_id} do
+    test_pid = self()
+    gate = make_ref()
+
+    tasks =
+      for _index <- 1..20 do
+        Task.async(fn ->
+          send(test_pid, {:remote_state_ensure_ready, self(), gate})
+
+          receive do
+            {:ensure_remote_state, ^gate} -> :ok
+          end
+
+          :ok = Sandbox.checkout(Repo, sandbox: false)
+
+          try do
+            RemoteStateJobs.ensure(remote_message_id)
+          after
+            Sandbox.checkin(Repo)
+          end
+        end)
+      end
+
+    caller_pids =
+      for _index <- 1..20 do
+        assert_receive {:remote_state_ensure_ready, caller_pid, ^gate}, 5_000
+        caller_pid
+      end
+
+    Enum.each(caller_pids, &send(&1, {:ensure_remote_state, gate}))
+
+    assert Enum.all?(Task.await_many(tasks, 10_000), &match?(%Oban.Job{}, &1))
+    assert [_job] = queued_remote_state_jobs(remote_message_id)
+  end
+
+  test "job insertion rolls back with the surrounding transaction", %{
+    remote_message_id: remote_message_id
+  } do
+    assert {:error, :forced_rollback} =
+             Repo.transaction(fn ->
+               assert %Oban.Job{} = RemoteStateJobs.ensure(remote_message_id)
+               assert [_job] = queued_remote_state_jobs(remote_message_id)
+               Repo.rollback(:forced_rollback)
+             end)
+
+    assert [] = queued_remote_state_jobs(remote_message_id)
+  end
+
+  defp queued_remote_state_jobs(remote_message_id) do
+    Oban.Job
+    |> where([job], job.worker == ^inspect(ApplyRemoteState))
+    |> where([job], job.state in ~w(available scheduled retryable suspended))
+    |> where(
+      [job],
+      fragment("?->>'remote_message_id' = ?", job.args, ^remote_message_id)
+    )
+    |> order_by([job], asc: job.id)
+    |> Repo.all()
+  end
+
+  defp delete_remote_state_jobs(remote_message_id) do
+    Oban.Job
+    |> where([job], job.worker == ^inspect(ApplyRemoteState))
+    |> where(
+      [job],
+      fragment("?->>'remote_message_id' = ?", job.args, ^remote_message_id)
+    )
+    |> Repo.delete_all()
+  end
 end
