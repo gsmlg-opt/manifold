@@ -1206,6 +1206,45 @@ defmodule Manifold.Outbound.SubmissionTest do
     assert Repo.get!(OutboundMessage, message.id).state == "failed"
   end
 
+  test "switching the enabled method never reroutes a queued Microsoft snapshot" do
+    %{message: message, method: snapshot, account: account, address: address} =
+      queued_operational_fixture("microsoft")
+
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+    assert submission.send_method_id == snapshot.id
+
+    alternate =
+      %SendMethod{}
+      |> SendMethod.changeset(%{
+        account_id: account.id,
+        kind: "smtp",
+        email_address: address,
+        status: "connected",
+        enabled: false
+      })
+      |> Repo.insert!()
+
+    assert {:ok, %SendMethod{id: alternate_id, enabled: true}} =
+             Connectors.enable_send_method(account.id, alternate.id)
+
+    assert alternate_id == alternate.id
+    refute Repo.get!(SendMethod, snapshot.id).enabled
+
+    assert {:error, %Provider.Error{class: :permanent, code: "send_method_required"}} =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: :unused]
+             )
+
+    refute_receive {:provider_submit, _, _}
+
+    persisted = Repo.get!(ProviderSubmission, submission.id)
+    assert persisted.send_method_id == snapshot.id
+    assert persisted.send_method_id != alternate.id
+    assert persisted.state == "failed"
+    assert Repo.get!(OutboundMessage, message.id).state == "failed"
+  end
+
   test "rendered SHA tampering fails before credential decryption or provider I/O" do
     %{message: tampered_message} = queued_operational_fixture("smtp")
     tampered = Repo.get_by!(ProviderSubmission, outbound_message_id: tampered_message.id)

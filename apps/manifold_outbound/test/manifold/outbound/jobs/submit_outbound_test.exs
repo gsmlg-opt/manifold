@@ -173,23 +173,74 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     assert Repo.aggregate(active_submit_jobs(message.id), :count) == 0
   end
 
-  test "Microsoft 429 snoozes without changing its persisted payload" do
+  test "Microsoft 429 schedules a byte-identical worker retry on the snapshotted method" do
     configure_microsoft_req_test!()
     message = microsoft_message_fixture()
     submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
     payload = explicit_request_payload(submission.id)
+    test_pid = self()
+    started_at = DateTime.utc_now()
 
     Req.Test.expect(__MODULE__, fn conn ->
+      {:ok, encoded, conn} = Plug.Conn.read_body(conn)
+      send(test_pid, {:microsoft_worker_request, :first, encoded})
+
       conn
       |> Plug.Conn.put_resp_header("retry-after", "75")
       |> Plug.Conn.put_status(429)
       |> Req.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
     end)
 
-    assert {:snooze, 75} = SubmitOutbound.perform(job(message.id))
+    first_drain = Oban.drain_queue(queue: :outbound)
+    assert first_drain.snoozed == 1
+    assert first_drain.success == 0
+
+    assert_receive {:microsoft_worker_request, :first, first_encoded}
+    assert Base.decode64!(first_encoded) == payload
+
     assert Repo.get!(OutboundMessage, message.id).state == "queued"
     assert Repo.get!(ProviderSubmission, submission.id).state == "pending"
     assert explicit_request_payload(submission.id) == payload
+
+    assert [%Oban.Job{} = scheduled] = Repo.all(submit_jobs(message.id))
+    assert scheduled.state == "scheduled"
+    assert scheduled.attempt == 1
+    assert DateTime.compare(scheduled.scheduled_at, started_at) == :gt
+    assert scheduled.args == %{"outbound_message_id" => message.id}
+    assert Repo.aggregate(active_submit_jobs(message.id), :count) == 1
+
+    retryable =
+      scheduled
+      |> Ecto.Changeset.change(state: "available", scheduled_at: DateTime.utc_now())
+      |> Repo.update!()
+
+    assert retryable.id == scheduled.id
+    assert retryable.state == "available"
+
+    Req.Test.expect(__MODULE__, fn conn ->
+      {:ok, encoded, conn} = Plug.Conn.read_body(conn)
+      send(test_pid, {:microsoft_worker_request, :second, encoded})
+      Plug.Conn.send_resp(conn, 202, "")
+    end)
+
+    second_drain = Oban.drain_queue(queue: :outbound)
+    assert second_drain.success == 1
+    assert second_drain.snoozed == 0
+
+    assert_receive {:microsoft_worker_request, :second, second_encoded}
+    assert second_encoded == first_encoded
+    assert Base.decode64!(second_encoded) == payload
+
+    accepted = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+    assert accepted.state == "accepted"
+    assert accepted.attempt_count == 2
+    assert accepted.send_method_id == submission.send_method_id
+    assert explicit_request_payload(accepted.id) == payload
+    assert Repo.get!(OutboundMessage, message.id).state == "accepted_by_provider"
+    assert Repo.aggregate(active_submit_jobs(message.id), :count) == 0
+
+    assert [%Oban.Job{id: job_id, state: "completed"}] = Repo.all(submit_jobs(message.id))
+    assert job_id == scheduled.id
   end
 
   defp job(message_id), do: %Oban.Job{args: %{"outbound_message_id" => message_id}}
@@ -336,10 +387,14 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
   end
 
   defp active_submit_jobs(message_id) do
+    submit_jobs(message_id)
+    |> where([job], job.state in ~w(available scheduled retryable))
+  end
+
+  defp submit_jobs(message_id) do
     from(job in Oban.Job,
       where:
         job.worker == ^inspect(SubmitOutbound) and
-          job.state in ~w(available scheduled retryable) and
           fragment("?->>'outbound_message_id' = ?", job.args, ^message_id)
     )
   end
