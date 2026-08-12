@@ -16,6 +16,7 @@ defmodule Manifold.Connectors.Sync do
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
     Credential,
+    OAuthAuthorization,
     ReceiveMethod,
     EasSettings,
     ImapSettings,
@@ -112,19 +113,20 @@ defmodule Manifold.Connectors.Sync do
          {:ok, auth} <-
            auth_material(account, adapter, config, now, provider_opts(opts)) do
       opts = prepare_provider_session(account, adapter, opts)
+      provider_auth = provider_auth(auth)
 
       try do
         with {:ok, cursor} <-
                maybe_reconcile_folder_mapping(
                  account,
                  cursor,
-                 auth,
+                 provider_auth,
                  adapter,
                  config,
                  provider_opts(opts)
                ),
              {:ok, %Page{} = page} <-
-               sync_page(adapter, auth, cursor, config, provider_opts(opts)),
+               sync_page(adapter, provider_auth, cursor, config, provider_opts(opts)),
              messages = collapse_messages(page.messages),
              :ok <-
                process_messages(
@@ -132,7 +134,7 @@ defmodule Manifold.Connectors.Sync do
                  account,
                  adapter,
                  config,
-                 auth,
+                 provider_auth,
                  now,
                  opts
                ),
@@ -154,7 +156,7 @@ defmodule Manifold.Connectors.Sync do
              handle_account_provider_error(account, error, now, auth)}
 
           {:error, %Error{} = error} ->
-            {:error, account.kind, error, handle_core_error(account_id, error, now)}
+            {:error, account.kind, error, handle_account_core_error(account, error, now, auth)}
 
           {:error, reason} ->
             error =
@@ -428,10 +430,17 @@ defmodule Manifold.Connectors.Sync do
        )
        when provider in ["gmail", "microsoft"] and is_binary(authorization_id) do
     with {:ok, required_scope} <- OAuthScopes.method_scope(provider, :receive) do
+      continuation = fn access_token ->
+        authorization = Repo.get!(OAuthAuthorization, authorization_id)
+
+        {:ok, {:oauth_access, access_token, authorization.id, authorization.lock_version}}
+      end
+
       Connectors.checkout_oauth_access_token(authorization_id,
         now: now,
         required_scope: required_scope,
-        provider_opts: provider_opts
+        provider_opts: provider_opts,
+        access_token_continuation: continuation
       )
     end
   end
@@ -454,6 +463,11 @@ defmodule Manifold.Connectors.Sync do
 
   defp auth_material(account, adapter, config, now, opts),
     do: access_token(account, adapter, config, now, opts)
+
+  defp provider_auth({:oauth_access, access_token, _authorization_id, _lock_version}),
+    do: access_token
+
+  defp provider_auth(auth), do: auth
 
   defp access_token(account, adapter, config, now, provider_opts) do
     case Repo.get_by(Credential, external_account_id: account.id) do
@@ -1126,6 +1140,10 @@ defmodule Manifold.Connectors.Sync do
     status = if error.class == :reconnect, do: "reconnect_required", else: "failed"
     record_provider_failure(account_id, status, error, now)
 
+    provider_error_outcome(error)
+  end
+
+  defp provider_error_outcome(error) do
     case error.class do
       :temporary -> {:snooze, error.retry_after_seconds || @default_retry_seconds}
       :reconnect -> {:cancel, :reconnect_required}
@@ -1140,10 +1158,11 @@ defmodule Manifold.Connectors.Sync do
          },
          %ProviderError{class: :reconnect} = error,
          now,
-         expected_access_token
+         auth
        )
-       when provider in ["gmail", "microsoft"] and is_binary(authorization_id) and
-              is_binary(expected_access_token) do
+       when provider in ["gmail", "microsoft"] and is_binary(authorization_id) do
+    expected_access_token = provider_auth(auth)
+
     case Connectors.mark_oauth_reconnect_required(authorization_id, error,
            now: now,
            expected_access_token: expected_access_token
@@ -1155,8 +1174,64 @@ defmodule Manifold.Connectors.Sync do
     end
   end
 
-  defp handle_account_provider_error(%ReceiveMethod{id: account_id}, error, now, _auth),
-    do: handle_provider_error(account_id, error, now)
+  defp handle_account_provider_error(%ReceiveMethod{} = account, error, now, auth) do
+    status = if error.class == :reconnect, do: "reconnect_required", else: "failed"
+
+    case record_provider_failure_if_current(account, status, error, now, auth) do
+      :lifecycle_changed ->
+        lifecycle_error =
+          Error.new(
+            :temporary,
+            :connector_lifecycle_changed,
+            "connector lifecycle changed during synchronization"
+          )
+
+        handle_core_error(account.id, lifecycle_error, now)
+
+      _recorded ->
+        provider_error_outcome(error)
+    end
+  end
+
+  defp handle_account_core_error(
+         %ReceiveMethod{id: account_id},
+         %Error{reason: reason} = error,
+         now,
+         _auth
+       )
+       when reason in [
+              :account_disconnected,
+              :sync_disabled,
+              :account_not_found,
+              :connector_lifecycle_changed
+            ],
+       do: handle_core_error(account_id, error, now)
+
+  defp handle_account_core_error(%ReceiveMethod{} = account, %Error{} = error, now, auth) do
+    provider_error = %ProviderError{
+      class: if(error.class == :temporary, do: :temporary, else: :permanent),
+      code: error.reason,
+      message: error.message
+    }
+
+    case record_provider_failure_if_current(account, "failed", provider_error, now, auth) do
+      :lifecycle_changed ->
+        lifecycle_error =
+          Error.new(
+            :temporary,
+            :connector_lifecycle_changed,
+            "connector lifecycle changed during synchronization"
+          )
+
+        handle_core_error(account.id, lifecycle_error, now)
+
+      _recorded when error.class == :permanent ->
+        {:cancel, error.reason}
+
+      _recorded ->
+        {:error, error}
+    end
+  end
 
   defp handle_cursor_provider_error(
          %ReceiveMethod{kind: provider} = account,
@@ -1308,6 +1383,69 @@ defmodule Manifold.Connectors.Sync do
       end
     end)
   end
+
+  defp record_provider_failure_if_current(account, status, error, now, auth) do
+    Repo.transaction(fn ->
+      case lock_current_failure_authorization(account, auth) do
+        :ok ->
+          account
+          |> ReceiveMethod.changeset(%{
+            status: status,
+            last_error_class: Atom.to_string(error.class),
+            last_error_code: Atom.to_string(error.code),
+            last_error_message: error.message
+          })
+          |> Repo.update!()
+
+          insert_failure_event(account.id, error.class, error.code, now)
+
+        :lifecycle_changed ->
+          Repo.rollback(:lifecycle_changed)
+      end
+    end)
+    |> case do
+      {:error, :lifecycle_changed} -> :lifecycle_changed
+      result -> result
+    end
+  rescue
+    Ecto.StaleEntryError -> :lifecycle_changed
+  end
+
+  defp lock_current_failure_authorization(
+         %ReceiveMethod{
+           account_id: account_id,
+           kind: provider,
+           oauth_authorization_id: authorization_id
+         },
+         {:oauth_access, _access_token, authorization_id, expected_lock_version}
+       )
+       when provider in ["gmail", "microsoft"] and is_binary(authorization_id) and
+              is_integer(expected_lock_version) do
+    authorization =
+      OAuthAuthorization
+      |> where([stored], stored.id == ^authorization_id)
+      |> lock("FOR UPDATE")
+      |> Repo.one()
+
+    case authorization do
+      %OAuthAuthorization{
+        account_id: ^account_id,
+        provider: ^provider,
+        status: "connected",
+        lock_version: ^expected_lock_version
+      } ->
+        :ok
+
+      _changed_or_missing ->
+        :lifecycle_changed
+    end
+  end
+
+  defp lock_current_failure_authorization(%ReceiveMethod{kind: provider}, _auth)
+       when provider in ["gmail", "microsoft"],
+       do: :lifecycle_changed
+
+  defp lock_current_failure_authorization(_account, _auth), do: :ok
 
   defp record_failure(account_id, class, code, message, now) do
     provider_error = %ProviderError{

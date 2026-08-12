@@ -768,6 +768,41 @@ defmodule Manifold.Connectors.SyncTest do
     assert Repo.get!(ReceiveMethod, microsoft.id).last_error_code == "rate_limited"
   end
 
+  test "Microsoft invalid folder mappings retain permanent failure handling", %{
+    account: account,
+    cursor: cursor
+  } do
+    microsoft = convert_to_microsoft!(account)
+
+    cursor
+    |> Repo.reload!()
+    |> SyncCursor.changeset(%{metadata: %{"folder_mapping_refresh_required" => true}})
+    |> Repo.update!()
+
+    Process.put(
+      :folder_mapping_result,
+      {:ok,
+       %FolderMapping{
+         version: 2,
+         kinds_by_id: %{"folder-inbox" => "inbox"}
+       }}
+    )
+
+    assert {:cancel, :invalid_folder_mapping} = Connectors.sync_account(microsoft.id)
+    refute_receive {:sync_access_token, "initial-access"}
+    assert Repo.get!(SyncCursor, cursor.id).committed_cursor == cursor.committed_cursor
+
+    failed = Repo.get!(ReceiveMethod, microsoft.id)
+    assert failed.status == "failed"
+    assert failed.last_error_class == "permanent"
+    assert failed.last_error_code == "invalid_folder_mapping"
+
+    assert Repo.get_by!(ConnectorEvent,
+             external_account_id: microsoft.id,
+             event_type: "sync_failed"
+           )
+  end
+
   test "Microsoft reconnect fences an in-flight mapping result before the provider page", %{
     account: account,
     cursor: cursor,
@@ -891,6 +926,121 @@ defmodule Manifold.Connectors.SyncTest do
     assert {:snooze, 1} = Task.await(stale_sync, 5_000)
     refute_receive {:sync_page_called, ^gate, _access_token, _cursor}, 100
     assert folder_mapping_lifecycle_state(microsoft.id, authorization.id) == reconnected_state
+  end
+
+  test "Microsoft reconnect after a mapping error fence preserves the new lifecycle", %{
+    account: account,
+    cursor: cursor,
+    mailbox: mailbox
+  } do
+    microsoft = convert_to_microsoft!(account)
+    authorization = Repo.get!(OAuthAuthorization, microsoft.oauth_authorization_id)
+
+    cursor
+    |> Repo.reload!()
+    |> SyncCursor.changeset(%{
+      metadata: %{
+        "folder_kinds_by_id" => %{"folder-inbox" => "archive"},
+        "folder_mapping_refresh_required" => true
+      }
+    })
+    |> Repo.update!()
+
+    resolver_gate = make_ref()
+    telemetry_gate = make_ref()
+    test_pid = self()
+    attach_blocking_folder_mapping_stop(:rate_limited, telemetry_gate)
+
+    stale_sync =
+      Task.async(fn ->
+        Connectors.sync_account(microsoft.id,
+          provider_opts: [test_pid: test_pid, folder_mapping_gate: resolver_gate]
+        )
+      end)
+
+    assert_receive {:folder_mapping_started, resolver_pid, ^resolver_gate, "initial-access"},
+                   5_000
+
+    stale_error = %Error{
+      class: :temporary,
+      code: :rate_limited,
+      message: "stale post-fence mapping failure",
+      retry_after_seconds: 47
+    }
+
+    send(resolver_pid, {:release_folder_mapping, resolver_gate, {:error, stale_error}})
+
+    assert_receive {:folder_mapping_stop_blocked, handler_pid, ^telemetry_gate}, 5_000
+
+    reconnect_microsoft!(mailbox, microsoft, authorization)
+    reconnected_state = folder_mapping_lifecycle_state(microsoft.id, authorization.id)
+
+    send(handler_pid, {:release_folder_mapping_stop, telemetry_gate})
+
+    assert {:snooze, 1} = Task.await(stale_sync, 5_000)
+    refute_receive {:sync_page_called, ^resolver_gate, _access_token, _cursor}, 100
+    assert folder_mapping_lifecycle_state(microsoft.id, authorization.id) == reconnected_state
+  end
+
+  test "Microsoft token rotation after a mapping error fence preserves the current lifecycle", %{
+    account: account,
+    cursor: cursor
+  } do
+    microsoft = convert_to_microsoft!(account)
+    authorization = Repo.get!(OAuthAuthorization, microsoft.oauth_authorization_id)
+
+    cursor
+    |> Repo.reload!()
+    |> SyncCursor.changeset(%{
+      metadata: %{
+        "folder_kinds_by_id" => %{"folder-inbox" => "archive"},
+        "folder_mapping_refresh_required" => true
+      }
+    })
+    |> Repo.update!()
+
+    resolver_gate = make_ref()
+    telemetry_gate = make_ref()
+    test_pid = self()
+    attach_blocking_folder_mapping_stop(:rate_limited, telemetry_gate)
+
+    stale_sync =
+      Task.async(fn ->
+        Connectors.sync_account(microsoft.id,
+          provider_opts: [test_pid: test_pid, folder_mapping_gate: resolver_gate]
+        )
+      end)
+
+    assert_receive {:folder_mapping_started, resolver_pid, ^resolver_gate, "initial-access"},
+                   5_000
+
+    stale_error = %Error{
+      class: :temporary,
+      code: :rate_limited,
+      message: "stale pre-rotation mapping failure",
+      retry_after_seconds: 47
+    }
+
+    send(resolver_pid, {:release_folder_mapping, resolver_gate, {:error, stale_error}})
+
+    assert_receive {:folder_mapping_stop_blocked, handler_pid, ^telemetry_gate}, 5_000
+
+    assert {:ok, rotated_access} =
+             Crypto.encrypt("rotated-after-fence", "credential:#{authorization.id}:access")
+
+    authorization
+    |> OAuthAuthorization.changeset(%{
+      access_token_ciphertext: rotated_access,
+      token_expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second)
+    })
+    |> Repo.update!()
+
+    rotated_state = folder_mapping_lifecycle_state(microsoft.id, authorization.id)
+    send(handler_pid, {:release_folder_mapping_stop, telemetry_gate})
+
+    assert {:snooze, 1} = Task.await(stale_sync, 5_000)
+    refute_receive {:sync_page_called, ^resolver_gate, _access_token, _cursor}, 100
+    assert folder_mapping_lifecycle_state(microsoft.id, authorization.id) == rotated_state
   end
 
   test "Microsoft reconnect errors pause the shared authorization and both methods", %{
@@ -1686,6 +1836,31 @@ defmodule Manifold.Connectors.SyncTest do
     on_exit(fn -> :telemetry.detach(handler_id) end)
   end
 
+  defp attach_blocking_folder_mapping_stop(error_code, gate) do
+    handler_id =
+      "microsoft-folder-mapping-blocking-stop-#{System.unique_integer([:positive])}"
+
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :connectors, :microsoft, :folder_mapping, :stop],
+        fn _event, _measurements, metadata, {pid, expected_error_code, gate} ->
+          if metadata.outcome == :error and metadata.error_code == expected_error_code do
+            send(pid, {:folder_mapping_stop_blocked, self(), gate})
+
+            receive do
+              {:release_folder_mapping_stop, ^gate} -> :ok
+            end
+          end
+        end,
+        {test_pid, error_code, gate}
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
   defp remote_message(id) do
     %ProviderRemoteMessage{
       id: id,
@@ -1893,8 +2068,88 @@ defmodule Manifold.Connectors.RemoteStateJobsConcurrencyTest do
 
     Enum.each(caller_pids, &send(&1, {:ensure_remote_state, gate}))
 
-    assert Enum.all?(Task.await_many(tasks, 10_000), &match?(%Oban.Job{}, &1))
-    assert [_job] = queued_remote_state_jobs(remote_message_id)
+    jobs = Task.await_many(tasks, 10_000)
+    assert [%Oban.Job{id: persisted_id}] = queued_remote_state_jobs(remote_message_id)
+    assert is_integer(persisted_id)
+    assert Enum.all?(jobs, &match?(%Oban.Job{id: ^persisted_id}, &1))
+    assert %Oban.Job{id: ^persisted_id} = Repo.get(Oban.Job, persisted_id)
+  end
+
+  test "losing ensure persists a job when the concurrent winner rolls back", %{
+    remote_message_id: remote_message_id
+  } do
+    test_pid = self()
+    gate = make_ref()
+
+    winner =
+      Task.async(fn ->
+        :ok = Sandbox.checkout(Repo, sandbox: false)
+
+        try do
+          Repo.transaction(fn ->
+            job = RemoteStateJobs.ensure(remote_message_id)
+            send(test_pid, {:remote_state_winner_inserted, self(), gate, job})
+
+            receive do
+              {:rollback_remote_state_winner, ^gate} -> Repo.rollback(:forced_rollback)
+            end
+          end)
+        after
+          Sandbox.checkin(Repo)
+        end
+      end)
+
+    assert_receive {:remote_state_winner_inserted, winner_pid, ^gate,
+                    %Oban.Job{id: winner_job_id}},
+                   5_000
+
+    assert is_integer(winner_job_id)
+
+    telemetry_gate = make_ref()
+    handler_id = "remote-state-advisory-lock-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        Repo.config()[:telemetry_prefix] ++ [:query],
+        fn _event, _measurements, metadata, {pid, telemetry_gate} ->
+          if String.contains?(metadata.query, "pg_try_advisory_xact_lock") and
+               match?({:ok, %{rows: [[false]]}}, metadata.result) do
+            send(pid, {:remote_state_lock_conflict, self(), telemetry_gate})
+
+            receive do
+              {:release_remote_state_lock_conflict, ^telemetry_gate} -> :ok
+            end
+          end
+        end,
+        {test_pid, telemetry_gate}
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    loser =
+      Task.async(fn ->
+        :ok = Sandbox.checkout(Repo, sandbox: false)
+
+        try do
+          RemoteStateJobs.ensure(remote_message_id)
+        after
+          Sandbox.checkin(Repo)
+        end
+      end)
+
+    assert_receive {:remote_state_lock_conflict, loser_pid, ^telemetry_gate}, 5_000
+    send(winner_pid, {:rollback_remote_state_winner, gate})
+
+    assert {:error, :forced_rollback} = Task.await(winner, 5_000)
+    send(loser_pid, {:release_remote_state_lock_conflict, telemetry_gate})
+
+    loser_job = Task.await(loser, 5_000)
+
+    assert %Oban.Job{id: loser_job_id} = loser_job
+    assert is_integer(loser_job_id)
+    assert %Oban.Job{id: ^loser_job_id} = Repo.get(Oban.Job, loser_job_id)
+    assert [%Oban.Job{id: ^loser_job_id}] = queued_remote_state_jobs(remote_message_id)
   end
 
   test "job insertion rolls back with the surrounding transaction", %{
