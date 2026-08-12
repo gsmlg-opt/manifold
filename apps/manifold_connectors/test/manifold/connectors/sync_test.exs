@@ -114,6 +114,7 @@ defmodule Manifold.Connectors.SyncTest do
 
           receive do
             {:release_folder_mapping, ^gate, %FolderMapping{} = mapping} -> {:ok, mapping}
+            {:release_folder_mapping, ^gate, {:error, _reason} = error} -> error
           end
       end
     end
@@ -798,51 +799,7 @@ defmodule Manifold.Connectors.SyncTest do
 
     assert_receive {:folder_mapping_started, resolver_pid, ^stale_gate, "initial-access"}, 5_000
 
-    assert {:ok, _authorization} =
-             Connectors.mark_oauth_reconnect_required(
-               authorization.id,
-               %Error{
-                 class: :reconnect,
-                 code: :invalid_grant,
-                 message: "provider reconnect required"
-               }
-             )
-
-    required_scopes = Enum.sort([MicrosoftScopes.read(), MicrosoftScopes.offline()])
-
-    consumed = %Consumed{
-      provider: "microsoft",
-      mailbox_id: mailbox.id,
-      purpose: :receive,
-      required_scopes: required_scopes,
-      redirect_uri: "https://mail.example.test/connectors/microsoft/callback",
-      pkce_verifier: "verifier"
-    }
-
-    reconnect_token = %Token{
-      access_token: "reconnected-access",
-      refresh_token: "reconnected-refresh",
-      expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
-      scopes: [MicrosoftScopes.read()]
-    }
-
-    reconnect_identity = %Identity{
-      id: "sync-account",
-      email_address: Accounts.account_address(mailbox)
-    }
-
-    assert {:ok, %ReceiveMethod{id: method_id, status: "connected"}} =
-             Connectors.complete_authorization(
-               "microsoft",
-               "valid-code",
-               consumed,
-               provider_opts: [
-                 exchange_result: {:ok, reconnect_token},
-                 identity_result: {:ok, reconnect_identity}
-               ]
-             )
-
-    assert method_id == microsoft.id
+    reconnect_microsoft!(mailbox, microsoft, authorization)
 
     invalidated = Repo.get!(SyncCursor, stale_cursor.id)
     assert invalidated.metadata["folder_mapping_refresh_required"]
@@ -887,6 +844,53 @@ defmodule Manifold.Connectors.SyncTest do
     assert page_cursor.metadata["folder_kinds_by_id"] == %{"folder-inbox" => "inbox"}
     refute Map.has_key?(page_cursor.metadata, "folder_mapping_refresh_required")
     assert :ok = Task.await(fresh_sync, 5_000)
+  end
+
+  test "Microsoft reconnect discards an in-flight mapping error before failure recording", %{
+    account: account,
+    cursor: cursor,
+    mailbox: mailbox
+  } do
+    microsoft = convert_to_microsoft!(account)
+    authorization = Repo.get!(OAuthAuthorization, microsoft.oauth_authorization_id)
+
+    cursor
+    |> Repo.reload!()
+    |> SyncCursor.changeset(%{
+      metadata: %{
+        "folder_kinds_by_id" => %{"folder-inbox" => "archive"},
+        "folder_mapping_refresh_required" => true
+      }
+    })
+    |> Repo.update!()
+
+    gate = make_ref()
+    test_pid = self()
+
+    stale_sync =
+      Task.async(fn ->
+        Connectors.sync_account(microsoft.id,
+          provider_opts: [test_pid: test_pid, folder_mapping_gate: gate]
+        )
+      end)
+
+    assert_receive {:folder_mapping_started, resolver_pid, ^gate, "initial-access"}, 5_000
+
+    reconnect_microsoft!(mailbox, microsoft, authorization)
+    reconnected_state = folder_mapping_lifecycle_state(microsoft.id, authorization.id)
+
+    stale_error = %Error{
+      class: :temporary,
+      code: :rate_limited,
+      message: "stale pre-reconnect mapping failure",
+      retry_after_seconds: 47
+    }
+
+    send(resolver_pid, {:release_folder_mapping, gate, {:error, stale_error}})
+
+    assert {:snooze, 1} = Task.await(stale_sync, 5_000)
+    refute_receive {:sync_page_called, ^gate, _access_token, _cursor}, 100
+    assert folder_mapping_lifecycle_state(microsoft.id, authorization.id) == reconnected_state
   end
 
   test "Microsoft reconnect errors pause the shared authorization and both methods", %{
@@ -1555,6 +1559,114 @@ defmodule Manifold.Connectors.SyncTest do
     )
     |> order_by([job], asc: job.id)
     |> Repo.all()
+  end
+
+  defp reconnect_microsoft!(mailbox, microsoft, authorization) do
+    assert {:ok, _authorization} =
+             Connectors.mark_oauth_reconnect_required(
+               authorization.id,
+               %Error{
+                 class: :reconnect,
+                 code: :invalid_grant,
+                 message: "provider reconnect required"
+               }
+             )
+
+    required_scopes = Enum.sort([MicrosoftScopes.read(), MicrosoftScopes.offline()])
+
+    consumed = %Consumed{
+      provider: "microsoft",
+      mailbox_id: mailbox.id,
+      purpose: :receive,
+      required_scopes: required_scopes,
+      redirect_uri: "https://mail.example.test/connectors/microsoft/callback",
+      pkce_verifier: "verifier"
+    }
+
+    token = %Token{
+      access_token: "reconnected-access",
+      refresh_token: "reconnected-refresh",
+      expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
+      scopes: [MicrosoftScopes.read()]
+    }
+
+    identity = %Identity{
+      id: "sync-account",
+      email_address: Accounts.account_address(mailbox)
+    }
+
+    assert {:ok, %ReceiveMethod{id: method_id, status: "connected"}} =
+             Connectors.complete_authorization(
+               "microsoft",
+               "valid-code",
+               consumed,
+               provider_opts: [
+                 exchange_result: {:ok, token},
+                 identity_result: {:ok, identity}
+               ]
+             )
+
+    assert method_id == microsoft.id
+  end
+
+  defp folder_mapping_lifecycle_state(receive_method_id, authorization_id) do
+    %{
+      authorization:
+        authorization_id
+        |> then(&Repo.get!(OAuthAuthorization, &1))
+        |> Map.take([
+          :status,
+          :access_token_ciphertext,
+          :refresh_token_ciphertext,
+          :token_expires_at,
+          :last_error_class,
+          :last_error_code,
+          :last_error_message,
+          :lock_version
+        ]),
+      method:
+        receive_method_id
+        |> then(&Repo.get!(ReceiveMethod, &1))
+        |> Map.take([
+          :status,
+          :enabled,
+          :sync_enabled,
+          :last_attempted_at,
+          :last_synced_at,
+          :last_error_class,
+          :last_error_code,
+          :last_error_message,
+          :lock_version
+        ]),
+      cursors:
+        SyncCursor
+        |> where([stored], stored.external_account_id == ^receive_method_id)
+        |> order_by([stored], asc: stored.id)
+        |> Repo.all()
+        |> Enum.map(
+          &Map.take(&1, [
+            :id,
+            :scope,
+            :phase,
+            :bootstrap_cursor,
+            :page_cursor,
+            :committed_cursor,
+            :metadata,
+            :generation,
+            :last_completed_at,
+            :lock_version
+          ])
+        ),
+      failure_events:
+        ConnectorEvent
+        |> where(
+          [event],
+          event.external_account_id == ^receive_method_id and event.event_type == "sync_failed"
+        )
+        |> order_by([event], asc: event.id)
+        |> select([event], {event.id, event.metadata})
+        |> Repo.all()
+    }
   end
 
   defp attach_folder_mapping_stop do

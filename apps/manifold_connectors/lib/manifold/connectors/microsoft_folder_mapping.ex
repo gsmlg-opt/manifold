@@ -48,13 +48,13 @@ defmodule Manifold.Connectors.MicrosoftFolderMapping do
             {:ok, selected_cursor, 0, 0, :current}
           else
             with {:ok, snapshot} <-
-                   lifecycle_snapshot(receive_method, selected_cursor.id, cursors),
-                 {:ok, %FolderMapping{version: @mapping_version} = mapping} <-
-                   adapter.resolve_folder_mapping(access_token, config, opts) do
-              reconcile(receive_method, selected_cursor.id, mapping, snapshot)
-            else
-              {:ok, %FolderMapping{}} -> {:error, invalid_mapping_error()}
-              {:error, reason} -> {:error, reason}
+                   lifecycle_snapshot(receive_method, selected_cursor.id, cursors) do
+              resolve_and_reconcile(
+                receive_method,
+                selected_cursor.id,
+                snapshot,
+                adapter.resolve_folder_mapping(access_token, config, opts)
+              )
             end
           end
         end
@@ -104,15 +104,41 @@ defmodule Manifold.Connectors.MicrosoftFolderMapping do
     _error in Postgrex.Error -> {:error, database_error()}
   end
 
-  defp reconcile(receive_method, selected_cursor_id, mapping, snapshot) do
-    Repo.transaction(fn ->
-      authorization = lock_authorization(snapshot.authorization.id)
-      cursors = lock_cursors(receive_method.id)
+  defp resolve_and_reconcile(
+         receive_method,
+         selected_cursor_id,
+         snapshot,
+         {:ok, %FolderMapping{version: @mapping_version} = mapping}
+       ) do
+    reconcile(receive_method, selected_cursor_id, mapping, snapshot)
+  end
 
-      with {:ok, folders_cursor} <- folders_cursor(cursors),
-           {:ok, _selected_cursor} <- selected_cursor(cursors, selected_cursor_id),
-           {:ok, locked_method} <- lock_active_method(receive_method.id),
-           :ok <- validate_lifecycle_snapshot(authorization, locked_method, cursors, snapshot) do
+  defp resolve_and_reconcile(
+         receive_method,
+         selected_cursor_id,
+         snapshot,
+         {:ok, %FolderMapping{}}
+       ) do
+    fence_resolver_error(
+      receive_method.id,
+      selected_cursor_id,
+      snapshot,
+      invalid_mapping_error()
+    )
+  end
+
+  defp resolve_and_reconcile(
+         receive_method,
+         selected_cursor_id,
+         snapshot,
+         {:error, reason}
+       ) do
+    fence_resolver_error(receive_method.id, selected_cursor_id, snapshot, reason)
+  end
+
+  defp reconcile(receive_method, selected_cursor_id, mapping, snapshot) do
+    with_locked_lifecycle(receive_method.id, selected_cursor_id, snapshot, fn
+      cursors, folders_cursor ->
         if current?(folders_cursor, cursors) do
           {Repo.get!(SyncCursor, selected_cursor_id), 0, 0, :current}
         else
@@ -122,9 +148,6 @@ defmodule Manifold.Connectors.MicrosoftFolderMapping do
           {Repo.get!(SyncCursor, selected_cursor_id), cursor_count, changed_message_count,
            :repaired}
         end
-      else
-        {:error, reason} -> Repo.rollback(reason)
-      end
     end)
     |> case do
       {:ok, {cursor, cursor_count, changed_message_count, outcome}} ->
@@ -133,6 +156,31 @@ defmodule Manifold.Connectors.MicrosoftFolderMapping do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp fence_resolver_error(receive_method_id, selected_cursor_id, snapshot, resolver_error) do
+    receive_method_id
+    |> with_locked_lifecycle(selected_cursor_id, snapshot, fn _cursors, _folders_cursor -> :ok end)
+    |> case do
+      {:ok, :ok} -> {:error, resolver_error}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp with_locked_lifecycle(receive_method_id, selected_cursor_id, snapshot, fun) do
+    Repo.transaction(fn ->
+      authorization = lock_authorization(snapshot.authorization.id)
+      cursors = lock_cursors(receive_method_id)
+
+      with {:ok, folders_cursor} <- folders_cursor(cursors),
+           {:ok, _selected_cursor} <- selected_cursor(cursors, selected_cursor_id),
+           {:ok, locked_method} <- lock_active_method(receive_method_id),
+           :ok <- validate_lifecycle_snapshot(authorization, locked_method, cursors, snapshot) do
+        fun.(cursors, folders_cursor)
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
   end
 
   defp load_cursors(receive_method_id) do
