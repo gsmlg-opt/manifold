@@ -4,12 +4,16 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
   use Manifold.Outbound.Schema
   import Ecto.Changeset
 
+  @derive {Inspect, except: [:request_payload]}
   schema "provider_submissions" do
     field(:outbound_message_id, :binary_id)
     field(:send_method_id, :binary_id)
     field(:provider, :string)
+    field(:canonical_sender_address, :string)
     field(:idempotency_key, :string)
     field(:request_sha256, :string)
+    field(:request_payload, :binary)
+    field(:render_version, :integer)
     field(:state, :string, default: "pending")
     field(:attempt_count, :integer, default: 0)
     field(:provider_message_id, :string)
@@ -33,8 +37,11 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
       :outbound_message_id,
       :send_method_id,
       :provider,
+      :canonical_sender_address,
       :idempotency_key,
       :request_sha256,
+      :request_payload,
+      :render_version,
       :state,
       :attempt_count,
       :provider_message_id,
@@ -51,15 +58,17 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
     |> validate_required([
       :outbound_message_id,
       :provider,
+      :canonical_sender_address,
       :idempotency_key,
       :request_sha256,
       :state,
       :attempt_count
     ])
-    |> validate_inclusion(:provider, ~w(resend gmail smtp))
+    |> validate_inclusion(:provider, ~w(resend gmail smtp microsoft))
     |> validate_provider_shape()
     |> validate_inclusion(:state, ~w(pending submitting accepted failed uncertain))
     |> validate_number(:attempt_count, greater_than_or_equal_to: 0)
+    |> validate_number(:render_version, greater_than: 0)
     |> validate_format(:request_sha256, ~r/\A[0-9a-f]{64}\z/)
     |> foreign_key_constraint(:outbound_message_id)
     |> foreign_key_constraint(:send_method_id)
@@ -73,6 +82,9 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
     |> check_constraint(:state, name: :provider_submissions_state_valid)
     |> check_constraint(:provider, name: :provider_submissions_provider_valid)
     |> check_constraint(:provider, name: :provider_submissions_method_shape_valid)
+    |> check_constraint(:render_version,
+      name: :provider_submissions_render_version_positive
+    )
   end
 
   defp validate_provider_shape(changeset) do
@@ -82,9 +94,14 @@ defmodule Manifold.Outbound.Schema.ProviderSubmission do
         |> validate_required([:idempotency_expires_at])
         |> require_nil(:send_method_id)
 
-      provider when provider in ["gmail", "smtp"] ->
+      provider when provider in ["gmail", "smtp", "microsoft"] ->
         changeset
-        |> validate_required([:send_method_id])
+        |> validate_required([
+          :send_method_id,
+          :request_payload,
+          :render_version,
+          :provider_rfc_message_id
+        ])
         |> require_nil(:idempotency_expires_at)
 
       _provider ->

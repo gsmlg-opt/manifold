@@ -56,7 +56,7 @@ defmodule Manifold.Outbound.RfcMessage do
 
   defp provider(opts) do
     case Keyword.get(opts, :provider) do
-      provider when provider in [:gmail, :smtp] -> {:ok, provider}
+      provider when provider in [:gmail, :smtp, :microsoft] -> {:ok, provider}
       _invalid -> invalid()
     end
   end
@@ -357,7 +357,9 @@ defmodule Manifold.Outbound.RfcMessage do
     end)
   end
 
-  defp maybe_add_bcc(headers, :gmail, values), do: add_address_header(headers, "Bcc", values)
+  defp maybe_add_bcc(headers, provider, values) when provider in [:gmail, :microsoft],
+    do: add_address_header(headers, "Bcc", values)
+
   defp maybe_add_bcc(headers, :smtp, _values), do: headers
 
   defp maybe_add_header(headers, _name, nil), do: headers

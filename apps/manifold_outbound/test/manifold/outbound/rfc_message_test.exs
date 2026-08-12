@@ -49,6 +49,37 @@ defmodule Manifold.Outbound.RfcMessageTest do
     refute Regex.match?(~r/\r(?!\n)/, raw)
   end
 
+  test "renders Microsoft MIME byte-identically to Gmail including Bcc and reply headers" do
+    gmail_raw =
+      RfcMessage.render!(@envelope,
+        provider: :gmail,
+        message_id: @message_id,
+        date: @date
+      )
+
+    microsoft_raw =
+      RfcMessage.render!(@envelope,
+        provider: :microsoft,
+        message_id: @message_id,
+        date: @date
+      )
+
+    assert microsoft_raw == gmail_raw
+    assert microsoft_raw =~ "To: recipient@example.net\r\n"
+    assert microsoft_raw =~ "Cc: \"Copy Person\" <copy@example.net>\r\n"
+    assert microsoft_raw =~ "Bcc: hidden@example.net\r\n"
+    assert microsoft_raw =~ "Subject: =?UTF-8?B?UHJvamVjdCDov5vlsZU=?=\r\n"
+    assert microsoft_raw =~ "Date: Tue, 11 Aug 2026 03:04:05 +0000\r\n"
+    assert microsoft_raw =~ "Message-ID: #{@message_id}\r\n"
+    assert microsoft_raw =~ "In-Reply-To: <reply@example.net>\r\n"
+    assert microsoft_raw =~ "References: <first-long-message-identifier@example.net>\r\n"
+    assert microsoft_raw =~ "Content-Type: text/plain; charset=UTF-8\r\n"
+    assert microsoft_raw =~ "Content-Transfer-Encoding: quoted-printable\r\n"
+    assert microsoft_raw =~ "Hello, =E4=B8=96=E7=95=8C!\r\n.leading dot\r\nlast line\r\n"
+    refute Regex.match?(~r/(?<!\r)\n/, microsoft_raw)
+    refute Regex.match?(~r/\r(?!\n)/, microsoft_raw)
+  end
+
   test "includes Bcc for Gmail and omits it for SMTP without changing envelope recipients" do
     gmail_opts = [provider: :gmail, message_id: @message_id, date: @date]
     smtp_opts = [provider: :smtp, message_id: @message_id, date: @date]

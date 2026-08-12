@@ -701,8 +701,11 @@ defmodule Manifold.Outbound do
       outbound_message_id: message.id,
       send_method_id: rendered.send_method_id,
       provider: rendered.provider,
+      canonical_sender_address: rendered.canonical_sender_address,
       idempotency_key: rendered.idempotency_key,
       request_sha256: rendered.request_sha256,
+      request_payload: rendered.request_payload,
+      render_version: rendered.render_version,
       provider_rfc_message_id: rendered.provider_rfc_message_id,
       state: "pending",
       attempt_count: 0,
@@ -741,6 +744,9 @@ defmodule Manifold.Outbound do
          provider: method.kind,
          provider_rfc_message_id: provider_rfc_message_id,
          idempotency_key: idempotency_key,
+         canonical_sender_address: message.canonical_sender_address,
+         render_version: 1,
+         request_payload: raw_message,
          request_sha256: sha256(raw_message)
        }}
     end
@@ -748,6 +754,7 @@ defmodule Manifold.Outbound do
 
   defp provider("gmail"), do: {:ok, :gmail}
   defp provider("smtp"), do: {:ok, :smtp}
+  defp provider("microsoft"), do: {:ok, :microsoft}
 
   defp provider(_kind),
     do: {:error, error(:permanent, :send_method_required, "an enabled send method is required")}

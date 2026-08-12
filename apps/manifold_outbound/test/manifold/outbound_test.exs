@@ -91,6 +91,9 @@ defmodule Manifold.OutboundTest do
              outbound_message_id: ^outbound_message_id,
              send_method_id: send_method_id,
              provider: "gmail",
+             canonical_sender_address: canonical_sender_address,
+             render_version: 1,
+             request_payload: request_payload,
              state: "pending",
              idempotency_key: idempotency_key,
              request_sha256: request_sha256,
@@ -99,11 +102,14 @@ defmodule Manifold.OutboundTest do
            } = Repo.one!(submissions_for(draft.id))
 
     assert send_method_id == method.id
+    assert canonical_sender_address == queued.canonical_sender_address
     assert provider_rfc_message_id == "<#{queued.id}@manifold.local>"
     assert byte_size(idempotency_key) > 0
+    assert is_binary(request_payload)
 
     expected_raw = expected_raw(queued, "gmail", idempotency_key)
     assert expected_raw =~ "Bcc: hidden@example.net\r\n"
+    assert request_payload == expected_raw
     assert request_sha256 == sha256(expected_raw)
     assert Repo.get_by!(OutboundEvent, outbound_message_id: draft.id, event_type: "queued")
 
@@ -669,10 +675,51 @@ defmodule Manifold.OutboundTest do
 
     assert submission.send_method_id == method.id
     assert submission.provider == "smtp"
+    assert submission.canonical_sender_address == queued.canonical_sender_address
+    assert submission.render_version == 1
+    assert submission.request_payload == expected_raw
     assert submission.provider_rfc_message_id == "<#{queued.id}@manifold.local>"
     assert submission.idempotency_expires_at == nil
     refute expected_raw =~ "Bcc:"
     assert submission.request_sha256 == sha256(expected_raw)
+  end
+
+  test "queueing snapshots exact Microsoft MIME without copying it into the job" do
+    %{mailbox: mailbox, address: address} = mailbox_fixture()
+    method = send_method_fixture(mailbox.id, address, "microsoft")
+
+    {:ok, draft} =
+      Outbound.create_draft(mailbox.id, %{
+        subject: "Microsoft snapshot",
+        text_body: "Private body",
+        recipients: [
+          %{kind: "to", address: "person@example.net"},
+          %{kind: "bcc", address: "blind@example.net"}
+        ]
+      })
+
+    assert {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
+
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: queued.id)
+    assert submission.provider == "microsoft"
+    assert submission.send_method_id == method.id
+    assert submission.canonical_sender_address == queued.canonical_sender_address
+    assert submission.render_version == 1
+    assert is_binary(submission.request_payload)
+    assert sha256(submission.request_payload) == submission.request_sha256
+    assert submission.request_payload =~ "Bcc: blind@example.net\r\n"
+    assert submission.provider_rfc_message_id == "<#{queued.id}@manifold.local>"
+
+    assert [%Oban.Job{args: args}] = Repo.all(jobs_for(queued.id))
+    assert args == %{"outbound_message_id" => queued.id}
+    refute inspect(args) =~ "blind@example.net"
+    refute inspect(args) =~ "Private body"
+
+    queued_event =
+      Repo.get_by!(OutboundEvent, outbound_message_id: queued.id, event_type: "queued")
+
+    refute inspect(queued_event) =~ "blind@example.net"
+    refute inspect(queued_event) =~ "Private body"
   end
 
   test "queueing rejects a draft sender that differs from the selected method" do

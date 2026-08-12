@@ -19,6 +19,81 @@ defmodule Manifold.Outbound.SubmissionTest do
   alias Manifold.Outbound.Schema.{OutboundEvent, OutboundMessage, ProviderSubmission}
   alias Manifold.Repo
 
+  test "provider submission stores immutable payload fields and redacts MIME inspection" do
+    sentinel = "Bcc: private-recipient@example.test\r\n\r\nprivate-body\r\n"
+
+    changeset =
+      ProviderSubmission.changeset(%ProviderSubmission{}, %{
+        outbound_message_id: Ecto.UUID.generate(),
+        send_method_id: Ecto.UUID.generate(),
+        provider: "microsoft",
+        canonical_sender_address: "sender@example.test",
+        idempotency_key: Ecto.UUID.generate(),
+        request_sha256: sha256(sentinel),
+        request_payload: sentinel,
+        render_version: 1,
+        provider_rfc_message_id: "<message@manifold.local>",
+        state: "pending",
+        attempt_count: 0
+      })
+
+    assert changeset.valid?
+    submission = Ecto.Changeset.apply_changes(changeset)
+    refute inspect(submission) =~ sentinel
+    refute inspect(submission) =~ "private-recipient"
+  end
+
+  test "new method-backed snapshots reject missing payload and nonpositive render version" do
+    assert %{request_payload: [_ | _]} =
+             errors_on(method_submission_changeset(request_payload: nil))
+
+    assert %{render_version: [_ | _]} =
+             errors_on(method_submission_changeset(render_version: 0))
+  end
+
+  test "legacy method-backed rows remain readable with nil payload and render version" do
+    %{message: message} = queued_operational_fixture("gmail")
+
+    message.id
+    |> then(&Repo.get_by!(ProviderSubmission, outbound_message_id: &1))
+    |> Ecto.Changeset.change(request_payload: nil, render_version: nil)
+    |> Repo.update!()
+
+    assert %ProviderSubmission{
+             canonical_sender_address: canonical_sender_address,
+             request_payload: nil,
+             render_version: nil
+           } = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+
+    assert canonical_sender_address == message.canonical_sender_address
+  end
+
+  test "legacy Resend snapshots retain their idempotency window without method payload fields" do
+    expires_at = DateTime.add(DateTime.utc_now(), 24, :hour)
+
+    changeset =
+      ProviderSubmission.changeset(%ProviderSubmission{}, %{
+        outbound_message_id: Ecto.UUID.generate(),
+        provider: "resend",
+        canonical_sender_address: "sender@example.test",
+        idempotency_key: Ecto.UUID.generate(),
+        request_sha256: sha256("legacy-resend-request"),
+        state: "pending",
+        attempt_count: 0,
+        idempotency_expires_at: expires_at
+      })
+
+    assert changeset.valid?
+
+    assert %ProviderSubmission{
+             provider: "resend",
+             send_method_id: nil,
+             request_payload: nil,
+             render_version: nil,
+             idempotency_expires_at: ^expires_at
+           } = Ecto.Changeset.apply_changes(changeset)
+  end
+
   defmodule TestProvider do
     @behaviour Manifold.Outbound.Provider
 
@@ -1075,6 +1150,29 @@ defmodule Manifold.Outbound.SubmissionTest do
 
     assert submission.request_sha256 == LegacyResendFixture.request_sha256(queued)
     queued
+  end
+
+  defp method_submission_changeset(overrides) do
+    attrs = %{
+      outbound_message_id: Ecto.UUID.generate(),
+      send_method_id: Ecto.UUID.generate(),
+      provider: "microsoft",
+      canonical_sender_address: "sender@example.test",
+      idempotency_key: Ecto.UUID.generate(),
+      request_payload: "From: sender@example.test\r\n\r\nBody\r\n",
+      render_version: 1,
+      provider_rfc_message_id: "<message@manifold.local>",
+      state: "pending",
+      attempt_count: 0
+    }
+
+    attrs = Map.merge(attrs, Map.new(overrides))
+    attrs = Map.put(attrs, :request_sha256, sha256(attrs.request_payload || ""))
+    ProviderSubmission.changeset(%ProviderSubmission{}, attrs)
+  end
+
+  defp errors_on(changeset) do
+    Ecto.Changeset.traverse_errors(changeset, fn {message, _opts} -> message end)
   end
 
   defp queued_operational_fixture(kind) do
