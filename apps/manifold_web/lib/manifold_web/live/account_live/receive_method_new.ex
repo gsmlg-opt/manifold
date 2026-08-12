@@ -6,6 +6,8 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Core.Error
 
+  @oauth_providers ~w(gmail microsoft)
+
   @impl Phoenix.LiveView
   def mount(%{"id" => id}, _session, socket) do
     case Accounts.get_account(id) do
@@ -24,6 +26,7 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
            configured_providers: Connectors.configured_providers(),
            step: :choose_kind,
            selected_kind: nil,
+           oauth_setup: nil,
            imap_form: empty_imap_form(account),
            imap_error: nil,
            imap_notice: nil,
@@ -40,9 +43,21 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
   def handle_event("choose-kind", %{"kind" => kind}, socket)
       when kind in ["gmail", "microsoft", "imap", "eas"] do
     cond do
-      kind in ["gmail", "microsoft"] ->
+      kind in @oauth_providers ->
         if kind in socket.assigns.configured_providers do
-          {:noreply, assign(socket, step: :oauth_confirm, selected_kind: kind)}
+          case Connectors.oauth_method_setup(socket.assigns.account.id, kind, :receive) do
+            {:ok, setup} ->
+              {:noreply,
+               assign(socket,
+                 step: :oauth_confirm,
+                 selected_kind: kind,
+                 oauth_setup: setup
+               )}
+
+            {:error, _reason} ->
+              {:noreply,
+               put_flash(socket, :error, "#{oauth_provider_label(kind)} setup is unavailable.")}
+          end
         else
           {:noreply, put_flash(socket, :error, "#{kind_label(kind)} is not configured.")}
         end
@@ -69,6 +84,31 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
     end
   end
 
+  def handle_event(
+        "add-oauth-method",
+        _params,
+        %{assigns: %{oauth_setup: %{state: :add}, selected_kind: kind}} = socket
+      )
+      when kind in @oauth_providers do
+    case Connectors.add_authorized_oauth_method(socket.assigns.account.id, kind, :receive) do
+      {:ok, _method} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "#{oauth_provider_label(kind)} receive method added and enabled.")
+         |> push_navigate(to: ~p"/settings/accounts/#{socket.assigns.account.id}")}
+
+      {:error, _reason} ->
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "The #{oauth_provider_label(kind)} receive method could not be added."
+         )}
+    end
+  end
+
+  def handle_event("add-oauth-method", _params, socket), do: {:noreply, socket}
+
   def handle_event("back", _params, socket) do
     if socket.assigns.imap_busy or socket.assigns.eas_busy do
       {:noreply, socket}
@@ -77,6 +117,7 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
        assign(socket,
          step: :choose_kind,
          selected_kind: nil,
+         oauth_setup: nil,
          imap_form: empty_imap_form(socket.assigns.account),
          imap_error: nil,
          imap_notice: nil,
@@ -310,20 +351,40 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
           <div class="add-account-panel-header">
             <div>
               <p class="add-account-step">Step 2</p>
-              <h2>Connect {kind_label(@selected_kind)}</h2>
+              <h2>{oauth_heading(@selected_kind, @oauth_setup.state)}</h2>
             </div>
           </div>
           <p class="settings-intro">
-            Authorize {kind_label(@selected_kind)} to import mail into this account.
+            Authorize {oauth_provider_label(@selected_kind)} to import mail into this account.
           </p>
           <div class="add-account-panel-footer">
             <button type="button" class="settings-action" phx-click="back">Back</button>
             <.link
+              :if={@oauth_setup.state in [:connect, :upgrade, :reconnect]}
+              id="oauth-method-action"
               href={~p"/connectors/#{@selected_kind}/start?account_id=#{@account.id}&purpose=receive"}
               class="settings-action settings-action-primary"
             >
-              Continue with {kind_label(@selected_kind)}
+              {oauth_action(@selected_kind, @oauth_setup.state)}
             </.link>
+            <button
+              :if={@oauth_setup.state == :add}
+              id="oauth-method-action"
+              type="button"
+              class="settings-action settings-action-primary"
+              phx-click="add-oauth-method"
+            >
+              {oauth_action(@selected_kind, @oauth_setup.state)}
+            </button>
+            <button
+              :if={@oauth_setup.state == :connected}
+              id="oauth-method-action"
+              type="button"
+              class="settings-action settings-action-primary"
+              disabled
+            >
+              {oauth_action(@selected_kind, @oauth_setup.state)}
+            </button>
           </div>
         </div>
 
@@ -626,6 +687,34 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
     do: "Exchange ActiveSync — host, username, and password"
 
   defp kind_description(_, _), do: ""
+
+  defp oauth_heading("microsoft", :connect), do: "Connect Microsoft"
+  defp oauth_heading("microsoft", :upgrade), do: "Upgrade Microsoft access"
+  defp oauth_heading("microsoft", :add), do: "Add Microsoft Receive"
+  defp oauth_heading("microsoft", :connected), do: "Microsoft Receive connected"
+  defp oauth_heading("microsoft", :reconnect), do: "Reconnect Microsoft"
+  defp oauth_heading("gmail", :connect), do: "Connect Gmail"
+  defp oauth_heading("gmail", :upgrade), do: "Upgrade Gmail access"
+  defp oauth_heading("gmail", :add), do: "Add Gmail Receive"
+  defp oauth_heading("gmail", :connected), do: "Gmail Receive connected"
+  defp oauth_heading("gmail", :reconnect), do: "Reconnect Gmail"
+
+  defp oauth_action("microsoft", state) when state in [:connect, :upgrade],
+    do: "Continue with Microsoft"
+
+  defp oauth_action("microsoft", :add), do: "Add Microsoft Receive"
+  defp oauth_action("microsoft", :connected), do: "Connected"
+  defp oauth_action("microsoft", :reconnect), do: "Reconnect Microsoft"
+
+  defp oauth_action("gmail", state) when state in [:connect, :upgrade],
+    do: "Continue with Gmail"
+
+  defp oauth_action("gmail", :add), do: "Add Gmail Receive"
+  defp oauth_action("gmail", :connected), do: "Connected"
+  defp oauth_action("gmail", :reconnect), do: "Reconnect Gmail"
+
+  defp oauth_provider_label("gmail"), do: "Gmail"
+  defp oauth_provider_label("microsoft"), do: "Microsoft"
 
   defp format_error(%Error{message: message}), do: message
   defp format_error(%ProviderError{message: message}), do: message

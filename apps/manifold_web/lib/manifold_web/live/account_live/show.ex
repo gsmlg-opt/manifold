@@ -6,6 +6,8 @@ defmodule ManifoldWeb.AccountLive.Show do
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Core.Error
 
+  @oauth_providers ~w(gmail microsoft)
+
   @impl Phoenix.LiveView
   def mount(%{"id" => id}, _session, socket) do
     case Accounts.get_account(id) do
@@ -22,7 +24,8 @@ defmodule ManifoldWeb.AccountLive.Show do
            account: account,
            address: Accounts.account_address(account),
            methods: Connectors.list_receive_methods_for_account(account.id),
-           send_methods: Connectors.list_send_methods_for_account(account.id)
+           send_methods: Connectors.list_send_methods_for_account(account.id),
+           oauth_providers: @oauth_providers
          )}
     end
   end
@@ -115,22 +118,24 @@ defmodule ManifoldWeb.AccountLive.Show do
         <div class="settings-heading-actions">
           <.link navigate={~p"/settings/accounts"} class="settings-action">Back</.link>
           <.link
-            :if={gmail_reconnect?(@methods, @send_methods)}
-            id="reconnect-gmail"
+            :for={provider <- @oauth_providers}
+            :if={oauth_reconnect?(provider, @methods, @send_methods)}
+            id={"reconnect-#{provider}"}
             href={
-              ~p"/connectors/gmail/start?account_id=#{@account.id}&purpose=#{gmail_reconnect_purpose(@methods)}"
+              ~p"/connectors/#{provider}/start?account_id=#{@account.id}&purpose=#{oauth_reconnect_purpose(provider, @methods)}"
             }
             class="settings-action settings-action-primary"
           >
-            Reconnect Gmail
+            Reconnect {oauth_provider_label(provider)}
           </.link>
           <.link
-            :if={gmail_upgrade?(@methods, @send_methods)}
-            id="upgrade-gmail-access"
-            href={~p"/connectors/gmail/start?account_id=#{@account.id}&purpose=send"}
+            :for={provider <- @oauth_providers}
+            :if={oauth_upgrade?(provider, @methods, @send_methods)}
+            id={"upgrade-#{provider}-access"}
+            href={~p"/connectors/#{provider}/start?account_id=#{@account.id}&purpose=send"}
             class="settings-action settings-action-primary"
           >
-            Upgrade Gmail access
+            Upgrade {oauth_provider_label(provider)} access
           </.link>
           <.link
             id="add-receive-method"
@@ -149,8 +154,12 @@ defmodule ManifoldWeb.AccountLive.Show do
         </div>
       </div>
 
-      <p :if={gmail_reconnect?(@methods, @send_methods)} class="settings-error">
-        Reconnect the shared Gmail authorization; both receive and send are paused.
+      <p
+        :for={provider <- @oauth_providers}
+        :if={oauth_reconnect?(provider, @methods, @send_methods)}
+        class="settings-error"
+      >
+        {oauth_reconnect_copy(provider)}
       </p>
 
       <h2>Receive methods</h2>
@@ -327,25 +336,45 @@ defmodule ManifoldWeb.AccountLive.Show do
 
   defp send_kind_label("smtp"), do: "SMTP"
   defp send_kind_label("gmail"), do: "Gmail"
+  defp send_kind_label("microsoft"), do: "Microsoft 365"
   defp send_kind_label(kind), do: kind
 
-  defp gmail_upgrade?(methods, send_methods) do
-    Enum.any?(methods, &(&1.kind == "gmail" and &1.status != "disconnected")) and
-      not Enum.any?(send_methods, &(&1.kind == "gmail" and &1.status != "disconnected")) and
-      not gmail_reconnect?(methods, send_methods)
+  defp oauth_upgrade?(provider, methods, send_methods) when provider in @oauth_providers do
+    Enum.any?(methods, &healthy_oauth_method?(&1, provider)) and
+      not Enum.any?(send_methods, &active_oauth_method?(&1, provider)) and
+      not oauth_reconnect?(provider, methods, send_methods)
   end
 
-  defp gmail_reconnect?(methods, send_methods) do
+  defp oauth_reconnect?(provider, methods, send_methods) when provider in @oauth_providers do
     Enum.any?(
       methods ++ send_methods,
-      &(&1.kind == "gmail" and &1.status == "reconnect_required")
+      &(&1.kind == provider and &1.status == "reconnect_required")
     )
   end
 
-  defp gmail_reconnect_purpose(methods) do
-    if Enum.any?(methods, &(&1.kind == "gmail" and &1.status == "reconnect_required")),
+  defp oauth_reconnect_purpose(provider, methods) when provider in @oauth_providers do
+    if Enum.any?(methods, &(&1.kind == provider and &1.status == "reconnect_required")),
       do: "receive",
       else: "send"
+  end
+
+  defp healthy_oauth_method?(method, provider) do
+    method.kind == provider and method.status not in ["disconnected", "reconnect_required"]
+  end
+
+  defp active_oauth_method?(method, provider) do
+    method.kind == provider and method.status != "disconnected"
+  end
+
+  defp oauth_provider_label("gmail"), do: "Gmail"
+  defp oauth_provider_label("microsoft"), do: "Microsoft"
+
+  defp oauth_reconnect_copy("gmail") do
+    "Reconnect the shared Gmail authorization; both receive and send are paused."
+  end
+
+  defp oauth_reconnect_copy("microsoft") do
+    "Reconnect the shared Microsoft authorization; both receive and send are paused."
   end
 
   defp format_datetime(nil), do: "Not yet"

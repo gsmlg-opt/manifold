@@ -5,6 +5,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
+  alias Manifold.Connectors.MicrosoftScopes
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
   alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
@@ -47,6 +48,66 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
       do: {:ok, %RawMessage{bytes: "Subject: test\r\n\r\nBody\r\n"}}
   end
 
+  defmodule MicrosoftProvider do
+    @behaviour Manifold.Connectors.Provider
+
+    alias Manifold.Connectors.MicrosoftScopes
+    alias Manifold.Connectors.Provider.{Error, Identity, Page, RawMessage, Token}
+    alias Manifold.Connectors.Provider.SyncCursor
+
+    @impl true
+    def exchange_code("provider-failure-code", _verifier, _redirect_uri, _config, _opts) do
+      {:error,
+       %Error{
+         class: :temporary,
+         code: :provider_unavailable,
+         message: "raw-microsoft-provider-error-body-secret",
+         retry_after_seconds: 30
+       }}
+    end
+
+    def exchange_code(code, _verifier, _redirect_uri, _config, opts) do
+      scopes =
+        if code == "missing-scope-code" do
+          []
+        else
+          opts
+          |> Keyword.fetch!(:required_scopes)
+          |> Enum.reject(&(&1 == MicrosoftScopes.offline()))
+        end
+
+      {:ok,
+       %Token{
+         access_token: "microsoft-access-token-private-sentinel",
+         refresh_token: "microsoft-refresh-token-private-sentinel",
+         expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
+         scopes: scopes
+       }}
+    end
+
+    @impl true
+    def refresh_token(_refresh_token, _config, _opts), do: raise("not used")
+
+    @impl true
+    def identity("microsoft-access-token-private-sentinel", _config, _opts) do
+      identity = Application.fetch_env!(:manifold_connectors, :microsoft_web_test_identity)
+      {:ok, %Identity{id: identity.subject, email_address: identity.email_address}}
+    end
+
+    @impl true
+    def initial_cursors(_access_token, _config, _opts) do
+      {:ok, [%SyncCursor{scope: "mailbox", phase: "bootstrap"}]}
+    end
+
+    @impl true
+    def sync_page(_access_token, cursor, _config, _opts), do: {:ok, %Page{cursor: cursor}}
+
+    @impl true
+    def fetch_raw(_access_token, _message_id, _config, _opts) do
+      {:ok, %RawMessage{bytes: "Subject: test\r\n\r\nBody\r\n"}}
+    end
+  end
+
   setup do
     old_key = Application.get_env(:manifold_connectors, :encryption_key)
     old_adapters = Application.get_env(:manifold_connectors, :adapters)
@@ -56,19 +117,30 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     old_eas_transport = Application.get_env(:manifold_connectors, :eas_transport)
     old_eas_fake = Application.get_env(:manifold_connectors, :eas_fake)
 
+    old_microsoft_identity =
+      Application.get_env(:manifold_connectors, :microsoft_web_test_identity)
+
     Application.put_env(
       :manifold_connectors,
       :encryption_key,
       Base.encode64(:crypto.strong_rand_bytes(32))
     )
 
-    Application.put_env(:manifold_connectors, :adapters, gmail: GmailProvider)
+    Application.put_env(:manifold_connectors, :adapters,
+      gmail: GmailProvider,
+      microsoft: MicrosoftProvider
+    )
 
     Application.put_env(:manifold_connectors, :providers,
       gmail: [
         client_id: "gmail-client-secret-id",
         client_secret: "gmail-client-secret",
         authorization_url: "https://accounts.google.test/o/oauth2/v2/auth"
+      ],
+      microsoft: [
+        client_id: "microsoft-client-secret-id",
+        client_secret: "microsoft-client-secret",
+        authorization_url: "https://login.microsoft.test/oauth2/v2.0/authorize"
       ]
     )
 
@@ -95,6 +167,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
       restore_env(:imap_fake, old_fake)
       restore_env(:eas_transport, old_eas_transport)
       restore_env(:eas_fake, old_eas_fake)
+      restore_env(:microsoft_web_test_identity, old_microsoft_identity)
     end)
 
     {:ok, account} =
@@ -245,6 +318,160 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     assert Connectors.list_send_methods_for_account(other.id) == []
     assert Repo.aggregate(OAuthAuthorization, :count) == 1
+  end
+
+  test "Microsoft Send OAuth is purpose-correct, account-scoped, and returns to the selected account",
+       %{
+         conn: conn,
+         account: account
+       } do
+    set_microsoft_identity!(Accounts.account_address(account), "microsoft-account-1")
+
+    {:ok, other} =
+      Accounts.create_account(%{name: "Other Microsoft", address: "other@microsoft.example"})
+
+    {:ok, view, _html} = live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
+    view |> element("#send-method-microsoft") |> render_click()
+
+    assert has_element?(
+             view,
+             ~s|a[href="/connectors/microsoft/start?account_id=#{account.id}&purpose=send"]|
+           )
+
+    start_conn =
+      get(conn, "/connectors/microsoft/start", %{
+        "account_id" => account.id,
+        "purpose" => "send"
+      })
+
+    authorization_url = redirected_to(start_conn, 302)
+    state = oauth_state(authorization_url)
+
+    transaction = Repo.get_by!(OAuthTransaction, state_digest: :crypto.hash(:sha256, state))
+    assert transaction.mailbox_id == account.id
+    assert transaction.purpose == "send"
+
+    callback_conn =
+      conn
+      |> recycle()
+      |> get("/connectors/microsoft/callback", %{
+        "code" => "valid-code",
+        "state" => state,
+        "account_id" => other.id
+      })
+
+    assert redirected_to(callback_conn, 302) == "/settings/accounts/#{account.id}"
+
+    assert Phoenix.Flash.get(callback_conn.assigns.flash, :info) ==
+             "Microsoft 365 send method connected."
+
+    assert [%{account_id: account_id, kind: "microsoft", enabled: true}] =
+             Connectors.list_send_methods_for_account(account.id)
+
+    assert account_id == account.id
+    assert Connectors.list_send_methods_for_account(other.id) == []
+
+    replay_conn =
+      callback_conn
+      |> recycle()
+      |> get("/connectors/microsoft/callback", %{
+        "code" => "valid-code",
+        "state" => state,
+        "account_id" => other.id
+      })
+
+    assert redirected_to(replay_conn, 302) == "/settings/accounts"
+
+    assert Phoenix.Flash.get(replay_conn.assigns.flash, :error) ==
+             "The Microsoft 365 authorization request is invalid or expired."
+
+    assert Connectors.list_send_methods_for_account(other.id) == []
+  end
+
+  test "Microsoft callback failures use safe account-aware flash text", %{
+    conn: conn,
+    account: account
+  } do
+    address = Accounts.account_address(account)
+    set_microsoft_identity!(address, "microsoft-original-subject")
+
+    assert redirected_to(connect_microsoft(conn, account.id, "send", "valid-code"), 302) ==
+             "/settings/accounts/#{account.id}"
+
+    set_microsoft_identity!(address, "microsoft-different-subject")
+
+    subject_mismatch =
+      connect_microsoft(conn, account.id, "send", "subject-mismatch-code")
+
+    assert_safe_microsoft_account_error(subject_mismatch, account.id, [
+      "microsoft-original-subject",
+      "microsoft-different-subject"
+    ])
+
+    {:ok, address_account} =
+      Accounts.create_account(%{name: "Address mismatch", address: "address@microsoft.example"})
+
+    set_microsoft_identity!("different-address@microsoft.example", "address-mismatch-subject")
+
+    address_mismatch =
+      connect_microsoft(conn, address_account.id, "send", "address-mismatch-code")
+
+    assert_safe_microsoft_account_error(address_mismatch, address_account.id, [
+      "different-address@microsoft.example",
+      "address-mismatch-subject"
+    ])
+
+    {:ok, scope_account} =
+      Accounts.create_account(%{name: "Scope mismatch", address: "scope@microsoft.example"})
+
+    set_microsoft_identity!(Accounts.account_address(scope_account), "scope-subject")
+    missing_scope = connect_microsoft(conn, scope_account.id, "send", "missing-scope-code")
+
+    assert_safe_microsoft_account_error(missing_scope, scope_account.id, [
+      MicrosoftScopes.send(),
+      MicrosoftScopes.offline()
+    ])
+
+    {:ok, provider_account} =
+      Accounts.create_account(%{name: "Provider failure", address: "provider@microsoft.example"})
+
+    set_microsoft_identity!(Accounts.account_address(provider_account), "provider-subject")
+
+    provider_failure =
+      connect_microsoft(conn, provider_account.id, "send", "provider-failure-code")
+
+    assert_safe_microsoft_account_error(provider_failure, provider_account.id, [
+      "raw-microsoft-provider-error-body-secret"
+    ])
+
+    {:ok, expired_account} =
+      Accounts.create_account(%{name: "Expired", address: "expired@microsoft.example"})
+
+    set_microsoft_identity!(Accounts.account_address(expired_account), "expired-subject")
+
+    {expired_start, expired_state} = start_microsoft(conn, expired_account.id, "send")
+    assert URI.parse(redirected_to(expired_start, 302)).host == "login.microsoft.test"
+
+    OAuthTransaction
+    |> Repo.get_by!(state_digest: :crypto.hash(:sha256, expired_state))
+    |> Ecto.Changeset.change(expires_at: DateTime.add(DateTime.utc_now(), -1, :second))
+    |> Repo.update!()
+
+    expired_callback =
+      conn
+      |> recycle()
+      |> get("/connectors/microsoft/callback", %{
+        "code" => "valid-code",
+        "state" => expired_state
+      })
+
+    assert redirected_to(expired_callback, 302) == "/settings/accounts"
+
+    assert Phoenix.Flash.get(expired_callback.assigns.flash, :error) ==
+             "The Microsoft 365 authorization request is invalid or expired."
+
+    refute inspect(expired_callback.assigns.flash) =~ expired_state
+    refute inspect(expired_callback.assigns.flash) =~ "expired-subject"
   end
 
   test "OAuth start rejects unsupported purposes without creating a transaction", %{
@@ -439,6 +666,58 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     |> render_click()
 
     assert Connectors.list_receive_methods_for_account(account.id) == []
+  end
+
+  defp set_microsoft_identity!(email_address, subject) do
+    Application.put_env(:manifold_connectors, :microsoft_web_test_identity, %{
+      email_address: email_address,
+      subject: subject
+    })
+  end
+
+  defp connect_microsoft(conn, account_id, purpose, code) do
+    {_start_conn, state} = start_microsoft(conn, account_id, purpose)
+
+    conn
+    |> recycle()
+    |> get("/connectors/microsoft/callback", %{"code" => code, "state" => state})
+  end
+
+  defp start_microsoft(conn, account_id, purpose) do
+    start_conn =
+      get(conn, "/connectors/microsoft/start", %{
+        "account_id" => account_id,
+        "purpose" => purpose
+      })
+
+    authorization_url = redirected_to(start_conn, 302)
+    {start_conn, oauth_state(authorization_url)}
+  end
+
+  defp oauth_state(authorization_url) do
+    authorization_url
+    |> URI.parse()
+    |> Map.fetch!(:query)
+    |> URI.decode_query()
+    |> Map.fetch!("state")
+  end
+
+  defp assert_safe_microsoft_account_error(conn, account_id, secrets) do
+    assert redirected_to(conn, 302) == "/settings/accounts/#{account_id}"
+
+    assert Phoenix.Flash.get(conn.assigns.flash, :error) ==
+             "The Microsoft 365 account could not be connected."
+
+    inspected = inspect(conn.assigns.flash)
+
+    for secret <-
+          secrets ++
+            [
+              "microsoft-access-token-private-sentinel",
+              "microsoft-refresh-token-private-sentinel"
+            ] do
+      refute inspected =~ secret
+    end
   end
 
   defp connect_gmail(conn, account_id, purpose \\ "receive") do

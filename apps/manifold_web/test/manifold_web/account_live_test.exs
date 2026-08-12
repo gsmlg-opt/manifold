@@ -9,9 +9,37 @@ defmodule ManifoldWeb.AccountLiveTest do
   alias Manifold.Accounts
   alias Manifold.Connectors
   alias Manifold.Connectors.Crypto
-  alias Manifold.Connectors.GmailScopes
+  alias Manifold.Connectors.{GmailScopes, MicrosoftScopes}
+  alias Manifold.Connectors.Provider.{Page, RawMessage}
+  alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
   alias Manifold.Connectors.Schema.{OAuthAuthorization, ReceiveMethod, SendMethod}
   alias Manifold.Repo
+
+  defmodule MicrosoftSetupProvider do
+    @behaviour Manifold.Connectors.Provider
+
+    @impl true
+    def exchange_code(_code, _verifier, _redirect_uri, _config, _opts), do: raise("not used")
+
+    @impl true
+    def refresh_token(_refresh_token, _config, _opts), do: raise("not used")
+
+    @impl true
+    def identity(_access_token, _config, _opts), do: raise("not used")
+
+    @impl true
+    def initial_cursors(_access_token, _config, _opts) do
+      {:ok, [%ProviderCursor{scope: "mailbox", phase: "bootstrap"}]}
+    end
+
+    @impl true
+    def sync_page(_access_token, cursor, _config, _opts), do: {:ok, %Page{cursor: cursor}}
+
+    @impl true
+    def fetch_raw(_access_token, _message_id, _config, _opts) do
+      {:ok, %RawMessage{bytes: "Subject: test\r\n\r\nBody\r\n"}}
+    end
+  end
 
   setup do
     start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
@@ -147,6 +175,233 @@ defmodule ManifoldWeb.AccountLiveTest do
     assert has_element?(view, "#send-method-gmail[disabled]")
     assert has_element?(view, "#send-method-gmail", "Provider not configured")
     assert has_element?(view, "#send-method-smtp")
+  end
+
+  test "Microsoft 365 send remains visible and disabled when provider config is absent", %{
+    conn: conn
+  } do
+    previous_providers = Application.get_env(:manifold_connectors, :providers)
+    Application.put_env(:manifold_connectors, :providers, [])
+
+    on_exit(fn -> restore_smtp_env(:providers, previous_providers) end)
+
+    {:ok, account} =
+      Accounts.create_account(%{name: "No Microsoft", address: "no-microsoft@example.test"})
+
+    {:ok, view, html} = live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
+
+    assert html =~ "Microsoft 365"
+    assert has_element?(view, "#send-method-microsoft[disabled]")
+    assert has_element?(view, "#send-method-microsoft", "Provider not configured")
+  end
+
+  test "Microsoft send setup renders connect upgrade add and connected states without secrets", %{
+    conn: conn
+  } do
+    configure_microsoft_provider!()
+
+    {:ok, connect_account} =
+      Accounts.create_account(%{name: "Connect", address: "connect@microsoft-ui.test"})
+
+    {:ok, connect_view, _html} =
+      live(conn, ~p"/settings/accounts/#{connect_account.id}/send_methods/new")
+
+    connect_html = connect_view |> element("#send-method-microsoft") |> render_click()
+    assert connect_html =~ "Connect Microsoft"
+
+    assert has_element?(
+             connect_view,
+             ~s|a[href*="account_id=#{connect_account.id}&purpose=send"]|,
+             "Continue with Microsoft"
+           )
+
+    assert_safe_oauth_html(connect_html, [])
+
+    {:ok, upgrade_account} =
+      Accounts.create_account(%{name: "Upgrade", address: "upgrade@microsoft-ui.test"})
+
+    upgrade_authorization =
+      insert_microsoft_authorization!(upgrade_account, [MicrosoftScopes.read()])
+
+    insert_microsoft_receive!(upgrade_account, upgrade_authorization)
+
+    {:ok, upgrade_view, _html} =
+      live(conn, ~p"/settings/accounts/#{upgrade_account.id}/send_methods/new")
+
+    upgrade_html = upgrade_view |> element("#send-method-microsoft") |> render_click()
+    assert upgrade_html =~ "Upgrade Microsoft access"
+
+    assert has_element?(
+             upgrade_view,
+             ~s|a[href*="account_id=#{upgrade_account.id}&purpose=send"]|,
+             "Continue with Microsoft"
+           )
+
+    assert_safe_oauth_html(upgrade_html, [upgrade_authorization.id])
+
+    {:ok, upgrade_show_view, upgrade_show_html} =
+      live(conn, ~p"/settings/accounts/#{upgrade_account.id}")
+
+    assert has_element?(
+             upgrade_show_view,
+             ~s|#upgrade-microsoft-access[href="/connectors/microsoft/start?account_id=#{upgrade_account.id}&purpose=send"]|,
+             "Upgrade Microsoft access"
+           )
+
+    assert_safe_oauth_html(upgrade_show_html, [upgrade_authorization.id])
+
+    {:ok, add_account} =
+      Accounts.create_account(%{name: "Add", address: "add@microsoft-ui.test"})
+
+    add_authorization = insert_microsoft_authorization!(add_account, microsoft_all_scopes())
+    insert_microsoft_receive!(add_account, add_authorization)
+
+    {:ok, add_view, _html} =
+      live(conn, ~p"/settings/accounts/#{add_account.id}/send_methods/new")
+
+    add_html = add_view |> element("#send-method-microsoft") |> render_click()
+    assert add_html =~ "Add Microsoft Send"
+    assert has_element?(add_view, "button[phx-click='add-oauth-method']", "Add Microsoft Send")
+    assert_safe_oauth_html(add_html, [add_authorization.id])
+
+    add_view
+    |> element("button[phx-click='add-oauth-method']")
+    |> render_click()
+
+    assert_redirect(add_view, ~p"/settings/accounts/#{add_account.id}")
+
+    assert [%{kind: "microsoft", enabled: true}] =
+             Connectors.list_send_methods_for_account(add_account.id)
+
+    {:ok, connected_account} =
+      Accounts.create_account(%{name: "Connected", address: "connected@microsoft-ui.test"})
+
+    connected_authorization =
+      insert_microsoft_authorization!(connected_account, microsoft_all_scopes())
+
+    insert_microsoft_send!(connected_account, connected_authorization)
+
+    {:ok, connected_view, _html} =
+      live(conn, ~p"/settings/accounts/#{connected_account.id}/send_methods/new")
+
+    connected_html = connected_view |> element("#send-method-microsoft") |> render_click()
+    assert connected_html =~ "Microsoft Send connected"
+    assert has_element?(connected_view, "button[disabled]", "Connected")
+    assert_safe_oauth_html(connected_html, [connected_authorization.id])
+  end
+
+  test "send-only Microsoft can add or upgrade Microsoft Receive symmetrically", %{conn: conn} do
+    configure_microsoft_provider!()
+
+    {:ok, add_account} =
+      Accounts.create_account(%{name: "Add receive", address: "add-receive@microsoft-ui.test"})
+
+    add_authorization = insert_microsoft_authorization!(add_account, microsoft_all_scopes())
+    insert_microsoft_send!(add_account, add_authorization)
+
+    {:ok, add_view, _html} =
+      live(conn, ~p"/settings/accounts/#{add_account.id}/receive_methods/new")
+
+    add_html =
+      add_view
+      |> element("button[phx-value-kind='microsoft']")
+      |> render_click()
+
+    assert add_html =~ "Add Microsoft Receive"
+    assert has_element?(add_view, "button[phx-click='add-oauth-method']", "Add Microsoft Receive")
+    assert_safe_oauth_html(add_html, [add_authorization.id])
+
+    add_view
+    |> element("button[phx-click='add-oauth-method']")
+    |> render_click()
+
+    assert_redirect(add_view, ~p"/settings/accounts/#{add_account.id}")
+
+    assert [%{kind: "microsoft", enabled: true}] =
+             Connectors.list_receive_methods_for_account(add_account.id)
+
+    {:ok, upgrade_account} =
+      Accounts.create_account(%{
+        name: "Upgrade receive",
+        address: "upgrade-receive@microsoft-ui.test"
+      })
+
+    upgrade_authorization =
+      insert_microsoft_authorization!(upgrade_account, [MicrosoftScopes.send()])
+
+    insert_microsoft_send!(upgrade_account, upgrade_authorization)
+
+    {:ok, upgrade_view, _html} =
+      live(conn, ~p"/settings/accounts/#{upgrade_account.id}/receive_methods/new")
+
+    upgrade_html =
+      upgrade_view
+      |> element("button[phx-value-kind='microsoft']")
+      |> render_click()
+
+    assert upgrade_html =~ "Upgrade Microsoft access"
+
+    assert has_element?(
+             upgrade_view,
+             ~s|a[href*="account_id=#{upgrade_account.id}&purpose=receive"]|,
+             "Continue with Microsoft"
+           )
+
+    assert_safe_oauth_html(upgrade_html, [upgrade_authorization.id])
+  end
+
+  test "Microsoft reconnect renders one shared action and explains both directions are paused", %{
+    conn: conn
+  } do
+    configure_microsoft_provider!()
+
+    {:ok, account} =
+      Accounts.create_account(%{name: "Reconnect", address: "reconnect@microsoft-ui.test"})
+
+    authorization =
+      insert_microsoft_authorization!(account, microsoft_all_scopes(),
+        status: "reconnect_required",
+        error: "raw-provider-error-body-secret"
+      )
+
+    insert_microsoft_receive!(account, authorization,
+      status: "reconnect_required",
+      enabled: false
+    )
+
+    insert_microsoft_send!(account, authorization, status: "reconnect_required", enabled: false)
+
+    {:ok, view, html} = live(conn, ~p"/settings/accounts/#{account.id}")
+
+    assert html =~
+             "Reconnect the shared Microsoft authorization; both receive and send are paused."
+
+    assert length(Regex.scan(~r/id="reconnect-microsoft"/, html)) == 1
+
+    assert has_element?(
+             view,
+             ~s|#reconnect-microsoft[href*="account_id=#{account.id}&purpose=receive"]|,
+             "Reconnect Microsoft"
+           )
+
+    refute html =~ authorization.id
+    refute html =~ "raw-provider-error-body-secret"
+    refute html =~ MicrosoftScopes.read()
+    refute html =~ MicrosoftScopes.send()
+
+    {:ok, reconnect_view, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
+
+    reconnect_html = reconnect_view |> element("#send-method-microsoft") |> render_click()
+    assert reconnect_html =~ "Reconnect Microsoft"
+
+    assert has_element?(
+             reconnect_view,
+             ~s|a[href="/connectors/microsoft/start?account_id=#{account.id}&purpose=send"]|,
+             "Reconnect Microsoft"
+           )
+
+    assert_safe_oauth_html(reconnect_html, [authorization.id])
   end
 
   test "Gmail reconnect follows the method that actually requires reconnect", %{conn: conn} do
@@ -623,6 +878,124 @@ defmodule ManifoldWeb.AccountLiveTest do
     updated = Accounts.get_account!(account.id)
     assert updated.name == "Danielle"
     assert Accounts.account_address(updated) == "danielle@example.test"
+  end
+
+  defp configure_microsoft_provider! do
+    previous_key = Application.get_env(:manifold_connectors, :encryption_key)
+    previous_adapters = Application.get_env(:manifold_connectors, :adapters)
+    previous_providers = Application.get_env(:manifold_connectors, :providers)
+
+    Application.put_env(
+      :manifold_connectors,
+      :encryption_key,
+      Base.encode64(:crypto.strong_rand_bytes(32))
+    )
+
+    Application.put_env(
+      :manifold_connectors,
+      :adapters,
+      Keyword.put(previous_adapters || [], :microsoft, MicrosoftSetupProvider)
+    )
+
+    Application.put_env(
+      :manifold_connectors,
+      :providers,
+      Keyword.put(previous_providers || [], :microsoft,
+        client_id: "microsoft-client-id",
+        client_secret: "microsoft-client-secret",
+        authorization_url: "https://login.microsoft.test/authorize"
+      )
+    )
+
+    on_exit(fn ->
+      restore_smtp_env(:encryption_key, previous_key)
+      restore_smtp_env(:adapters, previous_adapters)
+      restore_smtp_env(:providers, previous_providers)
+    end)
+  end
+
+  defp insert_microsoft_authorization!(account, scopes, opts \\ []) do
+    authorization_id = Ecto.UUID.generate()
+
+    {:ok, access_ciphertext} =
+      Crypto.encrypt(
+        "microsoft-access-token-private-sentinel",
+        "credential:#{authorization_id}:access"
+      )
+
+    {:ok, refresh_ciphertext} =
+      Crypto.encrypt(
+        "microsoft-refresh-token-private-sentinel",
+        "credential:#{authorization_id}:refresh"
+      )
+
+    %OAuthAuthorization{id: authorization_id}
+    |> OAuthAuthorization.changeset(%{
+      account_id: account.id,
+      provider: "microsoft",
+      provider_subject_id: "subject-#{authorization_id}",
+      email_address: Accounts.account_address(account),
+      granted_scopes: scopes,
+      status: Keyword.get(opts, :status, "connected"),
+      key_version: 1,
+      access_token_ciphertext: access_ciphertext,
+      refresh_token_ciphertext: refresh_ciphertext,
+      token_expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
+      last_error_class: if(Keyword.has_key?(opts, :error), do: "reconnect", else: nil),
+      last_error_code: if(Keyword.has_key?(opts, :error), do: "invalid_grant", else: nil),
+      last_error_message: Keyword.get(opts, :error)
+    })
+    |> Repo.insert!()
+  end
+
+  defp insert_microsoft_receive!(account, authorization, opts \\ []) do
+    %ReceiveMethod{}
+    |> ReceiveMethod.changeset(%{
+      account_id: account.id,
+      oauth_authorization_id: authorization.id,
+      kind: "microsoft",
+      provider_account_id: authorization.provider_subject_id,
+      email_address: Accounts.account_address(account),
+      status: Keyword.get(opts, :status, "connected"),
+      enabled: Keyword.get(opts, :enabled, true),
+      sync_enabled: Keyword.get(opts, :enabled, true),
+      granted_scopes: authorization.granted_scopes,
+      last_error_message: Keyword.get(opts, :error)
+    })
+    |> Repo.insert!()
+  end
+
+  defp insert_microsoft_send!(account, authorization, opts \\ []) do
+    %SendMethod{}
+    |> SendMethod.changeset(%{
+      account_id: account.id,
+      oauth_authorization_id: authorization.id,
+      kind: "microsoft",
+      email_address: Accounts.account_address(account),
+      status: Keyword.get(opts, :status, "connected"),
+      enabled: Keyword.get(opts, :enabled, true),
+      last_error_message: Keyword.get(opts, :error)
+    })
+    |> Repo.insert!()
+  end
+
+  defp microsoft_all_scopes do
+    [MicrosoftScopes.read(), MicrosoftScopes.send(), MicrosoftScopes.offline()]
+  end
+
+  defp assert_safe_oauth_html(html, secrets) do
+    for secret <-
+          secrets ++
+            [
+              MicrosoftScopes.read(),
+              MicrosoftScopes.send(),
+              MicrosoftScopes.offline(),
+              "microsoft-access-token-private-sentinel",
+              "microsoft-refresh-token-private-sentinel",
+              "raw-provider-error-body-secret"
+            ] do
+      refute html =~ secret
+    end
   end
 
   defp restore_smtp_env(key, nil), do: Application.delete_env(:manifold_connectors, key)

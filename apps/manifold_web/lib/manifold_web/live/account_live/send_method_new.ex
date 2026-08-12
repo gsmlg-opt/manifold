@@ -6,6 +6,8 @@ defmodule ManifoldWeb.AccountLive.SendMethodNew do
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Core.Error
 
+  @oauth_providers ~w(gmail microsoft)
+
   @impl Phoenix.LiveView
   def mount(%{"id" => id}, _session, socket) do
     case Accounts.get_account(id) do
@@ -23,6 +25,8 @@ defmodule ManifoldWeb.AccountLive.SendMethodNew do
            address: Accounts.account_address(account),
            configured_providers: Connectors.configured_providers(),
            step: :choose_kind,
+           selected_kind: nil,
+           oauth_setup: nil,
            smtp_form: empty_smtp_form(account),
            smtp_error: nil,
            smtp_notice: nil,
@@ -32,11 +36,23 @@ defmodule ManifoldWeb.AccountLive.SendMethodNew do
   end
 
   @impl Phoenix.LiveView
-  def handle_event("choose-kind", %{"kind" => "gmail"}, socket) do
-    if "gmail" in socket.assigns.configured_providers do
-      {:noreply, assign(socket, step: :gmail_confirm)}
+  def handle_event("choose-kind", %{"kind" => kind}, socket) when kind in @oauth_providers do
+    if kind in socket.assigns.configured_providers do
+      case Connectors.oauth_method_setup(socket.assigns.account.id, kind, :send) do
+        {:ok, setup} ->
+          {:noreply,
+           assign(socket,
+             step: :oauth_confirm,
+             selected_kind: kind,
+             oauth_setup: setup
+           )}
+
+        {:error, _reason} ->
+          {:noreply,
+           put_flash(socket, :error, "#{oauth_provider_label(kind)} setup is unavailable.")}
+      end
     else
-      {:noreply, put_flash(socket, :error, "Gmail is not configured.")}
+      {:noreply, put_flash(socket, :error, "#{oauth_provider_label(kind)} is not configured.")}
     end
   end
 
@@ -50,10 +66,37 @@ defmodule ManifoldWeb.AccountLive.SendMethodNew do
      )}
   end
 
+  def handle_event(
+        "add-oauth-method",
+        _params,
+        %{assigns: %{oauth_setup: %{state: :add}, selected_kind: kind}} = socket
+      )
+      when kind in @oauth_providers do
+    case Connectors.add_authorized_oauth_method(socket.assigns.account.id, kind, :send) do
+      {:ok, _method} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "#{oauth_provider_label(kind)} send method added and enabled.")
+         |> push_navigate(to: ~p"/settings/accounts/#{socket.assigns.account.id}")}
+
+      {:error, _reason} ->
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "The #{oauth_provider_label(kind)} send method could not be added."
+         )}
+    end
+  end
+
+  def handle_event("add-oauth-method", _params, socket), do: {:noreply, socket}
+
   def handle_event("back", _params, %{assigns: %{smtp_busy: false}} = socket) do
     {:noreply,
      assign(socket,
        step: :choose_kind,
+       selected_kind: nil,
+       oauth_setup: nil,
        smtp_form: empty_smtp_form(socket.assigns.account),
        smtp_error: nil,
        smtp_notice: nil
@@ -198,6 +241,24 @@ defmodule ManifoldWeb.AccountLive.SendMethodNew do
               </span>
             </button>
             <button
+              id="send-method-microsoft"
+              type="button"
+              class="add-account-choice"
+              phx-click="choose-kind"
+              phx-value-kind="microsoft"
+              disabled={"microsoft" not in @configured_providers}
+            >
+              <.dm_mdi name="microsoft" />
+              <span>
+                <strong>Microsoft 365</strong>
+                <small>
+                  {if "microsoft" in @configured_providers,
+                    do: "Send through Microsoft Graph",
+                    else: "Provider not configured"}
+                </small>
+              </span>
+            </button>
+            <button
               id="send-method-smtp"
               type="button"
               class="add-account-choice"
@@ -213,22 +274,44 @@ defmodule ManifoldWeb.AccountLive.SendMethodNew do
           </div>
         </div>
 
-        <div :if={@step == :gmail_confirm}>
+        <div :if={@step == :oauth_confirm}>
           <div class="add-account-panel-header">
             <div>
               <p class="add-account-step">Step 2</p>
-              <h2>Connect Gmail</h2>
+              <h2>{oauth_heading(@selected_kind, @oauth_setup.state)}</h2>
             </div>
           </div>
-          <p class="settings-intro">Authorize Gmail to send mail for this account.</p>
+          <p class="settings-intro">
+            Authorize {oauth_provider_label(@selected_kind)} to send mail for this account.
+          </p>
           <div class="add-account-panel-footer">
             <button type="button" class="settings-action" phx-click="back">Back</button>
             <.link
-              href={~p"/connectors/gmail/start?account_id=#{@account.id}&purpose=send"}
+              :if={@oauth_setup.state in [:connect, :upgrade, :reconnect]}
+              id="oauth-method-action"
+              href={~p"/connectors/#{@selected_kind}/start?account_id=#{@account.id}&purpose=send"}
               class="settings-action settings-action-primary"
             >
-              Continue with Gmail
+              {oauth_action(@selected_kind, @oauth_setup.state)}
             </.link>
+            <button
+              :if={@oauth_setup.state == :add}
+              id="oauth-method-action"
+              type="button"
+              class="settings-action settings-action-primary"
+              phx-click="add-oauth-method"
+            >
+              {oauth_action(@selected_kind, @oauth_setup.state)}
+            </button>
+            <button
+              :if={@oauth_setup.state == :connected}
+              id="oauth-method-action"
+              type="button"
+              class="settings-action settings-action-primary"
+              disabled
+            >
+              {oauth_action(@selected_kind, @oauth_setup.state)}
+            </button>
           </div>
         </div>
 
@@ -369,6 +452,34 @@ defmodule ManifoldWeb.AccountLive.SendMethodNew do
       as: :smtp
     )
   end
+
+  defp oauth_heading("microsoft", :connect), do: "Connect Microsoft"
+  defp oauth_heading("microsoft", :upgrade), do: "Upgrade Microsoft access"
+  defp oauth_heading("microsoft", :add), do: "Add Microsoft Send"
+  defp oauth_heading("microsoft", :connected), do: "Microsoft Send connected"
+  defp oauth_heading("microsoft", :reconnect), do: "Reconnect Microsoft"
+  defp oauth_heading("gmail", :connect), do: "Connect Gmail"
+  defp oauth_heading("gmail", :upgrade), do: "Upgrade Gmail access"
+  defp oauth_heading("gmail", :add), do: "Add Gmail Send"
+  defp oauth_heading("gmail", :connected), do: "Gmail Send connected"
+  defp oauth_heading("gmail", :reconnect), do: "Reconnect Gmail"
+
+  defp oauth_action("microsoft", state) when state in [:connect, :upgrade],
+    do: "Continue with Microsoft"
+
+  defp oauth_action("microsoft", :add), do: "Add Microsoft Send"
+  defp oauth_action("microsoft", :connected), do: "Connected"
+  defp oauth_action("microsoft", :reconnect), do: "Reconnect Microsoft"
+
+  defp oauth_action("gmail", state) when state in [:connect, :upgrade],
+    do: "Continue with Gmail"
+
+  defp oauth_action("gmail", :add), do: "Add Gmail Send"
+  defp oauth_action("gmail", :connected), do: "Connected"
+  defp oauth_action("gmail", :reconnect), do: "Reconnect Gmail"
+
+  defp oauth_provider_label("gmail"), do: "Gmail"
+  defp oauth_provider_label("microsoft"), do: "Microsoft"
 
   defp format_error(%Error{message: message}), do: message
   defp format_error(%ProviderError{message: message}), do: message
