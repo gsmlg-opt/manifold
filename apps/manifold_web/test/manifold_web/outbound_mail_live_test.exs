@@ -3,12 +3,37 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
-  alias Manifold.Connectors.Schema.SendMethod
+  alias Manifold.Connectors.{Crypto, MicrosoftScopes}
+  alias Manifold.Connectors.Schema.{OAuthAuthorization, SendMethod}
   alias Manifold.Ingest.Schema.InboundDelivery
   alias Manifold.Mail
   alias Manifold.Mail.Schema.{MailboxEntry, Message, MessageAddress}
   alias Manifold.Outbound
+  alias Manifold.Outbound.Provider
+  alias Manifold.Outbound.Schema.ProviderSubmission
   alias Manifold.Repo
+
+  @unavailable "The requested mailbox view is unavailable."
+
+  defmodule MicrosoftAcceptProvider do
+    @behaviour Manifold.Outbound.Provider
+
+    alias Manifold.Outbound.Provider
+
+    @impl true
+    def submit(config, %Provider.Request{provider: "microsoft"} = request) do
+      send(Keyword.fetch!(config, :test_pid), {:microsoft_submit, request})
+
+      {:ok,
+       %Provider.Submission{
+         provider_message_id: nil,
+         metadata: %{
+           "request_id" => "graph-request-accepted",
+           "client_request_id" => "graph-client-accepted"
+         }
+       }}
+    end
+  end
 
   test "compose creates one persisted draft and opens its editor", %{conn: conn} do
     mailbox = mailbox_fixture()
@@ -91,7 +116,7 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
 
   test "send-only Microsoft acceptance stays out of projected Sent", %{conn: conn} do
     mailbox = mailbox_fixture()
-    add_microsoft_send_method(mailbox)
+    method = add_microsoft_send_method(mailbox)
     assert Connectors.list_receive_methods_for_account(mailbox.id) == []
 
     assert {:ok, folders} = Mail.list_folders(mailbox.id)
@@ -106,9 +131,28 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
 
     assert {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
 
-    queued
-    |> Ecto.Changeset.change(state: "accepted_by_provider", accepted_at: DateTime.utc_now())
-    |> Repo.update!()
+    assert :ok =
+             Outbound.submit_message(queued.id,
+               provider: MicrosoftAcceptProvider,
+               provider_config: [test_pid: self()]
+             )
+
+    assert_receive {:microsoft_submit,
+                    %Provider.Request{
+                      provider: "microsoft",
+                      send_method_id: send_method_id
+                    }}
+
+    assert send_method_id == method.id
+
+    assert %ProviderSubmission{
+             state: "accepted",
+             provider_message_id: nil,
+             provider_metadata: %{
+               "request_id" => "graph-request-accepted",
+               "client_request_id" => "graph-client-accepted"
+             }
+           } = Repo.get_by!(ProviderSubmission, outbound_message_id: queued.id)
 
     assert {:ok, activity_view, activity_html} =
              live(conn, "/mail/#{mailbox.id}/send-activity/#{queued.id}")
@@ -123,6 +167,15 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
 
     refute sent_html =~ "Accepted by Microsoft only"
     assert has_element?(sent_view, ".empty-folder", "No messages in this folder")
+  end
+
+  test "malformed Send activity detail redirects safely", %{conn: conn} do
+    mailbox = mailbox_fixture()
+
+    assert {:error, {_kind, %{to: "/", flash: flash}}} =
+             live(conn, "/mail/#{mailbox.id}/send-activity/not-a-uuid")
+
+    assert flash["error"] == @unavailable
   end
 
   test "draft routes are mailbox scoped", %{conn: conn} do
@@ -244,9 +297,40 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
   defp add_microsoft_send_method(mailbox) do
     address = "#{mailbox.local_part}@#{mailbox.domain.normalized_domain}"
 
+    authorization_id = Ecto.UUID.generate()
+
+    assert {:ok, access} =
+             Crypto.encrypt(
+               "microsoft-web-access-token",
+               "credential:#{authorization_id}:access"
+             )
+
+    assert {:ok, refresh} =
+             Crypto.encrypt(
+               "microsoft-web-refresh-token",
+               "credential:#{authorization_id}:refresh"
+             )
+
+    authorization =
+      %OAuthAuthorization{id: authorization_id}
+      |> OAuthAuthorization.changeset(%{
+        account_id: mailbox.id,
+        provider: "microsoft",
+        provider_subject_id: "subject-#{authorization_id}",
+        email_address: address,
+        granted_scopes: [MicrosoftScopes.send()],
+        status: "connected",
+        key_version: 1,
+        access_token_ciphertext: access,
+        refresh_token_ciphertext: refresh,
+        token_expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second)
+      })
+      |> Repo.insert!()
+
     %SendMethod{}
     |> SendMethod.changeset(%{
       account_id: mailbox.id,
+      oauth_authorization_id: authorization.id,
       kind: "microsoft",
       email_address: address,
       status: "connected",

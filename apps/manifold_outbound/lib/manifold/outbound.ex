@@ -226,35 +226,35 @@ defmodule Manifold.Outbound do
   @spec get_send_activity(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, View.SendActivityDetail.t()} | {:error, Error.t()}
   def get_send_activity(mailbox_id, outbound_message_id) do
-    message =
-      OutboundMessage
-      |> where(
-        [message],
-        message.id == ^outbound_message_id and message.mailbox_id == ^mailbox_id and
-          message.state != "draft"
-      )
-      |> Repo.one()
+    with {:ok, mailbox_id} <- Ecto.UUID.cast(mailbox_id),
+         {:ok, outbound_message_id} <- Ecto.UUID.cast(outbound_message_id) do
+      message =
+        OutboundMessage
+        |> where(
+          [message],
+          message.id == ^outbound_message_id and message.mailbox_id == ^mailbox_id and
+            message.state != "draft"
+        )
+        |> Repo.one()
 
-    case message do
-      %OutboundMessage{} = message ->
-        submission =
-          Repo.get_by(ProviderSubmission, outbound_message_id: outbound_message_id)
+      case message do
+        %OutboundMessage{} = message ->
+          submission =
+            Repo.get_by(ProviderSubmission, outbound_message_id: outbound_message_id)
 
-        events =
-          OutboundEvent
-          |> where([event], event.outbound_message_id == ^outbound_message_id)
-          |> order_by([event], asc: event.occurred_at, asc: event.id)
-          |> Repo.all()
+          events =
+            OutboundEvent
+            |> where([event], event.outbound_message_id == ^outbound_message_id)
+            |> order_by([event], asc: event.occurred_at, asc: event.id)
+            |> Repo.all()
 
-        {:ok, send_activity_detail_view(message, submission, events)}
+          {:ok, send_activity_detail_view(message, submission, events)}
 
-      nil ->
-        {:error,
-         error(
-           :permanent,
-           :send_activity_not_found,
-           "send activity not found in mailbox"
-         )}
+        nil ->
+          send_activity_not_found()
+      end
+    else
+      :error -> send_activity_not_found()
     end
   rescue
     DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
@@ -596,6 +596,15 @@ defmodule Manifold.Outbound do
       last_error_message: message.last_error_message,
       updated_at: message.updated_at
     }
+  end
+
+  defp send_activity_not_found do
+    {:error,
+     error(
+       :permanent,
+       :send_activity_not_found,
+       "send activity not found in mailbox"
+     )}
   end
 
   defp recipient_view(recipient) do

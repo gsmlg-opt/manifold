@@ -1021,6 +1021,16 @@ defmodule Manifold.OutboundTest do
              Outbound.get_send_activity(mailbox.id, draft_fixture(mailbox.id).id)
   end
 
+  test "rejects malformed send activity UUIDs without raising" do
+    %{mailbox: mailbox} = mailbox_fixture()
+
+    assert {:error, %Error{reason: :send_activity_not_found}} =
+             Outbound.get_send_activity("not-a-uuid", Ecto.UUID.generate())
+
+    assert {:error, %Error{reason: :send_activity_not_found}} =
+             Outbound.get_send_activity(mailbox.id, "not-a-uuid")
+  end
+
   defp draft_fixture(mailbox_id, opts \\ []) do
     recipients =
       [%{kind: "to", address: "person@example.net"}] ++
