@@ -64,6 +64,8 @@ defmodule Manifold.Outbound.Submission do
     recipient_rejected
     request_integrity_failed
     request_rejected
+    retry_exhausted
+    retry_exhaustion_lifecycle_failed
     reauthorization_required
     send_failed
     send_method_provider_mismatch
@@ -89,6 +91,20 @@ defmodule Manifold.Outbound.Submission do
   def submit(message_id, opts \\ []) do
     start = System.monotonic_time()
 
+    case Ecto.UUID.cast(message_id) do
+      {:ok, message_id} ->
+        submit_valid(message_id, opts, start)
+
+      :error ->
+        result =
+          {:error, Error.new(:permanent, :outbound_not_found, "outbound message not found")}
+
+        emit_submit_stop(%{message_id: nil, attempt_count: 0}, result, start)
+        result
+    end
+  end
+
+  defp submit_valid(message_id, opts, start) do
     case capture_submission(fn -> prepare_attempt(message_id, start) end) do
       {:return, prepared} ->
         submit_prepared(prepared, opts, start)
@@ -106,6 +122,39 @@ defmodule Manifold.Outbound.Submission do
 
         reraise(exception, stacktrace)
     end
+  end
+
+  @doc false
+  @spec finalize_retry_exhausted(Ecto.UUID.t()) :: :ok | {:error, Error.t()}
+  def finalize_retry_exhausted(message_id) do
+    with {:ok, message_id} <- Ecto.UUID.cast(message_id) do
+      Repo.transaction(fn ->
+        message =
+          OutboundMessage
+          |> where([message], message.id == ^message_id)
+          |> lock("FOR UPDATE")
+          |> Repo.one()
+
+        submission =
+          ProviderSubmission
+          |> where([submission], submission.outbound_message_id == ^message_id)
+          |> lock("FOR UPDATE")
+          |> Repo.one()
+
+        finalize_retry_exhausted_locked(message, submission)
+      end)
+      |> case do
+        {:ok, :ok} -> :ok
+        {:ok, {:error, %Error{} = error}} -> {:error, error}
+        {:error, reason} -> {:error, database_error(reason)}
+      end
+    else
+      :error ->
+        {:error, Error.new(:permanent, :outbound_not_found, "outbound message not found")}
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error, database_error(:unavailable)}
   end
 
   defp submit_prepared({:ok, :already_accepted}, _opts, _start), do: :ok
@@ -184,6 +233,10 @@ defmodule Manifold.Outbound.Submission do
         emit_submit_stop(telemetry_context(message, submission), {:error, error}, start)
         {:error, error}
 
+      {:ok, {:marked_failed, error, message, submission}} ->
+        emit_submit_stop(telemetry_context(message, submission), {:error, error}, start)
+        {:error, error}
+
       {:ok, :already_accepted} ->
         {:ok, :already_accepted}
 
@@ -233,19 +286,23 @@ defmodule Manifold.Outbound.Submission do
   defp prepare_locked(message, submission, recipients) do
     now = DateTime.utc_now()
 
-    with {:ok, submission} <- ensure_request_payload(message, submission, recipients) do
-      if submission.provider == "resend" and submission.attempt_count > 0 and
-           DateTime.compare(now, submission.idempotency_expires_at) != :lt do
-        mark_uncertain(
-          message,
-          submission,
-          now,
-          "idempotency_expired",
-          "provider acceptance is ambiguous after idempotency expiry"
-        )
-      else
-        start_attempt(message, submission, recipients, now)
-      end
+    case ensure_request_payload(message, submission, recipients) do
+      {:ok, submission} ->
+        if submission.provider == "resend" and submission.attempt_count > 0 and
+             DateTime.compare(now, submission.idempotency_expires_at) != :lt do
+          mark_uncertain(
+            message,
+            submission,
+            now,
+            "idempotency_expired",
+            "provider acceptance is ambiguous after idempotency expiry"
+          )
+        else
+          start_attempt(message, submission, recipients, now)
+        end
+
+      {:error, %Provider.Error{code: "request_integrity_failed"} = error} ->
+        mark_failed(message, submission, now, error)
     end
   end
 
@@ -373,6 +430,89 @@ defmodule Manifold.Outbound.Submission do
     {:marked_uncertain,
      Error.new(:permanent, :submission_uncertain, "submission was not retried"), message,
      submission}
+  end
+
+  defp mark_failed(message, submission, now, %Provider.Error{} = error) do
+    with :ok <- State.validate_transition(message.state, "failed") do
+      message =
+        message
+        |> Ecto.Changeset.change(
+          state: "failed",
+          last_error_class: "permanent",
+          last_error_code: error.code,
+          last_error_message: error.message,
+          failed_at: now
+        )
+        |> Repo.update!()
+
+      submission =
+        submission
+        |> Ecto.Changeset.change(
+          state: "failed",
+          last_http_status: error.http_status,
+          last_error_code: error.code,
+          last_error_message: error.message
+        )
+        |> Repo.update!()
+
+      insert_event!(message.id, "submission_failed", %{code: error.code}, now)
+      {:marked_failed, error, message, submission}
+    end
+  end
+
+  defp finalize_retry_exhausted_locked(nil, _submission) do
+    {:error, Error.new(:permanent, :outbound_not_found, "outbound message not found")}
+  end
+
+  defp finalize_retry_exhausted_locked(_message, nil) do
+    {:error, Error.new(:permanent, :submission_not_found, "provider submission not found")}
+  end
+
+  defp finalize_retry_exhausted_locked(
+         %OutboundMessage{state: "queued"} = message,
+         %ProviderSubmission{state: "pending"} = submission
+       ) do
+    error = retry_exhausted_error()
+
+    case mark_failed(message, submission, DateTime.utc_now(), error) do
+      {:marked_failed, ^error, _message, _submission} -> :ok
+      {:error, %Error{} = state_error} -> {:error, state_error}
+    end
+  end
+
+  defp finalize_retry_exhausted_locked(
+         %OutboundMessage{state: "accepted_by_provider"},
+         %ProviderSubmission{state: "accepted"}
+       ),
+       do: :ok
+
+  defp finalize_retry_exhausted_locked(
+         %OutboundMessage{state: "submission_uncertain"},
+         %ProviderSubmission{state: "uncertain"}
+       ),
+       do: :ok
+
+  defp finalize_retry_exhausted_locked(
+         %OutboundMessage{state: "failed"},
+         %ProviderSubmission{state: "failed"}
+       ),
+       do: :ok
+
+  defp finalize_retry_exhausted_locked(_inconsistent_message, _inconsistent_submission) do
+    {:error,
+     Error.new(
+       :temporary,
+       :retry_exhaustion_lifecycle_failed,
+       "outbound retry exhaustion state could not be finalized"
+     )}
+  end
+
+  defp retry_exhausted_error do
+    %Provider.Error{
+      class: :permanent,
+      code: "retry_exhausted",
+      message: "outbound submission retry limit was exhausted"
+    }
   end
 
   defp call_provider(:already_accepted, _opts), do: :already_accepted
@@ -716,6 +856,7 @@ defmodule Manifold.Outbound.Submission do
   end
 
   defp persist_result(preparation, {:error, %Provider.Error{} = error}, opts) do
+    error = maybe_retry_exhausted(error, opts)
     now = DateTime.utc_now()
     state = if error.class == :transient, do: "queued", else: "failed"
     submission_state = if error.class == :transient, do: "pending", else: "failed"
@@ -765,6 +906,16 @@ defmodule Manifold.Outbound.Submission do
       {:error, reason} -> {:error, database_error(reason)}
     end
   end
+
+  defp maybe_retry_exhausted(%Provider.Error{class: :transient} = error, opts) do
+    if Keyword.get(opts, :retry_exhausted?) == true do
+      %{retry_exhausted_error() | http_status: error.http_status}
+    else
+      error
+    end
+  end
+
+  defp maybe_retry_exhausted(%Provider.Error{} = error, _opts), do: error
 
   defp maybe_reconcile_pending(provider, provider_message_id, message_id, now)
        when is_binary(provider_message_id) and provider_message_id != "" do

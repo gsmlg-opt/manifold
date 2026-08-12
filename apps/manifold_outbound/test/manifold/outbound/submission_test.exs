@@ -522,6 +522,51 @@ defmodule Manifold.Outbound.SubmissionTest do
     refute Repo.get_by!(ProviderSubmission, outbound_message_id: newer_message.id).provider_message_id
   end
 
+  test "stale final-attempt result cannot terminalize a newer submitting attempt" do
+    %{message: message} = queued_operational_fixture("smtp")
+
+    advance_attempt = fn preparation, _result ->
+      Repo.get!(ProviderSubmission, preparation.submission_id)
+      |> Ecto.Changeset.change(attempt_count: preparation.attempt_count + 1)
+      |> Repo.update!()
+    end
+
+    assert {:error, %{class: :temporary, reason: :stale_submission_result}} =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [
+                 test_pid: self(),
+                 result:
+                   {:error,
+                    %Provider.Error{
+                      class: :transient,
+                      code: "provider_unavailable",
+                      message: "provider is temporarily unavailable"
+                    }}
+               ],
+               retry_exhausted?: true,
+               before_result_persist: advance_attempt
+             )
+
+    assert_receive {:provider_submit, _, _}
+    assert Repo.get!(OutboundMessage, message.id).state == "submitting"
+
+    persisted = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+    assert persisted.state == "submitting"
+    assert persisted.attempt_count == 2
+
+    for event_type <- ["submission_failed", "submission_retryable"] do
+      assert Repo.aggregate(
+               from(event in OutboundEvent,
+                 where:
+                   event.outbound_message_id == ^message.id and
+                     event.event_type == ^event_type
+               ),
+               :count
+             ) == 0
+    end
+  end
+
   test "ambiguous submission outside the idempotency window becomes uncertain" do
     message = queued_message_fixture()
     submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
@@ -744,9 +789,10 @@ defmodule Manifold.Outbound.SubmissionTest do
     refute_receive {:provider_submit, _, _}
   end
 
-  test "payload integrity is validated before attempt state or credential checkout" do
+  test "payload integrity failure atomically terminalizes before credential checkout" do
     %{message: message, method: method} = queued_operational_fixture("microsoft")
     submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+    request_payload = explicit_request_payload(submission.id)
 
     authorization = Repo.get!(OAuthAuthorization, method.oauth_authorization_id)
 
@@ -763,11 +809,57 @@ defmodule Manifold.Outbound.SubmissionTest do
              )
 
     refute_receive {:provider_submit, _, _}
-    assert Repo.get!(OutboundMessage, message.id).state == "queued"
+
+    persisted_message = Repo.get!(OutboundMessage, message.id)
+    assert persisted_message.state == "failed"
+    assert persisted_message.last_error_class == "permanent"
+    assert persisted_message.last_error_code == "request_integrity_failed"
+    assert persisted_message.last_error_message == "outbound submission is invalid"
+    assert %DateTime{} = persisted_message.failed_at
 
     persisted = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
-    assert persisted.state == "pending"
+    assert persisted.state == "failed"
     assert persisted.attempt_count == 0
+    assert persisted.first_attempt_at == nil
+    assert persisted.last_attempt_at == nil
+    assert persisted.last_error_code == "request_integrity_failed"
+    assert persisted.last_error_message == "outbound submission is invalid"
+    assert explicit_request_payload(persisted.id) == request_payload
+
+    assert Repo.aggregate(
+             from(event in OutboundEvent,
+               where:
+                 event.outbound_message_id == ^message.id and
+                   event.event_type == "submission_failed"
+             ),
+             :count
+           ) == 1
+
+    assert Repo.aggregate(
+             from(event in OutboundEvent,
+               where:
+                 event.outbound_message_id == ^message.id and
+                   event.event_type == "submission_started"
+             ),
+             :count
+           ) == 0
+
+    assert {:error, %{class: :permanent, reason: :submission_not_retryable}} =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: :unused]
+             )
+
+    refute_receive {:provider_submit, _, _}
+
+    assert Repo.aggregate(
+             from(event in OutboundEvent,
+               where:
+                 event.outbound_message_id == ^message.id and
+                   event.event_type == "submission_failed"
+             ),
+             :count
+           ) == 1
 
     %{message: sender_message, method: sender_method} =
       queued_operational_fixture("microsoft")
@@ -791,6 +883,11 @@ defmodule Manifold.Outbound.SubmissionTest do
     assert Repo.get_by!(ProviderSubmission, outbound_message_id: sender_message.id).attempt_count ==
              0
 
+    assert Repo.get!(OutboundMessage, sender_message.id).state == "failed"
+
+    assert Repo.get_by!(ProviderSubmission, outbound_message_id: sender_message.id).state ==
+             "failed"
+
     %{message: legacy_microsoft} = insert_legacy_method_submission!("microsoft")
 
     assert {:error, %Provider.Error{class: :permanent, code: "request_integrity_failed"}} =
@@ -800,6 +897,10 @@ defmodule Manifold.Outbound.SubmissionTest do
              )
 
     refute_receive {:provider_submit, _, _}
+    assert Repo.get!(OutboundMessage, legacy_microsoft.id).state == "failed"
+
+    assert Repo.get_by!(ProviderSubmission, outbound_message_id: legacy_microsoft.id).state ==
+             "failed"
   end
 
   test "legacy Gmail and SMTP payloads backfill once under the submission lock" do
@@ -839,6 +940,8 @@ defmodule Manifold.Outbound.SubmissionTest do
     refute_receive {:provider_submit, _, _}
     assert explicit_request_payload(mismatch.id) == nil
     assert Repo.get!(ProviderSubmission, mismatch.id).attempt_count == 0
+    assert Repo.get!(ProviderSubmission, mismatch.id).state == "failed"
+    assert Repo.get!(OutboundMessage, mismatch_message.id).state == "failed"
   end
 
   test "interrupted Microsoft submission becomes uncertain before dispatch" do
