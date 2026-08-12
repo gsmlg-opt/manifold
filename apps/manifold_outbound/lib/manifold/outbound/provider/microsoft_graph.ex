@@ -63,12 +63,11 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
 
   defp perform_request(uri, access_token, raw_message, transport) do
     case request(uri, access_token, Base.encode64(raw_message), transport) do
-      {:ok, %Req.Response{status: 202} = response} ->
-        {:ok,
-         %Submission{
-           provider_message_id: nil,
-           metadata: diagnostic_metadata(response)
-         }}
+      {:ok, %Req.Response{status: 202, private: %{manifold_raw_body_size: 0}} = response} ->
+        accepted(response)
+
+      {:ok, %Req.Response{status: 202}} ->
+        {:error, invalid_response(202)}
 
       {:ok, %Req.Response{} = response} ->
         {:error, classify_response(response)}
@@ -78,19 +77,34 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
     end
   end
 
+  defp accepted(response) do
+    {:ok,
+     %Submission{
+       provider_message_id: nil,
+       metadata: diagnostic_metadata(response)
+     }}
+  end
+
   defp request(uri, access_token, encoded_message, %{plug: plug} = transport)
        when not is_nil(plug) do
-    Req.request(
-      method: :post,
-      url: URI.to_string(uri),
-      auth: {:bearer, access_token},
-      body: encoded_message,
-      headers: [{"content-type", "text/plain"}],
-      plug: plug,
-      receive_timeout: transport.receive_timeout,
-      retry: false,
-      redirect: false
-    )
+    case Req.request(
+           method: :post,
+           url: URI.to_string(uri),
+           auth: {:bearer, access_token},
+           body: encoded_message,
+           headers: [{"content-type", "text/plain"}],
+           plug: plug,
+           receive_timeout: transport.receive_timeout,
+           retry: false,
+           redirect: false,
+           decode_body: false
+         ) do
+      {:ok, %Req.Response{} = response} ->
+        {:ok, normalize_req_response(response)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp request(uri, access_token, encoded_message, transport) do
@@ -133,7 +147,8 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
             status: nil,
             headers: [],
             body: [],
-            body_size: 0
+            body_size: 0,
+            raw_body_size: 0
           })
 
         {:error, conn, reason} ->
@@ -218,28 +233,44 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
   end
 
   defp append_mint_body(%{body_size: size} = acc, data) when is_binary(data) do
-    new_size = size + byte_size(data)
+    remaining = max(@max_response_body_bytes - size, 0)
+    retained_size = min(byte_size(data), remaining)
+    retained = binary_part(data, 0, retained_size)
 
-    if new_size <= @max_response_body_bytes do
-      {:cont, {:more, %{acc | body: [data | acc.body], body_size: new_size}}}
-    else
-      {:halt, {:error, :response_body_too_large}}
-    end
+    {:cont,
+     {:more,
+      %{
+        acc
+        | body: if(retained == "", do: acc.body, else: [retained | acc.body]),
+          body_size: size + retained_size,
+          raw_body_size: acc.raw_body_size + byte_size(data)
+      }}}
   end
 
   defp mint_response(response) do
-    body = response.body |> Enum.reverse() |> IO.iodata_to_binary() |> decode_mint_body()
+    raw_body = response.body |> Enum.reverse() |> IO.iodata_to_binary()
 
     %Req.Response{
       status: response.status,
       headers: Req.Fields.new(response.headers),
-      body: body
+      body: decode_body(raw_body),
+      private: %{manifold_raw_body_size: response.raw_body_size}
     }
   end
 
-  defp decode_mint_body(""), do: ""
+  defp normalize_req_response(%Req.Response{body: body} = response) when is_binary(body) do
+    %{
+      response
+      | body: decode_body(body),
+        private: Map.put(response.private, :manifold_raw_body_size, byte_size(body))
+    }
+  end
 
-  defp decode_mint_body(body) do
+  defp normalize_req_response(%Req.Response{} = response), do: response
+
+  defp decode_body(""), do: ""
+
+  defp decode_body(body) do
     case JSON.decode(body) do
       {:ok, decoded} -> decoded
       {:error, _reason} -> ""
@@ -452,12 +483,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
         acceptance_unknown(status)
 
       status in 200..299 ->
-        error(
-          :uncertain,
-          "invalid_response",
-          "Microsoft may have accepted the message",
-          status
-        )
+        invalid_response(status)
 
       status == 401 or has_code?(codes, @authentication_codes) ->
         error(
@@ -505,6 +531,15 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
     error(
       :uncertain,
       "acceptance_unknown",
+      "Microsoft may have accepted the message",
+      status
+    )
+  end
+
+  defp invalid_response(status) do
+    error(
+      :uncertain,
+      "invalid_response",
       "Microsoft may have accepted the message",
       status
     )

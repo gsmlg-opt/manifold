@@ -1,5 +1,5 @@
 defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
 
@@ -70,6 +70,39 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
             }} = MicrosoftGraph.submit(@config, @request)
   end
 
+  test "treats every nonempty 202 response body as an invalid acceptance response" do
+    responses = [
+      {"whitespace", "text/plain"},
+      {"malformed", "application/json"},
+      {"json", "application/json"}
+    ]
+
+    for {name, content_type} <- responses do
+      secret = "#{name}-202-private-sentinel"
+
+      body =
+        case name do
+          "whitespace" -> " "
+          "malformed" -> "not-json-" <> secret
+          "json" -> JSON.encode!(%{"unexpected" => secret})
+        end
+
+      Req.Test.expect(MicrosoftGraph, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type(content_type)
+        |> Plug.Conn.send_resp(202, body)
+      end)
+
+      assert {:error,
+              %Provider.Error{
+                class: :uncertain,
+                code: "invalid_response",
+                message: "Microsoft may have accepted the message",
+                http_status: 202
+              }} = secure_submit(@config, secret)
+    end
+  end
+
   test "retains only single bounded safe diagnostic request IDs" do
     response_secret = "diagnostic-response-private-sentinel"
     valid_128 = String.duplicate("a", 128)
@@ -79,7 +112,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
       |> Plug.Conn.put_resp_header("request-id", valid_128)
       |> Plug.Conn.put_resp_header("client-request-id", "graph.client:1_safe")
       |> Plug.Conn.put_resp_header("x-private-diagnostic", response_secret)
-      |> Plug.Conn.send_resp(202, response_secret)
+      |> Plug.Conn.send_resp(202, "")
     end)
 
     assert {:ok,
@@ -101,7 +134,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
         {"request-id", "ambiguous-request-2"}
       ])
       |> Plug.Conn.put_resp_header("client-request-id", "valid-client-id")
-      |> Plug.Conn.send_resp(202, response_secret)
+      |> Plug.Conn.send_resp(202, "")
     end)
 
     assert {:ok,
@@ -114,7 +147,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
       conn
       |> Plug.Conn.put_resp_header("request-id", String.duplicate("b", 129))
       |> Plug.Conn.put_resp_header("client-request-id", "unsafe client id")
-      |> Plug.Conn.send_resp(202, response_secret)
+      |> Plug.Conn.send_resp(202, "")
     end)
 
     assert {:ok, %Provider.Submission{provider_message_id: nil, metadata: %{}}} =
@@ -515,6 +548,64 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     end
   end
 
+  @tag :tmp_dir
+  test "production transport preserves raw body presence and oversized response status", %{
+    tmp_dir: tmp_dir
+  } do
+    malformed_secret = "production-malformed-202-private-sentinel"
+    json_secret = "production-json-202-private-sentinel"
+    oversized_429_secret = "oversized-429-private-sentinel"
+    oversized_503_secret = "oversized-503-private-sentinel"
+
+    responses = [
+      {202, [{"content-type", "text/plain"}], " "},
+      {202, [{"content-type", "application/json"}], "not-json-" <> malformed_secret},
+      {202, [{"content-type", "application/json"}], JSON.encode!(%{"unexpected" => json_secret})},
+      {202, [], ""},
+      {429, [{"retry-after", "75"}], oversized_body(oversized_429_secret)},
+      {503, [], oversized_body(oversized_503_secret)}
+    ]
+
+    with_graph_tls_server(tmp_dir, responses, fn base_url ->
+      config = [
+        access_token: @access_token,
+        base_url: base_url,
+        req_options: [receive_timeout: 2_000, connect_options: [timeout: 2_000]]
+      ]
+
+      for secret <- [
+            "production-whitespace-202-private-sentinel",
+            malformed_secret,
+            json_secret
+          ] do
+        assert {:error,
+                %Provider.Error{
+                  class: :uncertain,
+                  code: "invalid_response",
+                  http_status: 202
+                }} = secure_submit(config, secret)
+      end
+
+      assert {:ok, %Provider.Submission{provider_message_id: nil, metadata: %{}}} =
+               secure_submit(config, "production-empty-202-private-sentinel")
+
+      assert {:error,
+              %Provider.Error{
+                class: :transient,
+                code: "rate_limited",
+                http_status: 429,
+                retry_after: 75
+              }} = secure_submit(config, oversized_429_secret)
+
+      assert {:error,
+              %Provider.Error{
+                class: :uncertain,
+                code: "acceptance_unknown",
+                http_status: 503
+              }} = secure_submit(config, oversized_503_secret)
+    end)
+  end
+
   defp expect_graph_error(status, code, secret, opts \\ []) do
     expect_graph_body(
       status,
@@ -599,6 +690,135 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
       0 -> Enum.reverse(entries)
     end
   end
+
+  defp with_graph_tls_server(tmp_dir, responses, fun) do
+    tls =
+      :public_key.pkix_test_data(%{
+        root: [key: {:rsa, 2_048, 65_537}, digest: :sha256],
+        peer: [key: {:rsa, 2_048, 65_537}, digest: :sha256]
+      })
+
+    cacertfile = Path.join(tmp_dir, "graph-test-ca.pem")
+    restore_cacertfile = Path.join(tmp_dir, "original-test-ca.pem")
+    previous_cacerts = :public_key.cacerts_get()
+
+    write_cacerts!(cacertfile, tls[:cacerts])
+    write_cacerts!(restore_cacertfile, previous_cacerts)
+
+    :ok = :public_key.cacerts_load(cacertfile)
+
+    {:ok, listener} =
+      :ssl.listen(0,
+        mode: :binary,
+        active: false,
+        reuseaddr: true,
+        cert: tls[:cert],
+        key: tls[:key]
+      )
+
+    {:ok, {_address, port}} = :ssl.sockname(listener)
+    hostname = :net_adm.localhost() |> List.to_string()
+    base_url = "https://#{hostname}:#{port}/v1.0"
+    previous_providers = Application.fetch_env!(:manifold_connectors, :providers)
+
+    microsoft =
+      previous_providers |> Keyword.fetch!(:microsoft) |> Keyword.put(:base_url, base_url)
+
+    Application.put_env(
+      :manifold_connectors,
+      :providers,
+      Keyword.put(previous_providers, :microsoft, microsoft)
+    )
+
+    server =
+      Task.async(fn ->
+        Enum.each(responses, &serve_graph_tls_response(listener, &1))
+      end)
+
+    try do
+      result = fun.(base_url)
+      Task.await(server, 5_000)
+      result
+    after
+      Task.shutdown(server, :brutal_kill)
+      :ssl.close(listener)
+      Application.put_env(:manifold_connectors, :providers, previous_providers)
+      :ok = :public_key.cacerts_load(restore_cacertfile)
+    end
+  end
+
+  defp write_cacerts!(path, cacerts) do
+    entries =
+      Enum.map(cacerts, fn
+        {:cert, der, _decoded} -> {:Certificate, der, :not_encrypted}
+        der when is_binary(der) -> {:Certificate, der, :not_encrypted}
+      end)
+
+    File.write!(path, :public_key.pem_encode(entries))
+  end
+
+  defp oversized_body(secret), do: secret <> String.duplicate("x", 64 * 1024 + 1)
+
+  defp serve_graph_tls_response(listener, {status, headers, body}) do
+    {:ok, transport_socket} = :ssl.transport_accept(listener, 2_000)
+    {:ok, socket} = :ssl.handshake(transport_socket, 2_000)
+    {:ok, request} = receive_http_request(socket, "")
+    assert request =~ "POST /v1.0/me/sendMail HTTP/1.1\r\n"
+
+    response_headers =
+      headers ++
+        [
+          {"content-length", Integer.to_string(byte_size(body))},
+          {"connection", "close"}
+        ]
+
+    response = [
+      "HTTP/1.1 #{status} #{status_reason(status)}\r\n",
+      Enum.map(response_headers, fn {name, value} -> [name, ": ", value, "\r\n"] end),
+      "\r\n",
+      body
+    ]
+
+    :ok = :ssl.send(socket, response)
+    :ok = :ssl.close(socket)
+  end
+
+  defp receive_http_request(socket, received) do
+    with {:more, _expected_size} <- complete_http_request?(received),
+         {:ok, data} <- :ssl.recv(socket, 0, 2_000) do
+      receive_http_request(socket, received <> data)
+    else
+      {:done, _expected_size} -> {:ok, received}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp complete_http_request?(request) do
+    case :binary.match(request, "\r\n\r\n") do
+      {header_end, 4} ->
+        body_start = header_end + 4
+        headers = binary_part(request, 0, header_end)
+
+        content_length =
+          case Regex.run(~r/\r\ncontent-length:\s*(\d+)/i, "\r\n" <> headers) do
+            [_, value] -> String.to_integer(value)
+            nil -> 0
+          end
+
+        expected_size = body_start + content_length
+
+        if byte_size(request) >= expected_size,
+          do: {:done, expected_size},
+          else: {:more, expected_size}
+
+      :nomatch ->
+        {:more, nil}
+    end
+  end
+
+  defp status_reason(202), do: "Accepted"
+  defp status_reason(429), do: "Too Many Requests"
+  defp status_reason(503), do: "Service Unavailable"
 
   defp tagged_transport_error(conn, reason) do
     put_in(conn.private[:req_test_exception], %Req.TransportError{reason: reason})
