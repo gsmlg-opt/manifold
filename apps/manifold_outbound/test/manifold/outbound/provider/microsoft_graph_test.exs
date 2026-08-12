@@ -309,6 +309,23 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     end
   end
 
+  test "Req.Test ignores code-shaped text outside a structural Graph error response" do
+    for {content_type, body, secret} <- non_structural_graph_code_bodies("req") do
+      Req.Test.expect(MicrosoftGraph, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type(content_type)
+        |> Plug.Conn.send_resp(403, body)
+      end)
+
+      assert {:error,
+              %Provider.Error{
+                class: :permanent,
+                code: "request_rejected",
+                http_status: 403
+              }} = secure_submit(@config, secret)
+    end
+  end
+
   test "Req.Test bounds oversized Graph error classification to the retained prefix" do
     for {status, graph_code, placement, expected_code} <- oversized_graph_cases() do
       secret = "req-#{placement}-#{graph_code}-private-sentinel"
@@ -659,6 +676,34 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     end)
   end
 
+  @tag :tmp_dir
+  test "production transport ignores code-shaped text outside a structural Graph error response",
+       %{tmp_dir: tmp_dir} do
+    cases = non_structural_graph_code_bodies("production")
+
+    responses =
+      Enum.map(cases, fn {content_type, body, _secret} ->
+        {403, [{"content-type", content_type}], body}
+      end)
+
+    with_graph_tls_server(tmp_dir, responses, fn base_url ->
+      config = [
+        access_token: @access_token,
+        base_url: base_url,
+        req_options: [receive_timeout: 2_000, connect_options: [timeout: 2_000]]
+      ]
+
+      for {_content_type, _body, secret} <- cases do
+        assert {:error,
+                %Provider.Error{
+                  class: :permanent,
+                  code: "request_rejected",
+                  http_status: 403
+                }} = secure_submit(config, secret)
+      end
+    end)
+  end
+
   defp expect_graph_error(status, code, secret, opts \\ []) do
     expect_graph_body(
       status,
@@ -816,6 +861,53 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
       {400, "InvalidAuthenticationToken", :before_limit, "reconnect_required"},
       {403, "TenantPolicyRejected", :before_limit, "policy_rejected"},
       {403, "Authorization_RequestDenied", :after_limit, "request_rejected"}
+    ]
+  end
+
+  defp non_structural_graph_code_bodies(prefix) do
+    plain_secret = "#{prefix}-plain-code-private-sentinel"
+    malformed_secret = "#{prefix}-malformed-code-private-sentinel"
+    escaped_secret = "#{prefix}-escaped-code-private-sentinel"
+    wrong_path_secret = "#{prefix}-wrong-path-code-private-sentinel"
+    oversized_wrong_path_secret = "#{prefix}-oversized-wrong-path-code-private-sentinel"
+
+    oversized_wrong_path_body =
+      IO.iodata_to_binary([
+        ~s({"metadata":{"code":"Authorization_RequestDenied","message":),
+        JSON.encode!(oversized_wrong_path_secret <> String.duplicate("x", 64 * 1024 + 1)),
+        "}}"
+      ])
+
+    assert byte_size(oversized_wrong_path_body) > 64 * 1024
+
+    assert {wrong_path_code_offset, _length} =
+             :binary.match(
+               oversized_wrong_path_body,
+               ~s("code":"Authorization_RequestDenied")
+             )
+
+    assert wrong_path_code_offset < 64 * 1024
+
+    [
+      {"text/plain", ~s(not-json #{plain_secret} "code":"Authorization_RequestDenied"),
+       plain_secret},
+      {"application/json",
+       ~s({"error":not-json "#{malformed_secret}","code":"Authorization_RequestDenied"}),
+       malformed_secret},
+      {"application/json",
+       JSON.encode!(%{
+         "error" => %{
+           "message" => ~s(#{escaped_secret} embedded {"code":"Authorization_RequestDenied"})
+         }
+       }), escaped_secret},
+      {"application/json",
+       JSON.encode!(%{
+         "metadata" => %{
+           "code" => "Authorization_RequestDenied",
+           "message" => wrong_path_secret
+         }
+       }), wrong_path_secret},
+      {"application/json", oversized_wrong_path_body, oversized_wrong_path_secret}
     ]
   end
 

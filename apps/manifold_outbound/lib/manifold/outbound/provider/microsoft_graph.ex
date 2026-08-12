@@ -36,10 +36,12 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
     "mailboxaccessdenied",
     "tenantpolicyrejected"
   ]
+  @max_json_prefix_depth 64
+  @max_graph_error_code_candidates 8
   @bounded_error_codes @authentication_codes ++
                          @insufficient_scope_codes ++
                          @policy_rejection_codes
-  @graph_error_code_token ~r/(?<!\\)"(?:code|error)"\s*:\s*"([A-Za-z0-9_.:-]{1,128})"/
+  @graph_error_code_token ~r/(?<!\\)"code"\s*:\s*"([A-Za-z0-9_.:-]{1,128})"/
 
   @impl true
   def submit(config, %Request{raw_message: raw_message}) when is_list(config) do
@@ -282,17 +284,89 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
     private =
       response.private
       |> Map.put(:manifold_raw_body_size, raw_body_size)
-      |> Map.put(:manifold_graph_error_codes, bounded_graph_error_codes(retained_body))
+      |> Map.put(
+        :manifold_graph_error_codes,
+        bounded_graph_error_codes(retained_body, raw_body_size > byte_size(retained_body))
+      )
 
     %{response | body: decode_body(retained_body), private: private}
   end
 
-  defp bounded_graph_error_codes(body) do
+  defp bounded_graph_error_codes(body, true) do
     @graph_error_code_token
-    |> Regex.scan(body, capture: :all_but_first)
-    |> Enum.map(fn [code] -> canonical_code(code) end)
-    |> Enum.filter(&(&1 in @bounded_error_codes))
+    |> Regex.scan(body, return: :index, capture: :all)
+    |> Enum.take(@max_graph_error_code_candidates)
+    |> Enum.reduce([], fn [{match_start, match_size}, {code_start, code_size}], codes ->
+      code = body |> binary_part(code_start, code_size) |> canonical_code()
+
+      if code in @bounded_error_codes and
+           structural_graph_error_code?(body, match_start + match_size, code) do
+        [code | codes]
+      else
+        codes
+      end
+    end)
     |> Enum.uniq()
+  end
+
+  defp bounded_graph_error_codes(_body, false), do: []
+
+  defp structural_graph_error_code?(body, prefix_size, expected_code) do
+    prefix = binary_part(body, 0, prefix_size)
+
+    with {:ok, suffix} <- json_prefix_suffix(prefix),
+         {:ok, decoded} <- JSON.decode(prefix <> suffix) do
+      expected_code in graph_error_codes(decoded)
+    else
+      _invalid_prefix -> false
+    end
+  end
+
+  defp json_prefix_suffix(prefix), do: scan_json_prefix(prefix, [], false, false)
+
+  defp scan_json_prefix(<<>>, stack, false, false) do
+    {:ok, List.to_string(stack)}
+  end
+
+  defp scan_json_prefix(<<>>, _stack, _in_string, _escaped), do: :error
+
+  defp scan_json_prefix(<<_byte, rest::binary>>, stack, true, true) do
+    scan_json_prefix(rest, stack, true, false)
+  end
+
+  defp scan_json_prefix(<<?\\, rest::binary>>, stack, true, false) do
+    scan_json_prefix(rest, stack, true, true)
+  end
+
+  defp scan_json_prefix(<<?", rest::binary>>, stack, true, false) do
+    scan_json_prefix(rest, stack, false, false)
+  end
+
+  defp scan_json_prefix(<<_byte, rest::binary>>, stack, true, false) do
+    scan_json_prefix(rest, stack, true, false)
+  end
+
+  defp scan_json_prefix(<<?", rest::binary>>, stack, false, false) do
+    scan_json_prefix(rest, stack, true, false)
+  end
+
+  defp scan_json_prefix(<<opening, rest::binary>>, stack, false, false)
+       when opening in [?{, ?[] and length(stack) < @max_json_prefix_depth do
+    closing = if opening == ?{, do: ?}, else: ?]
+    scan_json_prefix(rest, [closing | stack], false, false)
+  end
+
+  defp scan_json_prefix(<<closing, rest::binary>>, [closing | stack], false, false)
+       when closing in [?}, ?]] do
+    scan_json_prefix(rest, stack, false, false)
+  end
+
+  defp scan_json_prefix(<<closing, _rest::binary>>, _stack, false, false)
+       when closing in [?{, ?[, ?}, ?]],
+       do: :error
+
+  defp scan_json_prefix(<<_byte, rest::binary>>, stack, false, false) do
+    scan_json_prefix(rest, stack, false, false)
   end
 
   defp decode_body(""), do: ""
@@ -576,18 +650,27 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
     error(:permanent, "request_rejected", "Microsoft Graph rejected the request", status)
   end
 
-  defp graph_error_codes(map) when is_map(map) do
-    Enum.flat_map(map, fn
-      {key, value} when key in ["code", "error"] and is_binary(value) ->
-        [canonical_code(value)]
-
-      {_key, value} ->
-        graph_error_codes(value)
-    end)
+  defp graph_error_codes(%{"error" => error}) when is_map(error) do
+    graph_error_object_codes(error)
   end
 
-  defp graph_error_codes(list) when is_list(list), do: Enum.flat_map(list, &graph_error_codes/1)
   defp graph_error_codes(_value), do: []
+
+  defp graph_error_object_codes(error) do
+    own_codes =
+      case Map.get(error, "code") do
+        code when is_binary(code) -> [canonical_code(code)]
+        _missing_or_invalid -> []
+      end
+
+    inner_codes =
+      case Map.get(error, "innerError") do
+        inner_error when is_map(inner_error) -> graph_error_object_codes(inner_error)
+        _missing_or_invalid -> []
+      end
+
+    own_codes ++ inner_codes
+  end
 
   defp canonical_code(code) do
     code
