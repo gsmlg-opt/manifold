@@ -67,7 +67,7 @@ defmodule Manifold.Mail.ProjectorTest do
     attachment_sha256 = attachment.sha256
     assert {:ok, %{size: 18, sha256: ^attachment_sha256}} = BlobStore.stat(attachment.object_key)
 
-    assert Repo.aggregate(Folder, :count) == 3
+    assert Repo.aggregate(Folder, :count) == 4
     assert Repo.aggregate(Thread, :count) == 1
 
     entry = Repo.get_by!(MailboxEntry, inbound_delivery_id: source.inbound_delivery_id)
@@ -80,9 +80,12 @@ defmodule Manifold.Mail.ProjectorTest do
     assert {:ok, folders} = Mail.list_folders(mailbox_id)
     inbox = Enum.find(folders, &(&1.kind == "inbox"))
     archive = Enum.find(folders, &(&1.kind == "archive"))
+    sent = Enum.find(folders, &(&1.kind == "sent"))
     trash = Enum.find(folders, &(&1.kind == "trash"))
     assert inbox.total_count == 1
     assert inbox.unread_count == 1
+    assert sent.total_count == 0
+    assert sent.unread_count == 0
 
     assert {:ok, %{items: [summary]}} =
              Mail.list_conversations(mailbox_id, inbox.id)

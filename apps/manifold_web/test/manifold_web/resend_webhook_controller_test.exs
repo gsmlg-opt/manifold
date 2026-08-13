@@ -1,8 +1,14 @@
+Code.require_file(
+  "../../../manifold_outbound/test/support/legacy_resend_fixture.ex",
+  __DIR__
+)
+
 defmodule ManifoldWeb.ResendWebhookControllerTest do
   use ManifoldWeb.ConnCase, async: false
 
   alias Manifold.Accounts
   alias Manifold.Outbound
+  alias Manifold.Outbound.LegacyResendFixture
   alias Manifold.Outbound.Provider
 
   @secret "whsec_" <> Base.encode64("manifold webhook test key")
@@ -147,14 +153,12 @@ defmodule ManifoldWeb.ResendWebhookControllerTest do
     {:ok, domain} = Accounts.create_domain(%{name: "webhook#{suffix}.test"})
     {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "inbox"})
 
-    {:ok, draft} =
-      Outbound.create_draft(mailbox.id, %{
+    %{message: queued} =
+      LegacyResendFixture.queue!(mailbox.id, "inbox@#{domain.normalized_domain}", %{
         subject: "Webhook",
         text_body: "Body",
         recipients: [%{kind: "to", address: "recipient@example.net"}]
       })
-
-    {:ok, queued} = Outbound.queue_draft(mailbox.id, draft.id)
 
     assert :ok =
              Outbound.submit_message(queued.id,

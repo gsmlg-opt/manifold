@@ -20,20 +20,36 @@ defmodule Manifold.Outbound.LegacyResendFixture do
 
     {:ok, draft} = Outbound.create_draft(account_id, draft_attrs)
     {:ok, queued} = Outbound.queue_draft(account_id, draft.id)
+    current = Repo.get_by!(ProviderSubmission, outbound_message_id: queued.id)
+    request_sha256 = request_sha256(queued)
+    now = DateTime.utc_now()
 
-    submission =
-      ProviderSubmission
-      |> Repo.get_by!(outbound_message_id: queued.id)
-      |> Ecto.Changeset.change(
-        send_method_id: nil,
-        provider: "resend",
-        provider_rfc_message_id: nil,
-        request_sha256: request_sha256(queued),
-        idempotency_expires_at: DateTime.add(DateTime.utc_now(), 24, :hour)
-      )
-      |> Repo.update!()
-
+    Repo.delete!(current)
     Repo.delete!(method)
+
+    {1, nil} =
+      Repo.insert_all(ProviderSubmission, [
+        %{
+          id: current.id,
+          outbound_message_id: queued.id,
+          send_method_id: nil,
+          provider: "resend",
+          canonical_sender_address: queued.canonical_sender_address,
+          idempotency_key: current.idempotency_key,
+          request_sha256: request_sha256,
+          request_payload: nil,
+          render_version: nil,
+          state: "pending",
+          attempt_count: 0,
+          provider_rfc_message_id: nil,
+          idempotency_expires_at: DateTime.add(now, 24, :hour),
+          provider_metadata: %{},
+          inserted_at: now,
+          updated_at: now
+        }
+      ])
+
+    submission = Repo.get!(ProviderSubmission, current.id)
 
     %{message: queued, method: method, submission: submission}
   end

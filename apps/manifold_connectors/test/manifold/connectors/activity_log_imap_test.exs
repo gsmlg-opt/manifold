@@ -84,7 +84,7 @@ defmodule Manifold.Connectors.ActivityLogImapTest do
     assert [%{"metadata" => message_meta} | _] = message_entries
     assert message_meta["result"] == "ok"
     assert message_meta["account_id"] == account.id
-    assert message_meta["provider_message_id"] == "imap:3:1"
+    refute Map.has_key?(message_meta, "provider_message_id")
     refute Map.has_key?(message_meta, "password")
     refute Map.has_key?(message_meta, "bytes")
   end
