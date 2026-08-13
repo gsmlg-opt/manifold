@@ -9,8 +9,8 @@ installations that deploy it.
 
 Milestones 0-6 implement durable inbound delivery, mailbox projection, managed
 outbound submission, fail-closed inbound policy, optional cloud ingress,
-read-only Gmail and Microsoft 365 synchronization, and account-selected Gmail
-API or SMTP submission:
+read-only Gmail and Microsoft 365 synchronization, and account-selected Gmail,
+Microsoft Graph, or SMTP submission:
 
 - Phoenix umbrella with explicit Core, Data, Accounts, Storage, Ingest, SMTP,
   Mail, Security, Outbound, Cloud, Edge, Connectors, and Web application
@@ -30,8 +30,9 @@ API or SMTP submission:
   state workflows.
 - Persistent plain-text drafts with compose, reply, reply-all, and forward
   workflows.
-- Atomic outbound queueing with Oban, frozen account send-method snapshots,
-  Gmail API and authenticated SMTP submission, and legacy Resend compatibility.
+- Atomic outbound queueing with Oban, immutable provider MIME and frozen account
+  send-method snapshots, Gmail API, Microsoft Graph, authenticated SMTP
+  submission, and legacy Resend compatibility.
 - Authenticated Resend webhook ingestion with per-recipient delivered, bounced,
   complained, suppressed, delayed, and failed state.
 - Sent-mail and provider lifecycle views that distinguish provider acceptance
@@ -59,7 +60,7 @@ API or SMTP submission:
 The current milestones intentionally do not implement rich-text composition,
 outbound attachments, bundled DNS authentication engines, bundled spam or
 malware engines, POP3, JMAP, provider push notifications, Gmail or Microsoft
-mailbox mutation, Microsoft Graph sending, or cloud provider hosting.
+mailbox mutation, Graph draft creation, or cloud provider hosting.
 Read-only IMAP and Exchange ActiveSync (EAS) Inbox import are supported via the
 connectors application; POP3 and JMAP remain out of scope. Production
 authentication and scanning engines
@@ -67,9 +68,10 @@ plug into the Milestone 4 adapter boundaries. The optional edge is ingress-only
 and never performs outbound MX delivery.
 
 Manifold never performs direct outbound Internet MX delivery. Outbound messages
-use the sending account's frozen Gmail API or authenticated SMTP method. Legacy
-Resend submissions remain supported for messages queued with that provider
-shape. Microsoft Graph remains receive-only.
+use the sending account's frozen Gmail API, Microsoft Graph, or authenticated
+SMTP method. Legacy Resend submissions remain supported for messages queued
+with that provider shape. Microsoft receive remains read-only; independently
+authorized send uses direct MIME Graph `sendMail`.
 
 ## External Mailbox Connectors
 
@@ -80,16 +82,17 @@ for Manifold and does not bypass the durable local acceptance pipeline.
 The current implementation includes:
 
 - Purpose-scoped OAuth authorization-code primitives with one-time, hashed state
-  and PKCE `S256`; Gmail receive and send grants incrementally share one
-  authorization record.
+  and PKCE `S256`; Gmail and Microsoft receive/send grants incrementally share
+  one provider-specific authorization record.
 - AES-256-GCM encryption envelopes with context-bound associated data. Shared
-  Gmail tokens bind the authorization ID plus access/refresh kind; PKCE verifiers
-  bind the provider plus account ID.
+  Gmail and Microsoft tokens bind the authorization ID plus access/refresh kind;
+  PKCE verifiers bind the provider plus account ID.
 - Gmail OpenID identity, message-list, history, and `format=RAW` operations
   using the stable subject identifier and `gmail.readonly` scope. The shared
   authorization can also hold `gmail.send` for outbound Gmail API submission.
 - Microsoft Graph profile, folder-delta, message-delta, immutable message ID,
-  and `/$value` raw-message operations using `Mail.Read`.
+  and `/$value` raw-message operations using `Mail.Read`, plus independently
+  scoped direct MIME `sendMail` using `Mail.Send`.
 - Transactional account, credential, cursor, event, and first Oban sync-job
   persistence after OAuth completion.
 - Bounded, retryable sync pages with provider-message identity and cursor
@@ -187,7 +190,8 @@ Microsoft Graph:
 Use `organizations` as the Microsoft tenant default for work/school accounts.
 Authorization, token, and API endpoint overrides must be absolute HTTPS URLs
 without credentials or fragments. A provider is enabled only when its client ID
-and secret are both set; configuring only one makes startup fail.
+and secret are both set; an absent complete pair leaves the provider visible but
+unavailable, while configuring only one makes startup fail.
 Development and test configuration use non-production encryption keys;
 development has no provider client credentials and test uses inert endpoints.
 Set the provider client environment variables before
@@ -198,7 +202,8 @@ scopes used by the application:
 ```text
 Gmail:     openid email https://www.googleapis.com/auth/gmail.readonly
 Gmail send:             https://www.googleapis.com/auth/gmail.send
-Microsoft: openid profile offline_access User.Read Mail.Read
+Microsoft delegated permissions: User.Read, Mail.Read, and Mail.Send.
+Microsoft durable refresh grant: offline_access.
 ```
 
 Enable the Gmail API in the Google Cloud project before connecting an account.
@@ -211,13 +216,26 @@ public use, complete Google's consent-screen publication and verification
 requirements for the requested scopes. Never commit client credentials or use a
 callback for a host other than the deployed Manifold endpoint.
 
+Register the exact Microsoft callback
+`https://<host>/connectors/microsoft/callback`. The tenant default is
+`organizations`, which permits work/school accounts only. Restrict staging to a
+non-production app registration, tenant, and approved test users, and obtain
+tenant admin consent when the tenant's user-consent policy requires it. Existing
+receive-only accounts grant `Mail.Send` incrementally when Send is added.
+Provider acceptance is immediate in Send activity; the authoritative Sent copy
+appears after normal/manual Graph polling when Receive is enabled. Back up
+`MANIFOLD_CONNECTOR_ENCRYPTION_KEY`; changing it without a coordinated rotation
+makes stored OAuth credentials unreadable.
+
 ## Account Send Methods
 
 Each Manifold account can have one enabled send method. Gmail uses the Gmail API
-with `gmail.send`; SMTP uses the configured relay host, TLS mode, username, and
-encrypted password. A queued message permanently snapshots its method and sender
-address, so later settings changes do not reroute it. Gmail and SMTP render
-text-only RFC messages and preserve reply headers.
+with `gmail.send`; Microsoft uses direct MIME Graph `sendMail` with `Mail.Send`;
+SMTP uses the configured relay host, TLS mode, username, and encrypted password.
+A queued message permanently snapshots its method, sender address, and exact
+provider MIME payload, so later settings or draft changes do not reroute it or
+change retry bytes. All three methods render text-only RFC messages and preserve
+reply headers.
 
 If a provider response or process interruption makes acceptance ambiguous,
 Manifold marks the message `submission_uncertain` and does not resend it
@@ -225,6 +243,12 @@ automatically. Reconcile the provider's Sent folder or SMTP relay state before
 taking any manual action. Existing Resend submissions and webhooks remain
 supported for legacy queued rows; new account-selected routing does not rewrite
 them.
+
+For Microsoft, a bodyless Graph `202` is provider acceptance, not recipient
+delivery, and supplies no provider message ID. Send activity shows that state
+immediately. Graph Sent Items imported through normal/manual polling is the
+authoritative projected Sent copy; send-only accounts therefore have Send
+activity without a projected Sent message.
 
 ### Non-rolling Gmail authorization cutover
 
@@ -302,8 +326,8 @@ https://<your-manifold-host>/webhooks/providers/resend
 
 Set `RESEND_WEBHOOK_SECRET` to the endpoint signing secret. An optional
 `RESEND_API_BASE_URL` is supported for controlled testing. New drafts never
-select Resend: each account must have an enabled Gmail or SMTP send method before
-it can queue mail.
+select Resend: each account must have an enabled Gmail, Microsoft, or SMTP send
+method before it can queue mail.
 
 SMTP abuse limits can be tuned with
 `MANIFOLD_SMTP_MAX_CONNECTIONS_PER_PEER`,

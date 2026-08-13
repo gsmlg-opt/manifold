@@ -1,6 +1,6 @@
 # ADR 0007: Read-Only Provider Mailbox Connectors
 
-- **Status:** Accepted and implemented; outbound provider sending superseded by ADR 0010
+- **Status:** Accepted and implemented; outbound provider sending extended by ADR 0010 and ADR 0011
 - **Date:** 2026-07-29
 
 ## Context
@@ -57,10 +57,11 @@ Gmail:     openid email https://www.googleapis.com/auth/gmail.readonly
 Microsoft: openid profile offline_access User.Read Mail.Read
 ```
 
-The receive path does not request Gmail modify scopes or Microsoft
-`Mail.ReadWrite`/`Mail.Send`. Gmail send authorization and submission are a later,
-separate outbound concern recorded by ADR 0010; Microsoft provider send remains
-out of scope.
+The receive path does not request Gmail modify scopes, Microsoft
+`Mail.ReadWrite`, or any remote mutation capability. Separately scoped outbound
+authorization is owned by ADR 0010 for Gmail and ADR 0011 for Microsoft. A
+shared authorization may hold `Mail.Send`, but receive synchronization continues
+to use only `Mail.Read` and never creates drafts or mutates remote messages.
 
 ### OAuth and secrets
 
@@ -177,11 +178,12 @@ providers.
 
 ### Add provider send at the same boundary
 
-Rejected and retained by ADR 0010. Read synchronization and outbound submission
-have different scopes, idempotency, and failure semantics. Shared Gmail OAuth
-credentials are owned by `manifold_connectors`, while rendering, queueing, and
-Gmail API submission remain owned by `manifold_outbound`. Manifold never performs
-direct recipient-MX delivery.
+Rejected as a single combined boundary and retained by ADR 0010 and ADR 0011.
+Read synchronization and outbound submission have different scopes, idempotency,
+and failure semantics. Shared Gmail and Microsoft OAuth credentials are owned by
+`manifold_connectors`, while rendering, queueing, and provider submission remain
+owned by `manifold_outbound`. Manifold never performs direct recipient-MX
+delivery.
 
 ### Depend on push notifications
 

@@ -13,11 +13,12 @@ different delivery identities for different Manifold accounts. SMTP submission
 settings already had a persistent model but were not part of the outbound queue
 contract.
 
-Gmail receive and send grants belong to one Google identity and may be granted at
-different times. Duplicating OAuth records would allow their token generations,
-reconnect state, or permanent subject binding to diverge. Gmail API and SMTP
-submission are not idempotent after the remote server may have accepted bytes, so
-an interrupted request cannot be retried as though no side effect occurred.
+Gmail and Microsoft receive/send grants each belong to one provider identity and
+may be granted at different times. Duplicating OAuth records would allow token
+generations, reconnect state, or permanent subject binding to diverge. Gmail
+API, Microsoft Graph, and SMTP submission are not idempotent after the remote
+server may have accepted bytes, so an interrupted request cannot be retried as
+though no side effect occurred.
 
 ## Decision
 
@@ -39,11 +40,22 @@ both directions.
 `manifold_outbound` renders deterministic text-only RFC messages, including
 `Message-ID`, `Date`, `In-Reply-To`, and `References` where applicable. It checks
 the rendered hash before credential checkout or provider I/O. Gmail submissions
-use the Gmail API and appear through Gmail's normal Sent behavior. SMTP methods
-submit through the account's configured authenticated relay. HTML composition,
-attachments, sender aliases, and Microsoft Graph send are deferred.
+use the Gmail API and appear through Gmail's normal Sent behavior. Microsoft
+submissions use direct MIME `/me/sendMail` and independently granted `Mail.Send`;
+receive remains read-only with `Mail.Read`. SMTP methods submit through the
+account's configured authenticated relay. HTML composition, attachments, and
+sender aliases are deferred.
 
-Before provider I/O, the queue records a `submitting` attempt. Gmail and SMTP have
+Gmail and Microsoft receive/send methods each share one provider-specific
+authorization record. Queueing stores the exact provider MIME payload and hash
+as an immutable snapshot so any verified retry sends identical bytes. For
+Microsoft, a bodyless `202` records acceptance without a provider message ID;
+Graph Sent Items later imported through normal delta polling is authoritative.
+Projected Sent and outbound Send activity remain separate views. ADR 0011 owns
+the Microsoft-specific acceptance and uncertainty decisions.
+
+Before provider I/O, the queue records a `submitting` attempt. Gmail, Microsoft,
+and SMTP have
 no automatic resend after an interruption or an ambiguous provider response. The
 message becomes `submission_uncertain`; an operator or user must reconcile it
 before taking another action. This favors duplicate prevention over automatic
@@ -76,15 +88,16 @@ Resolve those conditions deliberately; do not bypass the guards.
 ### Positive
 
 - Each account submits through its explicitly selected identity.
-- Gmail receive and send share token rotation, reconnect state, and permanent
-  subject binding.
+- Gmail and Microsoft receive/send pairs share provider-specific token rotation,
+  reconnect state, and permanent subject binding.
 - Queued messages are stable across method changes.
 - Ambiguous acceptance cannot cause an automatic duplicate.
 - Legacy Resend lifecycle and webhook records remain readable and actionable.
 
 ### Negative
 
-- Gmail OAuth configuration and scope verification add operator work.
+- Gmail and Microsoft OAuth configuration and scope verification add operator
+  work.
 - An uncertain submission requires manual reconciliation.
 - The migration cannot be deployed safely as a rolling upgrade.
 - Text-only messages omit HTML and attachments until later milestones.
@@ -96,7 +109,7 @@ Resolve those conditions deliberately; do not bypass the guards.
 Rejected because tokens, scope upgrades, reconnect state, and durable Google
 subject binding could diverge.
 
-### Automatically retry Gmail or SMTP after an interrupted request
+### Automatically retry Gmail, Microsoft, or SMTP after an interrupted request
 
 Rejected because the remote provider may already have accepted the message.
 

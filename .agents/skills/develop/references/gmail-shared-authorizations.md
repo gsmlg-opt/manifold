@@ -2,10 +2,13 @@
 
 ## Ownership
 
-- `Manifold.Connectors.GmailAuthorizations` owns Gmail authorization creation,
-  incremental scope upgrades, disconnects, and reconnect-required propagation.
-- Gmail receive and send methods share `connector_oauth_authorizations`; Microsoft
-  and password-based connectors retain their existing credential paths.
+- `Manifold.Connectors.OAuthAuthorizations` owns shared Gmail and Microsoft
+  authorization creation, incremental scope upgrades, serialized refresh,
+  disconnects, active-account checkout fences, and reconnect propagation.
+- Gmail and Microsoft each share one provider-specific
+  `connector_oauth_authorizations` row across receive and send. Scopes and
+  provider adapters remain provider-specific; password connectors retain their
+  existing credential paths.
 - Connector lifecycle events use exactly one legacy receive-method or shared
   authorization anchor.
 
@@ -27,10 +30,11 @@
   disables only its own currently enabled alternate before resuming.
 - Public enable APIs reject reconnect-required receive and send methods with
   `:reauthorization_required` before changing any currently enabled alternate.
-- Gmail lifecycle transactions lock the shared authorization before dependent
-  receive or send rows. Disconnect and direct-delete paths discover the
-  authorization without a lock, then revalidate provider, authorization, and
-  mailbox relations after acquiring authorization-first locks.
+- Lifecycle paths use explicit lock orders for their state boundary: callback
+  persistence serializes on the active mailbox before authorization/method rows;
+  token checkout validates and locks the active mailbox before locking the
+  authorization; reconnect/disconnect operations lock only the authorization and
+  dependent methods and do not acquire the mailbox lock afterward.
 - Direct Gmail receive deletion cancels pending sync work and disconnects and
   clears the authorization only when no live receive or send method remains.
 - When Google omits `scope` from an authorization-code response, the adapter uses
@@ -38,6 +42,8 @@
   replace that fallback through provider options.
 - Same-account callback races serialize on the mailbox row. Cross-account reuse of
   one provider subject is rejected by the provider-subject unique constraint.
+- Microsoft receive uses `Mail.Read`; Microsoft send independently adds
+  `Mail.Send`. Gmail continues to use its provider-specific readonly/send scopes.
 
 ## Verification notes
 
