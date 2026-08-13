@@ -21,7 +21,7 @@ defmodule Manifold.Connectors.RemoteStateJobs do
   defp insert_until_persisted(remote_message_id, attempts_left) do
     %{"remote_message_id" => remote_message_id}
     |> ApplyRemoteState.new(unique: @queued_unique)
-    |> Oban.insert!(retry: false)
+    |> insert_job!()
     |> case do
       %Oban.Job{id: nil} when attempts_left > 1 ->
         Process.sleep(@insert_retry_delay_ms)
@@ -32,6 +32,32 @@ defmodule Manifold.Connectors.RemoteStateJobs do
 
       %Oban.Job{id: id} = job when is_integer(id) ->
         job
+    end
+  end
+
+  defp insert_job!(changeset) do
+    case Oban.Registry.lookup(Oban) do
+      nil -> insert_with_config!(changeset)
+      {_pid, _config} -> Oban.insert!(changeset, retry: false)
+    end
+  end
+
+  defp insert_with_config!(changeset) do
+    config =
+      :manifold_data
+      |> Application.fetch_env!(Oban)
+      |> Keyword.put(:insert_trigger, false)
+      |> Oban.Config.new()
+
+    case Oban.Engine.insert_job(config, changeset, retry: false) do
+      {:ok, job} ->
+        job
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        raise Ecto.InvalidChangesetError, action: :insert, changeset: changeset
+
+      {:error, reason} ->
+        raise RuntimeError, inspect(reason)
     end
   end
 end

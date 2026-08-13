@@ -56,8 +56,13 @@ defmodule Manifold.ConnectorsTest do
     def refresh_token(_refresh_token, _config, _opts), do: raise("not used")
 
     @impl true
-    def identity("access-secret", _config, _opts) do
-      {:ok, %Identity{id: "microsoft-subject-1", email_address: "person@microsoft.example"}}
+    def identity("access-secret", config, opts) do
+      {:ok,
+       %Identity{
+         id: "microsoft-subject-1",
+         email_address:
+           Keyword.get(opts, :identity_address, Keyword.fetch!(config, :identity_address))
+       }}
     end
 
     @impl true
@@ -95,14 +100,6 @@ defmodule Manifold.ConnectorsTest do
       messages: []
     })
 
-    Application.put_env(:manifold_connectors, :providers,
-      microsoft: [
-        client_id: "client",
-        client_secret: "secret",
-        authorization_url: "https://accounts.google.test/authorize"
-      ]
-    )
-
     on_exit(fn ->
       restore_env(:encryption_key, old_key)
       restore_env(:adapters, old_adapters)
@@ -114,10 +111,22 @@ defmodule Manifold.ConnectorsTest do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "connector#{suffix}.test"})
     {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "person"})
-    {:ok, domain: domain, mailbox: mailbox}
+    address = mailbox |> Repo.preload(:domain) |> Accounts.account_address()
+
+    Application.put_env(:manifold_connectors, :providers,
+      microsoft: [
+        client_id: "client",
+        client_secret: "secret",
+        authorization_url: "https://accounts.google.test/authorize",
+        identity_address: address
+      ]
+    )
+
+    {:ok, address: address, domain: domain, mailbox: mailbox}
   end
 
-  test "OAuth completion stores encrypted credentials, cursors, event, and job atomically", %{
+  test "OAuth completion stores a shared encrypted authorization, cursors, event, and job", %{
+    address: address,
     mailbox: mailbox
   } do
     consumed = consumed(mailbox.id)
@@ -129,36 +138,37 @@ defmodule Manifold.ConnectorsTest do
 
     assert account.kind == "microsoft"
     assert account.provider_account_id == "microsoft-subject-1"
-    assert account.email_address == "person@microsoft.example"
+    assert account.email_address == address
     assert account.account_id == mailbox.id
     assert account.status == "connected"
 
-    credential = Repo.get_by!(Credential, external_account_id: account.id)
-    refute credential.access_token_ciphertext =~ "access-secret"
-    refute credential.refresh_token_ciphertext =~ "refresh-secret"
+    authorization = Repo.get!(OAuthAuthorization, account.oauth_authorization_id)
+    refute authorization.access_token_ciphertext =~ "access-secret"
+    refute authorization.refresh_token_ciphertext =~ "refresh-secret"
+    refute Repo.get_by(Credential, external_account_id: account.id)
 
     assert {:ok, "access-secret"} =
              Crypto.decrypt(
-               credential.access_token_ciphertext,
-               "credential:#{account.id}:access"
+               authorization.access_token_ciphertext,
+               "credential:#{authorization.id}:access"
              )
 
     assert {:ok, "refresh-secret"} =
              Crypto.decrypt(
-               credential.refresh_token_ciphertext,
-               "credential:#{account.id}:refresh"
+               authorization.refresh_token_ciphertext,
+               "credential:#{authorization.id}:refresh"
              )
 
     assert %SyncCursor{scope: "mailbox", phase: "bootstrap"} =
              Repo.get_by!(SyncCursor, external_account_id: account.id)
 
-    legacy_event =
+    event =
       Repo.get_by!(ConnectorEvent,
-        external_account_id: account.id,
+        oauth_authorization_id: authorization.id,
         event_type: "connected"
       )
 
-    assert is_nil(legacy_event.oauth_authorization_id)
+    assert is_nil(event.external_account_id)
 
     assert Repo.get_by!(Oban.Job,
              worker: inspect(SyncAccount),
@@ -302,27 +312,29 @@ defmodule Manifold.ConnectorsTest do
            end)
   end
 
-  test "failure before initial job rolls back the entire local connection", %{mailbox: mailbox} do
-    assert {:error, %{reason: :after_credentials_before_job}} =
-             Connectors.complete_authorization("microsoft", "valid-code", consumed(mailbox.id),
-               fail_at: :after_credentials_before_job
-             )
+  test "failed OAuth exchange creates no local connection", %{mailbox: mailbox} do
+    assert {:error, %{reason: :invalid_code}} =
+             Connectors.complete_authorization("microsoft", "invalid-code", consumed(mailbox.id))
 
     assert Repo.aggregate(ReceiveMethod, :count) == 0
+    assert Repo.aggregate(OAuthAuthorization, :count) == 0
     assert Repo.aggregate(Credential, :count) == 0
     assert Repo.aggregate(SyncCursor, :count) == 0
     assert Repo.aggregate(ConnectorEvent, :count) == 0
     assert Repo.aggregate(Oban.Job, :count) == 0
   end
 
-  test "account list is a public projection without encrypted fields", %{mailbox: mailbox} do
+  test "account list is a public projection without encrypted fields", %{
+    address: address,
+    mailbox: mailbox
+  } do
     assert {:ok, account} =
              Connectors.complete_authorization("microsoft", "valid-code", consumed(mailbox.id))
 
     assert [view] = Connectors.list_accounts()
     assert view.id == account.id
     assert view.kind == "microsoft"
-    assert view.email_address == "person@microsoft.example"
+    assert view.email_address == address
     assert view.account_id == mailbox.id
     refute Map.has_key?(Map.from_struct(view), :access_token_ciphertext)
     refute Map.has_key?(Map.from_struct(view), :refresh_token_ciphertext)
@@ -338,11 +350,15 @@ defmodule Manifold.ConnectorsTest do
 
     {:ok, other_mailbox} = Accounts.create_account(domain, %{local_part: "other"})
 
-    assert {:error, %{class: :permanent, reason: :mailbox_reassignment_not_allowed}} =
+    other_mailbox = Repo.preload(other_mailbox, :domain)
+    other_address = Accounts.account_address(other_mailbox)
+
+    assert {:error, %{class: :permanent, reason: :provider_identity_already_bound}} =
              Connectors.complete_authorization(
                "microsoft",
                "valid-code",
-               consumed(other_mailbox.id)
+               consumed(other_mailbox.id),
+               provider_opts: [identity_address: other_address]
              )
 
     persisted = Repo.get!(ReceiveMethod, account.id)
@@ -611,7 +627,10 @@ defmodule Manifold.ConnectorsTest do
     end
 
     refute Repo.get!(SendMethod, send_method.id).enabled
-    assert Repo.get_by!(Credential, external_account_id: receive.id)
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+    assert is_binary(authorization.access_token_ciphertext)
+    assert is_binary(authorization.refresh_token_ciphertext)
+    refute Repo.get_by(Credential, external_account_id: receive.id)
     assert Repo.get_by!(SendCredential, send_method_id: send_method.id)
     assert Repo.get_by!(SmtpSettings, send_method_id: send_method.id)
     assert Repo.get!(ReceiveMethod, placeholder.id)
@@ -777,7 +796,8 @@ defmodule Manifold.ConnectorsTest do
 
     assert {:snooze, 5} = Connectors.cancel_account_jobs(mailbox.id, 2)
     assert Repo.get!(Oban.Job, executing.id).state == "cancelled"
-    assert %{cancelled: 0, done?: true} = Connectors.cancel_account_jobs(mailbox.id, 2)
+    assert %{cancelled: 1, done?: true} = Connectors.cancel_account_jobs(mailbox.id, 2)
+    refute Repo.get(Oban.Job, executing.id)
   end
 
   test "cancel_account_jobs treats suspended matching jobs as incomplete", %{mailbox: mailbox} do
@@ -795,7 +815,7 @@ defmodule Manifold.ConnectorsTest do
       |> Repo.update_all(set: [state: "suspended"])
 
     assert %{cancelled: 1, done?: true} = Connectors.cancel_account_jobs(mailbox.id, 10)
-    assert Repo.get!(Oban.Job, job.id).state == "cancelled"
+    refute Repo.get(Oban.Job, job.id)
   end
 
   test "cancel_account_jobs keeps account ownership matching inside the job query", %{
@@ -826,7 +846,7 @@ defmodule Manifold.ConnectorsTest do
       capture_repo_queries(fn -> Connectors.cancel_account_jobs(mailbox.id, 10) end)
 
     assert %{cancelled: 1, done?: true} = result
-    assert Repo.get!(Oban.Job, valid_job.id).state == "cancelled"
+    refute Repo.get(Oban.Job, valid_job.id)
     assert Enum.all?(malformed_jobs, &(Repo.get!(Oban.Job, &1.id).state == "available"))
 
     ownership_queries = Enum.filter(queries, &String.contains?(&1, "connector_accounts"))

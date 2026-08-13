@@ -6,7 +6,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
   alias Manifold.Accounts
   alias Manifold.Accounts.Schema.Account
   alias Manifold.Connectors
-  alias Manifold.Connectors.{Crypto, MicrosoftScopes, OAuthAuthorizations}
+  alias Manifold.Connectors.{Crypto, MicrosoftScopes, OAuth, OAuthAuthorizations}
   alias Manifold.Connectors.Jobs.SyncAccount
   alias Manifold.Connectors.OAuth.Consumed
   alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
@@ -225,6 +225,221 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     end
   end
 
+  test "Microsoft OAuth lifecycle telemetry is provider-aware and content-free", %{
+    account: account,
+    address: address
+  } do
+    events = [
+      [:manifold, :connectors, :oauth, :start, :stop],
+      [:manifold, :connectors, :oauth, :complete, :stop],
+      [:manifold, :connectors, :oauth, :refresh, :stop]
+    ]
+
+    attach_oauth_telemetry(events)
+
+    redirect_uri =
+      "https://mail.example.test/connectors/microsoft/callback?marker=telemetry-address-sentinel"
+
+    assert {:ok, _authorization} =
+             OAuth.start("microsoft", account.id, redirect_uri, purpose: :receive)
+
+    start_telemetry = assert_oauth_telemetry(:start, :started)
+
+    assert start_telemetry.metadata == %{
+             account_id: account.id,
+             provider: "microsoft",
+             method_kind: "microsoft",
+             outcome: :started
+           }
+
+    assert {:ok, receive} =
+             complete(:receive, account, address,
+               code: "telemetry-authorization-code-sentinel",
+               access_token: "telemetry-access-token-sentinel",
+               refresh_token: "telemetry-refresh-token-sentinel"
+             )
+
+    connected = assert_oauth_telemetry(:complete, :connected)
+
+    assert connected.metadata == %{
+             account_id: account.id,
+             authorization_id: receive.oauth_authorization_id,
+             method_id: receive.id,
+             provider: "microsoft",
+             method_kind: "microsoft",
+             outcome: :connected
+           }
+
+    assert {:ok, send_method} =
+             complete(:send, account, address,
+               access_token: "telemetry-upgrade-token-sentinel",
+               refresh_token: nil,
+               required_scopes: all_scopes(),
+               scopes: access_token_scopes(all_scopes())
+             )
+
+    upgraded = assert_oauth_telemetry(:complete, :scope_upgraded)
+
+    assert upgraded.metadata == %{
+             account_id: account.id,
+             authorization_id: receive.oauth_authorization_id,
+             method_id: send_method.id,
+             provider: "microsoft",
+             method_kind: "microsoft",
+             outcome: :scope_upgraded
+           }
+
+    rejected_error = %ProviderError{
+      class: :permanent,
+      code: :"telemetry-subject-sentinel",
+      message: "telemetry-body-sentinel"
+    }
+
+    assert {:error, %{reason: :"telemetry-subject-sentinel"}} =
+             complete(:send, account, address, provider_opts: [token: {:error, rejected_error}])
+
+    rejected = assert_oauth_telemetry(:complete, :error)
+
+    assert rejected.metadata == %{
+             account_id: account.id,
+             provider: "microsoft",
+             method_kind: "microsoft",
+             outcome: :error,
+             error_code: :connector_operation_failed
+           }
+
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    refreshed_token = %Token{
+      access_token: "telemetry-refreshed-access-sentinel",
+      refresh_token: "telemetry-refreshed-refresh-sentinel",
+      expires_at: ~U[2026-08-12 04:00:00.000000Z],
+      scopes: access_token_scopes(all_scopes())
+    }
+
+    assert {:ok, "telemetry-refreshed-access-sentinel"} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: MicrosoftScopes.send(),
+               now: @refresh_now,
+               provider_opts: [refresh_result: {:ok, refreshed_token}]
+             )
+
+    refreshed = assert_oauth_telemetry(:refresh, :refreshed)
+
+    assert refreshed.metadata == %{
+             account_id: account.id,
+             authorization_id: authorization.id,
+             provider: "microsoft",
+             method_kind: "microsoft",
+             outcome: :refreshed
+           }
+
+    reconnect_error_code = :"telemetry-reconnect-code-sentinel"
+
+    reconnect_error = %ProviderError{
+      class: :reconnect,
+      code: reconnect_error_code,
+      message: "telemetry-bcc-sentinel"
+    }
+
+    assert {:error, %ProviderError{code: ^reconnect_error_code}} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: MicrosoftScopes.send(),
+               now: ~U[2026-08-12 05:00:00.000000Z],
+               provider_opts: [refresh_result: {:error, reconnect_error}]
+             )
+
+    reconnect = assert_oauth_telemetry(:refresh, :reconnect_required)
+
+    assert reconnect.metadata == %{
+             account_id: account.id,
+             authorization_id: authorization.id,
+             provider: "microsoft",
+             method_kind: "microsoft",
+             outcome: :reconnect_required,
+             error_code: :connector_operation_failed
+           }
+
+    reconnect_event =
+      Repo.get_by!(ConnectorEvent,
+        oauth_authorization_id: authorization.id,
+        event_type: "reconnect_required"
+      )
+
+    assert reconnect_event.metadata == %{
+             "direction" => "authorization",
+             "error_class" => "reconnect",
+             "error_code" => "connector_operation_failed",
+             "provider" => "microsoft"
+           }
+
+    sentinels = [
+      "telemetry-address-sentinel",
+      "telemetry-authorization-code-sentinel",
+      "telemetry-access-token-sentinel",
+      "telemetry-refresh-token-sentinel",
+      "telemetry-upgrade-token-sentinel",
+      "telemetry-subject-sentinel",
+      "telemetry-body-sentinel",
+      "telemetry-refreshed-access-sentinel",
+      "telemetry-refreshed-refresh-sentinel",
+      "telemetry-reconnect-code-sentinel",
+      "telemetry-bcc-sentinel"
+    ]
+
+    inspected_safe_surfaces =
+      inspect(%{
+        telemetry: [start_telemetry, connected, upgraded, rejected, refreshed, reconnect],
+        connector_events: Enum.map(Repo.all(ConnectorEvent), & &1.metadata),
+        job_args: Enum.map(Repo.all(Oban.Job), & &1.args)
+      })
+
+    Enum.each(sentinels, &refute(inspected_safe_surfaces =~ &1))
+  end
+
+  test "token checkout rejects malformed authorization IDs without a cast exception" do
+    assert {:error, %{class: :permanent, reason: :authorization_not_found}} =
+             Connectors.checkout_oauth_access_token(
+               "not-an-authorization-id",
+               required_scope: MicrosoftScopes.read()
+             )
+  end
+
+  test "token checkout locks the active mailbox before the shared authorization", %{
+    account: account,
+    address: address
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+
+    queries =
+      repo_queries_during(fn ->
+        assert {:ok, "access-secret"} =
+                 OAuthAuthorizations.checkout_access_token(
+                   receive.oauth_authorization_id,
+                   FakeMicrosoft,
+                   [],
+                   required_scope: MicrosoftScopes.read(),
+                   now: @now
+                 )
+      end)
+
+    mailbox_lock =
+      Enum.find_index(queries, fn query ->
+        String.contains?(query, ~s(FROM "mailboxes")) and
+          String.contains?(query, "FOR UPDATE")
+      end)
+
+    authorization_lock =
+      Enum.find_index(queries, fn query ->
+        String.contains?(query, ~s(FROM "connector_oauth_authorizations")) and
+          String.contains?(query, "FOR UPDATE")
+      end)
+
+    assert is_integer(mailbox_lock)
+    assert is_integer(authorization_lock)
+    assert mailbox_lock < authorization_lock
+  end
+
   test "OAuth setup returns connect without exposing account state", %{
     account: account,
     address: address
@@ -319,7 +534,8 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
              complete(:send, add_receive_account, add_receive_address,
                subject: "add-receive-subject",
                required_scopes: all_scopes(),
-               scopes: access_token_scopes(all_scopes())
+               scopes: access_token_scopes(all_scopes()),
+               expires_at: ~U[2099-01-01 00:00:00.000000Z]
              )
 
     add_receive_authorization =
@@ -409,7 +625,8 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert {:ok, _send_method} =
              complete(:send, account, address,
                required_scopes: all_scopes(),
-               scopes: access_token_scopes(all_scopes())
+               scopes: access_token_scopes(all_scopes()),
+               expires_at: ~U[2099-01-01 00:00:00.000000Z]
              )
 
     Application.put_env(:manifold_connectors, :adapters, microsoft: FailingMicrosoft)
@@ -1697,6 +1914,36 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     local_part = "#{prefix}-#{System.unique_integer([:positive])}"
     {:ok, created} = Accounts.create_account(account.domain, %{local_part: local_part})
     Repo.preload(created, :domain)
+  end
+
+  defp attach_oauth_telemetry(events) do
+    handler_id = "microsoft-oauth-telemetry-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach_many(
+        handler_id,
+        events,
+        fn event, measurements, metadata, pid ->
+          send(pid, {:oauth_telemetry, event, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp assert_oauth_telemetry(operation, outcome) do
+    event = [:manifold, :connectors, :oauth, operation, :stop]
+
+    assert_receive {:oauth_telemetry, ^event,
+                    %{duration_ms: duration_ms, attempt_count: 1} = measurements,
+                    %{outcome: ^outcome} = metadata}
+
+    assert is_integer(duration_ms) and duration_ms >= 0
+    assert Map.keys(measurements) |> Enum.sort() == [:attempt_count, :duration_ms]
+
+    %{measurements: measurements, metadata: metadata}
   end
 
   defp assert_setup(setup, provider, purpose, state, secrets) do

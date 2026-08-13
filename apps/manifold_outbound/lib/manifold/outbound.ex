@@ -420,32 +420,21 @@ defmodule Manifold.Outbound do
           |> select([job], {job.id, job.state})
           |> Repo.all()
 
-        selected_ids = Enum.map(selected, &elem(&1, 0))
-        selected_executing? = Enum.any?(selected, &(elem(&1, 1) == "executing"))
+        executing_ids = for {id, "executing"} <- selected, do: id
+        drainable_ids = for {id, state} <- selected, state != "executing", do: id
 
-        cancelled =
-          case selected_ids do
-            [] ->
-              0
-
-            ids ->
-              {:ok, count} =
-                Oban.Job
-                |> where([job], job.id in ^ids)
-                |> Oban.cancel_all_jobs()
-
-              count
-          end
+        drained = delete_account_jobs(Repo, drainable_ids)
+        cancelled = cancel_executing_account_jobs(executing_ids)
 
         matching_executing? =
           matching
           |> where([job], job.state == "executing")
           |> Repo.exists?()
 
-        if selected_executing? or matching_executing? do
+        if executing_ids != [] or matching_executing? do
           {:snooze, 5}
         else
-          %{cancelled: cancelled, done?: not Repo.exists?(matching)}
+          %{cancelled: drained + cancelled, done?: not Repo.exists?(matching)}
         end
       end)
 
@@ -892,7 +881,7 @@ defmodule Manifold.Outbound do
     |> where(
       [job],
       job.worker == ^inspect(SubmitOutbound) and
-        job.state in ~w(available scheduled executing retryable suspended)
+        job.state in ~w(available scheduled executing retryable suspended cancelled)
     )
     |> where(
       [job],
@@ -915,6 +904,28 @@ defmodule Manifold.Outbound do
         job.args
       )
     )
+  end
+
+  defp delete_account_jobs(_repo, []), do: 0
+
+  defp delete_account_jobs(repo, ids) do
+    {count, _rows} =
+      Oban.Job
+      |> where([job], job.id in ^ids)
+      |> repo.delete_all()
+
+    count
+  end
+
+  defp cancel_executing_account_jobs([]), do: 0
+
+  defp cancel_executing_account_jobs(ids) do
+    {:ok, count} =
+      Oban.Job
+      |> where([job], job.id in ^ids and job.state == "executing")
+      |> Oban.cancel_all_jobs()
+
+    count
   end
 
   defp lock_active_sender(repo, mailbox_id) do

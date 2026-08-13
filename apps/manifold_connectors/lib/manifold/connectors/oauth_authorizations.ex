@@ -31,8 +31,34 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
 
   @providers ~w(gmail microsoft)
   @refresh_skew_seconds 60
-  @telemetry_forbidden_fragments ~w(token password authorization_code raw_message)
-  @telemetry_code_pattern ~r/\A[a-z0-9_.:-]{1,128}\z/
+  @telemetry_error_codes MapSet.new(~w(
+    account_disconnected
+    account_not_found
+    authorization_not_found
+    connector_lifecycle_changed
+    database_unavailable
+    insufficient_provider_scope
+    insufficient_scope
+    invalid_access_token_continuation
+    invalid_connector_state
+    invalid_encryption_key
+    invalid_grant
+    invalid_oauth_authorization
+    invalid_oauth_purpose
+    invalid_provider_cursors
+    missing_refresh_token
+    oauth_lifecycle_busy
+    oauth_provider_mismatch
+    provider_address_mismatch
+    provider_identity_already_bound
+    provider_identity_mismatch
+    provider_not_configured
+    provider_unavailable
+    reauthorization_required
+    stale_oauth_authorization
+    unexpected_exception
+    unsupported_oauth_purpose
+  ))
 
   @spec complete(String.t(), String.t(), Consumed.t(), module(), keyword(), keyword()) ::
           {:ok, ReceiveMethod.t() | SendMethod.t()}
@@ -131,33 +157,38 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     provider_opts = Keyword.get(opts, :provider_opts, [])
     continuation = Keyword.get(opts, :access_token_continuation, &default_continuation/1)
 
-    Repo.transaction(fn ->
-      with {:ok, authorization} <- lock_authorization(authorization_id),
-           :ok <-
-             validate_expected_authorization_lock_version(
-               authorization,
-               expected_authorization_lock_version
-             ),
-           :ok <- validate_required_scope(authorization.provider, required_scope),
-           :ok <- validate_checkout_authorization(authorization, required_scope) do
-        authorization
-        |> checkout_locked_access_token(
-          required_scope,
-          adapter,
-          config,
-          now,
-          provider_opts
-        )
-        |> continue_with_access_token(continuation)
-      else
-        {:error, reason} -> Repo.rollback(reason)
+    with {:ok, account_id} <- authorization_account_id(authorization_id) do
+      Repo.transaction(fn ->
+        with :ok <- lock_active_authorization_account(account_id),
+             {:ok, authorization} <- lock_authorization(authorization_id),
+             true <- authorization.account_id == account_id,
+             :ok <-
+               validate_expected_authorization_lock_version(
+                 authorization,
+                 expected_authorization_lock_version
+               ),
+             :ok <- validate_required_scope(authorization.provider, required_scope),
+             :ok <- validate_checkout_authorization(authorization, required_scope) do
+          authorization
+          |> checkout_locked_access_token(
+            required_scope,
+            adapter,
+            config,
+            now,
+            provider_opts
+          )
+          |> continue_with_access_token(continuation)
+        else
+          false -> Repo.rollback(stale_oauth_authorization())
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+      |> case do
+        {:ok, {:ok, result}} -> {:ok, result}
+        {:ok, {:reconnect, %ProviderError{} = error}} -> {:error, error}
+        {:ok, {:error, reason}} -> {:error, reason}
+        {:error, reason} -> {:error, reason}
       end
-    end)
-    |> case do
-      {:ok, {:ok, result}} -> {:ok, result}
-      {:ok, {:reconnect, %ProviderError{} = error}} -> {:error, error}
-      {:ok, {:error, reason}} -> {:error, reason}
-      {:error, reason} -> {:error, reason}
     end
   rescue
     DBConnection.ConnectionError ->
@@ -165,6 +196,30 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
 
     error in Postgrex.Error ->
       normalize_transaction_error(error, __STACKTRACE__)
+  end
+
+  defp authorization_account_id(authorization_id) do
+    with {:ok, authorization_id} <- Ecto.UUID.cast(authorization_id),
+         account_id when is_binary(account_id) <-
+           OAuthAuthorization
+           |> where([authorization], authorization.id == ^authorization_id)
+           |> select([authorization], authorization.account_id)
+           |> Repo.one() do
+      {:ok, account_id}
+    else
+      :error -> {:error, authorization_not_found()}
+      nil -> {:error, authorization_not_found()}
+    end
+  end
+
+  defp authorization_not_found,
+    do: CoreError.new(:permanent, :authorization_not_found, "authorization not found")
+
+  defp lock_active_authorization_account(account_id) do
+    case Accounts.active_account_for_update(Repo, account_id) do
+      {:ok, %Account{}} -> :ok
+      {:error, %CoreError{} = error} -> {:error, error}
+    end
   end
 
   @spec add_authorized_method(
@@ -990,7 +1045,10 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
              now,
              %{
                error_class: error_attrs.last_error_class,
-               error_code: error_attrs.last_error_code
+               error_code:
+                 error_attrs.last_error_code
+                 |> telemetry_error_code()
+                 |> to_string()
              }
            ) do
       {:ok, authorization}
@@ -1742,21 +1800,16 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
   defp normalized_error_code(_reason), do: :connector_operation_failed
 
   defp telemetry_error_code(code) when is_atom(code) do
-    if safe_telemetry_code?(Atom.to_string(code)), do: code, else: :connector_operation_failed
+    if MapSet.member?(@telemetry_error_codes, Atom.to_string(code)),
+      do: code,
+      else: :connector_operation_failed
   end
 
   defp telemetry_error_code(code) when is_binary(code) do
-    if safe_telemetry_code?(code), do: code, else: "connector_operation_failed"
+    if MapSet.member?(@telemetry_error_codes, code), do: code, else: "connector_operation_failed"
   end
 
   defp telemetry_error_code(_code), do: :connector_operation_failed
-
-  defp safe_telemetry_code?(code) do
-    downcased = String.downcase(code)
-
-    Regex.match?(@telemetry_code_pattern, downcased) and
-      not Enum.any?(@telemetry_forbidden_fragments, &String.contains?(downcased, &1))
-  end
 
   defp reconnect_error_attrs(provider, %ProviderError{} = error) do
     %{

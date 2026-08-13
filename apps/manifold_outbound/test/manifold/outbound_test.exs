@@ -323,7 +323,7 @@ defmodule Manifold.OutboundTest do
 
     assert %{cancelled: 2, done?: false} = Outbound.cancel_account_jobs(mailbox.id, 2)
     assert target_incomplete_job_count(mailbox.id) == 1
-    assert target_cancelled_job_count(mailbox.id) == 2
+    assert target_cancelled_job_count(mailbox.id) == 0
 
     Oban.Job
     |> where([job], job.id == ^pending_execution.id)
@@ -331,9 +331,10 @@ defmodule Manifold.OutboundTest do
 
     assert {:snooze, 5} = Outbound.cancel_account_jobs(mailbox.id, 2)
     assert target_incomplete_job_count(mailbox.id) == 0
-    assert target_cancelled_job_count(mailbox.id) == 3
+    assert target_cancelled_job_count(mailbox.id) == 1
 
-    assert %{cancelled: 0, done?: true} = Outbound.cancel_account_jobs(mailbox.id, 2)
+    assert %{cancelled: 1, done?: true} = Outbound.cancel_account_jobs(mailbox.id, 2)
+    assert target_cancelled_job_count(mailbox.id) == 0
 
     assert Repo.get!(Oban.Job, completed.id).state == "completed"
     assert Repo.get!(Oban.Job, unrelated.id).state == "available"
@@ -475,7 +476,7 @@ defmodule Manifold.OutboundTest do
     assert %{cancelled: 1, done?: true} = cancel_result
     assert {0, nil} = transition_result
 
-    assert on_repo(race_repo, fn -> Repo.get!(Oban.Job, job.id).state end) == "cancelled"
+    refute on_repo(race_repo, fn -> Repo.get(Oban.Job, job.id) end)
     assert on_repo(race_repo, fn -> Repo.get!(OutboundMessage, message.id).id end) == message.id
 
     cleanup_race_fixture(race_repo, job.id, message.id, mailbox.id, domain.id)

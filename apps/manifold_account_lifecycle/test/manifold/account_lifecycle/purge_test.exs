@@ -9,17 +9,59 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
   alias Manifold.AccountLifecycle.Schema.{AccountPurge, PurgeDelivery, PurgeObject}
   alias Manifold.Accounts
   alias Manifold.Accounts.Schema.Account
-  alias Manifold.Connectors.ActivityLog
-  alias Manifold.Connectors.Schema.{ReceiveMethod, RemoteMessage, SendMethod}
+  alias Manifold.Connectors
+  alias Manifold.Connectors.{ActivityLog, Crypto, MicrosoftScopes, OAuthAuthorizations}
+  alias Manifold.Connectors.OAuth.Consumed
+  alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
+  alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
+  alias Manifold.Connectors.Jobs.{ApplyRemoteState, SyncAccount}
+
+  alias Manifold.Connectors.Schema.{
+    ConnectorEvent,
+    OAuthAuthorization,
+    ReceiveMethod,
+    RemoteMessage,
+    SendMethod,
+    SyncCursor
+  }
+
   alias Manifold.Ingest.Schema.{DeliveryRecipient, InboundDelivery}
   alias Manifold.Ingest.Jobs.ArchiveRawEmail
+  alias Manifold.Mail
   alias Manifold.Mail.Schema.{Attachment, MailboxEntry, Message}
   alias Manifold.Outbound
-  alias Manifold.Outbound.Schema.OutboundMessage
+  alias Manifold.Outbound.Jobs.SubmitOutbound
+  alias Manifold.Outbound.Schema.{OutboundMessage, ProviderSubmission}
   alias Manifold.Repo
   alias Manifold.Storage.{BlobStore, RawStore}
 
   @moduletag :tmp_dir
+
+  defmodule FakeMicrosoft do
+    @behaviour Manifold.Connectors.Provider
+
+    @impl true
+    def exchange_code(_code, _verifier, _redirect_uri, _config, opts),
+      do: Keyword.fetch!(opts, :token)
+
+    @impl true
+    def identity(_access_token, _config, opts), do: Keyword.fetch!(opts, :identity)
+
+    @impl true
+    def initial_cursors(_access_token, _config, _opts) do
+      {:ok, [%ProviderCursor{scope: "folders", phase: "initial"}]}
+    end
+
+    @impl true
+    def refresh_token(_refresh_token, _config, opts), do: Keyword.fetch!(opts, :refresh_result)
+
+    @impl true
+    def sync_page(_access_token, cursor, _config, _opts), do: {:ok, %Page{cursor: cursor}}
+
+    @impl true
+    def fetch_raw(_access_token, _message_id, _config, _opts),
+      do: {:ok, %RawMessage{bytes: "Subject: lifecycle fixture\r\n\r\nbody\r\n"}}
+  end
 
   setup %{tmp_dir: tmp_dir} do
     old_storage =
@@ -28,11 +70,18 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
       end)
 
     old_activity_log_dir = Application.get_env(:manifold_connectors, :activity_log_dir)
+    old_encryption_key = Application.get_env(:manifold_connectors, :encryption_key)
 
     Application.put_env(:manifold_storage, :raw_store_dir, Path.join(tmp_dir, "raw"))
     Application.put_env(:manifold_storage, :blob_store_dir, Path.join(tmp_dir, "blob"))
     Application.put_env(:manifold_storage, :spool_dir, Path.join(tmp_dir, "spool"))
     Application.put_env(:manifold_connectors, :activity_log_dir, Path.join(tmp_dir, "logs"))
+
+    Application.put_env(
+      :manifold_connectors,
+      :encryption_key,
+      Base.encode64(:crypto.strong_rand_bytes(32))
+    )
 
     start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
 
@@ -46,9 +95,242 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
       else
         Application.delete_env(:manifold_connectors, :activity_log_dir)
       end
+
+      restore_env(:manifold_connectors, :encryption_key, old_encryption_key)
     end)
 
     :ok
+  end
+
+  test "account deactivation fences Microsoft OAuth and delivery while retaining data" do
+    suffix = System.unique_integer([:positive])
+    {:ok, domain} = Accounts.create_domain(%{name: "deactivate-microsoft-#{suffix}.test"})
+    {:ok, target} = Accounts.create_account(domain, %{local_part: "target"})
+    target = Repo.preload(target, :domain)
+    address = Accounts.account_address(target)
+    fixture = microsoft_connector_fixture!(target.id, address, "deactivation")
+
+    {:ok, draft} =
+      Outbound.create_draft(target.id, %{
+        subject: "Retained draft",
+        text_body: "Retained body",
+        recipients: [%{kind: "to", address: "recipient@example.test"}]
+      })
+
+    assert {:ok, %Account{active: false}} = AccountLifecycle.disable_account(target.id)
+
+    consumed = %Consumed{
+      provider: "microsoft",
+      mailbox_id: target.id,
+      purpose: :send,
+      required_scopes: [MicrosoftScopes.send(), MicrosoftScopes.offline()],
+      redirect_uri: "https://mail.example.test/connectors/microsoft/callback",
+      pkce_verifier: "deactivation-verifier-sentinel"
+    }
+
+    token = %Token{
+      access_token: "deactivation-new-access-sentinel",
+      refresh_token: nil,
+      expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
+      scopes: [MicrosoftScopes.send()]
+    }
+
+    identity = %Identity{
+      id: fixture.authorization.provider_subject_id,
+      email_address: address
+    }
+
+    assert {:error, %{reason: :mailbox_not_active}} =
+             OAuthAuthorizations.complete(
+               "microsoft",
+               "deactivation-authorization-code-sentinel",
+               consumed,
+               FakeMicrosoft,
+               [],
+               provider_opts: [token: {:ok, token}, identity: {:ok, identity}]
+             )
+
+    assert {:error, %{reason: :mailbox_not_active}} = Connectors.enqueue_sync(fixture.receive.id)
+
+    assert {:error, %{reason: :sender_not_active}} =
+             Outbound.queue_draft(target.id, draft.id)
+
+    assert {:error, %{reason: :mailbox_not_active}} =
+             OAuthAuthorizations.checkout_access_token(
+               fixture.authorization.id,
+               FakeMicrosoft,
+               [],
+               required_scope: MicrosoftScopes.read()
+             )
+
+    assert Repo.get!(OAuthAuthorization, fixture.authorization.id).status == "connected"
+    assert Repo.get!(ReceiveMethod, fixture.receive.id).status == "connected"
+    refute Repo.get!(ReceiveMethod, fixture.receive.id).enabled
+    assert Repo.get!(SendMethod, fixture.send_method.id).status == "connected"
+    refute Repo.get!(SendMethod, fixture.send_method.id).enabled
+    assert Repo.get!(OutboundMessage, draft.id).state == "draft"
+    assert Repo.aggregate(SyncCursor, :count) == 2
+  end
+
+  test "bounded purge removes Microsoft receive and send state without crossing accounts", %{
+    tmp_dir: tmp_dir
+  } do
+    suffix = System.unique_integer([:positive])
+    {:ok, domain} = Accounts.create_domain(%{name: "purge-microsoft-#{suffix}.test"})
+    {:ok, target} = Accounts.create_account(domain, %{local_part: "target"})
+    {:ok, other} = Accounts.create_account(domain, %{local_part: "other"})
+    target = Repo.preload(target, :domain)
+    other = Repo.preload(other, :domain)
+
+    target_connector =
+      microsoft_connector_fixture!(
+        target.id,
+        Accounts.account_address(target),
+        "purge-target"
+      )
+
+    target_ciphertexts = [
+      target_connector.authorization.access_token_ciphertext,
+      target_connector.authorization.refresh_token_ciphertext
+    ]
+
+    assert Enum.all?(target_ciphertexts, &(is_binary(&1) and byte_size(&1) > 0))
+
+    other_connector =
+      microsoft_connector_fixture!(
+        other.id,
+        Accounts.account_address(other),
+        "purge-other"
+      )
+
+    target_delivery =
+      delivery_fixture(domain.id, [target.id], nil, "purge-target-sent", tmp_dir)
+
+    other_delivery =
+      delivery_fixture(domain.id, [other.id], nil, "purge-other-sent", tmp_dir)
+
+    assert {:ok, %{sent: sent_folder_target}} = Mail.Folders.ensure(target.id)
+    assert {:ok, %{sent: sent_folder_other}} = Mail.Folders.ensure(other.id)
+
+    target_entry =
+      target_delivery.entries[target.id]
+      |> MailboxEntry.changeset(%{folder_id: sent_folder_target.id})
+      |> Repo.update!()
+
+    other_entry =
+      other_delivery.entries[other.id]
+      |> MailboxEntry.changeset(%{folder_id: sent_folder_other.id})
+      |> Repo.update!()
+
+    target_remote =
+      target_connector.receive.id
+      |> remote_message_fixture(target_delivery.delivery.id)
+      |> RemoteMessage.changeset(%{
+        remote_folder_id: "purge-target-sent-folder",
+        remote_folder_kind: "sent"
+      })
+      |> Repo.update!()
+
+    other_remote =
+      other_connector.receive.id
+      |> remote_message_fixture(other_delivery.delivery.id)
+      |> RemoteMessage.changeset(%{
+        remote_folder_id: "purge-other-sent-folder",
+        remote_folder_kind: "sent"
+      })
+      |> Repo.update!()
+
+    :ok = ActivityLog.append(target_connector.receive.id, %{event: "purge-microsoft-target"})
+    :ok = ActivityLog.append(other_connector.receive.id, %{event: "purge-microsoft-other"})
+
+    sync_job =
+      target_connector.receive.id
+      |> then(&SyncAccount.new(%{"external_account_id" => &1}))
+      |> Repo.insert!()
+
+    remote_state_job =
+      target_remote.id
+      |> then(&ApplyRemoteState.new(%{"remote_message_id" => &1}))
+      |> Repo.insert!()
+
+    {:ok, draft} =
+      Outbound.create_draft(target.id, %{
+        subject: "purge-subject-sentinel",
+        text_body: "purge-body-sentinel",
+        recipients: [
+          %{kind: "to", address: "recipient@example.test"},
+          %{kind: "bcc", address: "purge-bcc-sentinel@example.test"}
+        ]
+      })
+
+    assert {:ok, queued} = Outbound.queue_draft(target.id, draft.id)
+
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: queued.id)
+
+    request_payload =
+      ProviderSubmission
+      |> where([stored], stored.id == ^submission.id)
+      |> select([stored], stored.request_payload)
+      |> Repo.one!()
+
+    assert request_payload =~ Base.encode64("purge-subject-sentinel")
+    assert request_payload =~ "purge-body-sentinel"
+    assert request_payload =~ "purge-bcc-sentinel@example.test"
+
+    submit_job =
+      Repo.get_by!(Oban.Job,
+        worker: inspect(SubmitOutbound),
+        args: %{"outbound_message_id" => queued.id}
+      )
+
+    assert {:ok, purge} =
+             AccountLifecycle.request_deletion(
+               target.id,
+               "target@#{domain.normalized_domain}"
+             )
+
+    assert %AccountPurge{status: "completed"} = run_until_complete(purge.id)
+    completed = Repo.get!(AccountPurge, purge.id)
+
+    refute Repo.get(Account, target.id)
+    refute Repo.get(OAuthAuthorization, target_connector.authorization.id)
+    refute Repo.get(ReceiveMethod, target_connector.receive.id)
+    refute Repo.get(SendMethod, target_connector.send_method.id)
+    refute Repo.get(SyncCursor, target_connector.folders_cursor.id)
+    refute Repo.get(SyncCursor, target_connector.sent_cursor.id)
+    refute Repo.get(RemoteMessage, target_remote.id)
+    refute Repo.get(ConnectorEvent, target_connector.authorization_event.id)
+    refute Repo.get(OutboundMessage, queued.id)
+    refute Repo.get(ProviderSubmission, submission.id)
+    refute Repo.get(MailboxEntry, target_entry.id)
+    refute Repo.get(InboundDelivery, target_delivery.delivery.id)
+    assert {:ok, []} = ActivityLog.list_dates(target_connector.receive.id)
+    assert {:error, _reason} = RawStore.stat(target_delivery.delivery.raw_object_key)
+    refute File.exists?(target_delivery.delivery.spool_bundle_path)
+
+    for job <- [sync_job, remote_state_job, submit_job] do
+      refute Repo.get(Oban.Job, job.id)
+    end
+
+    assert Repo.get!(Account, other.id)
+    assert Repo.get!(OAuthAuthorization, other_connector.authorization.id).status == "connected"
+    assert Repo.get!(ReceiveMethod, other_connector.receive.id)
+    assert Repo.get!(SendMethod, other_connector.send_method.id)
+    assert Repo.get!(RemoteMessage, other_remote.id).remote_folder_kind == "sent"
+    assert Repo.get!(MailboxEntry, other_entry.id).folder_id == sent_folder_other.id
+    assert Repo.get!(InboundDelivery, other_delivery.delivery.id)
+    assert {:ok, [_date]} = ActivityLog.list_dates(other_connector.receive.id)
+
+    audit_surfaces = %{
+      purge: completed,
+      delivery_work: Repo.all(from(work in PurgeDelivery, where: work.purge_id == ^purge.id)),
+      object_work: Repo.all(from(work in PurgeObject, where: work.purge_id == ^purge.id)),
+      purge_jobs: PurgeAccount |> purge_job_query(purge.id) |> Repo.all()
+    }
+
+    Enum.each(target_ciphertexts ++ [request_payload], fn forbidden ->
+      refute_nested_audit_binary(audit_surfaces, forbidden)
+    end)
   end
 
   test "purges only the target account while retaining a shared delivery and blob", %{
@@ -207,6 +489,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "outbound-drain-#{suffix}.test"})
     {:ok, target} = Accounts.create_account(domain, %{local_part: "target"})
+    _send_method = send_method_fixture(target.id)
 
     {:ok, draft} =
       Outbound.create_draft(target.id, %{
@@ -301,7 +584,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
 
     assert {:snooze, 1} = perform(purge.id)
     drained = Repo.get!(AccountPurge, purge.id)
-    assert drained.stage == "connectors"
+    assert drained.stage == "outbound"
     assert drained.progress == %{}
   end
 
@@ -328,6 +611,33 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
     assert Repo.get!(ReceiveMethod, method.id)
     assert Repo.aggregate(PurgeObject, :count) == 0
     assert Repo.get!(AccountPurge, purge.id).stage == "connectors"
+  end
+
+  test "a persisted connector stage routes outbound snapshots before deleting send methods" do
+    suffix = System.unique_integer([:positive])
+    {:ok, domain} = Accounts.create_domain(%{name: "connector-route-#{suffix}.test"})
+    {:ok, target} = Accounts.create_account(domain, %{local_part: "target"})
+    send_method = send_method_fixture(target.id)
+
+    {:ok, draft} =
+      Outbound.create_draft(target.id, %{
+        subject: "Route snapshot first",
+        recipients: [%{kind: "to", address: "recipient@example.test"}]
+      })
+
+    assert {:ok, queued} = Outbound.queue_draft(target.id, draft.id)
+
+    assert {:ok, purge} =
+             AccountLifecycle.request_deletion(target.id, "target@#{domain.normalized_domain}")
+
+    purge
+    |> AccountPurge.changeset(%{status: "running", stage: "connectors", progress: %{}})
+    |> Repo.update!()
+
+    assert {:snooze, 1} = perform(purge.id)
+    assert Repo.get!(AccountPurge, purge.id).stage == "outbound"
+    assert Repo.get!(SendMethod, send_method.id)
+    assert Repo.get_by!(ProviderSubmission, outbound_message_id: queued.id)
   end
 
   test "a crash after delivery deletion resumes from durable object work", %{tmp_dir: tmp_dir} do
@@ -747,7 +1057,9 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
         assert :ok = perform(purge_id)
         {:halt, purge}
       else
-        assert result in [{:snooze, 1}, {:snooze, 5}]
+        assert result in [{:snooze, 1}, {:snooze, 5}],
+               "unexpected purge result #{inspect(result)} at #{purge.stage}: #{inspect(purge.progress)}"
+
         {:cont, purge}
       end
     end) || flunk("purge did not complete within 800 bounded executions")
@@ -903,13 +1215,15 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
   end
 
   defp send_method_fixture(mailbox_id) do
+    {:ok, sender} = Accounts.get_sender_identity(mailbox_id)
+
     %SendMethod{}
     |> SendMethod.changeset(%{
       account_id: mailbox_id,
       kind: "smtp",
-      email_address: "target@example.test",
+      email_address: sender.canonical_address,
       status: "connected",
-      enabled: false
+      enabled: true
     })
     |> Repo.insert!()
   end
@@ -927,6 +1241,153 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
       state: "imported"
     })
     |> Repo.insert!()
+  end
+
+  defp refute_nested_audit_binary(audit_surfaces, forbidden)
+       when is_binary(forbidden) and byte_size(forbidden) > 0 do
+    variants = [
+      forbidden,
+      inspect(forbidden, limit: :infinity, printable_limit: :infinity),
+      Base.encode64(forbidden)
+    ]
+
+    refute nested_binary_variant?(audit_surfaces, variants)
+  end
+
+  defp nested_binary_variant?(value, variants) when is_binary(value) do
+    Enum.any?(variants, &(:binary.match(value, &1) != :nomatch))
+  end
+
+  defp nested_binary_variant?(%_{} = value, variants) do
+    value
+    |> Map.from_struct()
+    |> nested_binary_variant?(variants)
+  end
+
+  defp nested_binary_variant?(value, variants) when is_map(value) do
+    Enum.any?(value, fn {key, item} ->
+      nested_binary_variant?(key, variants) or nested_binary_variant?(item, variants)
+    end)
+  end
+
+  defp nested_binary_variant?(value, variants) when is_list(value) do
+    Enum.any?(value, &nested_binary_variant?(&1, variants))
+  end
+
+  defp nested_binary_variant?(value, variants) when is_tuple(value) do
+    value
+    |> Tuple.to_list()
+    |> nested_binary_variant?(variants)
+  end
+
+  defp nested_binary_variant?(_value, _variants), do: false
+
+  defp microsoft_connector_fixture!(mailbox_id, address, sentinel) do
+    authorization_id = Ecto.UUID.generate()
+
+    {:ok, access_token_ciphertext} =
+      Crypto.encrypt(
+        "#{sentinel}-access-token-sentinel",
+        "credential:#{authorization_id}:access"
+      )
+
+    {:ok, refresh_token_ciphertext} =
+      Crypto.encrypt(
+        "#{sentinel}-refresh-token-sentinel",
+        "credential:#{authorization_id}:refresh"
+      )
+
+    authorization =
+      %OAuthAuthorization{id: authorization_id}
+      |> OAuthAuthorization.changeset(%{
+        account_id: mailbox_id,
+        provider: "microsoft",
+        provider_subject_id: "#{sentinel}-provider-subject",
+        email_address: address,
+        granted_scopes: [
+          MicrosoftScopes.read(),
+          MicrosoftScopes.send(),
+          MicrosoftScopes.offline()
+        ],
+        status: "connected",
+        access_token_ciphertext: access_token_ciphertext,
+        refresh_token_ciphertext: refresh_token_ciphertext,
+        token_expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second)
+      })
+      |> Repo.insert!()
+
+    receive =
+      %ReceiveMethod{}
+      |> ReceiveMethod.changeset(%{
+        account_id: mailbox_id,
+        oauth_authorization_id: authorization.id,
+        kind: "microsoft",
+        provider_account_id: authorization.provider_subject_id,
+        email_address: address,
+        status: "connected",
+        enabled: true,
+        sync_enabled: true,
+        granted_scopes: [MicrosoftScopes.read()]
+      })
+      |> Repo.insert!()
+
+    send_method =
+      %SendMethod{}
+      |> SendMethod.changeset(%{
+        account_id: mailbox_id,
+        oauth_authorization_id: authorization.id,
+        kind: "microsoft",
+        email_address: address,
+        status: "connected",
+        enabled: true
+      })
+      |> Repo.insert!()
+
+    folders =
+      %SyncCursor{}
+      |> SyncCursor.changeset(%{
+        external_account_id: receive.id,
+        scope: "folders",
+        phase: "incremental",
+        committed_cursor: "https://graph.microsoft.test/#{sentinel}/folders-delta",
+        metadata: %{
+          "folder_mapping_version" => 1,
+          "folder_kinds_by_id" => %{"#{sentinel}-sent-folder" => "sent"}
+        },
+        generation: 1
+      })
+      |> Repo.insert!()
+
+    sent =
+      %SyncCursor{}
+      |> SyncCursor.changeset(%{
+        external_account_id: receive.id,
+        scope: "folder:#{sentinel}-sent-folder",
+        phase: "incremental",
+        committed_cursor: "https://graph.microsoft.test/#{sentinel}/sent-delta",
+        metadata: %{"folder_mapping_version" => 1, "folder_kind" => "sent"},
+        generation: 1
+      })
+      |> Repo.insert!()
+
+    authorization_event =
+      %ConnectorEvent{}
+      |> ConnectorEvent.changeset(%{
+        oauth_authorization_id: authorization.id,
+        event_type: "connected",
+        metadata: %{provider: "microsoft", direction: "receive"},
+        occurred_at: DateTime.utc_now()
+      })
+      |> Repo.insert!()
+
+    %{
+      authorization: authorization,
+      receive: receive,
+      send_method: send_method,
+      folders_cursor: folders,
+      sent_cursor: sent,
+      authorization_event: authorization_event
+    }
   end
 end
 
@@ -1103,7 +1564,7 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
 
       assert {:snooze, 1} = perform_purge(fixture.purge_id)
       drained = Repo.get!(AccountPurge, fixture.purge_id)
-      assert drained.stage == "connectors"
+      assert drained.stage == "outbound"
       assert drained.progress == %{}
     after
       :telemetry.detach(handler_id)

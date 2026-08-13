@@ -238,10 +238,14 @@ defmodule Manifold.Connectors.Schema.OAuthAuthorizationTest do
         outbound_message_id: Ecto.UUID.generate(),
         send_method_id: send_method_id,
         provider: "gmail",
+        canonical_sender_address: "person@gmail.com",
         idempotency_key: Ecto.UUID.generate(),
         request_sha256: String.duplicate("a", 64),
+        request_payload: "Subject: snapshot\r\n\r\nBody\r\n",
+        render_version: 1,
         state: "pending",
         attempt_count: 0,
+        provider_rfc_message_id: "<snapshot@example.test>",
         idempotency_expires_at: nil
       })
 

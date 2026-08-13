@@ -137,7 +137,7 @@ defmodule Manifold.AccountLifecycle.Purge do
 
       case first_incomplete(@drain_sources, progress) do
         nil ->
-          advance_result(repo, purge, "connectors")
+          advance_result(repo, purge, "outbound")
 
         source ->
           case drain_call(source, purge, progress) do
@@ -153,7 +153,7 @@ defmodule Manifold.AccountLifecycle.Purge do
 
               with {:ok, updated} <- update_purge(repo, purge, %{progress: progress}) do
                 if all_complete?(@drain_sources, progress) do
-                  advance_result(repo, updated, "connectors")
+                  advance_result(repo, updated, "outbound")
                 else
                   {:snooze, 1}
                 end
@@ -165,18 +165,22 @@ defmodule Manifold.AccountLifecycle.Purge do
 
   defp connectors(purge_id, job) do
     with_stage(purge_id, "connectors", fn repo, purge ->
-      result = Connectors.purge_account_batch(repo, purge.mailbox_id, @batch_size)
-
-      if injected_after_connector_delete_before_object_outbox?(job) do
-        repo.rollback(:injected_after_connector_delete_before_object_outbox)
-      end
-
-      _inserted = insert_object_work(repo, purge.id, "activity_log", result.activity_log_ids)
-
-      if result.done? do
+      if Outbound.account_data_remaining?(purge.mailbox_id) do
         advance_result(repo, purge, "outbound")
       else
-        {:snooze, 1}
+        result = Connectors.purge_account_batch(repo, purge.mailbox_id, @batch_size)
+
+        if injected_after_connector_delete_before_object_outbox?(job) do
+          repo.rollback(:injected_after_connector_delete_before_object_outbox)
+        end
+
+        _inserted = insert_object_work(repo, purge.id, "activity_log", result.activity_log_ids)
+
+        if result.done? do
+          advance_result(repo, purge, "mailbox_copy")
+        else
+          {:snooze, 1}
+        end
       end
     end)
   end
@@ -184,7 +188,7 @@ defmodule Manifold.AccountLifecycle.Purge do
   defp outbound(purge_id) do
     with_stage(purge_id, "outbound", fn repo, purge ->
       if Outbound.purge_account_batch(purge.mailbox_id, @batch_size).done? do
-        advance_result(repo, purge, "mailbox_copy")
+        advance_result(repo, purge, "connectors")
       else
         {:snooze, 1}
       end
@@ -337,11 +341,11 @@ defmodule Manifold.AccountLifecycle.Purge do
       )
 
     cond do
-      Connectors.account_data_remaining?(purge.mailbox_id) ->
-        advance_result(repo, purge, "connectors")
-
       Outbound.account_data_remaining?(purge.mailbox_id) ->
         advance_result(repo, purge, "outbound")
+
+      Connectors.account_data_remaining?(purge.mailbox_id) ->
+        advance_result(repo, purge, "connectors")
 
       Mail.account_data_remaining?(purge.mailbox_id) ->
         advance_result(repo, purge, "mailbox_copy")

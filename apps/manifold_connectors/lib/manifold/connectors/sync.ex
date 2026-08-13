@@ -32,6 +32,24 @@ defmodule Manifold.Connectors.Sync do
 
   @refresh_skew_seconds 60
   @default_retry_seconds 30
+  @telemetry_error_codes MapSet.new(~w(
+    account_disconnected
+    authentication_expired
+    connector_lifecycle_changed
+    database_unavailable
+    folder_cursor_missing
+    insufficient_provider_scope
+    invalid_encryption_key
+    invalid_grant
+    invalid_provider_response
+    not_found
+    provider_not_configured
+    provider_unavailable
+    rate_limited
+    reauthorization_required
+    sync_disabled
+    sync_failed
+  ))
 
   @spec run(Ecto.UUID.t(), Keyword.t()) ::
           :ok | {:snooze, pos_integer()} | {:cancel, atom()} | {:error, term()}
@@ -260,8 +278,7 @@ defmodule Manifold.Connectors.Sync do
         account_id: account_id,
         provider: provider,
         result: :error,
-        error_code: error.code,
-        error_message: error.message
+        error_code: telemetry_error_code(error.code, :sync_failed)
       }
     )
   end
@@ -274,8 +291,7 @@ defmodule Manifold.Connectors.Sync do
         account_id: account_id,
         provider: provider,
         result: :error,
-        error_code: error.reason,
-        error_message: error.message
+        error_code: telemetry_error_code(error.reason, :sync_failed)
       }
     )
   end
@@ -288,11 +304,20 @@ defmodule Manifold.Connectors.Sync do
         account_id: account_id,
         provider: provider,
         result: :error,
-        error_code: :database_unavailable,
-        error_message: "connector database is unavailable"
+        error_code: :database_unavailable
       }
     )
   end
+
+  defp telemetry_error_code(code, fallback) when is_atom(code) do
+    if MapSet.member?(@telemetry_error_codes, Atom.to_string(code)), do: code, else: fallback
+  end
+
+  defp telemetry_error_code(code, fallback) when is_binary(code) do
+    if MapSet.member?(@telemetry_error_codes, code), do: code, else: Atom.to_string(fallback)
+  end
+
+  defp telemetry_error_code(_code, fallback), do: fallback
 
   defp duration_ms(start) do
     System.convert_time_unit(System.monotonic_time() - start, :native, :millisecond)
@@ -655,60 +680,53 @@ defmodule Manifold.Connectors.Sync do
     end
   end
 
-  defp emit_message_stop(account, provider_message_id, start, :ok) do
+  defp emit_message_stop(account, _provider_message_id, start, :ok) do
     :telemetry.execute(
       [:manifold, :connectors, :sync, :message, :stop],
       %{duration_ms: duration_ms(start)},
       %{
         account_id: account.id,
         provider: account.kind,
-        provider_message_id: provider_message_id,
         result: :ok
       }
     )
   end
 
-  defp emit_message_stop(account, provider_message_id, start, %ProviderError{} = error) do
+  defp emit_message_stop(account, _provider_message_id, start, %ProviderError{} = error) do
     :telemetry.execute(
       [:manifold, :connectors, :sync, :message, :stop],
       %{duration_ms: duration_ms(start)},
       %{
         account_id: account.id,
         provider: account.kind,
-        provider_message_id: provider_message_id,
         result: :error,
-        error_code: error.code,
-        error_message: error.message
+        error_code: telemetry_error_code(error.code, :sync_message_failed)
       }
     )
   end
 
-  defp emit_message_stop(account, provider_message_id, start, %Error{} = error) do
+  defp emit_message_stop(account, _provider_message_id, start, %Error{} = error) do
     :telemetry.execute(
       [:manifold, :connectors, :sync, :message, :stop],
       %{duration_ms: duration_ms(start)},
       %{
         account_id: account.id,
         provider: account.kind,
-        provider_message_id: provider_message_id,
         result: :error,
-        error_code: error.reason,
-        error_message: error.message
+        error_code: telemetry_error_code(error.reason, :sync_message_failed)
       }
     )
   end
 
-  defp emit_message_stop(account, provider_message_id, start, reason) do
+  defp emit_message_stop(account, _provider_message_id, start, _reason) do
     :telemetry.execute(
       [:manifold, :connectors, :sync, :message, :stop],
       %{duration_ms: duration_ms(start)},
       %{
         account_id: account.id,
         provider: account.kind,
-        provider_message_id: provider_message_id,
         result: :error,
-        error_code: :sync_message_failed,
-        error_message: inspect(reason)
+        error_code: :sync_message_failed
       }
     )
   end
@@ -1461,7 +1479,10 @@ defmodule Manifold.Connectors.Sync do
     ConnectorEvent.changeset(%ConnectorEvent{}, %{
       external_account_id: account_id,
       event_type: "sync_failed",
-      metadata: %{class: Atom.to_string(class), code: Atom.to_string(code)},
+      metadata: %{
+        class: Atom.to_string(class),
+        code: code |> telemetry_error_code(:sync_failed) |> to_string()
+      },
       occurred_at: now
     })
     |> Repo.insert!()

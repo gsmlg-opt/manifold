@@ -5,6 +5,7 @@ defmodule Manifold.Connectors.SyncTest do
   alias Manifold.Connectors
 
   alias Manifold.Connectors.{
+    ActivityLog,
     Crypto,
     MicrosoftFolderMapping,
     MicrosoftScopes,
@@ -191,6 +192,7 @@ defmodule Manifold.Connectors.SyncTest do
     old_key = Application.get_env(:manifold_connectors, :encryption_key)
     old_adapters = Application.get_env(:manifold_connectors, :adapters)
     old_providers = Application.get_env(:manifold_connectors, :providers)
+    old_activity_log_dir = Application.get_env(:manifold_connectors, :activity_log_dir)
     old_spool = Application.fetch_env!(:manifold_storage, :spool_dir)
     old_raw = Application.fetch_env!(:manifold_storage, :raw_store_dir)
 
@@ -212,11 +214,13 @@ defmodule Manifold.Connectors.SyncTest do
 
     Application.put_env(:manifold_storage, :spool_dir, Path.join(tmp_dir, "spool"))
     Application.put_env(:manifold_storage, :raw_store_dir, Path.join(tmp_dir, "raw"))
+    Application.put_env(:manifold_connectors, :activity_log_dir, Path.join(tmp_dir, "activity"))
 
     on_exit(fn ->
       restore_env(:manifold_connectors, :encryption_key, old_key)
       restore_env(:manifold_connectors, :adapters, old_adapters)
       restore_env(:manifold_connectors, :providers, old_providers)
+      restore_env(:manifold_connectors, :activity_log_dir, old_activity_log_dir)
       Application.put_env(:manifold_storage, :spool_dir, old_spool)
       Application.put_env(:manifold_storage, :raw_store_dir, old_raw)
       Process.delete(:sync_page_result)
@@ -298,6 +302,86 @@ defmodule Manifold.Connectors.SyncTest do
 
     assert Repo.get_by!(MailboxEntry, inbound_delivery_id: mapping.inbound_delivery_id).mailbox_id ==
              mailbox.id
+  end
+
+  test "Microsoft sync telemetry omits provider identities and free-form errors", %{
+    account: account,
+    cursor: cursor
+  } do
+    microsoft = convert_to_microsoft!(account)
+    provider_message_id = "telemetry-subject-sentinel"
+    error_message = "telemetry-body-sentinel"
+
+    attach_sync_telemetry()
+
+    Process.put(
+      :sync_page_result,
+      {:ok,
+       %Page{
+         messages: [remote_message(provider_message_id)],
+         cursor: %{provider_cursor(cursor) | committed_cursor: "101"}
+       }}
+    )
+
+    Process.put(
+      {:raw_result, provider_message_id},
+      {:error,
+       %Error{
+         class: :temporary,
+         code: :"telemetry-subject-sentinel",
+         message: error_message
+       }}
+    )
+
+    assert {:snooze, 30} = Connectors.sync_account(microsoft.id)
+
+    assert_receive {:sync_telemetry, [:manifold, :connectors, :sync, :message, :stop],
+                    %{duration_ms: message_duration}, message_metadata}
+
+    assert is_integer(message_duration) and message_duration >= 0
+
+    assert message_metadata == %{
+             account_id: microsoft.id,
+             provider: "microsoft",
+             result: :error,
+             error_code: :sync_message_failed
+           }
+
+    assert_receive {:sync_telemetry, [:manifold, :connectors, :sync, :stop],
+                    %{duration_ms: sync_duration, message_count: 0, page_count: 0}, sync_metadata}
+
+    assert is_integer(sync_duration) and sync_duration >= 0
+
+    assert sync_metadata == %{
+             account_id: microsoft.id,
+             provider: "microsoft",
+             result: :error,
+             error_code: :sync_failed
+           }
+
+    assert {:ok, activity_dates} = ActivityLog.list_dates(microsoft.id)
+
+    activity_lines =
+      Enum.flat_map(activity_dates, fn date ->
+        assert {:ok, entries} = ActivityLog.read(microsoft.id, date)
+        entries
+      end)
+
+    connector_event_metadata =
+      ConnectorEvent
+      |> where([event], event.external_account_id == ^microsoft.id)
+      |> select([event], event.metadata)
+      |> Repo.all()
+
+    inspected_safe_surfaces =
+      inspect(%{
+        telemetry: [message_metadata, sync_metadata],
+        activity_lines: activity_lines,
+        connector_events: connector_event_metadata
+      })
+
+    refute inspected_safe_surfaces =~ provider_message_id
+    refute inspected_safe_surfaces =~ error_message
   end
 
   test "provider mailbox receive time is applied after projection, not sync now", %{
@@ -961,6 +1045,55 @@ defmodule Manifold.Connectors.SyncTest do
     assert Repo.get!(ReceiveMethod, microsoft.id).last_error_code == "rate_limited"
   end
 
+  test "Microsoft folder mapping telemetry normalizes unknown provider codes", %{
+    account: account,
+    cursor: cursor
+  } do
+    microsoft = convert_to_microsoft!(account)
+    attach_folder_mapping_stop()
+
+    cursor
+    |> Repo.reload!()
+    |> SyncCursor.changeset(%{metadata: %{"folder_mapping_refresh_required" => true}})
+    |> Repo.update!()
+
+    Process.put(
+      :folder_mapping_result,
+      {:error,
+       %Error{
+         class: :temporary,
+         code: :"telemetry-subject-sentinel",
+         message: "telemetry-body-sentinel",
+         retry_after_seconds: 47
+       }}
+    )
+
+    assert {:snooze, 47} = Connectors.sync_account(microsoft.id)
+
+    assert_receive {:folder_mapping_stop,
+                    %{
+                      duration_ms: duration_ms,
+                      cursor_count: 0,
+                      changed_message_count: 0
+                    } = measurements, metadata}
+
+    assert is_integer(duration_ms) and duration_ms >= 0
+
+    assert Map.keys(measurements) |> Enum.sort() ==
+             [:changed_message_count, :cursor_count, :duration_ms]
+
+    assert metadata == %{
+             account_id: microsoft.account_id,
+             method_id: microsoft.id,
+             provider: "microsoft",
+             outcome: :error,
+             error_code: :folder_mapping_failed
+           }
+
+    refute inspect([measurements, metadata]) =~ "telemetry-subject-sentinel"
+    refute inspect([measurements, metadata]) =~ "telemetry-body-sentinel"
+  end
+
   test "Microsoft invalid folder mappings retain permanent failure handling", %{
     account: account,
     cursor: cursor
@@ -1256,8 +1389,7 @@ defmodule Manifold.Connectors.SyncTest do
     )
 
     assert {:cancel, :reconnect_required} = Connectors.sync_account(microsoft.id)
-    assert_receive {:sync_stop, %{provider: "microsoft", error_message: sanitized}}
-    assert sanitized == "Microsoft authorization must be reconnected"
+    assert_safe_sync_stop("microsoft", :invalid_grant)
     assert Repo.get!(SyncCursor, cursor.id).committed_cursor == "100"
 
     assert_oauth_reconnect_required(
@@ -1309,8 +1441,7 @@ defmodule Manifold.Connectors.SyncTest do
     )
 
     assert {:cancel, :reconnect_required} = Connectors.sync_account(account.id)
-    assert_receive {:sync_stop, %{provider: "gmail", error_message: sanitized}}
-    assert sanitized == "Gmail authorization must be reconnected"
+    assert_safe_sync_stop("gmail", :invalid_grant)
     assert Repo.get!(SyncCursor, cursor.id).committed_cursor == "100"
     assert_gmail_reconnect_required(authorization.id, account.id, send_method.id)
     refute_reconnect_secret("raw-sync-page-secret")
@@ -1339,8 +1470,7 @@ defmodule Manifold.Connectors.SyncTest do
     )
 
     assert {:cancel, :reconnect_required} = Connectors.sync_account(account.id)
-    assert_receive {:sync_stop, %{provider: "gmail", error_message: sanitized}}
-    assert sanitized == "Gmail authorization must be reconnected"
+    assert_safe_sync_stop("gmail", :invalid_grant)
     assert Repo.get!(SyncCursor, cursor.id).committed_cursor == "100"
     assert_gmail_reconnect_required(authorization.id, account.id, send_method.id)
     refute_reconnect_secret("raw-checkout-secret")
@@ -1374,8 +1504,7 @@ defmodule Manifold.Connectors.SyncTest do
     )
 
     assert {:cancel, :reconnect_required} = Connectors.sync_account(account.id)
-    assert_receive {:sync_stop, %{provider: "gmail", error_message: sanitized}}
-    assert sanitized == "Gmail authorization must be reconnected"
+    assert_safe_sync_stop("gmail", :authentication_expired)
     assert Repo.get!(SyncCursor, cursor.id).committed_cursor == "100"
     assert_gmail_reconnect_required(authorization.id, account.id, send_method.id)
     refute_reconnect_secret("raw-fetch-secret")
@@ -2136,11 +2265,46 @@ defmodule Manifold.Connectors.SyncTest do
       :telemetry.attach(
         handler_id,
         [:manifold, :connectors, :sync, :stop],
-        fn _event, _measurements, metadata, pid -> send(pid, {:sync_stop, metadata}) end,
+        fn _event, measurements, metadata, pid ->
+          send(pid, {:sync_stop, measurements, metadata})
+        end,
         test_pid
       )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp attach_sync_telemetry do
+    handler_id = "sync-safe-telemetry-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach_many(
+        handler_id,
+        [
+          [:manifold, :connectors, :sync, :stop],
+          [:manifold, :connectors, :sync, :message, :stop]
+        ],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:sync_telemetry, event, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp assert_safe_sync_stop(provider, error_code) do
+    assert_receive {:sync_stop, %{duration_ms: duration_ms, message_count: 0, page_count: 0},
+                    metadata}
+
+    assert is_integer(duration_ms) and duration_ms >= 0
+    assert metadata.provider == provider
+    assert metadata.result == :error
+    assert metadata.error_code == error_code
+
+    assert Map.keys(metadata) |> Enum.sort() ==
+             [:account_id, :error_code, :provider, :result]
   end
 
   defp assert_gmail_reconnect_required(authorization_id, receive_method_id, send_method_id) do
@@ -2189,6 +2353,24 @@ defmodule Manifold.Connectors.SyncTest do
 
   defp restore_env(app, key, nil), do: Application.delete_env(app, key)
   defp restore_env(app, key, value), do: Application.put_env(app, key, value)
+end
+
+defmodule Manifold.Connectors.RemoteStateJobsWithoutObanTest do
+  use Manifold.DataCase, async: false
+
+  alias Manifold.Connectors.RemoteStateJobs
+  alias Manifold.Repo
+
+  test "remote-state jobs persist when the scheduler is not running" do
+    assert is_nil(Oban.Registry.whereis(Oban))
+
+    remote_message_id = Ecto.UUID.generate()
+
+    assert %Oban.Job{id: job_id} = RemoteStateJobs.ensure(remote_message_id)
+    assert is_integer(job_id)
+    assert %Oban.Job{id: ^job_id} = Repo.get(Oban.Job, job_id)
+    assert %Oban.Job{id: ^job_id} = RemoteStateJobs.ensure(remote_message_id)
+  end
 end
 
 defmodule Manifold.Connectors.RemoteStateJobsConcurrencyTest do

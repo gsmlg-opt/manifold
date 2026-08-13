@@ -82,13 +82,12 @@ defmodule Manifold.Connectors do
   @spec checkout_oauth_access_token(Ecto.UUID.t(), Keyword.t()) ::
           {:ok, term()} | {:error, Error.t() | ProviderError.t() | Ecto.Changeset.t()}
   def checkout_oauth_access_token(authorization_id, opts \\ []) do
-    provider =
-      OAuthAuthorization
-      |> where([authorization], authorization.id == ^authorization_id)
-      |> select([authorization], authorization.provider)
-      |> Repo.one()
-
-    with provider when provider in ["gmail", "microsoft"] <- provider,
+    with {:ok, authorization_id} <- Ecto.UUID.cast(authorization_id),
+         provider when provider in ["gmail", "microsoft"] <-
+           OAuthAuthorization
+           |> where([authorization], authorization.id == ^authorization_id)
+           |> select([authorization], authorization.provider)
+           |> Repo.one(),
          {:ok, adapter, config} <- adapter_config(provider) do
       OAuthAuthorizations.checkout_access_token(
         authorization_id,
@@ -97,6 +96,9 @@ defmodule Manifold.Connectors do
         opts
       )
     else
+      :error ->
+        {:error, Error.new(:permanent, :authorization_not_found, "authorization not found")}
+
       nil ->
         {:error, Error.new(:permanent, :authorization_not_found, "authorization not found")}
 
@@ -734,42 +736,37 @@ defmodule Manifold.Connectors do
   @spec cancel_account_jobs(Ecto.UUID.t(), pos_integer()) ::
           {:snooze, 5} | %{cancelled: non_neg_integer(), done?: boolean()}
   def cancel_account_jobs(mailbox_id, limit) when is_integer(limit) and limit > 0 do
-    matching = account_job_query(mailbox_id)
+    {:ok, result} =
+      Repo.transaction(fn ->
+        matching = account_job_query(mailbox_id)
 
-    selected =
-      matching
-      |> order_by([job], asc: job.id)
-      |> limit(^limit)
-      |> select([job], {job.id, job.state})
-      |> Repo.all()
+        selected =
+          matching
+          |> order_by([job], asc: job.id)
+          |> limit(^limit)
+          |> lock("FOR UPDATE SKIP LOCKED")
+          |> select([job], {job.id, job.state})
+          |> Repo.all()
 
-    selected_ids = Enum.map(selected, &elem(&1, 0))
-    selected_executing? = Enum.any?(selected, &(elem(&1, 1) == "executing"))
+        executing_ids = for {id, "executing"} <- selected, do: id
+        drainable_ids = for {id, state} <- selected, state != "executing", do: id
 
-    cancelled =
-      case selected_ids do
-        [] ->
-          0
+        drained = delete_account_jobs(Repo, drainable_ids)
+        cancelled = cancel_executing_account_jobs(executing_ids)
 
-        ids ->
-          {:ok, count} =
-            Oban.Job
-            |> where([job], job.id in ^ids)
-            |> Oban.cancel_all_jobs()
+        matching_executing? =
+          matching
+          |> where([job], job.state == "executing")
+          |> Repo.exists?()
 
-          count
-      end
+        if executing_ids != [] or matching_executing? do
+          {:snooze, 5}
+        else
+          %{cancelled: drained + cancelled, done?: not Repo.exists?(matching)}
+        end
+      end)
 
-    matching_executing? =
-      matching
-      |> where([job], job.state == "executing")
-      |> Repo.exists?()
-
-    if selected_executing? or matching_executing? do
-      {:snooze, 5}
-    else
-      %{cancelled: cancelled, done?: not Repo.exists?(matching)}
-    end
+    result
   end
 
   @spec list_account_delivery_ids(Ecto.UUID.t(), Ecto.UUID.t() | nil, pos_integer()) :: %{
@@ -2395,7 +2392,7 @@ defmodule Manifold.Connectors do
 
   defp account_job_query(mailbox_id) do
     Oban.Job
-    |> where([job], job.state in ~w(available scheduled executing retryable suspended))
+    |> where([job], job.state in ~w(available scheduled executing retryable suspended cancelled))
     |> where(
       [job],
       (job.worker == ^inspect(SyncAccount) and
@@ -2439,6 +2436,28 @@ defmodule Manifold.Connectors do
              job.args
            ))
     )
+  end
+
+  defp delete_account_jobs(_repo, []), do: 0
+
+  defp delete_account_jobs(repo, ids) do
+    {count, _rows} =
+      Oban.Job
+      |> where([job], job.id in ^ids)
+      |> repo.delete_all()
+
+    count
+  end
+
+  defp cancel_executing_account_jobs([]), do: 0
+
+  defp cancel_executing_account_jobs(ids) do
+    {:ok, count} =
+      Oban.Job
+      |> where([job], job.id in ^ids and job.state == "executing")
+      |> Oban.cancel_all_jobs()
+
+    count
   end
 
   defp due_mailbox_ids(repo) do

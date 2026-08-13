@@ -64,7 +64,7 @@ purge record, and Oban job atomically.
 
 The persisted stage order is:
 
-`discover` -> `drain` -> `connectors` -> `outbound` -> `mailbox_copy` ->
+`discover` -> `drain` -> `outbound` -> `connectors` -> `mailbox_copy` ->
 `orphan_payloads` -> `objects` -> `finalize` -> `completed`.
 
 Each stage execution selects no more than 250 primary candidates or work rows
@@ -75,6 +75,13 @@ processes one delivery candidate per execution and pages at most 248 attachment
 keys at a time. Finalize repeats discovery and job drain, verifies every owning
 context and pending work table, and routes any remaining foreign-key ownership
 back to its cleanup stage instead of forcing deletion.
+
+The drain deletes bounded non-executing connector and outbound jobs instead of
+retaining cancelled rows. An executing job is cancelled first and forces a
+five-second snooze; a later bounded pass deletes that cancelled row before any
+destructive account-data stage. Outbound data is purged before connector send
+methods because provider-submission snapshots retain a foreign key to the
+selected send method.
 
 ## Mailbox-copy and shared-delivery rule
 

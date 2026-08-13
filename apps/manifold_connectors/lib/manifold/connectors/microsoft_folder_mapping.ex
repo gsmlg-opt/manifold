@@ -19,8 +19,19 @@ defmodule Manifold.Connectors.MicrosoftFolderMapping do
 
   @mapping_version 1
   @telemetry_event [:manifold, :connectors, :microsoft, :folder_mapping, :stop]
-  @telemetry_forbidden_fragments ~w(token password authorization_code raw_message)
-  @telemetry_code_pattern ~r/\A[a-z0-9_.:-]{1,128}\z/
+  @telemetry_error_codes MapSet.new(~w(
+    authentication_expired
+    connector_lifecycle_changed
+    database_unavailable
+    folder_cursor_missing
+    insufficient_provider_scope
+    insufficient_scope
+    invalid_folder_mapping
+    invalid_grant
+    not_found
+    provider_unavailable
+    rate_limited
+  ))
 
   @spec ensure_current(
           ReceiveMethod.t(),
@@ -448,21 +459,16 @@ defmodule Manifold.Connectors.MicrosoftFolderMapping do
   defp normalized_error_code(_reason), do: :folder_mapping_failed
 
   defp telemetry_error_code(code) when is_atom(code) do
-    if safe_telemetry_code?(Atom.to_string(code)), do: code, else: :folder_mapping_failed
+    if MapSet.member?(@telemetry_error_codes, Atom.to_string(code)),
+      do: code,
+      else: :folder_mapping_failed
   end
 
   defp telemetry_error_code(code) when is_binary(code) do
-    if safe_telemetry_code?(code), do: code, else: "folder_mapping_failed"
+    if MapSet.member?(@telemetry_error_codes, code), do: code, else: "folder_mapping_failed"
   end
 
   defp telemetry_error_code(_code), do: :folder_mapping_failed
-
-  defp safe_telemetry_code?(code) do
-    downcased = String.downcase(code)
-
-    Regex.match?(@telemetry_code_pattern, downcased) and
-      not Enum.any?(@telemetry_forbidden_fragments, &String.contains?(downcased, &1))
-  end
 
   defp duration_ms(start) do
     System.convert_time_unit(System.monotonic_time() - start, :native, :millisecond)
