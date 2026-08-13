@@ -6,6 +6,7 @@ defmodule Manifold.Outbound.SubmissionTest do
   alias Manifold.Connectors.{Crypto, GmailScopes, MicrosoftScopes}
 
   alias Manifold.Connectors.Schema.{
+    ConnectorEvent,
     OAuthAuthorization,
     ReceiveMethod,
     SendCredential,
@@ -544,7 +545,7 @@ defmodule Manifold.Outbound.SubmissionTest do
                       message: "provider is temporarily unavailable"
                     }}
                ],
-               retry_exhausted?: true,
+               provider_attempt_limit: 1,
                before_result_persist: advance_attempt
              )
 
@@ -1065,7 +1066,7 @@ defmodule Manifold.Outbound.SubmissionTest do
              method.id
   end
 
-  test "Gmail and SMTP submission telemetry identifies the method without leaking message data" do
+  test "Gmail, SMTP, and Microsoft submission telemetry identifies the method without leaking message data" do
     handler_id = "submission-telemetry-#{System.unique_integer([:positive])}"
     test_pid = self()
 
@@ -1081,7 +1082,7 @@ defmodule Manifold.Outbound.SubmissionTest do
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
 
-    for kind <- ["gmail", "smtp"] do
+    for kind <- ["gmail", "smtp", "microsoft"] do
       %{message: message, method: method, account: account} = queued_operational_fixture(kind)
 
       assert :ok =
@@ -1111,7 +1112,6 @@ defmodule Manifold.Outbound.SubmissionTest do
                         send_method_id: method_id,
                         provider: provider,
                         method_kind: method_kind,
-                        adapter: adapter,
                         outcome: :accepted
                       } = metadata}
 
@@ -1122,7 +1122,17 @@ defmodule Manifold.Outbound.SubmissionTest do
       assert method_id == method.id
       assert provider == kind
       assert method_kind == kind
-      assert adapter == kind
+
+      assert Map.keys(metadata) |> Enum.sort() ==
+               [
+                 :account_id,
+                 :method_kind,
+                 :outbound_message_id,
+                 :outcome,
+                 :provider,
+                 :send_method_id,
+                 :submission_id
+               ]
 
       assert_secret_free_telemetry(measurements, metadata, [
         "Stable body",
@@ -1131,6 +1141,211 @@ defmodule Manifold.Outbound.SubmissionTest do
         "gmail-access-token",
         "smtp-secret"
       ])
+    end
+  end
+
+  test "Microsoft submission outcomes keep telemetry and durable metadata content-free" do
+    attach_submit_telemetry()
+    suffix = System.unique_integer([:positive])
+    subject = "telemetry-subject-sentinel-#{suffix}"
+    body = "telemetry-body-sentinel-#{suffix}"
+    bcc = "telemetry-bcc-sentinel-#{suffix}@example.test"
+    address = "telemetry-address-sentinel-#{suffix}@example.test"
+    correlation = "telemetry-correlation-sentinel-#{suffix}"
+
+    outcomes = [
+      {:accepted,
+       {:ok,
+        %Provider.Submission{
+          provider_message_id: nil,
+          metadata: %{"request_id" => correlation}
+        }}, :accepted, nil, "provider_accepted"},
+      {:retryable,
+       {:error,
+        %Provider.Error{
+          class: :transient,
+          code: "rate_limited",
+          message: body,
+          http_status: 429,
+          retry_after: 5
+        }}, :retryable, "rate_limited", "submission_retryable"},
+      {:permanent,
+       {:error,
+        %Provider.Error{
+          class: :permanent,
+          code: subject,
+          message: address,
+          http_status: 403
+        }}, :failed, "provider_error", "submission_failed"},
+      {:uncertain,
+       {:error,
+        %Provider.Error{
+          class: :uncertain,
+          code: "acceptance_unknown",
+          message: bcc
+        }}, :uncertain, :submission_uncertain, "submission_uncertain"}
+    ]
+
+    observations =
+      Enum.map(outcomes, fn {result_kind, provider_result, outcome, error_code, event_type} ->
+        %{message: message, method: method, account: account} =
+          queued_operational_fixture("microsoft",
+            draft_attrs: %{
+              subject: subject,
+              text_body: body,
+              recipients: [
+                %{kind: "to", address: address},
+                %{kind: "bcc", address: bcc}
+              ]
+            }
+          )
+
+        submit_result =
+          Outbound.submit_message(message.id,
+            provider: TestProvider,
+            provider_config: [test_pid: self(), result: provider_result]
+          )
+
+        case {result_kind, provider_result} do
+          {:accepted, _result} ->
+            assert submit_result == :ok
+
+          {kind, {:error, error}} when kind in [:retryable, :permanent] ->
+            assert submit_result == {:error, error}
+
+          {:uncertain, _result} ->
+            assert {:error, %Manifold.Core.Error{reason: :submission_uncertain}} = submit_result
+        end
+
+        assert_receive {:provider_submit, _, _}
+
+        assert_receive {:telemetry, [:manifold, :outbound, :submit, :stop],
+                        %{duration_ms: duration_ms, attempt_count: 1} = measurements, metadata}
+
+        assert is_integer(duration_ms) and duration_ms >= 0
+
+        expected_metadata = %{
+          account_id: account.id,
+          outbound_message_id: message.id,
+          submission_id: Repo.get_by!(ProviderSubmission, outbound_message_id: message.id).id,
+          send_method_id: method.id,
+          provider: "microsoft",
+          method_kind: "microsoft",
+          outcome: outcome
+        }
+
+        expected_metadata =
+          if error_code,
+            do: Map.put(expected_metadata, :error_code, error_code),
+            else: expected_metadata
+
+        assert metadata == expected_metadata
+
+        event =
+          Repo.get_by!(OutboundEvent,
+            outbound_message_id: message.id,
+            event_type: event_type
+          )
+
+        submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+
+        connector_event_metadata =
+          ConnectorEvent
+          |> where(
+            [event],
+            event.oauth_authorization_id == ^method.oauth_authorization_id
+          )
+          |> select([event], event.metadata)
+          |> Repo.all()
+
+        job_args =
+          Repo.get_by!(Oban.Job,
+            worker: inspect(SubmitOutbound),
+            args: %{"outbound_message_id" => message.id}
+          ).args
+
+        %{
+          measurements: measurements,
+          telemetry: metadata,
+          outbound_event: event.metadata,
+          connector_events: connector_event_metadata,
+          provider_metadata: submission.provider_metadata,
+          job_args: job_args
+        }
+      end)
+
+    assert Enum.any?(
+             observations,
+             &(&1.provider_metadata == %{"request_id" => correlation})
+           )
+
+    inspected = inspect(observations)
+
+    for sentinel <- [subject, body, bcc, address] do
+      refute inspected =~ sentinel
+    end
+  end
+
+  test "send-method selection failure telemetry excludes draft content" do
+    handler_id = "send-method-selection-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:manifold, :outbound, :send_method, :select, :stop],
+        fn event, measurements, metadata, pid ->
+          send(pid, {:selection_telemetry, event, measurements, metadata})
+        end,
+        test_pid
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    suffix = System.unique_integer([:positive])
+    subject = "selection-subject-sentinel-#{suffix}"
+    body = "selection-body-sentinel-#{suffix}"
+    bcc = "selection-bcc-sentinel-#{suffix}@example.test"
+    {:ok, domain} = Accounts.create_domain(%{name: "selection-#{suffix}.test"})
+    {:ok, account} = Accounts.create_account(domain, %{local_part: "sender"})
+
+    assert {:ok, draft} =
+             Outbound.create_draft(account.id, %{
+               subject: subject,
+               text_body: body,
+               recipients: [
+                 %{kind: "to", address: "recipient@example.test"},
+                 %{kind: "bcc", address: bcc}
+               ]
+             })
+
+    assert {:error, %Manifold.Core.Error{reason: :send_method_required}} =
+             Outbound.queue_draft(account.id, draft.id)
+
+    assert_receive {:selection_telemetry, [:manifold, :outbound, :send_method, :select, :stop],
+                    %{duration_ms: duration_ms, attempt_count: 1} = measurements,
+                    %{
+                      account_id: account_id,
+                      outbound_message_id: outbound_message_id,
+                      outcome: :error,
+                      error_code: :send_method_required
+                    } = metadata}
+
+    assert is_integer(duration_ms) and duration_ms >= 0
+    assert account_id == account.id
+    assert outbound_message_id == draft.id
+
+    event_metadata =
+      OutboundEvent
+      |> where([event], event.outbound_message_id == ^draft.id)
+      |> select([event], event.metadata)
+      |> Repo.all()
+
+    inspected =
+      inspect(%{measurements: measurements, telemetry: metadata, events: event_metadata})
+
+    for sentinel <- [subject, body, bcc] do
+      refute inspected =~ sentinel
     end
   end
 
@@ -1900,12 +2115,14 @@ defmodule Manifold.Outbound.SubmissionTest do
         "microsoft" -> insert_microsoft_method!(account, address, opts)
       end
 
-    {:ok, draft} =
-      Outbound.create_draft(account.id, %{
+    draft_attrs =
+      Keyword.get(opts, :draft_attrs, %{
         subject: "Operational",
         text_body: "Stable body",
         recipients: [%{kind: "to", address: "person@example.net"}]
       })
+
+    {:ok, draft} = Outbound.create_draft(account.id, draft_attrs)
 
     {:ok, message} = Outbound.queue_draft(account.id, draft.id)
     %{message: message, method: method, account: account, address: address}

@@ -9,7 +9,6 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
   alias Manifold.Outbound.Jobs.SubmitOutbound
   alias Manifold.Outbound.LegacyResendFixture
   alias Manifold.Outbound.Provider
-  alias Manifold.Outbound.Submission
   alias Manifold.Outbound.Schema.OutboundMessage
   alias Manifold.Outbound.Schema.{OutboundEvent, ProviderSubmission}
   alias Manifold.Repo
@@ -97,7 +96,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
   test "final transient attempt terminalizes instead of exhausting queued work" do
     message = queued_message_fixture()
     submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
-    persisted_job = prepare_final_attempt!(message.id, submission.id, 7, 8)
+    persisted_job = prepare_final_attempt!(message.id, submission.id, 7, 9)
 
     Application.put_env(
       :manifold_outbound,
@@ -139,14 +138,83 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     assert event_count(message.id, "submission_retryable") == 0
     assert Repo.aggregate(active_submit_jobs(message.id), :count) == 0
 
-    assert %Oban.Job{state: "completed", attempt: 8, max_attempts: 8} =
+    assert %Oban.Job{state: "completed", attempt: 8, max_attempts: 9} =
              Repo.get!(Oban.Job, persisted_job.id)
 
     assert {:cancel, "submission_not_retryable"} =
-             SubmitOutbound.perform(job(message.id, attempt: 8, max_attempts: 8))
+             SubmitOutbound.perform(job(message.id, attempt: 9, max_attempts: 9))
 
     refute_receive {:configured_provider_submit, _request}
     assert event_count(message.id, "submission_failed") == 1
+  end
+
+  test "raw worker exhaustion follows durable provider attempts and cleanup snoozes retryable work" do
+    message = queued_message_fixture()
+    submission = set_completed_provider_attempts!(message.id, 1)
+
+    Application.put_env(
+      :manifold_outbound,
+      :provider_config,
+      test_pid: self(),
+      result:
+        {:error,
+         %Provider.Error{
+           class: :transient,
+           code: "provider_unavailable",
+           message: "provider is temporarily unavailable",
+           http_status: 503
+         }}
+    )
+
+    assert {:snooze, 7_200} =
+             SubmitOutbound.perform(job(message.id, attempt: 8, max_attempts: 8))
+
+    assert_receive {:configured_provider_submit, _request}
+    assert Repo.get!(OutboundMessage, message.id).state == "queued"
+
+    retryable_submission = Repo.get!(ProviderSubmission, submission.id)
+    assert retryable_submission.state == "pending"
+    assert retryable_submission.attempt_count == 2
+    assert retryable_submission.last_error_code == "provider_unavailable"
+    assert event_count(message.id, "submission_retryable") == 1
+    assert event_count(message.id, "submission_failed") == 0
+
+    assert {:snooze, 7_200} =
+             SubmitOutbound.perform(job(message.id, attempt: 9, max_attempts: 9))
+
+    assert_receive {:configured_provider_submit, _request}
+    refute_receive {:configured_provider_submit, _request}
+
+    retryable_submission = Repo.get!(ProviderSubmission, submission.id)
+    assert retryable_submission.state == "pending"
+    assert retryable_submission.attempt_count == 3
+    assert event_count(message.id, "submission_retryable") == 2
+    assert event_count(message.id, "submission_failed") == 0
+
+    retry_after_opts = [
+      provider: ConfiguredProvider,
+      provider_config: [
+        test_pid: self(),
+        result:
+          {:error,
+           %Provider.Error{
+             class: :transient,
+             code: "rate_limited",
+             message: "provider rate limit",
+             http_status: 429,
+             retry_after: 75
+           }}
+      ]
+    ]
+
+    assert {:snooze, 75} =
+             SubmitOutbound.perform(
+               job(message.id, attempt: 10, max_attempts: 10),
+               retry_after_opts
+             )
+
+    assert_receive {:configured_provider_submit, _request}
+    assert Repo.get!(ProviderSubmission, submission.id).attempt_count == 4
   end
 
   test "completes terminal failures after persisting failed state" do
@@ -401,21 +469,62 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
              Repo.get!(Oban.Job, persisted_job.id)
 
     assert {:cancel, "submission_not_retryable"} =
-             SubmitOutbound.perform(job(message.id, attempt: 8, max_attempts: 12))
+             SubmitOutbound.perform(job(message.id, attempt: 9, max_attempts: 12))
 
     assert event_count(message.id, "submission_failed") == 1
   end
 
-  test "malformed IDs and mismatched nonterminal state fail safely" do
+  test "cleanup rejects malformed IDs and never makes a ninth provider call" do
     assert {:cancel, "outbound_not_found"} =
-             SubmitOutbound.perform(job("not-a-uuid", attempt: 8, max_attempts: 8))
+             SubmitOutbound.perform(job("not-a-uuid", attempt: 9, max_attempts: 9))
 
     assert {:error, %{class: :permanent, reason: :outbound_not_found}} =
              Outbound.submit_message("not-a-uuid")
 
-    assert {:error, %{class: :permanent, reason: :outbound_not_found}} =
-             Submission.finalize_retry_exhausted("not-a-uuid")
+    message = queued_message_fixture()
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
 
+    submission
+    |> Ecto.Changeset.change(attempt_count: 8)
+    |> Repo.update!()
+
+    Application.put_env(
+      :manifold_outbound,
+      :provider_config,
+      test_pid: self(),
+      result: {:ok, %Provider.Submission{provider_message_id: "ninth-call", metadata: %{}}}
+    )
+
+    assert :ok = SubmitOutbound.perform(job(message.id, attempt: 9, max_attempts: 9))
+    refute_receive {:configured_provider_submit, _request}
+
+    assert Repo.get!(OutboundMessage, message.id).state == "failed"
+    assert Repo.get!(ProviderSubmission, submission.id).state == "failed"
+    assert Repo.get!(ProviderSubmission, submission.id).attempt_count == 8
+    assert event_count(message.id, "submission_failed") == 1
+  end
+
+  test "raw attempt eight cannot make a ninth durable provider call" do
+    message = queued_message_fixture()
+    submission = set_completed_provider_attempts!(message.id, 8)
+
+    Application.put_env(
+      :manifold_outbound,
+      :provider_config,
+      test_pid: self(),
+      result: {:ok, %Provider.Submission{provider_message_id: "ninth-call", metadata: %{}}}
+    )
+
+    assert :ok = SubmitOutbound.perform(job(message.id, attempt: 8, max_attempts: 9))
+    refute_receive {:configured_provider_submit, _request}
+
+    assert Repo.get!(OutboundMessage, message.id).state == "failed"
+    assert Repo.get!(ProviderSubmission, submission.id).state == "failed"
+    assert Repo.get!(ProviderSubmission, submission.id).attempt_count == 8
+    assert event_count(message.id, "submission_failed") == 1
+  end
+
+  test "cleanup never makes a ninth legacy Resend provider call" do
     message = queued_message_fixture()
     submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
 
@@ -424,17 +533,131 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     |> Repo.update!()
 
     submission
-    |> Ecto.Changeset.change(state: "submitting")
+    |> Ecto.Changeset.change(state: "submitting", attempt_count: 8)
     |> Repo.update!()
 
-    assert {:error,
-            %{class: :temporary, reason: :retry_exhaustion_lifecycle_failed, details: details}} =
-             Submission.finalize_retry_exhausted(message.id)
+    Application.put_env(
+      :manifold_outbound,
+      :provider_config,
+      test_pid: self(),
+      result: {:ok, %Provider.Submission{provider_message_id: "ninth-call", metadata: %{}}}
+    )
 
-    assert details == %{}
-    assert Repo.get!(OutboundMessage, message.id).state == "submitting"
-    assert Repo.get!(ProviderSubmission, submission.id).state == "submitting"
-    assert event_count(message.id, "submission_failed") == 0
+    assert :ok = SubmitOutbound.perform(job(message.id, attempt: 9, max_attempts: 9))
+    refute_receive {:configured_provider_submit, _request}
+
+    assert Repo.get!(OutboundMessage, message.id).state == "submission_uncertain"
+    assert Repo.get!(ProviderSubmission, submission.id).state == "uncertain"
+    assert Repo.get!(ProviderSubmission, submission.id).attempt_count == 8
+    assert event_count(message.id, "submission_uncertain") == 1
+  end
+
+  test "cleanup resolves an eighth-attempt acceptance commit failure without resending" do
+    message = microsoft_message_fixture()
+    submission = set_completed_provider_attempts!(message.id, 7)
+
+    opts = [
+      provider: ConfiguredProvider,
+      provider_config: [
+        test_pid: self(),
+        result:
+          {:ok,
+           %Provider.Submission{
+             provider_message_id: "accepted-before-rollback",
+             metadata: %{}
+           }}
+      ],
+      fail_at: :provider_accept_commit
+    ]
+
+    assert :ok = SubmitOutbound.perform(job(message.id, attempt: 9, max_attempts: 9), opts)
+
+    assert_receive {:configured_provider_submit, _request}
+    refute_receive {:configured_provider_submit, _request}
+    assert_uncertain_submission(message.id, submission.id, 8)
+  end
+
+  test "cleanup resolves an eighth-attempt provider error commit failure without resending" do
+    message = microsoft_message_fixture()
+    submission = set_completed_provider_attempts!(message.id, 7)
+
+    opts = [
+      provider: ConfiguredProvider,
+      provider_config: [
+        test_pid: self(),
+        result:
+          {:error,
+           %Provider.Error{
+             class: :permanent,
+             code: "request_rejected",
+             message: "provider rejected the request",
+             http_status: 400
+           }}
+      ],
+      fail_at: :provider_error_commit
+    ]
+
+    assert :ok = SubmitOutbound.perform(job(message.id, attempt: 9, max_attempts: 9), opts)
+
+    assert_receive {:configured_provider_submit, _request}
+    refute_receive {:configured_provider_submit, _request}
+    assert_uncertain_submission(message.id, submission.id, 8)
+  end
+
+  test "cleanup resolves an eighth-attempt unexpected exception without resending" do
+    message = microsoft_message_fixture()
+    submission = set_completed_provider_attempts!(message.id, 7)
+
+    opts = [
+      provider: ConfiguredProvider,
+      provider_config: [
+        test_pid: self(),
+        result:
+          {:ok,
+           %Provider.Submission{
+             provider_message_id: "accepted-before-exception",
+             metadata: %{}
+           }}
+      ],
+      before_result_persist: fn _preparation, _result ->
+        raise "unexpected result persistence failure"
+      end
+    ]
+
+    assert :ok = SubmitOutbound.perform(job(message.id, attempt: 9, max_attempts: 9), opts)
+
+    assert_receive {:configured_provider_submit, _request}
+    refute_receive {:configured_provider_submit, _request}
+    assert_uncertain_submission(message.id, submission.id, 8)
+  end
+
+  test "cleanup snoozes durably when interrupted-state recovery cannot commit" do
+    message = microsoft_message_fixture()
+    submission = set_completed_provider_attempts!(message.id, 7)
+
+    opts = [
+      provider: ConfiguredProvider,
+      provider_config: [
+        test_pid: self(),
+        result:
+          {:ok,
+           %Provider.Submission{
+             provider_message_id: "accepted-before-cleanup-rollback",
+             metadata: %{}
+           }}
+      ],
+      fail_at: [:provider_accept_commit, :cleanup_commit]
+    ]
+
+    assert {:snooze, 7_200} =
+             SubmitOutbound.perform(job(message.id, attempt: 9, max_attempts: 9), opts)
+
+    assert_receive {:configured_provider_submit, _request}
+    assert_interrupted_submission(message.id, submission.id, 8)
+
+    assert :ok = SubmitOutbound.perform(job(message.id, attempt: 10, max_attempts: 10))
+    refute_receive {:configured_provider_submit, _request}
+    assert_uncertain_submission(message.id, submission.id, 8)
   end
 
   defp job(message_id, attrs \\ []) do
@@ -599,6 +822,34 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
       scheduled_at: DateTime.utc_now()
     )
     |> Repo.update!()
+  end
+
+  defp set_completed_provider_attempts!(message_id, completed_attempts) do
+    message_id
+    |> then(&Repo.get_by!(ProviderSubmission, outbound_message_id: &1))
+    |> Ecto.Changeset.change(attempt_count: completed_attempts)
+    |> Repo.update!()
+  end
+
+  defp assert_interrupted_submission(message_id, submission_id, attempt_count) do
+    assert Repo.get!(OutboundMessage, message_id).state == "submitting"
+
+    interrupted = Repo.get!(ProviderSubmission, submission_id)
+    assert interrupted.state == "submitting"
+    assert interrupted.attempt_count == attempt_count
+    assert event_count(message_id, "submission_uncertain") == 0
+  end
+
+  defp assert_uncertain_submission(message_id, submission_id, attempt_count) do
+    uncertain_message = Repo.get!(OutboundMessage, message_id)
+    assert uncertain_message.state == "submission_uncertain"
+    assert uncertain_message.last_error_code == "interrupted_submission"
+
+    uncertain_submission = Repo.get!(ProviderSubmission, submission_id)
+    assert uncertain_submission.state == "uncertain"
+    assert uncertain_submission.attempt_count == attempt_count
+    assert uncertain_submission.last_error_code == "interrupted_submission"
+    assert event_count(message_id, "submission_uncertain") == 1
   end
 
   defp reinsert_submission!(submission, attrs) do

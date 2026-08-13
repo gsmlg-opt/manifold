@@ -105,7 +105,7 @@ defmodule Manifold.Outbound.Submission do
   end
 
   defp submit_valid(message_id, opts, start) do
-    case capture_submission(fn -> prepare_attempt(message_id, start) end) do
+    case capture_submission(fn -> prepare_attempt(message_id, opts, start) end) do
       {:return, prepared} ->
         submit_prepared(prepared, opts, start)
 
@@ -124,58 +124,102 @@ defmodule Manifold.Outbound.Submission do
     end
   end
 
-  @doc false
-  @spec finalize_retry_exhausted(Ecto.UUID.t()) :: :ok | {:error, Error.t()}
-  def finalize_retry_exhausted(message_id) do
-    with {:ok, message_id} <- Ecto.UUID.cast(message_id) do
-      Repo.transaction(fn ->
-        message =
-          OutboundMessage
-          |> where([message], message.id == ^message_id)
-          |> lock("FOR UPDATE")
-          |> Repo.one()
-
-        submission =
-          ProviderSubmission
-          |> where([submission], submission.outbound_message_id == ^message_id)
-          |> lock("FOR UPDATE")
-          |> Repo.one()
-
-        finalize_retry_exhausted_locked(message, submission)
-      end)
-      |> case do
-        {:ok, :ok} -> :ok
-        {:ok, {:error, %Error{} = error}} -> {:error, error}
-        {:error, reason} -> {:error, database_error(reason)}
-      end
-    else
-      :error ->
-        {:error, Error.new(:permanent, :outbound_not_found, "outbound message not found")}
-    end
-  rescue
-    DBConnection.ConnectionError ->
-      {:error, database_error(:unavailable)}
-  end
-
   defp submit_prepared({:ok, :already_accepted}, _opts, _start), do: :ok
 
   defp submit_prepared({:error, reason}, _opts, _start), do: {:error, reason}
 
   defp submit_prepared({:ok, preparation}, opts, start) do
-    case capture_submission(fn ->
-           preparation
-           |> call_provider(opts)
-           |> then(&persist_result(preparation, &1, opts))
-         end) do
-      {tag, result} when tag in [:return, :database_error] ->
+    case capture_submission(fn -> dispatch(preparation, opts) end) do
+      {:return, {:ok, provider, config, request, method}} ->
+        submit_dispatched(preparation, provider, config, request, method, opts, start)
+
+      {:return, result} ->
+        submit_without_provider(preparation, result, opts, start)
+
+      {:database_error, result} ->
         emit_submit_stop(preparation, result, start)
         result
 
       {:exception, exception, stacktrace} ->
-        emit_submit_stop(preparation, unexpected_exception_result(), start)
-        reraise(exception, stacktrace)
+        finish_pre_provider_exception(preparation, exception, stacktrace, opts, start)
     end
   end
+
+  defp submit_dispatched(preparation, provider, config, request, method, opts, start) do
+    capture_submission(fn ->
+      result =
+        provider.submit(config, request)
+        |> maybe_mark_oauth_reconnect(method, opts)
+
+      maybe_before_persist(opts, preparation, result)
+
+      result
+      |> maybe_inject_acceptance_failure(opts)
+      |> then(&persist_result(preparation, &1, opts))
+    end)
+    |> finish_provider_attempt(preparation, opts, start)
+  end
+
+  defp submit_without_provider(preparation, result, opts, start) do
+    capture_submission(fn ->
+      maybe_before_persist(opts, preparation, result)
+      persist_result(preparation, result, opts)
+    end)
+    |> finish_without_provider(preparation, opts, start)
+  end
+
+  defp finish_provider_attempt({tag, result}, preparation, opts, start)
+       when tag in [:return, :database_error] do
+    if cleanup_recovery_required?(result, opts) do
+      recover_dispatched_cleanup(preparation, opts, start)
+    else
+      emit_submit_stop(preparation, result, start)
+      result
+    end
+  end
+
+  defp finish_provider_attempt(
+         {:exception, exception, stacktrace},
+         preparation,
+         opts,
+         start
+       ) do
+    if cleanup?(opts) do
+      recover_dispatched_cleanup(preparation, opts, start)
+    else
+      emit_submit_stop(preparation, unexpected_exception_result(), start)
+      reraise(exception, stacktrace)
+    end
+  end
+
+  defp finish_without_provider({tag, result}, preparation, _opts, start)
+       when tag in [:return, :database_error] do
+    emit_submit_stop(preparation, result, start)
+    result
+  end
+
+  defp finish_without_provider(
+         {:exception, exception, stacktrace},
+         preparation,
+         opts,
+         start
+       ) do
+    finish_pre_provider_exception(preparation, exception, stacktrace, opts, start)
+  end
+
+  defp finish_pre_provider_exception(preparation, exception, stacktrace, opts, start) do
+    result = unexpected_exception_result()
+    emit_submit_stop(preparation, result, start)
+
+    if cleanup?(opts), do: result, else: reraise(exception, stacktrace)
+  end
+
+  defp cleanup_recovery_required?({:error, %Error{class: :temporary}}, opts),
+    do: cleanup?(opts)
+
+  defp cleanup_recovery_required?(_result, _opts), do: false
+
+  defp cleanup?(opts), do: Keyword.get(opts, :cleanup?) == true
 
   defp capture_submission(fun) do
     {:return, fun.()}
@@ -193,7 +237,7 @@ defmodule Manifold.Outbound.Submission do
      Error.new(:temporary, :unexpected_exception, "outbound submission failed unexpectedly")}
   end
 
-  defp prepare_attempt(message_id, start) do
+  defp prepare_attempt(message_id, opts, start) do
     Repo.transaction(fn ->
       message =
         OutboundMessage
@@ -215,7 +259,16 @@ defmodule Manifold.Outbound.Submission do
         |> lock("FOR UPDATE")
         |> Repo.all()
 
-      prepare_locked(message, submission, recipients)
+      if Keyword.get(opts, :cleanup?) == true do
+        prepare_cleanup_locked(
+          message,
+          submission,
+          recipients,
+          cleanup_provider_attempt_limit(opts)
+        )
+      else
+        prepare_capped_locked(message, submission, recipients, opts)
+      end
     end)
     |> case do
       {:ok, {:ready, message, submission, recipients}} ->
@@ -250,6 +303,24 @@ defmodule Manifold.Outbound.Submission do
         {:error, database_error(reason)}
     end
   end
+
+  defp prepare_capped_locked(
+         %OutboundMessage{state: "queued"} = message,
+         %ProviderSubmission{state: "pending", attempt_count: attempt_count} = submission,
+         recipients,
+         opts
+       ) do
+    case Keyword.get(opts, :provider_attempt_limit) do
+      limit when is_integer(limit) and limit > 0 and attempt_count >= limit ->
+        mark_failed(message, submission, DateTime.utc_now(), retry_exhausted_error())
+
+      _missing_invalid_or_available_limit ->
+        prepare_locked(message, submission, recipients)
+    end
+  end
+
+  defp prepare_capped_locked(message, submission, recipients, _opts),
+    do: prepare_locked(message, submission, recipients)
 
   defp prepare_locked(nil, _submission, _recipients),
     do: {:error, Error.new(:permanent, :outbound_not_found, "outbound message not found")}
@@ -303,6 +374,100 @@ defmodule Manifold.Outbound.Submission do
 
       {:error, %Provider.Error{code: "request_integrity_failed"} = error} ->
         mark_failed(message, submission, now, error)
+    end
+  end
+
+  defp prepare_cleanup_locked(
+         %OutboundMessage{state: "submitting"} = message,
+         %ProviderSubmission{
+           state: "submitting",
+           provider: "resend",
+           attempt_count: attempt_count
+         } = submission,
+         recipients,
+         attempt_limit
+       )
+       when attempt_count < attempt_limit do
+    prepare_locked(message, submission, recipients)
+  end
+
+  defp prepare_cleanup_locked(
+         %OutboundMessage{state: "submitting"} = message,
+         %ProviderSubmission{state: "submitting"} = submission,
+         _recipients,
+         _attempt_limit
+       ) do
+    mark_uncertain(
+      message,
+      submission,
+      DateTime.utc_now(),
+      "interrupted_submission",
+      "provider acceptance is ambiguous after an interrupted submission"
+    )
+  end
+
+  defp prepare_cleanup_locked(
+         %OutboundMessage{state: "queued"} = message,
+         %ProviderSubmission{state: "pending", attempt_count: attempt_count} = submission,
+         _recipients,
+         attempt_limit
+       )
+       when attempt_count >= attempt_limit do
+    mark_failed(message, submission, DateTime.utc_now(), retry_exhausted_error())
+  end
+
+  defp prepare_cleanup_locked(
+         %OutboundMessage{state: "queued"} = message,
+         %ProviderSubmission{state: "pending"} = submission,
+         recipients,
+         _attempt_limit
+       ) do
+    prepare_locked(message, submission, recipients)
+  end
+
+  defp prepare_cleanup_locked(nil, submission, recipients, _attempt_limit),
+    do: prepare_locked(nil, submission, recipients)
+
+  defp prepare_cleanup_locked(message, nil, recipients, _attempt_limit),
+    do: prepare_locked(message, nil, recipients)
+
+  defp prepare_cleanup_locked(
+         %OutboundMessage{state: "accepted_by_provider"} = message,
+         %ProviderSubmission{state: "accepted"} = submission,
+         recipients,
+         _attempt_limit
+       ),
+       do: prepare_locked(message, submission, recipients)
+
+  defp prepare_cleanup_locked(
+         %OutboundMessage{state: "submission_uncertain"} = message,
+         %ProviderSubmission{state: "uncertain"} = submission,
+         recipients,
+         _attempt_limit
+       ),
+       do: prepare_locked(message, submission, recipients)
+
+  defp prepare_cleanup_locked(
+         %OutboundMessage{state: "failed"} = message,
+         %ProviderSubmission{state: "failed"} = submission,
+         recipients,
+         _attempt_limit
+       ),
+       do: prepare_locked(message, submission, recipients)
+
+  defp prepare_cleanup_locked(_message, _submission, _recipients, _attempt_limit) do
+    {:error,
+     Error.new(
+       :temporary,
+       :retry_exhaustion_lifecycle_failed,
+       "outbound retry exhaustion state could not be prepared"
+     )}
+  end
+
+  defp cleanup_provider_attempt_limit(opts) do
+    case Keyword.get(opts, :provider_attempt_limit) do
+      limit when is_integer(limit) and limit > 0 -> limit
+      _missing_or_invalid_limit -> 8
     end
   end
 
@@ -425,7 +590,12 @@ defmodule Manifold.Outbound.Submission do
     )
     |> Repo.update!()
 
-    insert_event!(message.id, "submission_uncertain", %{code: code}, now)
+    insert_event!(
+      message.id,
+      "submission_uncertain",
+      %{code: normalized_event_error_code(code)},
+      now
+    )
 
     {:marked_uncertain,
      Error.new(:permanent, :submission_uncertain, "submission was not retried"), message,
@@ -455,56 +625,15 @@ defmodule Manifold.Outbound.Submission do
         )
         |> Repo.update!()
 
-      insert_event!(message.id, "submission_failed", %{code: error.code}, now)
+      insert_event!(
+        message.id,
+        "submission_failed",
+        %{code: normalized_event_error_code(error.code)},
+        now
+      )
+
       {:marked_failed, error, message, submission}
     end
-  end
-
-  defp finalize_retry_exhausted_locked(nil, _submission) do
-    {:error, Error.new(:permanent, :outbound_not_found, "outbound message not found")}
-  end
-
-  defp finalize_retry_exhausted_locked(_message, nil) do
-    {:error, Error.new(:permanent, :submission_not_found, "provider submission not found")}
-  end
-
-  defp finalize_retry_exhausted_locked(
-         %OutboundMessage{state: "queued"} = message,
-         %ProviderSubmission{state: "pending"} = submission
-       ) do
-    error = retry_exhausted_error()
-
-    case mark_failed(message, submission, DateTime.utc_now(), error) do
-      {:marked_failed, ^error, _message, _submission} -> :ok
-      {:error, %Error{} = state_error} -> {:error, state_error}
-    end
-  end
-
-  defp finalize_retry_exhausted_locked(
-         %OutboundMessage{state: "accepted_by_provider"},
-         %ProviderSubmission{state: "accepted"}
-       ),
-       do: :ok
-
-  defp finalize_retry_exhausted_locked(
-         %OutboundMessage{state: "submission_uncertain"},
-         %ProviderSubmission{state: "uncertain"}
-       ),
-       do: :ok
-
-  defp finalize_retry_exhausted_locked(
-         %OutboundMessage{state: "failed"},
-         %ProviderSubmission{state: "failed"}
-       ),
-       do: :ok
-
-  defp finalize_retry_exhausted_locked(_inconsistent_message, _inconsistent_submission) do
-    {:error,
-     Error.new(
-       :temporary,
-       :retry_exhaustion_lifecycle_failed,
-       "outbound retry exhaustion state could not be finalized"
-     )}
   end
 
   defp retry_exhausted_error do
@@ -515,18 +644,127 @@ defmodule Manifold.Outbound.Submission do
     }
   end
 
-  defp call_provider(:already_accepted, _opts), do: :already_accepted
-
-  defp call_provider(preparation, opts) do
+  defp recover_dispatched_cleanup(preparation, opts, start) do
     result =
-      with {:ok, provider, config, request, method} <- dispatch(preparation, opts) do
-        provider.submit(config, request)
-        |> maybe_mark_oauth_reconnect(method, opts)
-      end
+      Repo.transaction(fn ->
+        message =
+          OutboundMessage
+          |> where([message], message.id == ^preparation.message_id)
+          |> lock("FOR UPDATE")
+          |> Repo.one()
 
-    maybe_before_persist(opts, preparation, result)
+        submission =
+          ProviderSubmission
+          |> where([submission], submission.id == ^preparation.submission_id)
+          |> lock("FOR UPDATE")
+          |> Repo.one()
 
-    if Keyword.get(opts, :fail_at) == :after_provider_accept_before_commit and
+        recovery = recover_dispatched_cleanup_locked(message, submission, preparation)
+        maybe_fail(opts, :cleanup_commit)
+        recovery
+      end)
+      |> normalize_dispatched_cleanup_recovery()
+
+    emit_submit_stop(preparation, result, start)
+    result
+  rescue
+    DBConnection.ConnectionError ->
+      result = {:error, database_error(:unavailable)}
+      emit_submit_stop(preparation, result, start)
+      result
+  end
+
+  defp recover_dispatched_cleanup_locked(nil, _submission, _preparation) do
+    {:error, Error.new(:permanent, :outbound_not_found, "outbound message not found")}
+  end
+
+  defp recover_dispatched_cleanup_locked(_message, nil, _preparation) do
+    {:error, Error.new(:permanent, :submission_not_found, "provider submission not found")}
+  end
+
+  defp recover_dispatched_cleanup_locked(
+         %OutboundMessage{state: "submitting"} = message,
+         %ProviderSubmission{state: "submitting", attempt_count: attempt_count} = submission,
+         %{attempt_count: expected_attempt_count}
+       )
+       when attempt_count == expected_attempt_count do
+    mark_uncertain(
+      message,
+      submission,
+      DateTime.utc_now(),
+      "interrupted_submission",
+      "provider acceptance is ambiguous after an interrupted submission"
+    )
+  end
+
+  defp recover_dispatched_cleanup_locked(
+         %OutboundMessage{state: "queued"},
+         %ProviderSubmission{state: "pending", attempt_count: attempt_count},
+         %{attempt_count: expected_attempt_count}
+       )
+       when attempt_count <= expected_attempt_count,
+       do: :retry
+
+  defp recover_dispatched_cleanup_locked(
+         %OutboundMessage{state: "accepted_by_provider"},
+         %ProviderSubmission{state: "accepted"},
+         _preparation
+       ),
+       do: :accepted
+
+  defp recover_dispatched_cleanup_locked(
+         %OutboundMessage{state: "submission_uncertain"},
+         %ProviderSubmission{state: "uncertain"},
+         _preparation
+       ),
+       do: :uncertain
+
+  defp recover_dispatched_cleanup_locked(
+         %OutboundMessage{state: "failed"},
+         %ProviderSubmission{state: "failed"},
+         _preparation
+       ),
+       do: :failed
+
+  defp recover_dispatched_cleanup_locked(_message, _submission, _preparation) do
+    {:error,
+     Error.new(
+       :temporary,
+       :retry_exhaustion_lifecycle_failed,
+       "outbound retry exhaustion state could not be recovered"
+     )}
+  end
+
+  defp normalize_dispatched_cleanup_recovery(
+         {:ok, {:marked_uncertain, _error, _message, _submission}}
+       ),
+       do: submission_uncertain_error()
+
+  defp normalize_dispatched_cleanup_recovery({:ok, :accepted}), do: :ok
+
+  defp normalize_dispatched_cleanup_recovery({:ok, :uncertain}),
+    do: submission_uncertain_error()
+
+  defp normalize_dispatched_cleanup_recovery({:ok, :failed}),
+    do: {:error, Error.new(:permanent, :submission_not_retryable, "submission failed")}
+
+  defp normalize_dispatched_cleanup_recovery({:ok, :retry}) do
+    {:error,
+     Error.new(
+       :temporary,
+       :retry_exhaustion_lifecycle_failed,
+       "outbound retry exhaustion state requires another cleanup pass"
+     )}
+  end
+
+  defp normalize_dispatched_cleanup_recovery({:ok, {:error, %Error{} = error}}),
+    do: {:error, error}
+
+  defp normalize_dispatched_cleanup_recovery({:error, reason}),
+    do: {:error, database_error(reason)}
+
+  defp maybe_inject_acceptance_failure(result, opts) do
+    if :after_provider_accept_before_commit in List.wrap(Keyword.get(opts, :fail_at)) and
          match?({:ok, %Provider.Submission{}}, result) do
       {:injected_failure,
        Error.new(
@@ -765,7 +1003,13 @@ defmodule Manifold.Outbound.Submission do
             )
             |> Repo.update!()
 
-            insert_event!(message.id, "submission_uncertain", %{code: error.code}, now)
+            insert_event!(
+              message.id,
+              "submission_uncertain",
+              %{code: normalized_event_error_code(error.code)},
+              now
+            )
+
             :transitioned
 
           terminal_or_stale ->
@@ -856,7 +1100,7 @@ defmodule Manifold.Outbound.Submission do
   end
 
   defp persist_result(preparation, {:error, %Provider.Error{} = error}, opts) do
-    error = maybe_retry_exhausted(error, opts)
+    error = maybe_retry_exhausted(error, preparation, opts)
     now = DateTime.utc_now()
     state = if error.class == :transient, do: "queued", else: "failed"
     submission_state = if error.class == :transient, do: "pending", else: "failed"
@@ -890,7 +1134,13 @@ defmodule Manifold.Outbound.Submission do
             event_type =
               if error.class == :transient, do: "submission_retryable", else: "submission_failed"
 
-            insert_event!(message.id, event_type, %{code: error.code}, now)
+            insert_event!(
+              message.id,
+              event_type,
+              %{code: normalized_event_error_code(error.code)},
+              now
+            )
+
             :persisted_error
 
           terminal_or_stale ->
@@ -907,15 +1157,25 @@ defmodule Manifold.Outbound.Submission do
     end
   end
 
-  defp maybe_retry_exhausted(%Provider.Error{class: :transient} = error, opts) do
-    if Keyword.get(opts, :retry_exhausted?) == true do
+  defp maybe_retry_exhausted(
+         %Provider.Error{class: :transient} = error,
+         preparation,
+         opts
+       ) do
+    exhausted? =
+      case Keyword.get(opts, :provider_attempt_limit) do
+        limit when is_integer(limit) and limit > 0 -> preparation.attempt_count >= limit
+        _missing_or_invalid_limit -> false
+      end
+
+    if exhausted? do
       %{retry_exhausted_error() | http_status: error.http_status}
     else
       error
     end
   end
 
-  defp maybe_retry_exhausted(%Provider.Error{} = error, _opts), do: error
+  defp maybe_retry_exhausted(%Provider.Error{} = error, _preparation, _opts), do: error
 
   defp maybe_reconcile_pending(provider, provider_message_id, message_id, now)
        when is_binary(provider_message_id) and provider_message_id != "" do
@@ -1032,7 +1292,6 @@ defmodule Manifold.Outbound.Submission do
       send_method_id: submission.send_method_id,
       provider: submission.provider,
       method_kind: submission.provider,
-      adapter: submission.provider,
       outcome: outcome
     }
   end
@@ -1045,7 +1304,6 @@ defmodule Manifold.Outbound.Submission do
       send_method_id: nil,
       provider: nil,
       method_kind: nil,
-      adapter: nil,
       outcome: outcome
     }
   end
@@ -1058,6 +1316,12 @@ defmodule Manifold.Outbound.Submission do
       submission_id: submission.id,
       attempt_count: submission.attempt_count
     }
+  end
+
+  defp normalized_event_error_code(code) do
+    code
+    |> telemetry_error_code()
+    |> to_string()
   end
 
   defp envelope(message, submission, recipients) do
@@ -1108,7 +1372,7 @@ defmodule Manifold.Outbound.Submission do
   end
 
   defp maybe_fail(opts, boundary) do
-    if Keyword.get(opts, :fail_at) == boundary do
+    if boundary in List.wrap(Keyword.get(opts, :fail_at)) do
       Repo.rollback({:injected_failure, boundary})
     end
   end
