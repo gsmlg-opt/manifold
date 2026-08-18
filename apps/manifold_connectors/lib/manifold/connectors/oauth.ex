@@ -302,24 +302,26 @@ defmodule Manifold.Connectors.OAuth do
          provider: "gmail",
          oauth_provider_setting_id: nil,
          oauth_provider_setting_lock_version: nil
-       }) do
-    case ProviderConfig.fetch("gmail") do
-      {:ok, %ProviderConfig.Resolved{}} ->
-        :ok
-
-      {:error, %Error{reason: reason}}
-      when reason in [:provider_not_configured, :provider_configuration_error] ->
-        provider_configuration_changed()
-
-      {:error, %Error{} = error} ->
-        {:error, error}
-    end
-  end
+       }),
+       do: provider_configuration_changed()
 
   defp validate_transaction_generation(%OAuthTransaction{provider: "gmail"}),
     do: provider_configuration_changed()
 
   defp validate_transaction_generation(%OAuthTransaction{}), do: :ok
+
+  defp consume_invalidated_transaction(
+         %OAuthTransaction{
+           provider: "gmail",
+           oauth_provider_setting_id: nil,
+           oauth_provider_setting_lock_version: nil
+         } = transaction,
+         _now,
+         error
+       ) do
+    Repo.delete!(transaction)
+    {:error, error}
+  end
 
   defp consume_invalidated_transaction(transaction, now, error) do
     transaction

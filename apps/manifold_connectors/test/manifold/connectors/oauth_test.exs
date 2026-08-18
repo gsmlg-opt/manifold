@@ -438,21 +438,28 @@ defmodule Manifold.Connectors.OAuthTest do
     assert transaction.required_scopes == ["Mail.Read", "offline_access"]
   end
 
-  test "consumes a legacy Gmail receive transaction with canonical scopes", %{
+  test "rejects and consumes a pre-cutover Gmail transaction after database configuration", %{
     mailbox: mailbox
   } do
     redirect_uri = "https://mail.example.test/connectors/gmail/callback"
     now = ~U[2026-08-11 01:00:00.000000Z]
 
-    {state, verifier} =
+    {state, _verifier} =
       insert_legacy_transaction!("gmail", mailbox.id, redirect_uri, now)
 
-    assert {:ok, consumed} =
+    assert {:error,
+            %{
+              class: :permanent,
+              reason: :provider_configuration_changed,
+              message: "OAuth provider configuration changed",
+              details: %{}
+            }} =
              OAuth.consume("gmail", state, redirect_uri, now: DateTime.add(now, 60, :second))
 
-    assert consumed.purpose == :receive
-    assert consumed.required_scopes == [GmailScopes.read()]
-    assert consumed.pkce_verifier == verifier
+    assert Repo.aggregate(OAuthTransaction, :count) == 0
+
+    assert {:error, %{reason: :oauth_state_mismatch}} =
+             OAuth.consume("gmail", state, redirect_uri, now: DateTime.add(now, 61, :second))
   end
 
   test "legacy Gmail state still invalidates when current configuration is missing", %{
@@ -471,7 +478,9 @@ defmodule Manifold.Connectors.OAuthTest do
     assert {:error, %{class: :permanent, reason: :provider_configuration_changed}} =
              OAuth.consume("gmail", state, redirect_uri, now: DateTime.add(now, 60, :second))
 
-    assert {:error, %{reason: :oauth_state_replayed}} =
+    assert Repo.aggregate(OAuthTransaction, :count) == 0
+
+    assert {:error, %{reason: :oauth_state_mismatch}} =
              OAuth.consume("gmail", state, redirect_uri, now: DateTime.add(now, 61, :second))
   end
 

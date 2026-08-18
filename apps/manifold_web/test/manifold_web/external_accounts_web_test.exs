@@ -5,7 +5,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
-  alias Manifold.Connectors.MicrosoftScopes
+  alias Manifold.Connectors.{Crypto, MicrosoftScopes}
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
   alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
@@ -24,6 +24,15 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
          expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
          scopes: Enum.uniq(["openid", "email"] ++ Keyword.fetch!(opts, :required_scopes))
        }}
+    end
+
+    def exchange_code("pre-cutover-code", _verifier, _redirect_uri, _config, _opts) do
+      send(
+        Application.fetch_env!(:manifold_connectors, :oauth_exchange_probe),
+        :pre_cutover_exchange_called
+      )
+
+      raise "pre-cutover Gmail transaction reached provider exchange"
     end
 
     @impl true
@@ -116,6 +125,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     old_fake = Application.get_env(:manifold_connectors, :imap_fake)
     old_eas_transport = Application.get_env(:manifold_connectors, :eas_transport)
     old_eas_fake = Application.get_env(:manifold_connectors, :eas_fake)
+    old_oauth_exchange_probe = Application.get_env(:manifold_connectors, :oauth_exchange_probe)
 
     old_microsoft_identity =
       Application.get_env(:manifold_connectors, :microsoft_web_test_identity)
@@ -171,6 +181,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
       restore_env(:imap_fake, old_fake)
       restore_env(:eas_transport, old_eas_transport)
       restore_env(:eas_fake, old_eas_fake)
+      restore_env(:oauth_exchange_probe, old_oauth_exchange_probe)
       restore_env(:microsoft_web_test_identity, old_microsoft_identity)
     end)
 
@@ -253,6 +264,55 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     refute inspect(callback_conn.assigns.flash) =~ "configuration"
     refute inspect(callback_conn.assigns.flash) =~ "rotated"
+  end
+
+  test "pre-cutover Gmail state is consumed without reaching provider exchange", %{
+    conn: conn,
+    account: account
+  } do
+    Application.put_env(:manifold_connectors, :oauth_exchange_probe, self())
+    state = "pre-cutover-state-#{System.unique_integer([:positive])}"
+    redirect_uri = "http://www.example.com/connectors/gmail/callback"
+
+    assert {:ok, ciphertext} =
+             Crypto.encrypt("pre-cutover-verifier", "oauth:gmail:#{account.id}")
+
+    %OAuthTransaction{}
+    |> Ecto.Changeset.change(%{
+      state_digest: :crypto.hash(:sha256, state),
+      provider: "gmail",
+      mailbox_id: account.id,
+      purpose: "receive",
+      required_scopes: [],
+      pkce_verifier_ciphertext: ciphertext,
+      redirect_uri: redirect_uri,
+      expires_at: DateTime.add(DateTime.utc_now(), 600, :second)
+    })
+    |> Repo.insert!()
+
+    callback_conn =
+      get(conn, "/connectors/gmail/callback", %{
+        "code" => "pre-cutover-code",
+        "state" => state
+      })
+
+    assert redirected_to(callback_conn, 302) == "/settings/accounts"
+
+    assert Phoenix.Flash.get(callback_conn.assigns.flash, :error) ==
+             "The Gmail authorization request is invalid or expired."
+
+    refute_received :pre_cutover_exchange_called
+
+    replay_conn =
+      callback_conn
+      |> recycle()
+      |> get("/connectors/gmail/callback", %{
+        "code" => "pre-cutover-code",
+        "state" => state
+      })
+
+    assert redirected_to(replay_conn, 302) == "/settings/accounts"
+    refute_received :pre_cutover_exchange_called
   end
 
   test "receive and send pickers preserve their OAuth purpose", %{conn: conn, account: account} do

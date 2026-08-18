@@ -210,6 +210,11 @@ Gmail submission. There is no credential cache.
 
 OAuth start snapshots `oauth_provider_setting_id` and
 `oauth_provider_setting_lock_version` on `connector_oauth_transactions`.
+After the database-credential cutover, Gmail transaction rows without both
+generation fields are atomically removed and rejected as
+`provider_configuration_changed`, so a second consume is an OAuth state mismatch;
+only Microsoft transactions retain nil generation fields. Initial Gmail setting
+save starts the generation at one, and every real credential rotation advances it.
 Completion revalidates the snapshot before code exchange. External Google I/O is
 performed without holding a database/advisory lock. The final persistence
 transaction then takes the provider advisory lock and revalidates the same UUID,
