@@ -80,7 +80,7 @@ defmodule ManifoldWeb.SettingsLive.OAuthHelp do
           <h2 id={"oauth-provider-#{@definition.key}-help-scopes-title"}>Required scopes</h2>
           <p class="settings-secondary">Add only these scopes.</p>
           <dl class="grid gap-3">
-            <div :for={scope <- @help.scopes}>
+            <div :for={scope <- @help.scopes} data-scope={scope.value}>
               <dt><code class="break-all">{scope.value}</code></dt>
               <dd class="settings-secondary">{scope.purpose}</dd>
             </div>

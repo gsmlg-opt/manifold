@@ -505,12 +505,19 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
            )
 
     assert has_element?(view, "h2", "Required scopes")
-    assert html =~ "openid"
-    assert html =~ "email"
-    assert html =~ "https://www.googleapis.com/auth/gmail.readonly"
-    assert html =~ "Receive mail by reading Gmail messages without modifying them."
-    assert html =~ "https://www.googleapis.com/auth/gmail.send"
-    assert html =~ "Send mail through Gmail."
+
+    for {scope, purpose} <- [
+          {"openid", "Confirm the Google account identity."},
+          {"email", "Read the Google account email address."},
+          {"https://www.googleapis.com/auth/gmail.readonly",
+           "Receive mail by reading Gmail messages without modifying them."},
+          {"https://www.googleapis.com/auth/gmail.send", "Send mail through Gmail."}
+        ] do
+      row = "[data-scope='#{scope}']"
+      assert has_element?(view, "#{row} > dt > code", scope)
+      assert has_element?(view, "#{row} > dd", purpose)
+    end
+
     assert html =~ "Testing-mode authorizations can expire after seven days."
 
     assert html =~
