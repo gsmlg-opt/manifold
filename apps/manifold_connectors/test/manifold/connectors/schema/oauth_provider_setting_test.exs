@@ -120,6 +120,19 @@ defmodule Manifold.Connectors.Schema.OAuthProviderSettingTest do
              invalid_version.errors[:oauth_provider_setting_lock_version]
   end
 
+  test "OAuth transaction declares provider-setting generation constraints" do
+    constraints =
+      transaction_changeset(%{
+        oauth_provider_setting_id: Ecto.UUID.generate(),
+        oauth_provider_setting_lock_version: 1
+      })
+      |> Map.fetch!(:constraints)
+      |> Enum.map(&to_string(&1.constraint))
+
+    assert "oauth_transaction_setting_generation_valid" in constraints
+    assert "oauth_transaction_setting_lock_version_positive" in constraints
+  end
+
   defp transaction_changeset(attrs) do
     OAuthTransaction.changeset(
       %OAuthTransaction{},

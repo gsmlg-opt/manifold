@@ -54,6 +54,16 @@ defmodule Manifold.Repo.Migrations.AddOAuthProviderSettings do
             "(oauth_provider_setting_lock_version IS NULL)"
       )
     )
+
+    create(
+      constraint(
+        :connector_oauth_transactions,
+        :oauth_transaction_setting_lock_version_positive,
+        check:
+          "oauth_provider_setting_lock_version IS NULL OR " <>
+            "oauth_provider_setting_lock_version > 0"
+      )
+    )
   end
 
   def down do
@@ -70,6 +80,13 @@ defmodule Manifold.Repo.Migrations.AddOAuthProviderSettings do
     if settings_count > 0 or transaction_count > 0 do
       raise "cannot roll back OAuth provider settings while settings or fenced transactions exist"
     end
+
+    drop(
+      constraint(
+        :connector_oauth_transactions,
+        :oauth_transaction_setting_lock_version_positive
+      )
+    )
 
     drop(
       constraint(

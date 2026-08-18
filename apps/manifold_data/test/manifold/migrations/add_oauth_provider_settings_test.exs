@@ -118,6 +118,34 @@ defmodule Manifold.Repo.Migrations.AddOAuthProviderSettingsTest do
     assert_up_state()
   end
 
+  test "transaction generation constraints reject half-pairs and nonpositive versions" do
+    assert [@migration_version] = migrate_up()
+
+    assert_postgres_error(:check_violation, fn ->
+      insert_transaction_generation(
+        "40000000-0000-0000-0000-000000000001",
+        "40000000-0000-0000-0000-000000000002",
+        nil
+      )
+    end)
+
+    assert_postgres_error(:check_violation, fn ->
+      insert_transaction_generation(
+        "40000000-0000-0000-0000-000000000003",
+        nil,
+        1
+      )
+    end)
+
+    assert_postgres_error(:check_violation, fn ->
+      insert_transaction_generation(
+        "40000000-0000-0000-0000-000000000004",
+        "40000000-0000-0000-0000-000000000005",
+        0
+      )
+    end)
+  end
+
   test "down refuses before DDL when a provider setting exists" do
     assert [@migration_version] = migrate_up()
 
@@ -278,6 +306,23 @@ defmodule Manifold.Repo.Migrations.AddOAuthProviderSettingsTest do
       [Ecto.UUID.dump!(id), provider, key_version, lock_version]
     )
   end
+
+  defp insert_transaction_generation(id, setting_id, lock_version) do
+    MigrationRepo.query!(
+      """
+      INSERT INTO connector_oauth_transactions (
+        id,
+        oauth_provider_setting_id,
+        oauth_provider_setting_lock_version
+      )
+      VALUES ($1::uuid, $2::uuid, $3)
+      """,
+      [Ecto.UUID.dump!(id), dump_uuid(setting_id), lock_version]
+    )
+  end
+
+  defp dump_uuid(nil), do: nil
+  defp dump_uuid(id), do: Ecto.UUID.dump!(id)
 
   defp assert_postgres_error(code, fun) do
     error = assert_raise Postgrex.Error, fun

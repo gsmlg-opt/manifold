@@ -57,6 +57,12 @@ defmodule Manifold.Connectors.Schema.OAuthTransaction do
     end)
     |> validate_number(:oauth_provider_setting_lock_version, greater_than: 0)
     |> validate_setting_generation()
+    |> check_constraint(:oauth_provider_setting_id,
+      name: :oauth_transaction_setting_generation_valid
+    )
+    |> check_constraint(:oauth_provider_setting_lock_version,
+      name: :oauth_transaction_setting_lock_version_positive
+    )
     |> unique_constraint(:state_digest)
   end
 
