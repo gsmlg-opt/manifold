@@ -2,6 +2,12 @@ defmodule Manifold.Connectors.OAuthTest do
   use Manifold.DataCase, async: false
 
   @microsoft_redirect "https://mail.example.test/connectors/microsoft/callback"
+  @gmail_database_telemetry_sentinels [
+    "gmail-db-client",
+    "gmail-db-secret",
+    "rotated-client",
+    "rotated-secret"
+  ]
 
   alias Manifold.Accounts
   alias Manifold.Connectors
@@ -167,11 +173,19 @@ defmodule Manifold.Connectors.OAuthTest do
     assert is_integer(duration_ms) and duration_ms >= 0
     assert account_id == mailbox.id
 
-    assert_secret_free_telemetry(measurements, metadata, [
-      "oauth-start-secret",
-      "gmail-client",
-      "gmail-secret"
-    ])
+    success_secrets =
+      ["oauth-start-secret", "gmail-client", "gmail-secret"] ++
+        @gmail_database_telemetry_sentinels
+
+    assert_secret_free_telemetry(measurements, metadata, success_secrets)
+
+    assert_raise ExUnit.AssertionError, ~r/unsafe telemetry term/, fn ->
+      assert_secret_free_telemetry(
+        measurements,
+        Map.put(metadata, :injected, %{provider_value: "gmail-db-secret"}),
+        success_secrets
+      )
+    end
 
     assert {:error, %{reason: :invalid_oauth_purpose}} =
              OAuth.start(
@@ -194,11 +208,12 @@ defmodule Manifold.Connectors.OAuthTest do
     assert is_integer(failure_duration) and failure_duration >= 0
     assert failure_account_id == mailbox.id
 
-    assert_secret_free_telemetry(failure_measurements, failure_metadata, [
-      "oauth-failure-secret",
-      "gmail-client",
-      "gmail-secret"
-    ])
+    assert_secret_free_telemetry(
+      failure_measurements,
+      failure_metadata,
+      ["oauth-failure-secret", "gmail-client", "gmail-secret"] ++
+        @gmail_database_telemetry_sentinels
+    )
   end
 
   test "starts and consumes an explicit Gmail receive authorization without the send scope", %{
