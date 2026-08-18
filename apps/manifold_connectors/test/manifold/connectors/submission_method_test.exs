@@ -9,6 +9,7 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
     OAuthAuthorization,
+    OAuthProviderSetting,
     ReceiveMethod,
     SendCredential,
     SendMethod,
@@ -32,8 +33,13 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
     def initial_cursors(_access_token, _config, _opts), do: {:ok, []}
 
     @impl true
-    def refresh_token(_refresh_token, _config, opts),
-      do: Keyword.fetch!(opts, :refresh_result)
+    def refresh_token(_refresh_token, config, opts) do
+      if test_pid = Keyword.get(opts, :test_pid) do
+        send(test_pid, {:send_refresh_config, config})
+      end
+
+      Keyword.fetch!(opts, :refresh_result)
+    end
 
     @impl true
     def sync_page(_access_token, cursor, _config, _opts), do: {:ok, %Page{cursor: cursor}}
@@ -61,8 +67,6 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
 
     Application.put_env(:manifold_connectors, :providers,
       gmail: [
-        client_id: "client-id-must-not-escape",
-        client_secret: "client-secret-must-not-escape",
         authorization_url: "https://accounts.google.test/authorize",
         base_url: "https://gmail.test",
         req_options: [
@@ -84,6 +88,12 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
         ]
       ]
     )
+
+    assert {:ok, _setting} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               "client_id" => "db-client-id-must-not-escape",
+               "client_secret" => "db-client-secret-must-not-escape"
+             })
 
     on_exit(fn ->
       restore_env(:encryption_key, previous_key)
@@ -182,6 +192,7 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
     refute Keyword.has_key?(gmail_config, :client_secret)
     refute inspect(checked_out) =~ "sender-token"
     refute inspect(checked_out) =~ "client-secret-must-not-escape"
+    refute inspect(checked_out) =~ "db-client-secret-must-not-escape"
     refute inspect(checked_out) =~ "gmail-config-cookie-secret"
     assert inspect(checked_out) =~ "config: :redacted"
 
@@ -190,6 +201,62 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
                other_gmail.id,
                Accounts.account_address(other_account)
              )
+  end
+
+  test "Gmail send checkout stops at a missing stored setting", %{
+    account: account
+  } do
+    gmail =
+      insert_gmail_method!(account, "sender-subject", expires_at: ~U[2026-08-11 01:00:00.000000Z])
+
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+    Repo.delete!(setting)
+
+    assert {:error, %CoreError{reason: :provider_not_configured} = missing_error} =
+             Connectors.checkout_send_method(gmail.id, Accounts.account_address(account),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [test_pid: self(), refresh_result: {:ok, send_refresh_token()}]
+             )
+
+    refute inspect(missing_error) =~ "db-client-secret-must-not-escape"
+    refute_receive {:send_refresh_config, _config}
+  end
+
+  test "Gmail send checkout stops at a corrupt stored setting", %{account: account} do
+    gmail =
+      insert_gmail_method!(account, "sender-subject", expires_at: ~U[2026-08-11 01:00:00.000000Z])
+
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+
+    setting
+    |> Ecto.Changeset.change(client_secret_ciphertext: <<1, 2, 3>>)
+    |> Repo.update!()
+
+    assert {:error, %CoreError{reason: :provider_configuration_error} = corrupt_error} =
+             Connectors.checkout_send_method(gmail.id, Accounts.account_address(account),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [test_pid: self(), refresh_result: {:ok, send_refresh_token()}]
+             )
+
+    refute inspect(corrupt_error) =~ "corrupt-secret"
+    refute inspect(corrupt_error) =~ "ciphertext"
+    refute_receive {:send_refresh_config, _config}
+  end
+
+  test "Gmail send checkout refresh uses the stored client credentials", %{account: account} do
+    gmail =
+      insert_gmail_method!(account, "sender-subject", expires_at: ~U[2026-08-11 01:00:00.000000Z])
+
+    assert {:ok, %SubmissionMethod{} = checked_out} =
+             Connectors.checkout_send_method(gmail.id, Accounts.account_address(account),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [test_pid: self(), refresh_result: {:ok, send_refresh_token()}]
+             )
+
+    assert_receive {:send_refresh_config, config}
+    assert config[:client_id] == "db-client-id-must-not-escape"
+    assert config[:client_secret] == "db-client-secret-must-not-escape"
+    refute inspect(checked_out) =~ "db-client-secret-must-not-escape"
   end
 
   test "Gmail checkout rejects a missing gmail.send grant without exposing a token", %{
@@ -822,6 +889,15 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)
   defp restore_env(key, value), do: Application.put_env(:manifold_connectors, key, value)
+
+  defp send_refresh_token do
+    %Token{
+      access_token: "send-refreshed-access",
+      refresh_token: nil,
+      expires_at: ~U[2026-08-11 04:00:00.000000Z],
+      scopes: [GmailScopes.send()]
+    }
+  end
 
   defp repo_queries_during(fun) do
     handler_id = "submission-method-query-#{System.unique_integer([:positive])}"

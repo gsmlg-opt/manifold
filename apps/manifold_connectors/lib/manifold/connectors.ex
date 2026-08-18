@@ -110,12 +110,7 @@ defmodule Manifold.Connectors do
   @spec checkout_oauth_access_token(Ecto.UUID.t(), Keyword.t()) ::
           {:ok, term()} | {:error, Error.t() | ProviderError.t() | Ecto.Changeset.t()}
   def checkout_oauth_access_token(authorization_id, opts \\ []) do
-    with {:ok, authorization_id} <- Ecto.UUID.cast(authorization_id),
-         provider when provider in ["gmail", "microsoft"] <-
-           OAuthAuthorization
-           |> where([authorization], authorization.id == ^authorization_id)
-           |> select([authorization], authorization.provider)
-           |> Repo.one(),
+    with {:ok, authorization_id, provider} <- oauth_authorization_provider(authorization_id),
          {:ok, adapter, config} <- adapter_config(provider) do
       OAuthAuthorizations.checkout_access_token(
         authorization_id,
@@ -123,20 +118,40 @@ defmodule Manifold.Connectors do
         config,
         opts
       )
+    end
+  rescue
+    DBConnection.ConnectionError ->
+      {:error, database_error(:unavailable)}
+  end
+
+  @doc false
+  @spec checkout_resolved_oauth_access_token(
+          Ecto.UUID.t(),
+          String.t(),
+          module(),
+          keyword(),
+          Keyword.t()
+        ) :: {:ok, term()} | {:error, Error.t() | ProviderError.t() | Ecto.Changeset.t()}
+  def checkout_resolved_oauth_access_token(
+        authorization_id,
+        expected_provider,
+        adapter,
+        config,
+        opts \\ []
+      )
+      when expected_provider in ["gmail", "microsoft"] and is_atom(adapter) and
+             is_list(config) do
+    with {:ok, authorization_id, ^expected_provider} <-
+           oauth_authorization_provider(authorization_id) do
+      OAuthAuthorizations.checkout_access_token(
+        authorization_id,
+        adapter,
+        config,
+        opts
+      )
     else
-      :error ->
-        {:error, Error.new(:permanent, :authorization_not_found, "authorization not found")}
-
-      nil ->
-        {:error, Error.new(:permanent, :authorization_not_found, "authorization not found")}
-
-      _provider ->
-        {:error,
-         Error.new(
-           :permanent,
-           :invalid_oauth_authorization,
-           "authorization is not a supported OAuth authorization"
-         )}
+      {:ok, _authorization_id, _other_provider} -> invalid_oauth_authorization()
+      {:error, %Error{} = error} -> {:error, error}
     end
   rescue
     DBConnection.ConnectionError ->
@@ -1300,24 +1315,26 @@ defmodule Manifold.Connectors do
 
   defp normalize_authorized_method_result(result), do: result
 
-  defp adapter_config(provider) when provider in ["gmail", "microsoft"] do
-    key = String.to_existing_atom(provider)
+  defp adapter_config("gmail") do
+    adapters = Application.get_env(:manifold_connectors, :adapters, [])
+
+    adapter = Keyword.get(adapters, :gmail) || Manifold.Connectors.Provider.Gmail
+
+    with {:ok, %ProviderConfig.Resolved{config: config}} <- ProviderConfig.fetch("gmail") do
+      {:ok, adapter, config}
+    end
+  end
+
+  defp adapter_config("microsoft") do
     adapters = Application.get_env(:manifold_connectors, :adapters, [])
     providers = Application.get_env(:manifold_connectors, :providers, [])
 
     adapter =
-      Keyword.get(adapters, key) ||
-        case provider do
-          "gmail" -> Manifold.Connectors.Provider.Gmail
-          "microsoft" -> Manifold.Connectors.Provider.MicrosoftGraph
-        end
+      Keyword.get(adapters, :microsoft) || Manifold.Connectors.Provider.MicrosoftGraph
 
-    case Keyword.get(providers, key) do
-      config when is_list(config) ->
-        {:ok, adapter, config}
-
-      _missing ->
-        {:error, Error.new(:permanent, :provider_not_configured, "provider is not configured")}
+    case Keyword.get(providers, :microsoft) do
+      config when is_list(config) -> {:ok, adapter, config}
+      _missing -> provider_not_configured()
     end
   end
 
@@ -2096,7 +2113,8 @@ defmodule Manifold.Connectors do
          opts
        )
        when provider in ["gmail", "microsoft"] and is_binary(authorization_id) do
-    with {:ok, config} <- oauth_submission_config(provider),
+    with {:ok, adapter, provider_config} <- adapter_config(provider),
+         {:ok, config} <- oauth_submission_config(provider, provider_config),
          {:ok, required_scope} <- OAuthScopes.method_scope(provider, :send) do
       continuation = fn access_token ->
         with :ok <- after_oauth_checkout(opts) do
@@ -2109,8 +2127,11 @@ defmodule Manifold.Connectors do
         end
       end
 
-      checkout_oauth_access_token(
+      checkout_resolved_oauth_access_token(
         authorization_id,
+        provider,
+        adapter,
+        provider_config,
         opts
         |> Keyword.delete(:after_oauth_checkout)
         |> Keyword.put(:required_scope, required_scope)
@@ -2213,34 +2234,61 @@ defmodule Manifold.Connectors do
     end
   end
 
-  defp oauth_submission_config(provider) when provider in ["gmail", "microsoft"] do
-    provider_key = String.to_existing_atom(provider)
+  defp oauth_submission_config(provider, config)
+       when provider in ["gmail", "microsoft"] and is_list(config) do
+    case Keyword.get(config, :base_url) do
+      base_url when is_binary(base_url) and base_url != "" ->
+        safe_req_options =
+          config
+          |> Keyword.get(:req_options, [])
+          |> Keyword.take([:plug])
 
-    case Application.get_env(:manifold_connectors, :providers, [])[provider_key] do
-      config when is_list(config) ->
-        case Keyword.get(config, :base_url) do
-          base_url when is_binary(base_url) and base_url != "" ->
-            safe_req_options =
-              config
-              |> Keyword.get(:req_options, [])
-              |> Keyword.take([:plug])
+        submission_config = [base_url: base_url]
 
-            submission_config = [base_url: base_url]
-
-            if safe_req_options == [] do
-              {:ok, submission_config}
-            else
-              {:ok, Keyword.put(submission_config, :req_options, safe_req_options)}
-            end
-
-          _missing ->
-            {:error,
-             Error.new(:permanent, :provider_not_configured, "provider is not configured")}
+        if safe_req_options == [] do
+          {:ok, submission_config}
+        else
+          {:ok, Keyword.put(submission_config, :req_options, safe_req_options)}
         end
 
       _missing ->
-        {:error, Error.new(:permanent, :provider_not_configured, "provider is not configured")}
+        provider_not_configured()
     end
+  end
+
+  defp oauth_authorization_provider(authorization_id) do
+    with {:ok, authorization_id} <- Ecto.UUID.cast(authorization_id),
+         provider when is_binary(provider) <-
+           OAuthAuthorization
+           |> where([authorization], authorization.id == ^authorization_id)
+           |> select([authorization], authorization.provider)
+           |> Repo.one() do
+      if provider in ["gmail", "microsoft"] do
+        {:ok, authorization_id, provider}
+      else
+        invalid_oauth_authorization()
+      end
+    else
+      :error -> authorization_not_found()
+      nil -> authorization_not_found()
+    end
+  end
+
+  defp authorization_not_found do
+    {:error, Error.new(:permanent, :authorization_not_found, "authorization not found")}
+  end
+
+  defp invalid_oauth_authorization do
+    {:error,
+     Error.new(
+       :permanent,
+       :invalid_oauth_authorization,
+       "authorization is not a supported OAuth authorization"
+     )}
+  end
+
+  defp provider_not_configured do
+    {:error, Error.new(:permanent, :provider_not_configured, "provider is not configured")}
   end
 
   defp require_account_sender(parsed, account) do

@@ -161,11 +161,6 @@ defmodule ManifoldWeb.AccountLiveTest do
   end
 
   test "add send keeps unconfigured Gmail visible but disabled", %{conn: conn} do
-    previous_providers = Application.get_env(:manifold_connectors, :providers)
-    Application.put_env(:manifold_connectors, :providers, [])
-
-    on_exit(fn -> restore_smtp_env(:providers, previous_providers) end)
-
     {:ok, account} =
       Accounts.create_account(%{name: "No OAuth", address: "no-oauth@example.test"})
 

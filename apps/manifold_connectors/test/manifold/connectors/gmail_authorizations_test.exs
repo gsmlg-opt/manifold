@@ -28,7 +28,9 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     @behaviour Manifold.Connectors.Provider
 
     @impl true
-    def exchange_code(_code, _verifier, _redirect_uri, _config, opts) do
+    def exchange_code(_code, _verifier, _redirect_uri, config, opts) do
+      notify_config(opts, :exchange_config, config)
+
       if test_pid = Keyword.get(opts, :test_pid) do
         send(test_pid, {:exchange_required_scopes, Keyword.get(opts, :required_scopes)})
       end
@@ -49,18 +51,25 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     end
 
     @impl true
-    def identity(_access_token, _config, opts), do: Keyword.fetch!(opts, :identity)
+    def identity(_access_token, config, opts) do
+      notify_config(opts, :identity_config, config)
+      Keyword.fetch!(opts, :identity)
+    end
 
     @impl true
-    def initial_cursors(_access_token, _config, opts),
-      do:
-        Keyword.get(opts, :cursors, {:ok, [%ProviderCursor{scope: "mailbox", phase: "initial"}]})
+    def initial_cursors(_access_token, config, opts) do
+      notify_config(opts, :initial_cursors_config, config)
+
+      Keyword.get(opts, :cursors, {:ok, [%ProviderCursor{scope: "mailbox", phase: "initial"}]})
+    end
 
     @impl true
-    def refresh_token(refresh_token, _config, opts) do
+    def refresh_token(refresh_token, config, opts) do
       if counter = Keyword.get(opts, :refresh_count) do
         Agent.update(counter, &(&1 + 1))
       end
+
+      notify_config(opts, :refresh_config, config)
 
       if test_pid = Keyword.get(opts, :test_pid) do
         send(test_pid, {:refresh_token, refresh_token})
@@ -73,6 +82,14 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
       end
 
       Keyword.fetch!(opts, :refresh_result)
+    end
+
+    defp notify_config(opts, event, config) do
+      if test_pid =
+           Keyword.get(opts, :test_pid) ||
+             Application.get_env(:manifold_connectors, :gmail_authorizations_test_pid) do
+        send(test_pid, {event, config})
+      end
     end
 
     @impl true
@@ -140,8 +157,13 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert {:ok, %ReceiveMethod{status: "connected"}} =
              Connectors.complete_authorization("gmail", "authorization-code", consumed,
                now: ~U[2026-08-11 01:00:00.000000Z],
-               provider_opts: completion_provider_opts(address)
+               provider_opts: completion_provider_opts(address, test_pid: self())
              )
+
+    assert_receive {:exchange_config, config}
+    assert_receive {:identity_config, ^config}
+    assert config[:client_id] == "db-client"
+    assert config[:client_secret] == "db-secret"
   end
 
   test "legacy Gmail completion fences the resolved generation across code exchange", %{
@@ -1371,6 +1393,9 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
       end)
 
     assert_receive {:refresh_token, "refresh-secret"}
+    assert_receive {:refresh_config, refresh_config}
+    assert refresh_config[:client_id] == "db-client"
+    assert refresh_config[:client_secret] == "db-secret"
     assert is_integer(authorization_lock_index(queries))
     persisted = Repo.get!(OAuthAuthorization, authorization.id)
     assert persisted.token_expires_at == refreshed.expires_at
@@ -1387,6 +1412,147 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
                persisted.refresh_token_ciphertext,
                "credential:#{authorization.id}:refresh"
              )
+  end
+
+  test "the next refresh resolves a setting rotated before the operation", %{
+    account: account,
+    address: address,
+    gmail_setting: gmail_setting
+  } do
+    assert {:ok, _rotated} =
+             Connectors.put_oauth_provider_setting(
+               "gmail",
+               %{"client_id" => "rotated-client", "client_secret" => "rotated-secret"},
+               expected_lock_version: gmail_setting.lock_version
+             )
+
+    assert {:ok, receive} = complete(:receive, account, address)
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    refreshed = %Token{
+      access_token: "rotated-setting-access",
+      refresh_token: nil,
+      expires_at: ~U[2026-08-11 04:00:00.000000Z],
+      scopes: [GmailScopes.read()]
+    }
+
+    assert {:ok, "rotated-setting-access"} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: GmailScopes.read(),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [test_pid: self(), refresh_result: {:ok, refreshed}]
+             )
+
+    assert_receive {:refresh_config, config}
+    assert config[:client_id] == "rotated-client"
+    assert config[:client_secret] == "rotated-secret"
+  end
+
+  test "missing and corrupt settings stop refresh before provider I/O", %{
+    account: account,
+    address: address,
+    gmail_setting: gmail_setting
+  } do
+    assert {:ok, receive} = complete(:receive, account, address)
+    authorization = Repo.get!(OAuthAuthorization, receive.oauth_authorization_id)
+
+    Repo.delete!(gmail_setting)
+
+    assert {:error, %CoreError{reason: :provider_not_configured}} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: GmailScopes.read(),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [
+                 test_pid: self(),
+                 refresh_result: {:ok, must_not_refresh_token()}
+               ]
+             )
+
+    refute_receive {:refresh_config, _config}
+
+    assert {:ok, _setting} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               "client_id" => "corrupt-client",
+               "client_secret" => "corrupt-secret"
+             })
+
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+
+    setting
+    |> Ecto.Changeset.change(client_secret_ciphertext: <<1, 2, 3>>)
+    |> Repo.update!()
+
+    assert {:error, %CoreError{reason: :provider_configuration_error} = error} =
+             Connectors.checkout_oauth_access_token(authorization.id,
+               required_scope: GmailScopes.read(),
+               now: ~U[2026-08-11 03:00:00.000000Z],
+               provider_opts: [
+                 test_pid: self(),
+                 refresh_result: {:ok, must_not_refresh_token()}
+               ]
+             )
+
+    refute inspect(error) =~ "corrupt-secret"
+    refute inspect(error) =~ "ciphertext"
+    refute_receive {:refresh_config, _config}
+  end
+
+  test "authorized receive setup uses stored credentials and fails closed when missing", %{
+    account: account,
+    address: address,
+    gmail_setting: gmail_setting
+  } do
+    Application.put_env(:manifold_connectors, :gmail_authorizations_test_pid, self())
+
+    on_exit(fn ->
+      Application.delete_env(:manifold_connectors, :gmail_authorizations_test_pid)
+    end)
+
+    token = %Token{
+      access_token: "authorized-setup-access",
+      refresh_token: "authorized-setup-refresh",
+      expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
+      scopes: [GmailScopes.read(), GmailScopes.send()]
+    }
+
+    assert {:ok, _send_method} = complete(:send, account, address, token: token)
+
+    assert {:ok, %ReceiveMethod{}} =
+             Connectors.add_authorized_oauth_method(account.id, "gmail", :receive)
+
+    assert_receive {:initial_cursors_config, config}
+    assert config[:client_id] == "db-client"
+    assert config[:client_secret] == "db-secret"
+
+    Repo.delete!(gmail_setting)
+
+    assert {:error, %CoreError{reason: :provider_not_configured}} =
+             Connectors.add_authorized_oauth_method(account.id, "gmail", :receive)
+
+    refute_receive {:initial_cursors_config, _config}
+  end
+
+  test "authorized send setup requires the stored Gmail setting", %{
+    account: account,
+    address: address,
+    gmail_setting: gmail_setting
+  } do
+    token = %Token{
+      access_token: "authorized-send-access",
+      refresh_token: "authorized-send-refresh",
+      expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
+      scopes: [GmailScopes.read(), GmailScopes.send()]
+    }
+
+    assert {:ok, _receive_method} = complete(:receive, account, address, token: token)
+
+    assert {:ok, %SendMethod{}} =
+             Connectors.add_authorized_oauth_method(account.id, "gmail", :send)
+
+    Repo.delete!(gmail_setting)
+
+    assert {:error, %CoreError{reason: :provider_not_configured}} =
+             Connectors.add_authorized_oauth_method(account.id, "gmail", :send)
   end
 
   test "refresh omission preserves the stored refresh token", %{
@@ -1614,7 +1780,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     consumed
   end
 
-  defp completion_provider_opts(address, extra \\ []) do
+  defp completion_provider_opts(address, extra) do
     token = %Token{
       access_token: "access-secret",
       refresh_token: "refresh-secret",
@@ -1629,6 +1795,15 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
       ],
       extra
     )
+  end
+
+  defp must_not_refresh_token do
+    %Token{
+      access_token: "must-not-refresh",
+      refresh_token: nil,
+      expires_at: ~U[2026-08-11 04:00:00.000000Z],
+      scopes: [GmailScopes.read()]
+    }
   end
 
   defp insert_other_receive!(account_id, address) do

@@ -63,6 +63,10 @@ defmodule Manifold.Connectors.ProviderConfigTest do
         token_url: "https://accounts.example/token",
         userinfo_url: "https://openid.example/userinfo",
         base_url: "https://gmail.example",
+        req_options: [
+          plug: {Req.Test, __MODULE__},
+          headers: [{"authorization", "legacy-request-secret"}]
+        ],
         untrusted_extra: "ignored"
       ]
     )
@@ -75,11 +79,13 @@ defmodule Manifold.Connectors.ProviderConfigTest do
              userinfo_url: "https://openid.example/userinfo",
              base_url: "https://gmail.example",
              client_id: "db-client",
-             client_secret: secret
+             client_secret: secret,
+             req_options: [plug: {Req.Test, __MODULE__}]
            }
 
     refute inspect(resolved) =~ secret
     refute inspect(resolved) =~ "legacy-secret"
+    refute inspect(resolved.config) =~ "legacy-request-secret"
     refute Keyword.has_key?(resolved.config, :untrusted_extra)
   end
 

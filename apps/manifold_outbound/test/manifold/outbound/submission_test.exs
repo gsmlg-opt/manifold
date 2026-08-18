@@ -21,6 +21,16 @@ defmodule Manifold.Outbound.SubmissionTest do
   alias Manifold.Outbound.Schema.{OutboundEvent, OutboundMessage, ProviderSubmission}
   alias Manifold.Repo
 
+  setup do
+    assert {:ok, _setting} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               "client_id" => "outbound-db-client",
+               "client_secret" => "outbound-db-secret"
+             })
+
+    :ok
+  end
+
   test "provider submission stores immutable payload fields and redacts MIME inspection" do
     sentinel = "Bcc: private-recipient@example.test\r\n\r\nprivate-body\r\n"
 
@@ -268,6 +278,44 @@ defmodule Manifold.Outbound.SubmissionTest do
              outbound_message_id: message.id,
              event_type: "provider_accepted"
            )
+  end
+
+  test "Gmail submission checks out through the stored setting and omits OAuth client secrets" do
+    %{message: message} = queued_operational_fixture("gmail")
+
+    assert :ok =
+             Outbound.submit_message(message.id,
+               provider: TestProvider,
+               provider_config: [
+                 test_pid: self(),
+                 result:
+                   {:ok,
+                    %Provider.Submission{
+                      provider_message_id: "gmail-stored-setting",
+                      metadata: %{}
+                    }}
+               ]
+             )
+
+    assert_receive {:provider_submit, %Provider.Request{provider: "gmail"}, config}
+    assert config[:base_url] == "https://gmail.googleapis.com"
+    assert config[:access_token] == "gmail-access-token"
+    refute Keyword.has_key?(config, :client_id)
+    refute Keyword.has_key?(config, :client_secret)
+
+    %{message: missing_message} = queued_operational_fixture("gmail")
+
+    Manifold.Connectors.Schema.OAuthProviderSetting
+    |> Manifold.Repo.delete_all()
+
+    assert {:error, %Provider.Error{code: "provider_not_configured"} = error} =
+             Outbound.submit_message(missing_message.id,
+               provider: TestProvider,
+               provider_config: [test_pid: self(), result: :unused]
+             )
+
+    refute inspect(error) =~ "outbound-db-secret"
+    refute_receive {:provider_submit, _, _}
   end
 
   test "provider acceptance commit failure is returned as a temporary database error" do

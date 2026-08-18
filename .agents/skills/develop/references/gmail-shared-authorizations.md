@@ -44,6 +44,16 @@
   repeats generation validation under the provider lock before writing account,
   authorization, method, event, cursor, or job state. Legacy and Microsoft
   transactions retain nil generation fields.
+- Every Gmail runtime operation resolves the current provider setting without a
+  cross-operation cache. Code exchange, access-token refresh, authorized method
+  setup, receive sync, and send checkout all receive
+  `ProviderConfig.Resolved.config`; sync and send carry one resolved config
+  through the operation to avoid a second database read. Microsoft continues to
+  use its application configuration.
+- Missing, corrupt, or unavailable Gmail settings fail before provider I/O with
+  normalized, secret-free configuration errors. Legacy application client
+  credentials are ignored; only trusted endpoint and test-transport overrides
+  are merged into the stored credentials by `ProviderConfig`.
 - Direct Gmail receive deletion cancels pending sync work and disconnects and
   clears the authorization only when no live receive or send method remains.
 - When Google omits `scope` from an authorization-code response, the adapter uses

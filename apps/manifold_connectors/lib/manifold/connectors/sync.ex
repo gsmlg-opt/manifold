@@ -5,7 +5,7 @@ defmodule Manifold.Connectors.Sync do
 
   alias Manifold.Accounts
   alias Manifold.Connectors
-  alias Manifold.Connectors.{Crypto, OAuthScopes}
+  alias Manifold.Connectors.{Crypto, OAuthScopes, ProviderConfig}
   alias Manifold.Connectors.{MicrosoftFolderMapping, RemoteStateJobs}
   alias Manifold.Connectors.Provider
   alias Manifold.Connectors.Provider.Error, as: ProviderError
@@ -448,8 +448,8 @@ defmodule Manifold.Connectors.Sync do
 
   defp auth_material(
          %ReceiveMethod{kind: provider, oauth_authorization_id: authorization_id},
-         _adapter,
-         _config,
+         adapter,
+         config,
          now,
          provider_opts
        )
@@ -461,7 +461,11 @@ defmodule Manifold.Connectors.Sync do
         {:ok, {:oauth_access, access_token, authorization.id, authorization.lock_version}}
       end
 
-      Connectors.checkout_oauth_access_token(authorization_id,
+      Connectors.checkout_resolved_oauth_access_token(
+        authorization_id,
+        provider,
+        adapter,
+        config,
         now: now,
         required_scope: required_scope,
         provider_opts: provider_opts,
@@ -1062,19 +1066,24 @@ defmodule Manifold.Connectors.Sync do
     {:ok, adapter, []}
   end
 
-  defp runtime(provider) when provider in ["gmail", "microsoft"] do
-    key = String.to_existing_atom(provider)
+  defp runtime("gmail") do
+    adapters = Application.get_env(:manifold_connectors, :adapters, [])
+
+    adapter = Keyword.get(adapters, :gmail) || Manifold.Connectors.Provider.Gmail
+
+    with {:ok, %ProviderConfig.Resolved{config: config}} <- ProviderConfig.fetch("gmail") do
+      {:ok, adapter, config}
+    end
+  end
+
+  defp runtime("microsoft") do
     adapters = Application.get_env(:manifold_connectors, :adapters, [])
     providers = Application.get_env(:manifold_connectors, :providers, [])
 
     adapter =
-      Keyword.get(adapters, key) ||
-        case provider do
-          "gmail" -> Manifold.Connectors.Provider.Gmail
-          "microsoft" -> Manifold.Connectors.Provider.MicrosoftGraph
-        end
+      Keyword.get(adapters, :microsoft) || Manifold.Connectors.Provider.MicrosoftGraph
 
-    case Keyword.get(providers, key) do
+    case Keyword.get(providers, :microsoft) do
       config when is_list(config) ->
         {:ok, adapter, config}
 

@@ -78,7 +78,9 @@ defmodule Manifold.Connectors.SyncTest do
     end
 
     @impl true
-    def identity("initial-access", _config, opts) do
+    def identity("initial-access", config, opts) do
+      notify_config(opts, :identity_config, config)
+
       Keyword.get(opts, :identity_result) ||
         {:ok,
          %Identity{id: "sync-account", email_address: Keyword.fetch!(opts, :identity_address)}}
@@ -89,7 +91,8 @@ defmodule Manifold.Connectors.SyncTest do
     end
 
     @impl true
-    def initial_cursors("initial-access", _config, _opts) do
+    def initial_cursors("initial-access", config, opts) do
+      notify_config(opts, :initial_cursors_config, config)
       {:ok, [%ProviderCursor{scope: "mailbox", phase: "initial", bootstrap_cursor: "100"}]}
     end
 
@@ -123,7 +126,8 @@ defmodule Manifold.Connectors.SyncTest do
     end
 
     @impl true
-    def sync_page(access_token, cursor, _config, opts) do
+    def sync_page(access_token, cursor, config, opts) do
+      notify_config(opts, :sync_config, config)
       send(self(), {:sync_access_token, access_token})
 
       if test_pid = Keyword.get(opts, :test_pid) do
@@ -169,6 +173,12 @@ defmodule Manifold.Connectors.SyncTest do
           result
       end
     end
+
+    defp notify_config(opts, event, config) do
+      if test_pid = Keyword.get(opts, :test_pid) do
+        send(test_pid, {event, config})
+      end
+    end
   end
 
   defmodule AcceptingOutboundProvider do
@@ -207,10 +217,7 @@ defmodule Manifold.Connectors.SyncTest do
       microsoft: FakeProvider
     )
 
-    Application.put_env(:manifold_connectors, :providers,
-      gmail: [client_id: "client"],
-      microsoft: [client_id: "client"]
-    )
+    Application.put_env(:manifold_connectors, :providers, microsoft: [client_id: "client"])
 
     assert {:ok, _setting} =
              Connectors.put_oauth_provider_setting("gmail", %{
@@ -253,7 +260,11 @@ defmodule Manifold.Connectors.SyncTest do
                  pkce_verifier: "verifier"
                },
                now: DateTime.utc_now(),
-               provider_opts: [now: DateTime.utc_now(), identity_address: address]
+               provider_opts: [
+                 now: DateTime.utc_now(),
+                 identity_address: address,
+                 test_pid: self()
+               ]
              )
 
     cursor = Repo.get_by!(SyncCursor, external_account_id: account.id)
@@ -268,6 +279,51 @@ defmodule Manifold.Connectors.SyncTest do
       |> Repo.update!()
 
     {:ok, account: account, cursor: cursor, domain: domain, mailbox: mailbox}
+  end
+
+  test "initial discovery and ongoing Gmail sync receive stored provider credentials", %{
+    account: account
+  } do
+    assert_receive {:identity_config, initial_config}
+    assert_receive {:initial_cursors_config, ^initial_config}
+    assert initial_config[:client_id] == "client"
+    assert initial_config[:client_secret] == "secret"
+
+    assert :ok = Connectors.sync_account(account.id, provider_opts: [test_pid: self()])
+
+    assert_receive {:sync_config, sync_config}
+    assert sync_config[:client_id] == "client"
+    assert sync_config[:client_secret] == "secret"
+  end
+
+  test "a missing Gmail setting stops sync before provider I/O", %{account: account} do
+    setting = Repo.get_by!(Manifold.Connectors.Schema.OAuthProviderSetting, provider: "gmail")
+    Repo.delete!(setting)
+
+    assert {:cancel, :provider_not_configured} =
+             Connectors.sync_account(account.id, provider_opts: [test_pid: self()])
+
+    refute_receive {:sync_config, _config}
+  end
+
+  test "a corrupt Gmail setting stops sync before provider I/O", %{account: account} do
+    attach_sync_telemetry()
+    setting = Repo.get_by!(Manifold.Connectors.Schema.OAuthProviderSetting, provider: "gmail")
+
+    setting
+    |> Ecto.Changeset.change(client_secret_ciphertext: <<1, 2, 3>>)
+    |> Repo.update!()
+
+    assert {:cancel, :provider_configuration_error} =
+             Connectors.sync_account(account.id, provider_opts: [test_pid: self()])
+
+    refute_receive {:sync_config, _config}
+
+    assert_receive {:sync_telemetry, [:manifold, :connectors, :sync, :stop], measurements,
+                    metadata}
+
+    refute inspect({measurements, metadata}) =~ "corrupt-secret"
+    refute inspect({measurements, metadata}) =~ "ciphertext"
   end
 
   test "imports raw mail before advancing the provider cursor", %{

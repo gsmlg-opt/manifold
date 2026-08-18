@@ -133,8 +133,6 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     Application.put_env(:manifold_connectors, :providers,
       gmail: [
-        client_id: "gmail-client-secret-id",
-        client_secret: "gmail-client-secret",
         authorization_url: "https://accounts.google.test/o/oauth2/v2/auth"
       ],
       microsoft: [

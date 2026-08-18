@@ -66,14 +66,32 @@ defmodule Manifold.Connectors.ProviderConfig do
   end
 
   defp gmail_runtime_config(definition) do
-    configured_endpoints =
+    application_config =
       :manifold_connectors
       |> Application.get_env(:providers, [])
       |> gmail_application_config()
+
+    configured_endpoints =
+      application_config
       |> Keyword.take(Keyword.keys(definition.runtime_config))
 
-    Keyword.merge(definition.runtime_config, configured_endpoints)
+    safe_req_options =
+      application_config
+      |> Keyword.get(:req_options, [])
+      |> then(fn
+        options when is_list(options) -> Keyword.take(options, [:plug])
+        _other -> []
+      end)
+
+    definition.runtime_config
+    |> Keyword.merge(configured_endpoints)
+    |> maybe_put_req_options(safe_req_options)
   end
+
+  defp maybe_put_req_options(config, []), do: config
+
+  defp maybe_put_req_options(config, req_options),
+    do: Keyword.put(config, :req_options, req_options)
 
   defp gmail_application_config(providers) when is_list(providers) do
     case Keyword.get(providers, :gmail, []) do
