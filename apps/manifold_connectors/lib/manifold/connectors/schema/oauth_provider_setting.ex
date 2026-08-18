@@ -40,5 +40,7 @@ defmodule Manifold.Connectors.Schema.OAuthProviderSetting do
     |> unique_constraint(:provider)
     |> check_constraint(:provider, name: :oauth_provider_settings_provider_present)
     |> check_constraint(:client_id, name: :oauth_provider_settings_client_id_present)
+    |> check_constraint(:key_version, name: :oauth_provider_settings_key_version_positive)
+    |> check_constraint(:lock_version, name: :oauth_provider_settings_lock_version_positive)
   end
 end

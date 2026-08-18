@@ -64,6 +64,8 @@ defmodule Manifold.Connectors.Schema.OAuthProviderSettingTest do
     assert "connector_oauth_provider_settings_provider_index" in constraints
     assert "oauth_provider_settings_provider_present" in constraints
     assert "oauth_provider_settings_client_id_present" in constraints
+    assert "oauth_provider_settings_key_version_positive" in constraints
+    assert "oauth_provider_settings_lock_version_positive" in constraints
   end
 
   test "OAuth transaction accepts a paired provider-setting generation" do

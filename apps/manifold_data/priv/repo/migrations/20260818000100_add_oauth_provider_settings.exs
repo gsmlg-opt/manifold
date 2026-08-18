@@ -26,6 +26,22 @@ defmodule Manifold.Repo.Migrations.AddOAuthProviderSettings do
       )
     )
 
+    create(
+      constraint(
+        :connector_oauth_provider_settings,
+        :oauth_provider_settings_key_version_positive,
+        check: "key_version > 0"
+      )
+    )
+
+    create(
+      constraint(
+        :connector_oauth_provider_settings,
+        :oauth_provider_settings_lock_version_positive,
+        check: "lock_version > 0"
+      )
+    )
+
     alter table(:connector_oauth_transactions) do
       add(:oauth_provider_setting_id, :binary_id)
       add(:oauth_provider_setting_lock_version, :integer)
