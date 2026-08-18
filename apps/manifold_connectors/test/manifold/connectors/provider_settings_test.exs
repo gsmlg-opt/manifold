@@ -4,6 +4,7 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
   alias Manifold.Accounts
   alias Manifold.Connectors
   alias Manifold.Connectors.Crypto
+  alias Manifold.Connectors.ProviderSettings
   alias Manifold.Core.Error
 
   alias Manifold.Connectors.Schema.{
@@ -415,6 +416,73 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
              )
 
     assert is_nil(Repo.get_by(OAuthProviderSetting, provider: "gmail"))
+  end
+
+  test "generation validation requires a transaction and returns no credentials" do
+    assert {:ok, _setting} = put_setting("client", "generation-validation-secret")
+    row = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+
+    assert {:error, %Error{reason: :oauth_provider_lock_requires_transaction}} =
+             ProviderSettings.validate_generation_for_transaction(
+               "gmail",
+               row.id,
+               row.lock_version
+             )
+
+    assert {:ok, :ok} =
+             Repo.transaction(fn ->
+               assert :ok = ProviderSettings.lock_provider_for_transaction("gmail")
+
+               assert :ok =
+                        ProviderSettings.validate_generation_for_transaction(
+                          "gmail",
+                          row.id,
+                          row.lock_version
+                        )
+             end)
+  end
+
+  test "generation validation fails closed for mismatched and corrupt settings" do
+    secret = "generation-validation-secret"
+    assert {:ok, _setting} = put_setting("client", secret)
+    row = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+
+    for {setting_id, setting_lock_version} <- [
+          {Ecto.UUID.generate(), row.lock_version},
+          {row.id, row.lock_version + 1}
+        ] do
+      assert {:ok, {:error, %Error{reason: :provider_configuration_changed} = error}} =
+               Repo.transaction(fn ->
+                 assert :ok = ProviderSettings.lock_provider_for_transaction("gmail")
+
+                 ProviderSettings.validate_generation_for_transaction(
+                   "gmail",
+                   setting_id,
+                   setting_lock_version
+                 )
+               end)
+
+      refute inspect(error) =~ secret
+      refute inspect(error) =~ "credential"
+    end
+
+    OAuthProviderSetting
+    |> where([setting], setting.id == ^row.id)
+    |> Repo.update_all(set: [client_secret_ciphertext: <<1, 2, 3>>])
+
+    assert {:ok, {:error, %Error{reason: :provider_configuration_changed} = corrupt_error}} =
+             Repo.transaction(fn ->
+               assert :ok = ProviderSettings.lock_provider_for_transaction("gmail")
+
+               ProviderSettings.validate_generation_for_transaction(
+                 "gmail",
+                 row.id,
+                 row.lock_version
+               )
+             end)
+
+    refute inspect(corrupt_error) =~ secret
+    refute inspect(corrupt_error) =~ "ciphertext"
   end
 
   defp put_setting(client_id, client_secret) do

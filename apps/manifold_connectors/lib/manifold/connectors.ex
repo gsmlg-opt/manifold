@@ -82,14 +82,17 @@ defmodule Manifold.Connectors do
       |> Keyword.put(:required_scopes, consumed.required_scopes)
 
     with :ok <- validate_consumed(provider, consumed),
-         {:ok, adapter, config} <- adapter_config(provider) do
+         {:ok, adapter, config, generation_opts} <-
+           completion_adapter_config(provider, consumed) do
       OAuthAuthorizations.complete(
         provider,
         code,
         consumed,
         adapter,
         config,
-        Keyword.put(opts, :provider_opts, provider_opts)
+        opts
+        |> Keyword.put(:provider_opts, provider_opts)
+        |> Keyword.merge(generation_opts)
       )
     end
   rescue
@@ -1320,6 +1323,76 @@ defmodule Manifold.Connectors do
 
   defp adapter_config(_provider) do
     {:error, Error.new(:permanent, :unsupported_provider, "provider is not supported")}
+  end
+
+  defp completion_adapter_config("gmail", %Consumed{} = consumed) do
+    adapters = Application.get_env(:manifold_connectors, :adapters, [])
+
+    adapter =
+      Keyword.get(adapters, :gmail) || Manifold.Connectors.Provider.Gmail
+
+    with {:ok, %ProviderConfig.Resolved{} = resolved} <- ProviderConfig.fetch("gmail"),
+         :ok <- validate_completion_generation(consumed, resolved) do
+      {:ok, adapter, resolved.config,
+       expected_oauth_provider_setting_id: resolved.setting_id,
+       expected_oauth_provider_setting_lock_version: resolved.setting_lock_version}
+    else
+      {:error, %Error{reason: reason}}
+      when reason in [:provider_not_configured, :provider_configuration_error] ->
+        provider_configuration_changed()
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp completion_adapter_config("microsoft", %Consumed{}) do
+    case adapter_config("microsoft") do
+      {:ok, adapter, config} -> {:ok, adapter, config, []}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  defp validate_completion_generation(
+         %Consumed{
+           provider: "gmail",
+           oauth_provider_setting_id: setting_id,
+           oauth_provider_setting_lock_version: setting_lock_version
+         },
+         %ProviderConfig.Resolved{
+           provider: "gmail",
+           setting_id: setting_id,
+           setting_lock_version: setting_lock_version
+         }
+       )
+       when is_binary(setting_id) and is_integer(setting_lock_version),
+       do: :ok
+
+  defp validate_completion_generation(
+         %Consumed{
+           provider: "gmail",
+           oauth_provider_setting_id: nil,
+           oauth_provider_setting_lock_version: nil
+         },
+         %ProviderConfig.Resolved{provider: "gmail"}
+       ),
+       do: :ok
+
+  defp validate_completion_generation(
+         %Consumed{provider: "gmail"},
+         %ProviderConfig.Resolved{provider: "gmail"}
+       ),
+       do: provider_configuration_changed()
+
+  defp validate_completion_generation(%Consumed{}, %ProviderConfig.Resolved{}), do: :ok
+
+  defp provider_configuration_changed do
+    {:error,
+     Error.new(
+       :permanent,
+       :provider_configuration_changed,
+       "OAuth provider configuration changed"
+     )}
   end
 
   defp provider_opts(opts), do: Keyword.get(opts, :provider_opts, [])

@@ -173,6 +173,29 @@ defmodule Manifold.Connectors.ProviderSettings do
       {:error, database_error()}
   end
 
+  # The caller must hold the provider advisory lock for the surrounding transaction.
+  # This validates only the credential generation and never returns plaintext credentials.
+  @doc false
+  @spec validate_generation_for_transaction(String.t(), Ecto.UUID.t(), pos_integer()) ::
+          :ok | {:error, Error.t()}
+  def validate_generation_for_transaction(provider, setting_id, setting_lock_version) do
+    with {:ok, _definition} <- OAuthProviderCatalog.fetch(provider),
+         :ok <- require_transaction(),
+         %OAuthProviderSetting{} = setting <- lock_setting(provider),
+         true <- setting.id == setting_id and setting.lock_version == setting_lock_version do
+      case decrypt_secret(setting) do
+        {:ok, _client_secret} -> :ok
+        {:error, _crypto_error} -> provider_configuration_changed()
+      end
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      _missing_changed_or_corrupt -> provider_configuration_changed()
+    end
+  rescue
+    _error in [DBConnection.ConnectionError, Postgrex.Error, ArgumentError] ->
+      {:error, database_error()}
+  end
+
   @doc false
   @spec runtime_credentials(String.t()) :: {:ok, Credentials.t()} | {:error, Error.t()}
   def runtime_credentials(provider) do
@@ -566,6 +589,15 @@ defmodule Manifold.Connectors.ProviderSettings do
       :oauth_provider_configuration_error,
       "OAuth provider configuration is invalid"
     )
+  end
+
+  defp provider_configuration_changed do
+    {:error,
+     Error.new(
+       :permanent,
+       :provider_configuration_changed,
+       "OAuth provider configuration changed"
+     )}
   end
 
   defp database_error(_error \\ nil) do

@@ -212,6 +212,12 @@ defmodule Manifold.Connectors.SyncTest do
       microsoft: [client_id: "client"]
     )
 
+    assert {:ok, _setting} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               "client_id" => "client",
+               "client_secret" => "secret"
+             })
+
     Application.put_env(:manifold_storage, :spool_dir, Path.join(tmp_dir, "spool"))
     Application.put_env(:manifold_storage, :raw_store_dir, Path.join(tmp_dir, "raw"))
     Application.put_env(:manifold_connectors, :activity_log_dir, Path.join(tmp_dir, "activity"))

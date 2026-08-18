@@ -31,10 +31,19 @@
 - Public enable APIs reject reconnect-required receive and send methods with
   `:reauthorization_required` before changing any currently enabled alternate.
 - Lifecycle paths use explicit lock orders for their state boundary: callback
-  persistence serializes on the active mailbox before authorization/method rows;
+  persistence for generation-fenced Gmail callbacks acquires the provider
+  advisory lock, revalidates the provider-setting UUID and lock version, then
+  serializes on the active mailbox before authorization/method rows;
   token checkout validates and locks the active mailbox before locking the
   authorization; reconnect/disconnect operations lock only the authorization and
   dependent methods and do not acquire the mailbox lock afterward.
+- Gmail OAuth starts resolve client credentials from the encrypted provider
+  setting and snapshot its UUID and lock version into the one-time transaction.
+  Consume rejects and invalidates changed, removed, recreated, or corrupt
+  generations. Completion exchanges outside any database transaction, then
+  repeats generation validation under the provider lock before writing account,
+  authorization, method, event, cursor, or job state. Legacy and Microsoft
+  transactions retain nil generation fields.
 - Direct Gmail receive deletion cancels pending sync work and disconnects and
   clears the authorization only when no live receive or send method remains.
 - When Google omits `scope` from an authorization-code response, the adapter uses

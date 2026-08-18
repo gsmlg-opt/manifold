@@ -159,6 +159,12 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
       messages: []
     })
 
+    assert {:ok, gmail_setting} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               "client_id" => "gmail-client-secret-id",
+               "client_secret" => "gmail-client-secret"
+             })
+
     on_exit(fn ->
       restore_env(:encryption_key, old_key)
       restore_env(:adapters, old_adapters)
@@ -176,7 +182,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
         address: "person@gmail.example"
       })
 
-    {:ok, account: account}
+    {:ok, account: account, gmail_setting: gmail_setting}
   end
 
   test "settings accounts lists local accounts", %{conn: conn, account: account} do
@@ -215,6 +221,40 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert method.account_id == account.id
     assert method.kind == "gmail"
     assert method.enabled
+  end
+
+  test "Gmail generation changes return only the generic invalid authorization response", %{
+    conn: conn,
+    account: account,
+    gmail_setting: gmail_setting
+  } do
+    start_conn =
+      get(conn, "/connectors/gmail/start", %{
+        "account_id" => account.id,
+        "purpose" => "receive"
+      })
+
+    state = start_conn |> redirected_to(302) |> oauth_state()
+
+    assert {:ok, _rotated} =
+             Connectors.put_oauth_provider_setting(
+               "gmail",
+               %{"client_id" => "rotated-client", "client_secret" => "rotated-secret"},
+               expected_lock_version: gmail_setting.lock_version
+             )
+
+    callback_conn =
+      conn
+      |> recycle()
+      |> get("/connectors/gmail/callback", %{"code" => "valid-code", "state" => state})
+
+    assert redirected_to(callback_conn, 302) == "/settings/accounts"
+
+    assert Phoenix.Flash.get(callback_conn.assigns.flash, :error) ==
+             "The Gmail authorization request is invalid or expired."
+
+    refute inspect(callback_conn.assigns.flash) =~ "configuration"
+    refute inspect(callback_conn.assigns.flash) =~ "rotated"
   end
 
   test "receive and send pickers preserve their OAuth purpose", %{conn: conn, account: account} do

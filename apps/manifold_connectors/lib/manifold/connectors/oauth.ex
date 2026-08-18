@@ -7,6 +7,7 @@ defmodule Manifold.Connectors.OAuth do
 
   alias Manifold.Connectors.Crypto
   alias Manifold.Connectors.OAuthScopes
+  alias Manifold.Connectors.ProviderConfig
   alias Manifold.Connectors.Schema.{OAuthAuthorization, OAuthTransaction}
   alias Manifold.Core.Error
   alias Manifold.Repo
@@ -34,7 +35,13 @@ defmodule Manifold.Connectors.OAuth do
   defmodule Consumed do
     @moduledoc false
     @enforce_keys [:provider, :mailbox_id, :redirect_uri, :pkce_verifier]
-    defstruct @enforce_keys ++ [purpose: :receive, required_scopes: []]
+    defstruct @enforce_keys ++
+                [
+                  purpose: :receive,
+                  required_scopes: [],
+                  oauth_provider_setting_id: nil,
+                  oauth_provider_setting_lock_version: nil
+                ]
 
     @type t :: %__MODULE__{
             provider: String.t(),
@@ -42,7 +49,9 @@ defmodule Manifold.Connectors.OAuth do
             purpose: :receive | :send,
             required_scopes: [String.t()],
             redirect_uri: String.t(),
-            pkce_verifier: String.t()
+            pkce_verifier: String.t(),
+            oauth_provider_setting_id: Ecto.UUID.t() | nil,
+            oauth_provider_setting_lock_version: pos_integer() | nil
           }
   end
 
@@ -64,7 +73,7 @@ defmodule Manifold.Connectors.OAuth do
     now = Keyword.get(opts, :now, DateTime.utc_now())
     ttl_seconds = Keyword.get(opts, :ttl_seconds, @default_ttl_seconds)
 
-    with {:ok, config} <- provider_config(provider),
+    with {:ok, %ProviderConfig.Resolved{} = resolved} <- ProviderConfig.fetch(provider),
          {:ok, purpose} <- normalize_purpose(Keyword.get(opts, :purpose, :receive)),
          {:ok, purpose_scopes} <- required_scopes(provider, purpose),
          :ok <- validate_redirect_uri(redirect_uri),
@@ -83,6 +92,8 @@ defmodule Manifold.Connectors.OAuth do
         required_scopes: required_scopes,
         pkce_verifier_ciphertext: encrypted_verifier,
         redirect_uri: redirect_uri,
+        oauth_provider_setting_id: resolved.setting_id,
+        oauth_provider_setting_lock_version: resolved.setting_lock_version,
         expires_at: DateTime.add(now, ttl_seconds, :second)
       }
 
@@ -93,7 +104,7 @@ defmodule Manifold.Connectors.OAuth do
              url:
                authorization_url(
                  provider,
-                 config,
+                 resolved.config,
                  redirect_uri,
                  state,
                  verifier,
@@ -228,7 +239,8 @@ defmodule Manifold.Connectors.OAuth do
         {:error, oauth_error(:oauth_state_expired, "OAuth state expired")}
 
       true ->
-        with {:ok, purpose} <- persisted_purpose(transaction.purpose),
+        with :ok <- validate_transaction_generation(transaction),
+             {:ok, purpose} <- persisted_purpose(transaction.purpose),
              {:ok, consumed_scopes} <- consumed_required_scopes(transaction),
              {:ok, verifier} <-
                Crypto.decrypt(
@@ -246,10 +258,75 @@ defmodule Manifold.Connectors.OAuth do
              purpose: purpose,
              required_scopes: consumed_scopes,
              redirect_uri: transaction.redirect_uri,
-             pkce_verifier: verifier
+             pkce_verifier: verifier,
+             oauth_provider_setting_id: transaction.oauth_provider_setting_id,
+             oauth_provider_setting_lock_version: transaction.oauth_provider_setting_lock_version
            }}
+        else
+          {:error, %Error{reason: :provider_configuration_changed} = error} ->
+            consume_invalidated_transaction(transaction, now, error)
+
+          {:error, %Error{} = error} ->
+            {:error, error}
         end
     end
+  end
+
+  defp validate_transaction_generation(%OAuthTransaction{
+         provider: "gmail",
+         oauth_provider_setting_id: setting_id,
+         oauth_provider_setting_lock_version: setting_lock_version
+       })
+       when is_binary(setting_id) and is_integer(setting_lock_version) do
+    case ProviderConfig.fetch("gmail") do
+      {:ok,
+       %ProviderConfig.Resolved{
+         setting_id: ^setting_id,
+         setting_lock_version: ^setting_lock_version
+       }} ->
+        :ok
+
+      {:ok, %ProviderConfig.Resolved{}} ->
+        provider_configuration_changed()
+
+      {:error, %Error{reason: reason}}
+      when reason in [:provider_not_configured, :provider_configuration_error] ->
+        provider_configuration_changed()
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp validate_transaction_generation(%OAuthTransaction{
+         provider: "gmail",
+         oauth_provider_setting_id: nil,
+         oauth_provider_setting_lock_version: nil
+       }) do
+    case ProviderConfig.fetch("gmail") do
+      {:ok, %ProviderConfig.Resolved{}} ->
+        :ok
+
+      {:error, %Error{reason: reason}}
+      when reason in [:provider_not_configured, :provider_configuration_error] ->
+        provider_configuration_changed()
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp validate_transaction_generation(%OAuthTransaction{provider: "gmail"}),
+    do: provider_configuration_changed()
+
+  defp validate_transaction_generation(%OAuthTransaction{}), do: :ok
+
+  defp consume_invalidated_transaction(transaction, now, error) do
+    transaction
+    |> Ecto.Changeset.change(consumed_at: now)
+    |> Repo.update!()
+
+    {:error, error}
   end
 
   defp authorization_url(provider, config, redirect_uri, state, verifier, required_scopes) do
@@ -337,37 +414,6 @@ defmodule Manifold.Connectors.OAuth do
 
   defp normalize_scopes(scopes), do: scopes |> Enum.uniq() |> Enum.sort()
 
-  defp provider_config(provider) when provider in @providers do
-    providers = Application.get_env(:manifold_connectors, :providers, [])
-
-    case Keyword.get(providers, String.to_existing_atom(provider)) do
-      config when is_list(config) ->
-        if Keyword.has_key?(config, :client_id) and
-             Keyword.has_key?(config, :authorization_url) do
-          {:ok, config}
-        else
-          provider_not_configured(provider)
-        end
-
-      _missing ->
-        provider_not_configured(provider)
-    end
-  end
-
-  defp provider_config(_provider) do
-    {:error, oauth_error(:unsupported_provider, "OAuth provider is not supported")}
-  end
-
-  defp provider_not_configured(provider) do
-    {:error,
-     Error.new(
-       :permanent,
-       :provider_not_configured,
-       "OAuth provider is not configured",
-       %{provider: provider}
-     )}
-  end
-
   defp validate_redirect_uri(uri) do
     parsed = URI.parse(uri)
 
@@ -412,6 +458,15 @@ defmodule Manifold.Connectors.OAuth do
   defp verifier_context(provider, mailbox_id), do: "oauth:" <> provider <> ":" <> mailbox_id
 
   defp oauth_error(reason, message), do: Error.new(:permanent, reason, message)
+
+  defp provider_configuration_changed do
+    {:error,
+     Error.new(
+       :permanent,
+       :provider_configuration_changed,
+       "OAuth provider configuration changed"
+     )}
+  end
 
   defp database_error(reason) do
     Error.new(:temporary, :database_unavailable, "OAuth database operation failed", %{

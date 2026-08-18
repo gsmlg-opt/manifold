@@ -5,6 +5,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
   alias Manifold.Connectors
   alias Manifold.Connectors.{Crypto, GmailScopes}
   alias Manifold.Connectors.Jobs.SyncAccount
+  alias Manifold.Connectors.OAuth
   alias Manifold.Connectors.OAuth.Consumed
   alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
   alias Manifold.Connectors.Provider.Error, as: ProviderError
@@ -15,6 +16,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     ConnectorEvent,
     Credential,
     OAuthAuthorization,
+    OAuthProviderSetting,
     ReceiveMethod,
     SendMethod,
     SyncCursor
@@ -29,6 +31,15 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     def exchange_code(_code, _verifier, _redirect_uri, _config, opts) do
       if test_pid = Keyword.get(opts, :test_pid) do
         send(test_pid, {:exchange_required_scopes, Keyword.get(opts, :required_scopes)})
+      end
+
+      if gate = Keyword.get(opts, :exchange_gate) do
+        test_pid = Keyword.fetch!(opts, :test_pid)
+        send(test_pid, {:oauth_code_exchanged, self(), gate})
+
+        receive do
+          {:release_oauth_exchange, ^gate} -> :ok
+        end
       end
 
       case Keyword.get(opts, :raise) do
@@ -93,6 +104,14 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
       ]
     )
 
+    assert {:ok, _setting_view} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               "client_id" => "db-client",
+               "client_secret" => "db-secret"
+             })
+
+    gmail_setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+
     on_exit(fn ->
       restore_env(:encryption_key, old_key)
       restore_env(:adapters, old_adapters)
@@ -104,7 +123,72 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     {:ok, account} = Accounts.create_account(domain, %{local_part: "person"})
     account = Repo.preload(account, :domain)
 
-    {:ok, account: account, address: Accounts.account_address(account)}
+    {:ok,
+     account: account, address: Accounts.account_address(account), gmail_setting: gmail_setting}
+  end
+
+  test "unchanged Gmail setting generation completes through the public context", %{
+    account: account,
+    address: address,
+    gmail_setting: gmail_setting
+  } do
+    consumed = start_and_consume_gmail!(account.id)
+
+    assert consumed.oauth_provider_setting_id == gmail_setting.id
+    assert consumed.oauth_provider_setting_lock_version == gmail_setting.lock_version
+
+    assert {:ok, %ReceiveMethod{status: "connected"}} =
+             Connectors.complete_authorization("gmail", "authorization-code", consumed,
+               now: ~U[2026-08-11 01:00:00.000000Z],
+               provider_opts: completion_provider_opts(address)
+             )
+  end
+
+  test "legacy Gmail completion fences the resolved generation across code exchange", %{
+    account: account,
+    address: address,
+    gmail_setting: gmail_setting
+  } do
+    consumed =
+      account.id
+      |> start_and_consume_gmail!()
+      |> Map.put(:oauth_provider_setting_id, nil)
+      |> Map.put(:oauth_provider_setting_lock_version, nil)
+
+    test_pid = self()
+    gate = make_ref()
+
+    completion =
+      Task.async(fn ->
+        Connectors.complete_authorization("gmail", "authorization-code", consumed,
+          now: ~U[2026-08-11 01:00:00.000000Z],
+          provider_opts:
+            completion_provider_opts(address,
+              test_pid: test_pid,
+              exchange_gate: gate
+            )
+        )
+      end)
+
+    assert_receive {:oauth_code_exchanged, completion_pid, ^gate}, 5_000
+
+    assert {:ok, _rotated} =
+             Connectors.put_oauth_provider_setting(
+               "gmail",
+               %{"client_id" => "rotated-client", "client_secret" => "rotated-secret"},
+               expected_lock_version: gmail_setting.lock_version
+             )
+
+    send(completion_pid, {:release_oauth_exchange, gate})
+
+    assert {:error, %CoreError{class: :permanent, reason: :provider_configuration_changed}} =
+             Task.await(completion, 5_000)
+
+    assert Repo.aggregate(OAuthAuthorization, :count) == 0
+    assert Repo.aggregate(ReceiveMethod, :count) == 0
+    assert Repo.aggregate(SendMethod, :count) == 0
+    assert Repo.aggregate(ConnectorEvent, :count) == 0
+    assert Repo.aggregate(Oban.Job, :count) == 0
   end
 
   test "receive grant creates shared authorization and linked receive state", %{
@@ -1523,6 +1607,30 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     )
   end
 
+  defp start_and_consume_gmail!(account_id) do
+    redirect_uri = "https://mail.example.test/connectors/gmail/callback"
+    assert {:ok, authorization} = OAuth.start("gmail", account_id, redirect_uri)
+    assert {:ok, consumed} = OAuth.consume("gmail", authorization.state, redirect_uri)
+    consumed
+  end
+
+  defp completion_provider_opts(address, extra \\ []) do
+    token = %Token{
+      access_token: "access-secret",
+      refresh_token: "refresh-secret",
+      expires_at: ~U[2026-08-11 02:00:00.000000Z],
+      scopes: ["openid", "email", GmailScopes.read()]
+    }
+
+    Keyword.merge(
+      [
+        token: {:ok, token},
+        identity: {:ok, %Identity{id: "google-subject-1", email_address: address}}
+      ],
+      extra
+    )
+  end
+
   defp insert_other_receive!(account_id, address) do
     %ReceiveMethod{}
     |> ReceiveMethod.changeset(%{
@@ -1680,6 +1788,231 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
       String.contains?(query, ~s(FROM "connector_accounts")) and
         String.contains?(query, "FOR UPDATE")
     end)
+  end
+
+  defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)
+  defp restore_env(key, value), do: Application.put_env(:manifold_connectors, key, value)
+end
+
+defmodule Manifold.Connectors.GmailAuthorizationGenerationConcurrencyTest do
+  use ExUnit.Case, async: false
+
+  import Ecto.Query
+
+  alias Ecto.Adapters.SQL.Sandbox
+  alias Manifold.Accounts
+  alias Manifold.Accounts.Schema.{Account, Domain}
+  alias Manifold.Connectors
+  alias Manifold.Connectors.GmailAuthorizationsTest.FakeGmail
+  alias Manifold.Connectors.GmailScopes
+  alias Manifold.Connectors.OAuth
+  alias Manifold.Connectors.Provider.{Identity, Token}
+
+  alias Manifold.Connectors.Schema.{
+    OAuthAuthorization,
+    OAuthProviderSetting,
+    OAuthTransaction,
+    ReceiveMethod,
+    SendMethod,
+    SyncCursor
+  }
+
+  alias Manifold.Repo
+
+  setup do
+    :ok = Sandbox.checkout(Repo, sandbox: false)
+    old_key = Application.get_env(:manifold_connectors, :encryption_key)
+    old_adapters = Application.get_env(:manifold_connectors, :adapters)
+    old_providers = Application.get_env(:manifold_connectors, :providers)
+
+    Application.put_env(
+      :manifold_connectors,
+      :encryption_key,
+      Base.encode64(:crypto.strong_rand_bytes(32))
+    )
+
+    Application.put_env(:manifold_connectors, :adapters, gmail: FakeGmail)
+
+    Application.put_env(:manifold_connectors, :providers,
+      gmail: [authorization_url: "https://accounts.google.test/authorize"]
+    )
+
+    Repo.delete_all(from(setting in OAuthProviderSetting, where: setting.provider == "gmail"))
+
+    suffix = System.unique_integer([:positive])
+    {:ok, domain} = Accounts.create_domain(%{name: "gmail-fence-#{suffix}.test"})
+    {:ok, account} = Accounts.create_account(domain, %{local_part: "person"})
+    account = Repo.preload(account, :domain)
+
+    assert {:ok, setting_view} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               "client_id" => "db-client",
+               "client_secret" => "db-secret"
+             })
+
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+
+    on_exit(fn ->
+      :ok = Sandbox.checkout(Repo, sandbox: false)
+
+      try do
+        cleanup_fixture(account.id, domain.id)
+      after
+        restore_env(:encryption_key, old_key)
+        restore_env(:adapters, old_adapters)
+        restore_env(:providers, old_providers)
+        Sandbox.checkin(Repo)
+      end
+    end)
+
+    {:ok, account: account, setting: setting, setting_view: setting_view}
+  end
+
+  test "completion owns the provider lock before account locks and rotation reconnects its result",
+       %{
+         account: account,
+         setting: setting,
+         setting_view: setting_view
+       } do
+    redirect_uri = "https://mail.example.test/connectors/gmail/callback"
+    assert {:ok, authorization} = OAuth.start("gmail", account.id, redirect_uri)
+    assert {:ok, consumed} = OAuth.consume("gmail", authorization.state, redirect_uri)
+
+    test_pid = self()
+    gate = make_ref()
+
+    account_holder =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            assert {:ok, _account} = Accounts.active_account_for_update(Repo, account.id)
+            send(test_pid, {:account_locked, self(), gate})
+
+            receive do
+              {:release_account, ^gate} -> :ok
+            end
+          end)
+        end)
+      end)
+
+    assert_receive {:account_locked, account_holder_pid, ^gate}, 5_000
+
+    completion =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          token = %Token{
+            access_token: "access-secret",
+            refresh_token: "refresh-secret",
+            expires_at: ~U[2026-08-11 02:00:00.000000Z],
+            scopes: ["openid", "email", GmailScopes.read()]
+          }
+
+          identity = %Identity{
+            id: "google-concurrent-subject",
+            email_address: Accounts.account_address(account)
+          }
+
+          Connectors.complete_authorization("gmail", "authorization-code", consumed,
+            now: ~U[2026-08-11 01:00:00.000000Z],
+            provider_opts: [token: {:ok, token}, identity: {:ok, identity}]
+          )
+        end)
+      end)
+
+    assert_provider_lock_state(1, 0)
+
+    rotation =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          send(test_pid, {:rotation_attempting, self(), gate})
+
+          Connectors.put_oauth_provider_setting(
+            "gmail",
+            %{"client_id" => "rotated-client", "client_secret" => "rotated-secret"},
+            expected_lock_version: setting_view.lock_version
+          )
+        end)
+      end)
+
+    assert_receive {:rotation_attempting, _rotation_pid, ^gate}, 5_000
+    assert_provider_lock_state(1, 1)
+
+    send(account_holder_pid, {:release_account, gate})
+    assert {:ok, :ok} = Task.await(account_holder, 5_000)
+    assert {:ok, %ReceiveMethod{} = completed_method} = Task.await(completion, 5_000)
+    assert {:ok, rotated_view} = Task.await(rotation, 5_000)
+    assert rotated_view.lock_version == setting.lock_version + 1
+
+    authorization = Repo.get!(OAuthAuthorization, completed_method.oauth_authorization_id)
+    receive = Repo.get!(ReceiveMethod, completed_method.id)
+
+    assert authorization.status == "reconnect_required"
+    assert authorization.last_error_code == "oauth_provider_configuration_changed"
+    assert receive.status == "reconnect_required"
+    refute receive.enabled
+    refute receive.sync_enabled
+  end
+
+  defp assert_provider_lock_state(granted, waiting, attempts \\ 500)
+
+  defp assert_provider_lock_state(_granted, _waiting, 0) do
+    flunk("provider advisory lock did not reach the expected state")
+  end
+
+  defp assert_provider_lock_state(granted, waiting, attempts) do
+    case provider_lock_state() do
+      {^granted, ^waiting} -> :ok
+      _state -> assert_provider_lock_state(granted, waiting, attempts - 1)
+    end
+  end
+
+  defp provider_lock_state do
+    %{rows: [[granted, waiting]]} =
+      Repo.query!(
+        """
+        WITH key AS (
+          SELECT hashtextextended($1::text, 0) AS value
+        )
+        SELECT
+          COUNT(*) FILTER (WHERE locks.granted),
+          COUNT(*) FILTER (WHERE NOT locks.granted)
+        FROM pg_locks AS locks
+        CROSS JOIN key
+        WHERE locks.locktype = 'advisory'
+          AND locks.classid::bigint = ((key.value >> 32) & 4294967295)
+          AND locks.objid::bigint = (key.value & 4294967295)
+        """,
+        ["oauth_provider_setting:gmail"]
+      )
+
+    {granted, waiting}
+  end
+
+  defp cleanup_fixture(account_id, domain_id) do
+    receive_ids =
+      ReceiveMethod
+      |> where([method], method.account_id == ^account_id)
+      |> select([method], method.id)
+      |> Repo.all()
+
+    Repo.delete_all(
+      from(job in Oban.Job,
+        where: fragment("?->>'external_account_id' = ANY(?)", job.args, ^receive_ids)
+      )
+    )
+
+    Repo.delete_all(from(cursor in SyncCursor, where: cursor.external_account_id in ^receive_ids))
+    Repo.delete_all(from(method in ReceiveMethod, where: method.account_id == ^account_id))
+    Repo.delete_all(from(method in SendMethod, where: method.account_id == ^account_id))
+    Repo.delete_all(from(auth in OAuthAuthorization, where: auth.account_id == ^account_id))
+
+    Repo.delete_all(
+      from(transaction in OAuthTransaction, where: transaction.mailbox_id == ^account_id)
+    )
+
+    Repo.delete_all(from(account in Account, where: account.id == ^account_id))
+    Repo.delete_all(from(domain in Domain, where: domain.id == ^domain_id))
+    Repo.delete_all(from(setting in OAuthProviderSetting, where: setting.provider == "gmail"))
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)

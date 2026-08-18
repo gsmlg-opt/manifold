@@ -4,11 +4,12 @@ defmodule Manifold.Connectors.OAuthTest do
   @microsoft_redirect "https://mail.example.test/connectors/microsoft/callback"
 
   alias Manifold.Accounts
+  alias Manifold.Connectors
   alias Manifold.Connectors.Crypto
   alias Manifold.Connectors.GmailScopes
   alias Manifold.Connectors.OAuth
 
-  alias Manifold.Connectors.Schema.{OAuthAuthorization, OAuthTransaction}
+  alias Manifold.Connectors.Schema.{OAuthAuthorization, OAuthProviderSetting, OAuthTransaction}
 
   alias Manifold.Repo
 
@@ -35,6 +36,14 @@ defmodule Manifold.Connectors.OAuthTest do
       ]
     )
 
+    assert {:ok, _setting_view} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               "client_id" => "gmail-db-client",
+               "client_secret" => "gmail-db-secret"
+             })
+
+    gmail_setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+
     on_exit(fn ->
       restore_env(:encryption_key, old_key)
       restore_env(:providers, old_providers)
@@ -43,10 +52,13 @@ defmodule Manifold.Connectors.OAuthTest do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "oauth#{suffix}.test"})
     {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "person"})
-    {:ok, mailbox: mailbox}
+    {:ok, mailbox: mailbox, gmail_setting: gmail_setting}
   end
 
-  test "starts a persisted PKCE authorization without storing plain state", %{mailbox: mailbox} do
+  test "starts Gmail OAuth with the database client and snapshots its exact generation", %{
+    mailbox: mailbox,
+    gmail_setting: gmail_setting
+  } do
     redirect_uri = "https://mail.example.test/connectors/gmail/callback"
     now = ~U[2026-07-29 01:00:00.000000Z]
 
@@ -58,6 +70,8 @@ defmodule Manifold.Connectors.OAuthTest do
     assert authorization.url =~ "access_type=offline"
     assert authorization.url =~ "prompt=consent"
     assert authorization.url =~ URI.encode_www_form(authorization.state)
+    assert URI.decode_query(URI.parse(authorization.url).query)["client_id"] == "gmail-db-client"
+    refute authorization.url =~ "gmail-client"
 
     transaction = Repo.one!(OAuthTransaction)
     refute transaction.state_digest == authorization.state
@@ -65,6 +79,8 @@ defmodule Manifold.Connectors.OAuthTest do
     assert transaction.redirect_uri == redirect_uri
     assert transaction.purpose == "receive"
     assert transaction.required_scopes == [GmailScopes.read()]
+    assert transaction.oauth_provider_setting_id == gmail_setting.id
+    assert transaction.oauth_provider_setting_lock_version == gmail_setting.lock_version
     assert DateTime.compare(transaction.expires_at, now) == :gt
   end
 
@@ -78,6 +94,8 @@ defmodule Manifold.Connectors.OAuthTest do
 
     assert consumed.purpose == :receive
     assert consumed.required_scopes == []
+    assert is_nil(consumed.oauth_provider_setting_id)
+    assert is_nil(consumed.oauth_provider_setting_lock_version)
   end
 
   test "starts and consumes a Gmail send authorization with only the send provider scope", %{
@@ -105,6 +123,10 @@ defmodule Manifold.Connectors.OAuthTest do
 
     assert consumed.purpose == :send
     assert consumed.required_scopes == [GmailScopes.send()]
+    assert consumed.oauth_provider_setting_id == transaction.oauth_provider_setting_id
+
+    assert consumed.oauth_provider_setting_lock_version ==
+             transaction.oauth_provider_setting_lock_version
   end
 
   test "OAuth start telemetry reports sanitized success and failure outcomes", %{
@@ -241,6 +263,12 @@ defmodule Manifold.Connectors.OAuthTest do
     assert MapSet.new(authorization_scopes(receive.url)) ==
              MapSet.new(~w(openid profile offline_access User.Read Mail.Read))
 
+    assert {:ok, consumed_receive} =
+             OAuth.consume("microsoft", receive.state, @microsoft_redirect)
+
+    assert is_nil(consumed_receive.oauth_provider_setting_id)
+    assert is_nil(consumed_receive.oauth_provider_setting_lock_version)
+
     assert {:ok, send} =
              OAuth.start("microsoft", mailbox.id, @microsoft_redirect, purpose: :send)
 
@@ -248,6 +276,103 @@ defmodule Manifold.Connectors.OAuthTest do
              MapSet.new(~w(openid profile offline_access User.Read Mail.Send))
 
     refute String.contains?(send.url, "Mail.ReadWrite")
+
+    assert Repo.all(OAuthTransaction)
+           |> Enum.all?(fn transaction ->
+             is_nil(transaction.oauth_provider_setting_id) and
+               is_nil(transaction.oauth_provider_setting_lock_version)
+           end)
+  end
+
+  test "rotation after Gmail start invalidates the state exactly once", %{
+    mailbox: mailbox,
+    gmail_setting: gmail_setting
+  } do
+    redirect_uri = "https://mail.example.test/connectors/gmail/callback"
+
+    assert {:ok, authorization} = OAuth.start("gmail", mailbox.id, redirect_uri)
+
+    assert {:ok, _rotated} =
+             Connectors.put_oauth_provider_setting(
+               "gmail",
+               %{"client_id" => "rotated-client", "client_secret" => "rotated-secret"},
+               expected_lock_version: gmail_setting.lock_version
+             )
+
+    assert {:error,
+            %{
+              class: :permanent,
+              reason: :provider_configuration_changed,
+              message: "OAuth provider configuration changed",
+              details: %{}
+            }} = OAuth.consume("gmail", authorization.state, redirect_uri)
+
+    assert {:error, %{reason: :oauth_state_replayed}} =
+             OAuth.consume("gmail", authorization.state, redirect_uri)
+  end
+
+  test "remove and recreate with the same version invalidates the old Gmail state", %{
+    mailbox: mailbox,
+    gmail_setting: gmail_setting
+  } do
+    redirect_uri = "https://mail.example.test/connectors/gmail/callback"
+    assert {:ok, authorization} = OAuth.start("gmail", mailbox.id, redirect_uri)
+
+    assert {:ok, %{status: :not_configured}} =
+             Connectors.remove_oauth_provider_setting("gmail",
+               expected_lock_version: gmail_setting.lock_version
+             )
+
+    assert {:ok, recreated} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               "client_id" => "gmail-db-client",
+               "client_secret" => "gmail-db-secret"
+             })
+
+    recreated_row = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+    assert recreated.lock_version == gmail_setting.lock_version
+    refute recreated_row.id == gmail_setting.id
+
+    assert {:error, %{class: :permanent, reason: :provider_configuration_changed}} =
+             OAuth.consume("gmail", authorization.state, redirect_uri)
+  end
+
+  test "missing or corrupt Gmail configuration invalidates state without leaking details", %{
+    mailbox: mailbox,
+    gmail_setting: gmail_setting
+  } do
+    redirect_uri = "https://mail.example.test/connectors/gmail/callback"
+    assert {:ok, missing_state} = OAuth.start("gmail", mailbox.id, redirect_uri)
+
+    assert {:ok, %{status: :not_configured}} =
+             Connectors.remove_oauth_provider_setting("gmail",
+               expected_lock_version: gmail_setting.lock_version
+             )
+
+    assert {:error, %{reason: :provider_configuration_changed} = missing_error} =
+             OAuth.consume("gmail", missing_state.state, redirect_uri)
+
+    refute inspect(missing_error) =~ "missing"
+    refute inspect(missing_error) =~ "credential"
+
+    assert {:ok, _recreated} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               "client_id" => "gmail-db-client",
+               "client_secret" => "gmail-db-secret"
+             })
+
+    recreated_row = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+    assert {:ok, corrupt_state} = OAuth.start("gmail", mailbox.id, redirect_uri)
+
+    OAuthProviderSetting
+    |> where([setting], setting.id == ^recreated_row.id)
+    |> Repo.update_all(set: [client_secret_ciphertext: <<1, 2, 3>>])
+
+    assert {:error, %{reason: :provider_configuration_changed} = corrupt_error} =
+             OAuth.consume("gmail", corrupt_state.state, redirect_uri)
+
+    refute inspect(corrupt_error) =~ "ciphertext"
+    refute inspect(corrupt_error) =~ "credential"
   end
 
   test "Microsoft incremental consent unions the existing grant in both directions", %{
@@ -313,6 +438,26 @@ defmodule Manifold.Connectors.OAuthTest do
     assert consumed.purpose == :receive
     assert consumed.required_scopes == [GmailScopes.read()]
     assert consumed.pkce_verifier == verifier
+  end
+
+  test "legacy Gmail state still invalidates when current configuration is missing", %{
+    mailbox: mailbox,
+    gmail_setting: gmail_setting
+  } do
+    redirect_uri = "https://mail.example.test/connectors/gmail/callback"
+    now = ~U[2026-08-11 01:00:00.000000Z]
+    {state, _verifier} = insert_legacy_transaction!("gmail", mailbox.id, redirect_uri, now)
+
+    assert {:ok, %{status: :not_configured}} =
+             Connectors.remove_oauth_provider_setting("gmail",
+               expected_lock_version: gmail_setting.lock_version
+             )
+
+    assert {:error, %{class: :permanent, reason: :provider_configuration_changed}} =
+             OAuth.consume("gmail", state, redirect_uri, now: DateTime.add(now, 60, :second))
+
+    assert {:error, %{reason: :oauth_state_replayed}} =
+             OAuth.consume("gmail", state, redirect_uri, now: DateTime.add(now, 61, :second))
   end
 
   test "consumes a legacy Microsoft receive transaction with canonical scopes", %{

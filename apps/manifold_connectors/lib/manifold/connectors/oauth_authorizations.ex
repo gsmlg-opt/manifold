@@ -6,7 +6,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
 
   alias Manifold.Accounts
   alias Manifold.Accounts.Schema.Account
-  alias Manifold.Connectors.{Crypto, MicrosoftFolderMapping}
+  alias Manifold.Connectors.{Crypto, MicrosoftFolderMapping, ProviderSettings}
   alias Manifold.Connectors.Jobs.SyncAccount
   alias Manifold.Connectors.MicrosoftScopes
   alias Manifold.Connectors.OAuth.Consumed
@@ -53,6 +53,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     provider_identity_already_bound
     provider_identity_mismatch
     provider_not_configured
+    provider_configuration_changed
     provider_unavailable
     reauthorization_required
     stale_oauth_authorization
@@ -74,6 +75,8 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
       opts
       |> Keyword.get(:provider_opts, [])
       |> Keyword.put(:required_scopes, consumed.required_scopes)
+
+    expected_provider_generation = expected_provider_generation(consumed, opts)
 
     case capture_complete(fn ->
            with {:ok, purpose} <- normalize_purpose(consumed.purpose),
@@ -99,7 +102,17 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
                     provider_opts
                   ),
                 :ok <- validate_cursors(purpose, cursors) do
-             persist(provider, consumed, purpose, token, identity, provider_address, cursors, now)
+             persist(
+               provider,
+               consumed,
+               purpose,
+               token,
+               identity,
+               provider_address,
+               cursors,
+               now,
+               expected_provider_generation
+             )
            else
              {:error, %ProviderError{} = error} -> {:error, provider_error(error)}
              {:error, %CoreError{} = error} -> {:error, error}
@@ -1134,9 +1147,20 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     secure_digest_match?(left_rest, right_rest, bor(difference, bxor(left, right)))
   end
 
-  defp persist(provider, consumed, purpose, token, identity, provider_address, cursors, now) do
+  defp persist(
+         provider,
+         consumed,
+         purpose,
+         token,
+         identity,
+         provider_address,
+         cursors,
+         now,
+         expected_provider_generation
+       ) do
     Repo.transaction(fn ->
-      with {:ok, account, account_address} <- lock_account(consumed.mailbox_id),
+      with :ok <- lock_and_validate_provider_generation(provider, expected_provider_generation),
+           {:ok, account, account_address} <- lock_account(consumed.mailbox_id),
            :ok <- require_matching_address(account_address, provider_address),
            {account_authorization, subject_authorization} <-
              lock_authorizations(provider, account.id, identity.id),
@@ -1203,6 +1227,53 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
       {:ok, {method, event_type}} -> {:ok, method, event_type}
       {:error, reason} -> {:error, normalize_constraint_error(reason)}
     end
+  end
+
+  defp lock_and_validate_provider_generation(
+         "gmail",
+         {setting_id, setting_lock_version}
+       )
+       when is_binary(setting_id) and is_integer(setting_lock_version) do
+    with :ok <- ProviderSettings.lock_provider_for_transaction("gmail") do
+      ProviderSettings.validate_generation_for_transaction(
+        "gmail",
+        setting_id,
+        setting_lock_version
+      )
+    end
+  end
+
+  defp lock_and_validate_provider_generation(
+         "gmail",
+         {nil, nil}
+       ),
+       do: :ok
+
+  defp lock_and_validate_provider_generation("gmail", {_setting_id, _setting_lock_version}) do
+    {:error,
+     CoreError.new(
+       :permanent,
+       :provider_configuration_changed,
+       "OAuth provider configuration changed"
+     )}
+  end
+
+  defp lock_and_validate_provider_generation(_provider, {_setting_id, _setting_lock_version}),
+    do: :ok
+
+  defp expected_provider_generation(%Consumed{} = consumed, opts) do
+    {
+      Keyword.get(
+        opts,
+        :expected_oauth_provider_setting_id,
+        consumed.oauth_provider_setting_id
+      ),
+      Keyword.get(
+        opts,
+        :expected_oauth_provider_setting_lock_version,
+        consumed.oauth_provider_setting_lock_version
+      )
+    }
   end
 
   defp lock_account(account_id) do
