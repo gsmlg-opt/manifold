@@ -341,9 +341,13 @@ recreation of the original account).
 
 ## Configuration and operations
 
-Continue using the existing `MANIFOLD_GMAIL_CLIENT_ID` and
-`MANIFOLD_GMAIL_CLIENT_SECRET` configuration and callback route. Operator
-documentation must cover:
+Superseded by the 2026-08-18 OAuth provider settings design: this approved design
+originally used `MANIFOLD_GMAIL_CLIENT_ID` and
+`MANIFOLD_GMAIL_CLIENT_SECRET`, but current code ignores both variables and does
+not import them. Current operators configure Google in Settings → OAuth; the
+remaining callback requirements below still apply.
+
+Operator documentation must cover:
 
 - Enabling Gmail API in Google Cloud.
 - Registering the exact HTTPS callback URI.
@@ -352,9 +356,9 @@ documentation must cover:
 - Verification requirements before public production use.
 - The stable connector encryption key requirement.
 
-The application must never start with only one of the Gmail client ID/secret
-values configured. Missing credentials keep Gmail visible but unavailable in
-both method pickers.
+The former environment-pair startup validation is superseded. Current settings
+require both fields on initial save, and a missing database setting keeps Gmail
+visible but unavailable in both method pickers.
 
 ## Observability
 

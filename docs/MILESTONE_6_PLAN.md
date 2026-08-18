@@ -22,6 +22,8 @@
 - [x] Add `manifold_connectors` to the local release and enable the
       `connectors` Oban queue.
 - [x] Add OAuth controllers and the no-auth `/settings/accounts` LiveView.
+- [x] Move Google client credentials into encrypted, database-backed
+      `/settings/oauth` configuration with provider-specific setup help.
 - [x] Add periodic polling and missing-job reconciliation.
 - [x] Normalize provider raw-fetch disappearance into a deletion reconciliation
       path.
@@ -93,9 +95,11 @@ spool, ingest, mail, or Oban tables directly.
 - Optimistic lock version and disconnect timestamp.
 
 `Credential` separately stores versioned AES-256-GCM encrypted access and
-refresh tokens plus token expiry. `OAuthTransaction` stores a hashed one-time
-state, provider, mailbox ID, encrypted PKCE verifier, exact redirect URI,
-expiry, and consumed timestamp.
+refresh tokens plus token expiry. `OAuthProviderSetting` stores the code-defined
+provider key, plaintext client ID, encrypted client secret, key version, and lock
+version. `OAuthTransaction` stores a hashed one-time state, provider, mailbox ID,
+encrypted PKCE verifier, exact redirect URI, expiry, consumed timestamp, and the
+provider-setting UUID/version snapshot used to start Gmail authorization.
 
 `SyncCursor` stores one serialized synchronization lane per provider scope:
 
@@ -146,8 +150,6 @@ The production local release maps these environment variables into
 
 ```text
 MANIFOLD_CONNECTOR_ENCRYPTION_KEY
-MANIFOLD_GMAIL_CLIENT_ID
-MANIFOLD_GMAIL_CLIENT_SECRET
 MANIFOLD_GMAIL_AUTHORIZATION_URL
 MANIFOLD_GMAIL_TOKEN_URL
 MANIFOLD_GMAIL_USERINFO_URL
@@ -173,10 +175,50 @@ registered with provider consoles automatically. Microsoft defaults to the
 Endpoint overrides must be absolute HTTPS URLs without credentials or
 fragments.
 
+Google client credentials are configured at `/settings/oauth`, with instructions
+and the deployed exact callback at `/settings/oauth/gmail/help`. The client ID is
+stored plaintext and the secret is encrypted with
+`oauth_provider_setting:<setting-id>:client_secret` associated data. A blank
+secret preserves the stored secret only when the client ID is unchanged; changing
+the client ID requires a new secret. The legacy `MANIFOLD_GMAIL_CLIENT_ID` and
+`MANIFOLD_GMAIL_CLIENT_SECRET` variables are ignored and are not imported or used
+as fallback. Endpoint overrides remain static operator configuration. Microsoft
+environment behavior is unchanged.
+
 Development has a non-production encryption key but no default OAuth client
-credentials. The development and production runtimes use the same provider
-client environment variables; production additionally requires a stable
-connector encryption key.
+credentials. Production requires a stable `MANIFOLD_CONNECTOR_ENCRYPTION_KEY` as
+the out-of-database master key. Missing Gmail settings fail closed as
+`provider_not_configured`; corrupt settings use `provider_configuration_error`.
+Browser output, logs, telemetry, and activity events never include secrets or
+ciphertext. The Settings routes retain the trusted-local-instance boundary and
+do not add administrator authentication.
+
+The database-backed provider catalog is code-defined rather than user-extensible.
+`Manifold.Connectors.OAuthProviderCatalog` and
+`Manifold.Connectors.OAuthProvider.<Provider>` own the stable key, name, icon,
+callback, capabilities, scopes, endpoints, and help content. Users cannot enter
+arbitrary endpoints or scopes. A future provider reuses the generic table without
+a schema migration but must implement and test its own OAuth, refresh, receive,
+send, and lifecycle integration.
+
+### Provider-settings cutover
+
+`20260818000100_add_oauth_provider_settings.exs` is non-rolling. Drain old
+Phoenix, connector, and Oban processes before migration. There is no environment
+backfill, Gmail remains unavailable until Settings → OAuth is saved, and existing
+Gmail grants require reconnect. Saving, rotating, or removing settings takes
+effect without restart and never auto-resumes disabled methods; removal does not
+revoke Google access.
+
+OAuth start snapshots the setting UUID and lock version. Completion revalidates
+that generation before provider exchange and, under the provider advisory lock,
+again in the final database transaction after external I/O; no database lock is
+held across the network request. Rollback refuses while a provider setting or a
+fenced OAuth transaction exists.
+
+Staging must confirm immediate receive/send picker enablement after save, the help
+page and exact callback, real receive and send, reconnect after client-ID/secret
+rotation, removal behavior, and no automatic method resumption.
 
 ## Synchronization Flow
 

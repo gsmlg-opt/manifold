@@ -232,8 +232,9 @@ Initial official references:
 ## Runtime Configuration Changes
 
 Remove the Gmail client ID and secret loader from `config/runtime.exs`. Remove
-`MANIFOLD_GMAIL_CLIENT_ID` and `MANIFOLD_GMAIL_CLIENT_SECRET` from tests,
-operator documentation, and supported-environment lists.
+`MANIFOLD_GMAIL_CLIENT_ID` and `MANIFOLD_GMAIL_CLIENT_SECRET` from operator
+instructions and supported-environment lists; retain them only in tests that
+prove legacy values are ignored and never imported.
 
 Code-defined Google endpoint defaults remain static application configuration.
 Endpoint override environment variables are outside the browser credential form

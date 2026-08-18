@@ -1004,6 +1004,10 @@ Use event prefixes `[:manifold, :connectors, :oauth, ...]` and existing `[:manif
 
 ADR 0010 must record account-selected routing, shared Gmail authorization, functional SMTP, uncertainty semantics, and legacy Resend compatibility. Mark ADR 0007 as superseded only for outbound provider sending; its receive-sync read-only decision remains active. Update `docs/DESIGN.md` and README with:
 
+> **Superseded configuration note (2026-08-18):** The two legacy variables in
+> this historical task are now ignored and are not imported. Current operators
+> save Google credentials in Settings → OAuth.
+
 ```text
 MANIFOLD_GMAIL_CLIENT_ID
 MANIFOLD_GMAIL_CLIENT_SECRET

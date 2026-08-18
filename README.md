@@ -54,6 +54,8 @@ Microsoft Graph, or SMTP submission:
   transactions and credentials, durable provider-message identity, bounded
   cursor pages, and idempotent raw-message import through the normal spool and
   ingest boundary.
+- Trusted-local OAuth provider settings at `/settings/oauth`, with an encrypted
+  database-backed Gmail client secret and catalog-defined setup help.
 
 ## Out Of Scope
 
@@ -102,6 +104,8 @@ The current implementation includes:
   mailbox projection, and a retryable remote-state application job.
 - A no-auth `/settings/accounts` LiveView with OAuth start/callback routes,
   sync-now, status, and disconnect controls.
+- A trusted-local `/settings/oauth` LiveView for Google client credentials and
+  `/settings/oauth/gmail/help` for the exact callback, scopes, and setup steps.
 - A local-release `connectors` Oban queue and five-minute polling job that
   recreates missing active-account sync work.
 
@@ -131,8 +135,6 @@ The local release and development runtime support:
 
 ```text
 MANIFOLD_CONNECTOR_ENCRYPTION_KEY
-MANIFOLD_GMAIL_CLIENT_ID
-MANIFOLD_GMAIL_CLIENT_SECRET
 MANIFOLD_GMAIL_AUTHORIZATION_URL
 MANIFOLD_GMAIL_TOKEN_URL
 MANIFOLD_GMAIL_USERINFO_URL
@@ -147,13 +149,31 @@ MANIFOLD_MICROSOFT_API_BASE_URL
 
 `MANIFOLD_CONNECTOR_ENCRYPTION_KEY` must be standard Base64 encoding of exactly
 32 random bytes and is required for the production local release even when no
-provider client is configured. Generate one with:
+provider client is configured. It remains the out-of-database master key for
+provider-setting, OAuth-token, and PKCE ciphertext. Generate one with:
 
 ```sh
 openssl rand -base64 32
 ```
 
-The provider application registrations will use these exact callback paths:
+Configure the Google client ID and secret in **Settings → OAuth** at
+`/settings/oauth`; provider-specific instructions are at
+`/settings/oauth/gmail/help`. The client ID is stored as plaintext because it is
+sent in browser authorization requests. The client secret is encrypted in
+PostgreSQL and is never returned to the browser. On an existing configuration,
+leaving the secret field blank preserves it when the client ID is unchanged.
+Changing the client ID requires a new secret. Changing either credential or
+removing the configuration immediately disables affected Gmail receive/send
+methods and requires reconnect. Removal is local only and does not revoke the
+grant at Google.
+
+The legacy `MANIFOLD_GMAIL_CLIENT_ID` and `MANIFOLD_GMAIL_CLIENT_SECRET`
+variables are ignored and are never imported or used as a fallback. Gmail
+endpoint override variables remain static operator/development configuration.
+Microsoft client credentials and endpoint environment behavior are unchanged.
+No application restart is required after a Google credential save or removal.
+
+The provider application registrations use these exact callback paths:
 
 ```text
 https://<your-manifold-host>/connectors/gmail/callback
@@ -189,13 +209,16 @@ Microsoft Graph:
 
 Use `organizations` as the Microsoft tenant default for work/school accounts.
 Authorization, token, and API endpoint overrides must be absolute HTTPS URLs
-without credentials or fragments. A provider is enabled only when its client ID
-and secret are both set; an absent complete pair leaves the provider visible but
-unavailable, while configuring only one makes startup fail.
+without credentials or fragments. Gmail is unavailable until a complete,
+decryptable setting has been saved; a corrupt setting fails closed as a provider
+configuration error. Microsoft remains enabled only when its client ID and secret
+are both set; an absent complete Microsoft pair leaves it unavailable, while a
+partial pair fails startup.
 Development and test configuration use non-production encryption keys;
-development has no provider client credentials and test uses inert endpoints.
-Set the provider client environment variables before
-`devenv processes start` to exercise a real provider in `MIX_ENV=dev`.
+development has no default provider client credentials and test uses inert
+endpoints. Save Google credentials through Settings → OAuth to exercise Gmail in
+`MIX_ENV=dev`; continue to set the Microsoft variables before
+`devenv processes start` when exercising Microsoft.
 The configured Gmail OAuth consent screen must include the receive and send
 scopes used by the application:
 
@@ -215,6 +238,10 @@ without a credential migration makes stored OAuth credentials unreadable. Before
 public use, complete Google's consent-screen publication and verification
 requirements for the requested scopes. Never commit client credentials or use a
 callback for a host other than the deployed Manifold endpoint.
+
+The Settings routes currently inherit Manifold's trusted-local-instance boundary;
+they are not an authenticated administrator surface. Network-exposed deployments
+must add access control before treating browser-managed secrets as safe.
 
 Register the exact Microsoft callback
 `https://<host>/connectors/microsoft/callback`. The tenant default is
@@ -264,6 +291,31 @@ legacy Gmail credentials losslessly and refuses unsafe rollback. Migration
 event to have exactly one legacy receive anchor. Migration
 `20260811000700_enforce_provider_submission_methods.exs` refuses rollback while
 Gmail or SMTP provider submissions exist. Do not bypass these preflights.
+
+### Non-rolling OAuth provider-settings cutover
+
+Migration `20260818000100_add_oauth_provider_settings.exs` is also a non-rolling
+cutover. Drain and stop every old Phoenix instance, connector process, and Oban
+worker before migrating; otherwise old nodes can keep using removed environment
+credentials while new nodes resolve the database row. The migration does not
+backfill from environment. Gmail is unavailable after deployment until Google
+credentials are saved at `/settings/oauth`, and all existing Gmail grants must be
+reconnected to the saved OAuth application.
+
+Before promoting staging, verify all of the following without restarting:
+
+- saving Google credentials immediately enables Gmail in both receive and send
+  method pickers;
+- `/settings/oauth/gmail/help` shows the deployed exact callback URI and required
+  scopes;
+- receive connection and Gmail API send work with an approved staging identity;
+- secret rotation and client-ID change require reconnect, and removal disables
+  Gmail without deleting or revoking the Google grant;
+- previously disabled or reconnect-required methods do not resume automatically.
+
+Rollback of `20260818000100` is refused while any OAuth provider setting exists or
+any OAuth transaction carries a provider-setting UUID/version fence. Remove those
+rows only as an explicit, reviewed rollback operation; never bypass the guard.
 
 ## Development
 
