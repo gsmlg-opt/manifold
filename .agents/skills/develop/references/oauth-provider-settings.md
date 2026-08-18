@@ -47,19 +47,104 @@ The browser never accepts an arbitrary provider, endpoint, callback, or scope.
 Endpoint override environment variables remain static operator/development
 configuration and are allowlisted by the resolver.
 
-To add a provider:
+The catalog currently drives provider-setting validation/listing, the Settings
+cards and help pages, and Gmail's non-secret runtime endpoint defaults in
+`ProviderConfig`. Registering a module in the catalog does **not** make the
+provider usable for OAuth, account setup, receive sync, or outbound submission.
+Those paths still contain explicit provider registries, guards, ordering, labels,
+and database constraints.
+
+### Complete provider-extension checklist
 
 1. Add `Manifold.Connectors.OAuthProvider.<Provider>` with every definition field
-   above and register it in `OAuthProviderCatalog.list/0` and `fetch/1`.
-2. Add catalog and help-page tests for ordering, exact callback/scopes, official
-   links, and rejection of unsupported keys.
-3. Extend `ProviderConfig.fetch/1` and ensure credentials are resolved per
-   operation rather than cached.
-4. Implement provider-specific OAuth exchange, identity/scopes, refresh, receive,
-   send, and dependent authorization/method lifecycle behavior.
-5. Add migration only for genuinely provider-specific data. The generic
-   `connector_oauth_provider_settings` table needs no schema change for another
-   catalog provider.
+   above and register it in
+   `apps/manifold_connectors/lib/manifold/connectors/oauth_provider_catalog.ex` in
+   `OAuthProviderCatalog.list/0` and `fetch/1`. Settings consumption is in
+   `ProviderSettings` plus `SettingsLive.OAuth.load_providers/1` and
+   `SettingsLive.OAuthHelp.mount/3`.
+2. Extend
+   `apps/manifold_connectors/lib/manifold/connectors/provider_config.ex` in
+   `ProviderConfig.fetch/1`, including credential source and safe endpoint
+   allowlisting. Do not cache resolved credentials.
+3. Extend `apps/manifold_connectors/lib/manifold/connectors/oauth.ex`:
+   `@providers`, the `authorization_url/6` provider case, transaction-generation
+   validation when settings-backed, and the `required_scopes/2` path. Extend
+   `apps/manifold_connectors/lib/manifold/connectors/oauth_scopes.ex` in
+   `identity/1`, `purpose/2`, `method_scope/2`, and `approved?/2`.
+4. Extend `apps/manifold_connectors/lib/manifold/connectors.ex` in every OAuth
+   gate: `complete_authorization/4`,
+   `checkout_resolved_oauth_access_token/5`, `configured_providers/0`,
+   `checkout_send_method/3`, `disconnect_send_method/2`, `disconnect/1`,
+   `delete_receive_method/1`, `oauth_method_scope/2`,
+   `checkout_oauth_send_method/3`, `validate_oauth_method_snapshot/2`,
+   `oauth_submission_config/2`, and `oauth_authorization_provider/1`. Add
+   `adapter_config/1` and `completion_adapter_config/2` clauses and setting
+   generation validation when the provider is database-backed.
+5. Extend
+   `apps/manifold_connectors/lib/manifold/connectors/oauth_authorizations.ex`:
+   `@providers` and the guards in `complete/6`, `add_authorized_method/6`,
+   `validate_checkout_authorization/2`, and both
+   `do_method_authorization_id/2,3` forms. Implement provider-specific identity,
+   cursor initialization, refresh, generation fencing, reconnect text, and
+   lifecycle transitions.
+6. Extend `apps/manifold_connectors/lib/manifold/connectors/sync.ex` in
+   `runtime/1`, `auth_material/5`, `handle_account_provider_error/4`,
+   `handle_cursor_provider_error/5`, `normalize_provider_error/2`,
+   `oauth_provider_name/1`, and `lock_current_failure_authorization/2`. Add a
+   receive adapter implementing the applicable callbacks in
+   `Manifold.Connectors.Provider` when `:receive` is advertised.
+7. Extend `apps/manifold_web/lib/manifold_web/controllers/connector_oauth_controller.ex`
+   in `@providers` and `provider_name/1`. In
+   `AccountLive.ReceiveMethodNew`, update `@oauth_providers`, the
+   `choose-kind` guard, the explicit `gmail microsoft imap eas` display order,
+   configured-provider disabling, icons, descriptions, headings, actions, and
+   labels. In `AccountLive.SendMethodNew`, update `@oauth_providers`, the explicit
+   Gmail → Microsoft → SMTP card order, disabled state, copy, headings, actions,
+   and labels. Also update the `@oauth_providers` ordering plus labels/reconnect
+   behavior in `AccountLive.Show`, and provider labels in `AccountLive.Index`.
+8. Extend schema allowlists in
+   `Schema.OAuthAuthorization`, `Schema.OAuthTransaction`,
+   `Schema.ReceiveMethod.kinds/0` and `implemented_kinds/0`, and
+   `Schema.SendMethod.kinds/0` as applicable. The generic
+   `connector_oauth_provider_settings` table needs no provider-specific column,
+   but a usable provider still needs a new migration for the OAuth authorization,
+   transaction, receive/send-method, and outbound provider check constraints.
+   Current constraints were established by
+   `20260811000500_add_shared_gmail_authorizations.exs`,
+   `20260812000200_add_shared_microsoft_authorizations.exs`, and
+   `20260812000300_add_microsoft_provider_payloads.exs`; do not edit those applied
+   migrations.
+9. When `:send` is advertised, add the connector checkout/configuration path, an
+   adapter in `apps/manifold_outbound/lib/manifold/outbound/provider/`, and update
+   `Manifold.Outbound.Provider.adapter/1`,
+   `Manifold.Outbound.Submission.provider_config/3` and
+   `maybe_mark_oauth_reconnect/3`,
+   `Manifold.Outbound.Schema.ProviderSubmission` validation, and matching database
+   constraints. Preserve submission uncertainty and method snapshot fences.
+10. Test the catalog/settings/help surface and every registry changed above. At a
+    minimum run the catalog, provider-config, OAuth, both existing provider
+    authorization, sync, account LiveView, OAuth settings LiveView, outbound
+    submission, and provider-adapter suites; add provider-specific receive/send
+    coverage for every advertised capability.
+
+Use this existing-provider regression command when changing the extension
+surface, then add the new provider's own test files:
+
+```sh
+devenv shell -- mix test \
+  apps/manifold_connectors/test/manifold/connectors/oauth_provider_catalog_test.exs \
+  apps/manifold_connectors/test/manifold/connectors/provider_config_test.exs \
+  apps/manifold_connectors/test/manifold/connectors/oauth_test.exs \
+  apps/manifold_connectors/test/manifold/connectors/gmail_authorizations_test.exs \
+  apps/manifold_connectors/test/manifold/connectors/microsoft_authorizations_test.exs \
+  apps/manifold_connectors/test/manifold/connectors/sync_test.exs \
+  apps/manifold_web/test/manifold_web/account_live_test.exs \
+  apps/manifold_web/test/manifold_web/external_accounts_web_test.exs \
+  apps/manifold_web/test/manifold_web/oauth_settings_live_test.exs \
+  apps/manifold_outbound/test/manifold/outbound/submission_test.exs \
+  apps/manifold_outbound/test/manifold/outbound/provider/gmail_test.exs \
+  apps/manifold_outbound/test/manifold/outbound/provider/microsoft_graph_test.exs
+```
 
 Microsoft is intentionally unchanged and remains environment-backed until its own
 catalog/lifecycle migration.
@@ -155,7 +240,11 @@ unavailable until Google credentials are saved in Settings → OAuth, and all
 existing Gmail grants require reconnect.
 
 The down migration refuses before DDL when any provider setting exists or any
-OAuth transaction has a setting UUID/version fence. Do not bypass this guard.
+OAuth transaction has a setting UUID/version fence. The Settings UI removes only
+the setting; consumed fenced transaction history still blocks rollback. Do not
+delete rows based on this summary. Follow README's guarded rollback runbook for
+backup/export, inspection, explicitly authorized transaction-history deletion,
+development/release commands, and post-rollback verification.
 
 ## Exact verification commands
 

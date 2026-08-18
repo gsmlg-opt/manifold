@@ -1544,7 +1544,9 @@ key, name, icon, callback path, capabilities, scopes, non-secret runtime endpoin
 and provider help content/links. Adding a provider requires code and tests, plus
 its lifecycle integration with OAuth completion, refresh, receive, send, and
 dependency transitions. The generic settings table requires no provider-specific
-schema migration.
+schema migration, but existing OAuth authorization, method-kind, and outbound
+provider constraints still require a new migration before that provider can be a
+usable connector.
 
 Operators must enable the Gmail API, configure both `gmail.readonly` and
 `gmail.send` on the Google OAuth consent screen, and register the exact production
@@ -1852,14 +1854,14 @@ wiring, polling, and no-auth account settings are implemented and verified.
 - Durable raw import without fabricated SMTP metadata.
 - Polling-based synchronization; provider push remains out of scope.
 
-The in-progress Microsoft delivery extension adds account-selected Graph direct
-MIME submission and provider-neutral projected Sent separated from outbound Send
-activity. Its implementation remains under lifecycle and staging verification.
+The Microsoft delivery extension implements account-selected Graph direct MIME
+submission and provider-neutral projected Sent separated from outbound Send
+activity. Credentialed staging verification remains operator work.
 
 The Phoenix web application remains the primary client. External protocols and
 connectors extend interoperability; they do not define the core user
-experience. JMAP and IMAP remain future extension points and are not part of
-Milestone 6.
+experience. Read-only IMAP and EAS receive are implemented after the original
+Milestone 6 scope; JMAP remains a future extension point.
 
 ---
 

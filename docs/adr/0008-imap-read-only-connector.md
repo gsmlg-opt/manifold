@@ -31,7 +31,10 @@ Extend `manifold_connectors` with `provider = "imap"`:
   mark-read/unread write-back via `UID STORE ±FLAGS (\\Seen)`.
 - Test connection before persisting the account.
 
-POP3, JMAP, multi-folder sync, and per-account SMTP send remain out of scope.
+At acceptance, POP3, JMAP, multi-folder sync, and per-account SMTP send were out
+of scope. ADR 0010 later superseded the SMTP portion by implementing
+account-selected authenticated SMTP; POP3, JMAP, and multi-folder IMAP sync remain
+out of scope.
 Provider write-back beyond IMAP `\\Seen` remains out of scope.
 
 ## Consequences

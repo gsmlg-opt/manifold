@@ -2,6 +2,11 @@
 
 **Status:** Implemented
 
+**Current-state note:** This document records the original receive-focused
+Milestone 6 scope. Later work implemented account-selected Gmail API and Microsoft
+Graph send plus IMAP and EAS receive methods. Provider receive synchronization
+remains read-only with respect to remote Gmail and Microsoft mailboxes.
+
 ## Implementation Status
 
 - [x] Add the `manifold_connectors` application and dependency boundary.
@@ -50,12 +55,13 @@ Microsoft 365:
 7. Expose connection, synchronization, reconnect, and disconnect operations in
    the no-auth local Phoenix interface.
 
-This milestone does not request remote mutation or send scopes, synchronize
-contacts or calendars, implement provider push notifications, expose provider
-tokens, implement direct outbound MX delivery, or add IMAP, POP3, or JMAP.
-Gmail and Microsoft send remain separate future outbound adapters. JMAP and
-IMAP remain documented extension points until a concrete interoperability
-requirement justifies them.
+The original milestone did not request remote mutation or send scopes,
+synchronize contacts or calendars, implement provider push notifications, expose
+provider tokens, implement direct outbound MX delivery, or add IMAP, POP3, or
+JMAP. The future-send and IMAP statements are superseded: Gmail API, Microsoft
+Graph, and SMTP send are implemented as account-selected outbound methods, and
+read-only IMAP plus EAS receive are implemented. POP3, JMAP, provider push, and
+direct outbound MX delivery remain out of scope.
 
 ## Application Boundary
 
@@ -123,7 +129,11 @@ request bodies, or opaque cursor values.
 retains the accepted raw and target-mailbox fingerprints. Repeated matching imports
 return the original receipt; conflicting content is rejected.
 
-## OAuth Contract
+## Original OAuth Contract
+
+The bullets below record the receive-only Milestone 6 contract. Later send work
+keeps receive least-privilege but incrementally adds `gmail.send` for Gmail and
+`Mail.Send` for Microsoft to each provider's shared authorization.
 
 - Providers are selected from the fixed `gmail` and `microsoft` allowlist.
 - State contains at least 256 random bits, is stored only as a SHA-256 digest,
@@ -197,9 +207,10 @@ The database-backed provider catalog is code-defined rather than user-extensible
 `Manifold.Connectors.OAuthProviderCatalog` and
 `Manifold.Connectors.OAuthProvider.<Provider>` own the stable key, name, icon,
 callback, capabilities, scopes, endpoints, and help content. Users cannot enter
-arbitrary endpoints or scopes. A future provider reuses the generic table without
-a schema migration but must implement and test its own OAuth, refresh, receive,
-send, and lifecycle integration.
+arbitrary endpoints or scopes. A future provider reuses the generic settings
+table without provider-specific columns, but a usable connector may still need a
+migration for existing OAuth/provider-kind database constraints as well as its
+OAuth, refresh, receive, send, and lifecycle integration.
 
 ### Provider-settings cutover
 

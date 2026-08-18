@@ -313,9 +313,175 @@ Before promoting staging, verify all of the following without restarting:
   Gmail without deleting or revoking the Google grant;
 - previously disabled or reconnect-required methods do not resume automatically.
 
-Rollback of `20260818000100` is refused while any OAuth provider setting exists or
-any OAuth transaction carries a provider-setting UUID/version fence. Remove those
-rows only as an explicit, reviewed rollback operation; never bypass the guard.
+#### Guarded rollback runbook
+
+Rollback of `20260818000100` is destructive and non-rolling. It drops the OAuth
+provider-settings table and the setting-generation columns from OAuth transaction
+history. Before any cleanup, block new OAuth starts, take a restorable database
+backup, and keep the current release available for recovery. The Settings UI
+removes only the provider-setting row; it deliberately does not delete OAuth
+transactions. Consumed transaction history with a non-null setting UUID therefore
+continues to block rollback just like an unfinished transaction.
+
+Take a normal full database snapshot. If command-line PostgreSQL tooling is the
+approved backup path, keep both a full dump and a narrow export in a private
+directory; both contain sensitive connector data and must not be logged or
+committed:
+
+```sh
+umask 077
+rollback_dir="oauth-settings-rollback-backup-$(date -u +%Y%m%dT%H%M%SZ)"
+install -d -m 0700 "$rollback_dir"
+pg_dump --format=custom --file="$rollback_dir/manifold.dump" "$DATABASE_URL"
+pg_dump --format=custom --data-only \
+  --table=public.connector_oauth_provider_settings \
+  --table=public.connector_oauth_transactions \
+  --file="$rollback_dir/oauth-settings-tables.dump" \
+  "$DATABASE_URL"
+test -s "$rollback_dir/manifold.dump"
+test -s "$rollback_dir/oauth-settings-tables.dump"
+sha256sum "$rollback_dir/manifold.dump" "$rollback_dir/oauth-settings-tables.dump"
+```
+
+Verify the dump files exist and record their checksums according to the deployment
+backup policy. The narrow dump can be restored only after the provider-settings
+migration has been reapplied; it is not compatible with the rolled-back schema.
+
+While one current-version Phoenix instance is still available, remove the Gmail
+configuration through `/settings/oauth` so the supported lifecycle path marks
+dependent Gmail grants and methods reconnect-required. If the UI cannot remove a
+remaining setting, stop and restore a compatible release; do not bypass lifecycle
+effects with a direct table delete. Then drain and stop every Phoenix instance,
+connector process, and Oban worker before inspecting or changing the database.
+
+Run these read-only queries first:
+
+```sql
+SELECT id, provider, client_id, key_version, lock_version, inserted_at, updated_at
+FROM connector_oauth_provider_settings
+ORDER BY provider;
+
+SELECT
+  COUNT(*) AS provider_setting_rows
+FROM connector_oauth_provider_settings;
+
+SELECT
+  COUNT(*) AS fenced_transaction_rows,
+  COUNT(*) FILTER (WHERE consumed_at IS NULL) AS unfinished_fenced_rows,
+  COUNT(*) FILTER (WHERE consumed_at IS NOT NULL) AS consumed_fenced_rows
+FROM connector_oauth_transactions
+WHERE oauth_provider_setting_id IS NOT NULL;
+
+SELECT
+  id,
+  provider,
+  mailbox_id,
+  purpose,
+  oauth_provider_setting_id,
+  oauth_provider_setting_lock_version,
+  consumed_at,
+  expires_at,
+  inserted_at
+FROM connector_oauth_transactions
+WHERE oauth_provider_setting_id IS NOT NULL
+ORDER BY inserted_at, id;
+
+SELECT version
+FROM schema_migrations
+WHERE version >= 20260818000100
+ORDER BY version;
+```
+
+Proceed only when `provider_setting_rows` is zero and the schema query returns
+exactly `20260818000100`. If a setting remains or any later migration is applied,
+stop; this runbook does not authorize deleting the setting directly or rolling
+back later migrations.
+
+Deleting fenced transactions permanently destroys one-time OAuth state and its
+consumed audit history. Only after the operator has reviewed the transaction list,
+confirmed that losing every returned row is acceptable, and verified the backup,
+run this narrowly scoped transaction. Review the `RETURNING` output before issuing
+`COMMIT`; do not paste a commit together with the delete:
+
+```sql
+BEGIN;
+
+DELETE FROM connector_oauth_transactions
+WHERE oauth_provider_setting_id IS NOT NULL
+RETURNING
+  id,
+  provider,
+  mailbox_id,
+  purpose,
+  oauth_provider_setting_id,
+  oauth_provider_setting_lock_version,
+  consumed_at,
+  expires_at,
+  inserted_at;
+```
+
+If any returned row is unexpected, preserve the backup and abort with:
+
+```sql
+ROLLBACK;
+```
+
+Only when every returned row matches the reviewed list, commit separately:
+
+```sql
+COMMIT;
+```
+
+Repeat the count and schema-version queries. Both row counts must be zero and the
+only version at or above the target must still be `20260818000100`. With all
+application processes still stopped, a development checkout can then roll back
+the target migration with:
+
+```sh
+devenv shell -- mix ecto.rollback --to 20260818000100
+```
+
+The main release currently has no `Manifold.Release` migration API. Do not call
+`Manifold.Edge.Release`, which operates on the separate edge database. The main
+release equivalent follows the existing edge release's `Ecto.Migrator.with_repo/2`
+pattern but targets `Manifold.Repo` and the `manifold_data` migration directory:
+
+```sh
+bin/manifold eval '
+:ok = Application.ensure_loaded(:manifold_data)
+path = Application.app_dir(:manifold_data, "priv/repo/migrations")
+{:ok, migrated, _apps} =
+  Ecto.Migrator.with_repo(Manifold.Repo, fn repo ->
+    Ecto.Migrator.run(repo, path, :down, to: 20260818000100)
+  end)
+IO.inspect(migrated, label: "rolled_back")
+'
+```
+
+Require `rolled_back: [20260818000100]`, then run these post-rollback verification
+queries before starting the older release:
+
+```sql
+SELECT to_regclass('connector_oauth_provider_settings') AS provider_settings_table;
+
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = current_schema()
+  AND table_name = 'connector_oauth_transactions'
+  AND column_name IN (
+    'oauth_provider_setting_id',
+    'oauth_provider_setting_lock_version'
+  )
+ORDER BY column_name;
+
+SELECT version
+FROM schema_migrations
+WHERE version = 20260818000100;
+```
+
+The first result must be `NULL`, and the other two queries must return no rows.
+Any unexpected result is a stop condition; restore the backup or the compatible
+release rather than forcing the migration guard.
 
 ## Development
 

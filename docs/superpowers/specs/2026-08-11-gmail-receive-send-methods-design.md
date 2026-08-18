@@ -52,6 +52,10 @@ remain unchanged after token acquisition.
 - Microsoft Graph send.
 - Direct recipient-MX delivery.
 
+The Microsoft Graph send exclusion records this feature's 2026-08-11 scope; it
+was superseded by the later Microsoft 365 receive/send implementation and ADR
+0011.
+
 ## Architecture and ownership
 
 Introduce a shared OAuth authorization owned by `manifold_connectors`:
@@ -114,11 +118,14 @@ Enforce:
 - One binding per `{provider, provider_subject_id}` across the installation.
 - A Gmail authorization address equal to the account's canonical address.
 
-Existing OAuth receive credentials migrate into this model without changing
-method enabled state or requiring reauthorization. Preserve the existing
-credential associated-data binding when possible; if identifiers change,
-decrypt and re-encrypt inside the migration path rather than copying ciphertext
-under a different authentication context.
+At the time of the shared-authorization migration, existing OAuth receive
+credentials migrated into this model without changing method enabled state or
+requiring reauthorization. That no-reauthorization promise is superseded by the
+2026-08-18 OAuth provider-settings cutover: the first database-backed Google
+credential save marks existing Gmail grants and methods reconnect-required.
+Preserve the existing credential associated-data binding when possible; if
+identifiers change, decrypt and re-encrypt inside the migration path rather than
+copying ciphertext under a different authentication context.
 
 Password credentials for IMAP, EAS, and SMTP remain purpose-bound password
 secrets and are not converted into OAuth authorizations.
@@ -378,8 +385,10 @@ message content.
 
 - Backfill existing Gmail receive connections into shared authorizations.
 - Preserve existing receive status, enabled state, tokens, cursors, and jobs.
-- Do not require existing receive-only Gmail users to reauthorize until they
-  add Send or Google revokes the grant.
+- Superseded by the 2026-08-18 provider-settings cutover: the original migration
+  did not require existing receive-only Gmail users to reauthorize until they
+  added Send or Google revoked the grant, but the first stored Google credential
+  save now requires all existing Gmail grants to reconnect.
 - Existing SMTP method records become real submission choices after deploy.
 - Existing accounts without enabled send methods lose implicit Resend delivery
   and see the configuration link instead.

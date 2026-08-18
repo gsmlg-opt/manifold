@@ -184,14 +184,38 @@ smoke tests belong to the release verification task, not unit tests.
 
 ## Staging smoke checklist
 
+Use this read-only prerequisite check before `20260818000100`:
+
+```sql
+SELECT version
+FROM schema_migrations
+WHERE version IN (
+  20260811000500,
+  20260811000600,
+  20260811000700,
+  20260812000100,
+  20260812000200,
+  20260812000300
+)
+ORDER BY version;
+```
+
+All six rows must be present.
+
 - [ ] Confirm all old Phoenix, connector, and Oban workers are drained before
-      applying `20260818000100`; the migration does not import environment values.
+      any migration step.
+- [ ] Before applying `20260818000100`, query `schema_migrations` and verify that
+      `20260811000500`, `20260811000600`, `20260811000700`,
+      `20260812000100`, `20260812000200`, and `20260812000300` are already
+      applied. Never apply the OAuth provider-settings migration first and then
+      attempt to run these older Gmail/Microsoft migrations.
+- [ ] Apply `20260818000100` only after the prerequisite versions are present;
+      inspect its constraints and confirm it did not import environment values.
 - [ ] Save Google credentials at `/settings/oauth` and verify Gmail immediately
       becomes selectable in both receive and send pickers without restart.
 - [ ] Verify `/settings/oauth/gmail/help` renders the deployed exact callback and
       the four expected scopes.
-- [ ] Apply `00500`, `00600`, and `00700`; inspect constraints and migrated shared
-      authorization rows without exposing ciphertext.
+- [ ] Inspect migrated shared authorization rows without exposing ciphertext.
 - [ ] Confirm Gmail API is enabled, consent scopes are configured, the exact HTTPS
       callback is registered, and the test identity is authorized for staging.
 - [ ] Create two distinct Manifold accounts whose exact addresses match two
@@ -222,6 +246,5 @@ smoke tests belong to the release verification task, not unit tests.
 
 - HTML composition and outbound attachments.
 - Gmail and SMTP sender aliases.
-- Microsoft Graph send.
 - Gmail watch and Microsoft Graph subscription push optimization; polling remains
   the durable fallback.
