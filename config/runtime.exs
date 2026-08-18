@@ -301,38 +301,28 @@ if not edge_release? do
     end
   end
 
-  gmail_config =
-    provider_credentials!.(
-      "Gmail",
-      "MANIFOLD_GMAIL_CLIENT_ID",
-      "MANIFOLD_GMAIL_CLIENT_SECRET",
-      fn client_id, client_secret ->
-        [
-          client_id: client_id,
-          client_secret: client_secret,
-          authorization_url:
-            https_endpoint!.(
-              "MANIFOLD_GMAIL_AUTHORIZATION_URL",
-              "https://accounts.google.com/o/oauth2/v2/auth"
-            ),
-          token_url:
-            https_endpoint!.(
-              "MANIFOLD_GMAIL_TOKEN_URL",
-              "https://oauth2.googleapis.com/token"
-            ),
-          userinfo_url:
-            https_endpoint!.(
-              "MANIFOLD_GMAIL_USERINFO_URL",
-              "https://openidconnect.googleapis.com/v1/userinfo"
-            ),
-          base_url:
-            https_endpoint!.(
-              "MANIFOLD_GMAIL_API_BASE_URL",
-              "https://gmail.googleapis.com"
-            )
-        ]
-      end
-    )
+  gmail_config = [
+    authorization_url:
+      https_endpoint!.(
+        "MANIFOLD_GMAIL_AUTHORIZATION_URL",
+        "https://accounts.google.com/o/oauth2/v2/auth"
+      ),
+    token_url:
+      https_endpoint!.(
+        "MANIFOLD_GMAIL_TOKEN_URL",
+        "https://oauth2.googleapis.com/token"
+      ),
+    userinfo_url:
+      https_endpoint!.(
+        "MANIFOLD_GMAIL_USERINFO_URL",
+        "https://openidconnect.googleapis.com/v1/userinfo"
+      ),
+    base_url:
+      https_endpoint!.(
+        "MANIFOLD_GMAIL_API_BASE_URL",
+        "https://gmail.googleapis.com"
+      )
+  ]
 
   microsoft_tenant = System.get_env("MANIFOLD_MICROSOFT_TENANT", "organizations")
 

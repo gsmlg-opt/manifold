@@ -105,7 +105,7 @@ defmodule Manifold.ConfigTest do
     refute Keyword.has_key?(connectors[:providers][:microsoft], :client_secret)
   end
 
-  test "production runtime parses connector credentials and endpoint overrides" do
+  test "production runtime ignores legacy Gmail credentials and parses endpoint overrides" do
     encryption_key = Base.encode64(:crypto.strong_rand_bytes(32))
 
     put_runtime_env(%{
@@ -131,8 +131,6 @@ defmodule Manifold.ConfigTest do
     assert connectors[:encryption_key] == encryption_key
 
     assert connectors[:providers][:gmail] == [
-             client_id: "gmail-id",
-             client_secret: "gmail-secret",
              authorization_url: "https://accounts.example/authorize",
              token_url: "https://accounts.example/token",
              userinfo_url: "https://openid.example/userinfo",
@@ -165,7 +163,7 @@ defmodule Manifold.ConfigTest do
     assert microsoft[:token_url] =~ "/organizations/"
   end
 
-  test "development runtime accepts optional OAuth credentials from the environment" do
+  test "development runtime ignores complete legacy Gmail credentials" do
     put_runtime_env(%{
       "MANIFOLD_GMAIL_CLIENT_ID" => "gmail-dev-id",
       "MANIFOLD_GMAIL_CLIENT_SECRET" => "gmail-dev-secret"
@@ -173,9 +171,31 @@ defmodule Manifold.ConfigTest do
 
     connectors = read_runtime(:dev)[:manifold_connectors]
 
-    assert connectors[:providers][:gmail][:client_id] == "gmail-dev-id"
-    assert connectors[:providers][:gmail][:client_secret] == "gmail-dev-secret"
+    refute Keyword.has_key?(connectors[:providers][:gmail], :client_id)
+    refute Keyword.has_key?(connectors[:providers][:gmail], :client_secret)
     refute Keyword.has_key?(connectors, :encryption_key)
+  end
+
+  test "development runtime ignores half-configured legacy Gmail credentials" do
+    for legacy_env <- [
+          %{"MANIFOLD_GMAIL_CLIENT_ID" => "gmail-dev-id"},
+          %{"MANIFOLD_GMAIL_CLIENT_SECRET" => "gmail-dev-secret"}
+        ] do
+      put_runtime_env(legacy_env)
+
+      connectors = read_runtime(:dev)[:manifold_connectors]
+
+      refute Keyword.has_key?(connectors[:providers][:gmail], :client_id)
+      refute Keyword.has_key?(connectors[:providers][:gmail], :client_secret)
+    end
+  end
+
+  test "Gmail endpoint overrides still require absolute HTTPS URLs" do
+    put_runtime_env(%{"MANIFOLD_GMAIL_TOKEN_URL" => "http://oauth.example/token"})
+
+    assert_raise RuntimeError, ~r/MANIFOLD_GMAIL_TOKEN_URL must be an absolute https URL/, fn ->
+      read_runtime(:dev)
+    end
   end
 
   test "production local release rejects a missing connector encryption key" do

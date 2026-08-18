@@ -17,6 +17,7 @@ defmodule Manifold.Connectors do
   alias Manifold.Connectors.OAuth.Consumed
   alias Manifold.Connectors.OAuthAuthorizations
   alias Manifold.Connectors.OAuthScopes
+  alias Manifold.Connectors.ProviderConfig
   alias Manifold.Connectors.ProviderSettings
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.IMAP, as: ProviderIMAP
@@ -258,17 +259,8 @@ defmodule Manifold.Connectors do
 
   @spec configured_providers() :: [String.t()]
   def configured_providers do
-    providers = Application.get_env(:manifold_connectors, :providers, [])
-
     ["gmail", "microsoft"]
-    |> Enum.filter(fn provider ->
-      config = Keyword.get(providers, String.to_existing_atom(provider), [])
-
-      Enum.all?([:client_id, :client_secret, :authorization_url], fn key ->
-        value = Keyword.get(config, key)
-        is_binary(value) and value != ""
-      end)
-    end)
+    |> Enum.filter(&match?({:ok, %ProviderConfig.Resolved{}}, ProviderConfig.fetch(&1)))
   end
 
   @spec oauth_method_setup(Ecto.UUID.t(), String.t(), :receive | :send) ::
