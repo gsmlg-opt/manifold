@@ -332,12 +332,15 @@ committed:
 umask 077
 rollback_dir="oauth-settings-rollback-backup-$(date -u +%Y%m%dT%H%M%SZ)"
 install -d -m 0700 "$rollback_dir"
-pg_dump --format=custom --file="$rollback_dir/manifold.dump" "$DATABASE_URL"
-pg_dump --format=custom --data-only \
+PGDATABASE="$DATABASE_URL" pg_dump \
+  --format=custom \
+  --file="$rollback_dir/manifold.dump"
+PGDATABASE="$DATABASE_URL" pg_dump \
+  --format=custom \
+  --data-only \
   --table=public.connector_oauth_provider_settings \
   --table=public.connector_oauth_transactions \
-  --file="$rollback_dir/oauth-settings-tables.dump" \
-  "$DATABASE_URL"
+  --file="$rollback_dir/oauth-settings-tables.dump"
 test -s "$rollback_dir/manifold.dump"
 test -s "$rollback_dir/oauth-settings-tables.dump"
 sha256sum "$rollback_dir/manifold.dump" "$rollback_dir/oauth-settings-tables.dump"
@@ -353,6 +356,17 @@ dependent Gmail grants and methods reconnect-required. If the UI cannot remove a
 remaining setting, stop and restore a compatible release; do not bypass lifecycle
 effects with a direct table delete. Then drain and stop every Phoenix instance,
 connector process, and Oban worker before inspecting or changing the database.
+
+Use the deployment's approved libpq service and passfile for SQL sessions. If the
+deployment supplies only `DATABASE_URL`, pass it through libpq's environment
+rather than exposing the URI in process arguments:
+
+```sh
+PGDATABASE="$DATABASE_URL" psql --set=ON_ERROR_STOP=1
+```
+
+Do not echo `DATABASE_URL` or include it as a positional `psql`/`pg_dump`
+argument.
 
 Run these read-only queries first:
 
@@ -396,6 +410,19 @@ Proceed only when `provider_setting_rows` is zero and the schema query returns
 exactly `20260818000100`. If a setting remains or any later migration is applied,
 stop; this runbook does not authorize deleting the setting directly or rolling
 back later migrations.
+
+Before any destructive `DELETE`, also confirm through the approved deployment
+secret store that the older release's original
+`MANIFOLD_GMAIL_CLIENT_ID`/`MANIFOLD_GMAIL_CLIENT_SECRET` pair is complete and
+recoverable, without displaying either value. Confirm that the exact existing
+`MANIFOLD_CONNECTOR_ENCRYPTION_KEY` and its secret-store version are retained; the
+older release still needs that unchanged key to decrypt preserved connector
+credentials. If any one of these three values is missing or its provenance is
+uncertain, stop and do not delete transaction history.
+
+This is rollback-only compatibility for a release that predates Settings-managed
+Google credentials. The current release ignores the two legacy Gmail variables;
+they are not a current configuration source, import path, or fallback.
 
 Deleting fenced transactions permanently destroys one-time OAuth state and its
 consumed audit history. Only after the operator has reviewed the transaction list,
@@ -482,6 +509,31 @@ WHERE version = 20260818000100;
 The first result must be `NULL`, and the other two queries must return no rows.
 Any unexpected result is a stop condition; restore the backup or the compatible
 release rather than forcing the migration guard.
+
+Before starting the older release, restore/export the complete legacy Gmail
+client pair through the deployment's approved secret mechanism and bind the same,
+unchanged connector encryption-key secret version. Verify presence without
+printing values in the exact environment that will launch the older release:
+
+```sh
+test -n "${MANIFOLD_GMAIL_CLIENT_ID:-}" || {
+  echo "MANIFOLD_GMAIL_CLIENT_ID is missing" >&2
+  exit 1
+}
+test -n "${MANIFOLD_GMAIL_CLIENT_SECRET:-}" || {
+  echo "MANIFOLD_GMAIL_CLIENT_SECRET is missing" >&2
+  exit 1
+}
+test -n "${MANIFOLD_CONNECTOR_ENCRYPTION_KEY:-}" || {
+  echo "MANIFOLD_CONNECTOR_ENCRYPTION_KEY is missing" >&2
+  exit 1
+}
+```
+
+The presence check does not prove key continuity: separately compare the
+connector-key secret-store version/metadata with the recorded pre-rollback
+version, without printing the key. Start the older release only after both Gmail
+values are present and the connector key is confirmed unchanged.
 
 ## Development
 
