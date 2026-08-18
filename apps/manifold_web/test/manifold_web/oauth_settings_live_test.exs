@@ -325,6 +325,29 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     refute contains_binary?(socket_assigns(stale_view), stale_secret)
   end
 
+  test "malformed lock versions remount without retaining the submitted secret", %{conn: conn} do
+    assert {:ok, configured} = put_setting("current-client", "current-secret")
+    {:ok, view, _html} = live(conn, "/settings/oauth")
+    secret = "malformed-version-secret-never-render"
+
+    _html =
+      render_click(view, "save-provider", %{
+        "provider" => "gmail",
+        "oauth_provider_setting" => %{
+          "client_id" => "attacker-client",
+          "client_secret" => secret,
+          "lock_version" => "not-a-version"
+        }
+      })
+
+    assert_redirect(view, "/settings/oauth")
+
+    row = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+    assert row.client_id == "current-client"
+    assert row.lock_version == configured.lock_version
+    refute inspect(row) =~ secret
+  end
+
   test "corrupt stored credentials show a generic configuration error", %{conn: conn} do
     assert {:ok, _view} = put_setting("corrupt-client", "corrupt-secret-never-render")
     row = Repo.get_by!(OAuthProviderSetting, provider: "gmail")

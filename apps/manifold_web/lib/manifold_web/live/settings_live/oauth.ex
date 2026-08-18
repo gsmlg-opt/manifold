@@ -28,10 +28,12 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
         socket
       )
       when is_binary(provider) and is_map(params) do
-    with {:ok, _definition} <- OAuthProviderCatalog.fetch(provider) do
+    with {:ok, _definition} <- OAuthProviderCatalog.fetch(provider),
+         expected_lock_version when expected_lock_version != :invalid <-
+           parse_lock_version(params["lock_version"]) do
       result =
         Connectors.put_oauth_provider_setting(provider, params,
-          expected_lock_version: parse_lock_version(params["lock_version"])
+          expected_lock_version: expected_lock_version
         )
 
       case result do
@@ -52,6 +54,9 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
       end
     else
       {:error, _error} ->
+        reject_save(socket)
+
+      :invalid ->
         reject_save(socket)
     end
   end

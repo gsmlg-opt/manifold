@@ -224,6 +224,9 @@ start.
   events, or public errors.
 - The secret input always renders empty. Submitted secret material is cleared on
   validation and persistence errors.
+- Malformed provider payloads and malformed setting lock versions are rejected
+  with a fresh LiveView navigation so browser-local secret input cannot survive
+  a no-op diff.
 - Credential structs redact secret inspection; safe view structs expose only the
   client ID and boolean secret state.
 - OAuth/sync/submission telemetry uses bounded `provider_not_configured` for a
