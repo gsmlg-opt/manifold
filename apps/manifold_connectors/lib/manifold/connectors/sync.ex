@@ -220,7 +220,9 @@ defmodule Manifold.Connectors.Sync do
          handle_cursor_provider_error(account.id, cursor, error, now)}
 
       {:error, %ProviderError{} = error} ->
-        {:error, account.kind, error, handle_provider_error(account.id, error, now)}
+        :ok = maybe_before_preflight_provider_error(error, opts)
+
+        {:error, account.kind, error, handle_preflight_provider_error(account, error, now)}
 
       {:error, %Error{} = error} ->
         {:error, account.kind, error,
@@ -1197,6 +1199,32 @@ defmodule Manifold.Connectors.Sync do
     provider_error_outcome(error)
   end
 
+  defp handle_preflight_provider_error(account, error, now) do
+    status = if error.class == :reconnect, do: "reconnect_required", else: "failed"
+
+    case record_provider_failure_if_current(
+           account,
+           status,
+           error,
+           now,
+           {:sync_snapshot, account.lock_version}
+         ) do
+      :lifecycle_changed ->
+        handle_core_error(
+          account.id,
+          Error.new(
+            :temporary,
+            :connector_lifecycle_changed,
+            "connector lifecycle changed during synchronization"
+          ),
+          now
+        )
+
+      _recorded ->
+        provider_error_outcome(error)
+    end
+  end
+
   defp provider_error_outcome(error) do
     case error.class do
       :temporary -> {:snooze, error.retry_after_seconds || @default_retry_seconds}
@@ -1565,6 +1593,13 @@ defmodule Manifold.Connectors.Sync do
   defp maybe_after_begin_sync(account, opts) do
     case Keyword.get(opts, :after_begin_sync) do
       callback when is_function(callback, 1) -> callback.(account)
+      nil -> :ok
+    end
+  end
+
+  defp maybe_before_preflight_provider_error(error, opts) do
+    case Keyword.get(opts, :before_preflight_provider_error) do
+      callback when is_function(callback, 1) -> callback.(error)
       nil -> :ok
     end
   end

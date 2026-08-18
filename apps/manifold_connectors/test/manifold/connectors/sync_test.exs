@@ -67,7 +67,7 @@ defmodule Manifold.Connectors.SyncTest do
     def refresh_token("initial-refresh", _config, opts) do
       now = Keyword.get(opts, :now, DateTime.utc_now())
 
-      Process.get(:refresh_result) ||
+      default =
         {:ok,
          %Token{
            access_token: "refreshed-access",
@@ -75,6 +75,19 @@ defmodule Manifold.Connectors.SyncTest do
            expires_at: DateTime.add(now, 3_600, :second),
            scopes: ["https://www.googleapis.com/auth/gmail.readonly"]
          }}
+
+      case Keyword.get(opts, :refresh_gate) do
+        nil ->
+          Keyword.get(opts, :refresh_result) || Process.get(:refresh_result) || default
+
+        gate ->
+          test_pid = Keyword.fetch!(opts, :test_pid)
+          send(test_pid, {:refresh_started, self(), gate})
+
+          receive do
+            {:release_refresh, ^gate} -> Keyword.fetch!(opts, :refresh_result)
+          end
+      end
     end
 
     @impl true
@@ -410,6 +423,176 @@ defmodule Manifold.Connectors.SyncTest do
 
     assert_receive {:sync_telemetry, [:manifold, :connectors, :sync, :stop], _measurements,
                     %{error_code: :provider_not_configured}}
+  end
+
+  test "Gmail setting rotation after refresh rollback wins over stale provider failure", %{
+    account: account
+  } do
+    send_method = insert_gmail_send_method!(account)
+    authorization = expire_oauth_authorization!(account.oauth_authorization_id)
+    tokens = Map.take(authorization, [:access_token_ciphertext, :refresh_token_ciphertext])
+
+    setting =
+      Repo.get_by!(Manifold.Connectors.Schema.OAuthProviderSetting, provider: "gmail")
+
+    provider_error = temporary_refresh_error()
+    attach_sync_telemetry()
+
+    {sync, sync_pid, refresh_gate, handler_gate} =
+      start_paused_refresh_failure(account.id, provider_error)
+
+    test_pid = self()
+
+    rotation =
+      Task.async(fn ->
+        send(test_pid, {:provider_setting_change_started, self()})
+
+        Connectors.put_oauth_provider_setting(
+          "gmail",
+          %{"client_id" => "refresh-race-client", "client_secret" => "refresh-race-secret"},
+          expected_lock_version: setting.lock_version
+        )
+      end)
+
+    assert_receive {:provider_setting_change_started, _rotation_pid}, 5_000
+    assert Task.yield(rotation, 0) == nil
+    send(sync_pid, {:release_refresh, refresh_gate})
+    assert_receive {:preflight_provider_error, ^sync_pid, ^handler_gate, ^provider_error}, 5_000
+    assert {:ok, _rotated} = Task.await(rotation, 5_000)
+    send(sync_pid, {:release_preflight_provider_error, handler_gate})
+
+    assert {:cancel, :reconnect_required} = Task.await(sync, 5_000)
+
+    assert_provider_setting_reconnect_lifecycle(
+      account.id,
+      authorization.id,
+      send_method.id,
+      tokens
+    )
+
+    refute_provider_sync_io()
+    refute Repo.get_by(ConnectorEvent, external_account_id: account.id, event_type: "sync_failed")
+    assert_provider_failure_telemetry(:rate_limited)
+  end
+
+  test "Gmail setting removal after refresh rollback wins over stale provider failure", %{
+    account: account
+  } do
+    send_method = insert_gmail_send_method!(account)
+    authorization = expire_oauth_authorization!(account.oauth_authorization_id)
+    tokens = Map.take(authorization, [:access_token_ciphertext, :refresh_token_ciphertext])
+
+    setting =
+      Repo.get_by!(Manifold.Connectors.Schema.OAuthProviderSetting, provider: "gmail")
+
+    provider_error = temporary_refresh_error()
+    attach_sync_telemetry()
+
+    {sync, sync_pid, refresh_gate, handler_gate} =
+      start_paused_refresh_failure(account.id, provider_error)
+
+    test_pid = self()
+
+    removal =
+      Task.async(fn ->
+        send(test_pid, {:provider_setting_change_started, self()})
+
+        Connectors.remove_oauth_provider_setting("gmail",
+          expected_lock_version: setting.lock_version
+        )
+      end)
+
+    assert_receive {:provider_setting_change_started, _removal_pid}, 5_000
+    assert Task.yield(removal, 0) == nil
+    send(sync_pid, {:release_refresh, refresh_gate})
+    assert_receive {:preflight_provider_error, ^sync_pid, ^handler_gate, ^provider_error}, 5_000
+    assert {:ok, %{status: :not_configured}} = Task.await(removal, 5_000)
+    send(sync_pid, {:release_preflight_provider_error, handler_gate})
+
+    assert {:cancel, :reconnect_required} = Task.await(sync, 5_000)
+
+    assert_provider_setting_reconnect_lifecycle(
+      account.id,
+      authorization.id,
+      send_method.id,
+      tokens
+    )
+
+    refute_provider_sync_io()
+    refute Repo.get_by(ConnectorEvent, external_account_id: account.id, event_type: "sync_failed")
+    assert_provider_failure_telemetry(:rate_limited)
+  end
+
+  test "Gmail disconnect after refresh rollback wins over stale provider failure", %{
+    account: account
+  } do
+    send_method = insert_gmail_send_method!(account)
+    authorization = expire_oauth_authorization!(account.oauth_authorization_id)
+    tokens = Map.take(authorization, [:access_token_ciphertext, :refresh_token_ciphertext])
+    provider_error = temporary_refresh_error()
+    attach_sync_telemetry()
+
+    {sync, sync_pid, refresh_gate, handler_gate} =
+      start_paused_refresh_failure(account.id, provider_error)
+
+    test_pid = self()
+
+    disconnect =
+      Task.async(fn ->
+        send(test_pid, {:disconnect_started, self()})
+        Connectors.disconnect(account.id)
+      end)
+
+    assert_receive {:disconnect_started, _disconnect_pid}, 5_000
+    assert Task.yield(disconnect, 0) == nil
+    send(sync_pid, {:release_refresh, refresh_gate})
+    assert_receive {:preflight_provider_error, ^sync_pid, ^handler_gate, ^provider_error}, 5_000
+    assert {:ok, %ReceiveMethod{status: "disconnected"}} = Task.await(disconnect, 5_000)
+    send(sync_pid, {:release_preflight_provider_error, handler_gate})
+
+    assert {:cancel, :account_disconnected} = Task.await(sync, 5_000)
+    disconnected = Repo.get!(ReceiveMethod, account.id)
+    assert disconnected.status == "disconnected"
+    refute disconnected.enabled
+    refute disconnected.sync_enabled
+
+    authorization = Repo.get!(OAuthAuthorization, authorization.id)
+    assert authorization.status == "connected"
+
+    assert Map.take(authorization, [:access_token_ciphertext, :refresh_token_ciphertext]) ==
+             tokens
+
+    assert Repo.get!(SendMethod, send_method.id).status == "connected"
+    refute_provider_sync_io()
+    refute Repo.get_by(ConnectorEvent, external_account_id: account.id, event_type: "sync_failed")
+    assert_provider_failure_telemetry(:rate_limited)
+  end
+
+  test "same-generation Gmail refresh failure still records failed and retry outcome", %{
+    account: account
+  } do
+    authorization = expire_oauth_authorization!(account.oauth_authorization_id)
+    tokens = Map.take(authorization, [:access_token_ciphertext, :refresh_token_ciphertext])
+    provider_error = temporary_refresh_error()
+
+    assert {:snooze, 47} =
+             Connectors.sync_account(account.id,
+               provider_opts: [refresh_result: {:error, provider_error}]
+             )
+
+    failed = Repo.get!(ReceiveMethod, account.id)
+    assert failed.status == "failed"
+    assert failed.last_error_code == "rate_limited"
+
+    assert Map.take(Repo.get!(OAuthAuthorization, authorization.id), [
+             :access_token_ciphertext,
+             :refresh_token_ciphertext
+           ]) == tokens
+
+    assert Repo.get_by!(ConnectorEvent,
+             external_account_id: account.id,
+             event_type: "sync_failed"
+           )
   end
 
   test "imports raw mail before advancing the provider cursor", %{
@@ -2445,6 +2628,61 @@ defmodule Manifold.Connectors.SyncTest do
                    5_000
 
     {sync, sync_pid, gate}
+  end
+
+  defp start_paused_refresh_failure(receive_method_id, provider_error) do
+    test_pid = self()
+    refresh_gate = make_ref()
+    handler_gate = make_ref()
+
+    sync =
+      Task.async(fn ->
+        Connectors.sync_account(receive_method_id,
+          before_preflight_provider_error: fn error ->
+            send(test_pid, {:preflight_provider_error, self(), handler_gate, error})
+
+            receive do
+              {:release_preflight_provider_error, ^handler_gate} -> :ok
+            end
+          end,
+          provider_opts: [
+            test_pid: test_pid,
+            refresh_gate: refresh_gate,
+            refresh_result: {:error, provider_error}
+          ]
+        )
+      end)
+
+    assert_receive {:refresh_started, sync_pid, ^refresh_gate}, 5_000
+    {sync, sync_pid, refresh_gate, handler_gate}
+  end
+
+  defp expire_oauth_authorization!(authorization_id) do
+    authorization_id
+    |> then(&Repo.get!(OAuthAuthorization, &1))
+    |> OAuthAuthorization.changeset(%{
+      token_expires_at: DateTime.add(DateTime.utc_now(), -60, :second)
+    })
+    |> Repo.update!()
+  end
+
+  defp temporary_refresh_error do
+    %Error{
+      class: :temporary,
+      code: :rate_limited,
+      message: "provider refresh temporarily failed",
+      retry_after_seconds: 47
+    }
+  end
+
+  defp refute_provider_sync_io do
+    refute_receive {:sync_page_called, _gate, _access_token, _cursor}, 100
+    refute_receive {:sync_config, _config}, 100
+  end
+
+  defp assert_provider_failure_telemetry(error_code) do
+    assert_receive {:sync_telemetry, [:manifold, :connectors, :sync, :stop], _measurements,
+                    %{error_code: ^error_code}}
   end
 
   defp assert_provider_setting_reconnect_lifecycle(
