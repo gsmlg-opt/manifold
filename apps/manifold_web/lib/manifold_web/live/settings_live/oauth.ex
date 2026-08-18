@@ -74,7 +74,8 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
           {:noreply,
            socket
            |> reload_provider(provider)
-           |> put_flash(:info, "#{provider_title(socket, provider)} configuration removed.")}
+           |> put_flash(:info, "#{provider_title(socket, provider)} configuration removed.")
+           |> push_event("focus-oauth-provider", %{provider: provider})}
 
         {:error, _error} ->
           {:noreply,
@@ -187,20 +188,20 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
           <.link navigate={~p"/settings/accounts"} class="settings-action">
             Manage accounts
           </.link>
-          <.dm_btn
+          <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#143 --%>
+          <button
             :if={provider.view.client_secret_configured?}
             id={"remove-oauth-provider-#{provider.definition.key}"}
             type="button"
-            variant="error"
-            confirm={remove_confirmation(provider.definition)}
-            confirm_title={"Remove #{card_title(provider.definition)} configuration?"}
-            confirm_text="Remove configuration"
+            class="settings-action settings-action-error"
+            aria-label={"Remove #{card_title(provider.definition)} configuration"}
             phx-click="remove-provider"
             phx-value-provider={provider.definition.key}
             phx-value-lock_version={provider.view.lock_version}
+            data-confirm={remove_confirmation(provider.definition)}
           >
             Remove configuration
-          </.dm_btn>
+          </button>
         </div>
       </.dm_card>
     </section>

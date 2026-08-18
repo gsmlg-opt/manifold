@@ -343,25 +343,12 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
 
     {:ok, view, _html} = live(conn, "/settings/oauth")
 
-    assert has_element?(view, "#remove-oauth-provider-gmail")
-    refute has_element?(view, "#remove-oauth-provider-gmail[phx-click]")
-
     assert has_element?(
              view,
-             "#remove-oauth-provider-gmail[onclick*='confirm-dialog-remove-oauth-provider-gmail']"
+             "button#remove-oauth-provider-gmail.settings-action-error[phx-click='remove-provider'][aria-label='Remove Google OAuth configuration'][data-confirm*='Gmail receive and send will stop'][data-confirm*='reconnect']"
            )
 
-    assert has_element?(
-             view,
-             "#confirm-dialog-remove-oauth-provider-gmail[role='dialog'] p",
-             "Gmail receive and send will stop"
-           )
-
-    assert has_element?(
-             view,
-             "#confirm-dialog-remove-oauth-provider-gmail el-dm-button[phx-click='remove-provider'][phx-value-provider='gmail'][phx-value-lock_version='#{configured.lock_version}']",
-             "Remove configuration"
-           )
+    refute has_element?(view, "#confirm-dialog-remove-oauth-provider-gmail")
 
     html =
       render_click(view, "remove-provider", %{
@@ -369,6 +356,7 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
         "lock_version" => Integer.to_string(configured.lock_version)
       })
 
+    assert_push_event(view, "focus-oauth-provider", %{provider: "gmail"})
     assert html =~ "Not configured"
     assert html =~ "Google OAuth configuration removed."
     refute html =~ "revok"

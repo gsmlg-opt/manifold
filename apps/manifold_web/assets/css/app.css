@@ -657,6 +657,19 @@ code {
   color: var(--color-primary-content);
 }
 
+.settings-action-error {
+  border-color: var(--color-error);
+  background: var(--color-error);
+  color: var(--color-error-content);
+}
+
+.settings-action-error:hover,
+.settings-action-error:focus-visible {
+  border-color: var(--color-error);
+  background: color-mix(in oklch, var(--color-error) 88%, var(--color-on-surface));
+  color: var(--color-error-content);
+}
+
 .settings-action:disabled,
 .settings-action-primary:disabled {
   border-color: var(--color-outline-variant);
