@@ -141,6 +141,7 @@ config :manifold_api, ManifoldAPI.Endpoint,
   pubsub_server: ManifoldAPI.PubSub
 
 config :phoenix, :json_library, Jason
+config :phoenix, :filter_parameters, ["password", "token", "secret"]
 
 config :codepagex,
   encodings: [

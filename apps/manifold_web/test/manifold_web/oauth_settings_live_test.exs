@@ -1,6 +1,7 @@
 defmodule ManifoldWeb.OAuthSettingsLiveTest do
   use ManifoldWeb.ConnCase, async: false
 
+  import ExUnit.CaptureLog
   import Phoenix.LiveViewTest
 
   alias Manifold.Accounts
@@ -28,6 +29,58 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     on_exit(fn -> restore_env(:encryption_key, previous_key) end)
 
     :ok
+  end
+
+  test "Phoenix filters nested client secrets without weakening password and token filters" do
+    sentinel = "filter-unit-secret-#{System.unique_integer([:positive])}"
+
+    filtered =
+      Phoenix.Logger.filter_values(%{
+        "password" => "password-value",
+        "token" => "token-value",
+        "oauth_provider_setting" => %{
+          "client_id" => "visible-client",
+          "client_secret" => sentinel
+        }
+      })
+
+    assert filtered == %{
+             "password" => "[FILTERED]",
+             "token" => "[FILTERED]",
+             "oauth_provider_setting" => %{
+               "client_id" => "visible-client",
+               "client_secret" => "[FILTERED]"
+             }
+           }
+
+    refute contains_binary?(filtered, sentinel)
+  end
+
+  test "LiveView debug event logs filter submitted client secrets", %{conn: conn} do
+    previous_level = Logger.level()
+    Logger.configure(level: :debug)
+    on_exit(fn -> Logger.configure(level: previous_level) end)
+
+    {:ok, view, _html} = live(conn, "/settings/oauth")
+    sentinel = "live-event-log-secret-#{System.unique_integer([:positive])}"
+
+    log =
+      capture_log([level: :debug], fn ->
+        view
+        |> form("#oauth-provider-gmail-form",
+          provider: "gmail",
+          oauth_provider_setting: %{
+            client_id: "logged-client",
+            client_secret: sentinel,
+            lock_version: ""
+          }
+        )
+        |> render_submit()
+      end)
+
+    assert log =~ "HANDLE EVENT"
+    assert log =~ "[FILTERED]"
+    refute log =~ sentinel
   end
 
   test "OAuth settings renders the catalog Gmail card and a secret-safe form", %{conn: conn} do
@@ -290,9 +343,24 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
 
     {:ok, view, _html} = live(conn, "/settings/oauth")
 
+    assert has_element?(view, "#remove-oauth-provider-gmail")
+    refute has_element?(view, "#remove-oauth-provider-gmail[phx-click]")
+
     assert has_element?(
              view,
-             "#remove-oauth-provider-gmail[data-confirm*='Gmail receive and send will stop'][data-confirm*='reconnect']"
+             "#remove-oauth-provider-gmail[onclick*='confirm-dialog-remove-oauth-provider-gmail']"
+           )
+
+    assert has_element?(
+             view,
+             "#confirm-dialog-remove-oauth-provider-gmail[role='dialog'] p",
+             "Gmail receive and send will stop"
+           )
+
+    assert has_element?(
+             view,
+             "#confirm-dialog-remove-oauth-provider-gmail el-dm-button[phx-click='remove-provider'][phx-value-provider='gmail'][phx-value-lock_version='#{configured.lock_version}']",
+             "Remove configuration"
            )
 
     html =
@@ -353,7 +421,7 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
 
     {:ok, view, _html} = live(conn, "/settings/oauth")
 
-    html =
+    _result =
       render_click(view, "save-provider", %{
         "provider" => provider,
         "oauth_provider_setting" => %{
@@ -363,17 +431,28 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
         }
       })
 
-    assert html =~ "OAuth configuration could not be saved."
-    refute html =~ "unsupported-secret-never-render"
+    assert_redirect(view, "/settings/oauth")
+    assert_raise ArgumentError, fn -> String.to_existing_atom(provider) end
+
+    {:ok, malformed_view, _html} = live(conn, "/settings/oauth")
+
+    _result =
+      render_click(malformed_view, "save-provider", %{
+        "provider" => "gmail",
+        "oauth_provider_setting" => "malformed"
+      })
+
+    assert_redirect(malformed_view, "/settings/oauth")
+
+    {:ok, remove_view, _html} = live(conn, "/settings/oauth")
 
     html =
-      render_click(view, "remove-provider", %{
+      render_click(remove_view, "remove-provider", %{
         "provider" => provider,
         "lock_version" => ""
       })
 
     assert html =~ "OAuth configuration could not be removed."
-    assert_raise ArgumentError, fn -> String.to_existing_atom(provider) end
 
     assert {:error, {:live_redirect, %{to: "/settings/oauth", flash: flash}}} =
              live(conn, "/settings/oauth/#{provider}/help")

@@ -52,12 +52,12 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
       end
     else
       {:error, _error} ->
-        {:noreply, put_flash(socket, :error, "OAuth configuration could not be saved.")}
+        reject_save(socket)
     end
   end
 
   def handle_event("save-provider", _params, socket) do
-    {:noreply, put_flash(socket, :error, "OAuth configuration could not be saved.")}
+    reject_save(socket)
   end
 
   def handle_event(
@@ -192,10 +192,12 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
             id={"remove-oauth-provider-#{provider.definition.key}"}
             type="button"
             variant="error"
+            confirm={remove_confirmation(provider.definition)}
+            confirm_title={"Remove #{card_title(provider.definition)} configuration?"}
+            confirm_text="Remove configuration"
             phx-click="remove-provider"
             phx-value-provider={provider.definition.key}
             phx-value-lock_version={provider.view.lock_version}
-            data-confirm={remove_confirmation(provider.definition)}
           >
             Remove configuration
           </.dm_btn>
@@ -306,6 +308,13 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
   end
 
   defp parse_lock_version(_invalid), do: :invalid
+
+  defp reject_save(socket) do
+    {:noreply,
+     socket
+     |> put_flash(:error, "OAuth configuration could not be saved.")
+     |> push_navigate(to: ~p"/settings/oauth")}
+  end
 
   defp provider_title(socket, provider) do
     socket.assigns.providers

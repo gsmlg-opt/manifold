@@ -1,9 +1,18 @@
 import "phoenix_html";
 import { Socket } from "phoenix";
 import { LiveSocket } from "phoenix_live_view";
+import "@duskmoon-dev/el-button/register";
+import "@duskmoon-dev/el-dialog/register";
 import * as DuskmoonHooks from "phoenix_duskmoon/hooks";
 import "./datetime.js";
 import { ConversationRow } from "./conversation_row.js";
+
+// WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#142
+document.addEventListener("submit", (event) => {
+  const dialogForm = event.target.closest("el-dm-dialog form[method='dialog']");
+  const dialog = dialogForm?.closest("el-dm-dialog");
+  if (dialog) dialog.close();
+});
 
 // Prefer localStorage over an empty/default server theme so LiveView remounts
 // do not clobber an explicit sunshine/moonlight choice with OS auto.
