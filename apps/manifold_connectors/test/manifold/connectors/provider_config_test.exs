@@ -7,6 +7,10 @@ defmodule Manifold.Connectors.ProviderConfigTest do
   alias Manifold.Core.Error
   alias Manifold.Repo
 
+  defmodule RuntimeErrorRepo do
+    def prepare_query(_operation, _query, _opts), do: raise("unrelated runtime error")
+  end
+
   setup do
     old_key = Application.get_env(:manifold_connectors, :encryption_key)
     old_providers = Application.get_env(:manifold_connectors, :providers)
@@ -234,6 +238,33 @@ defmodule Manifold.Connectors.ProviderConfigTest do
     after
       Process.exit(unrelated_process, :kill)
     end
+  end
+
+  test "Gmail resolver and configured providers fail closed on a stopped named repository" do
+    configure_microsoft!()
+    repo_name = Manifold.ProviderConfigStoppedRepo
+    failed_repo = start_isolated_repo!(name: repo_name)
+    Supervisor.stop(failed_repo)
+
+    on_repo(repo_name, fn ->
+      assert_database_unavailable(ProviderConfig.fetch("gmail"))
+      assert Connectors.configured_providers() == ["microsoft"]
+    end)
+  end
+
+  test "Gmail resolver reraises unrelated runtime errors" do
+    metadata =
+      Repo
+      |> Ecto.Repo.Registry.lookup()
+      |> Map.put(:repo, RuntimeErrorRepo)
+
+    :ok = Ecto.Repo.Registry.associate(self(), nil, metadata)
+
+    on_repo(self(), fn ->
+      assert_raise RuntimeError, "unrelated runtime error", fn ->
+        ProviderConfig.fetch("gmail")
+      end
+    end)
   end
 
   defp put_gmail_setting!(client_id, client_secret) do

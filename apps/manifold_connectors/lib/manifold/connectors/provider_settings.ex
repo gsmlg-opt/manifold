@@ -216,6 +216,13 @@ defmodule Manifold.Connectors.ProviderSettings do
       else
         reraise(error, __STACKTRACE__)
       end
+
+    error in RuntimeError ->
+      if stopped_named_repo_error?(error, __STACKTRACE__) do
+        {:error, database_error()}
+      else
+        reraise(error, __STACKTRACE__)
+      end
   end
 
   defp persist_setting(nil, provider, attrs) do
@@ -591,4 +598,20 @@ defmodule Manifold.Connectors.ProviderSettings do
        do: true
 
   defp dead_repo_stacktrace?(_stacktrace), do: false
+
+  defp stopped_named_repo_error?(
+         %RuntimeError{message: message},
+         [{Ecto.Repo.Registry, :lookup, 1, _registry_metadata} | _rest]
+       ) do
+    case Repo.get_dynamic_repo() do
+      repo when is_atom(repo) ->
+        message ==
+          "could not lookup Ecto repo #{inspect(repo)} because it was not started or it does not exist"
+
+      _repo ->
+        false
+    end
+  end
+
+  defp stopped_named_repo_error?(_error, _stacktrace), do: false
 end
