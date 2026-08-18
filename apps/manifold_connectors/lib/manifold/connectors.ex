@@ -17,6 +17,7 @@ defmodule Manifold.Connectors do
   alias Manifold.Connectors.OAuth.Consumed
   alias Manifold.Connectors.OAuthAuthorizations
   alias Manifold.Connectors.OAuthScopes
+  alias Manifold.Connectors.ProviderSettings
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.IMAP, as: ProviderIMAP
   alias Manifold.Connectors.Provider.EAS, as: ProviderEAS
@@ -43,6 +44,28 @@ defmodule Manifold.Connectors do
   alias Manifold.Mail
   alias Manifold.Mail.Schema.MailboxEntry
   alias Manifold.Repo
+
+  @spec list_oauth_provider_settings() :: [ProviderSettings.safe_view()]
+  def list_oauth_provider_settings, do: ProviderSettings.list()
+
+  @spec get_oauth_provider_setting(String.t()) ::
+          {:ok, ProviderSettings.safe_view()} | {:error, Error.t()}
+  def get_oauth_provider_setting(provider), do: ProviderSettings.get(provider)
+
+  @spec change_oauth_provider_setting(String.t(), map()) ::
+          Ecto.Changeset.t() | {:error, Error.t()}
+  def change_oauth_provider_setting(provider, attrs \\ %{}),
+    do: ProviderSettings.change(provider, attrs)
+
+  @spec put_oauth_provider_setting(String.t(), map(), Keyword.t()) ::
+          {:ok, ProviderSettings.safe_view()} | {:error, Error.t() | Ecto.Changeset.t()}
+  def put_oauth_provider_setting(provider, attrs, opts \\ []),
+    do: ProviderSettings.put(provider, attrs, opts)
+
+  @spec remove_oauth_provider_setting(String.t(), Keyword.t()) ::
+          {:ok, ProviderSettings.safe_view()} | {:error, Error.t() | Ecto.Changeset.t()}
+  def remove_oauth_provider_setting(provider, opts \\ []),
+    do: ProviderSettings.remove(provider, opts)
 
   @spec complete_authorization(String.t(), String.t(), Consumed.t(), Keyword.t()) ::
           {:ok, ReceiveMethod.t() | SendMethod.t()}
