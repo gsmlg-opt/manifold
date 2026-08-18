@@ -204,7 +204,18 @@ defmodule Manifold.Connectors.ProviderSettings do
         {:error, reason}
     end
   rescue
-    DBConnection.ConnectionError -> {:error, database_error()}
+    DBConnection.ConnectionError ->
+      {:error, database_error()}
+
+    Postgrex.Error ->
+      {:error, database_error()}
+
+    error in ArgumentError ->
+      if dead_dynamic_repo_error?(error, __STACKTRACE__) do
+        {:error, database_error()}
+      else
+        reraise(error, __STACKTRACE__)
+      end
   end
 
   defp persist_setting(nil, provider, attrs) do
@@ -557,4 +568,27 @@ defmodule Manifold.Connectors.ProviderSettings do
       "OAuth provider settings are temporarily unavailable"
     )
   end
+
+  defp dead_dynamic_repo_error?(%ArgumentError{}, stacktrace) do
+    case Repo.get_dynamic_repo() do
+      repo when is_pid(repo) -> not Process.alive?(repo) and dead_repo_stacktrace?(stacktrace)
+      _repo -> false
+    end
+  end
+
+  defp dead_dynamic_repo_error?(_error, _stacktrace), do: false
+
+  defp dead_repo_stacktrace?([
+         {:ets, :lookup_element, [Ecto.Repo.Registry, _repo, 4], _ets_metadata},
+         {Ecto.Repo.Registry, :lookup, 1, _registry_metadata} | _rest
+       ]),
+       do: true
+
+  defp dead_repo_stacktrace?([
+         {:ets, :lookup, [_query_cache, _query], _ets_metadata},
+         {Ecto.Query.Planner, :query_lookup, 6, _planner_metadata} | _rest
+       ]),
+       do: true
+
+  defp dead_repo_stacktrace?(_stacktrace), do: false
 end

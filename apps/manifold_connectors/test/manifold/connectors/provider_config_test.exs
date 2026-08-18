@@ -176,6 +176,66 @@ defmodule Manifold.Connectors.ProviderConfigTest do
     assert_raise ArgumentError, fn -> String.to_existing_atom(provider) end
   end
 
+  test "Gmail resolver and configured providers fail closed on connection errors" do
+    configure_microsoft!()
+
+    failed_repo =
+      start_isolated_repo!(
+        url: "ecto://postgres:postgres@127.0.0.1:1/manifold_test",
+        socket_dir: nil,
+        queue_target: 5,
+        queue_interval: 5
+      )
+
+    try do
+      on_repo(failed_repo, fn ->
+        assert_database_unavailable(ProviderConfig.fetch("gmail"))
+        assert Connectors.configured_providers() == ["microsoft"]
+      end)
+    after
+      Supervisor.stop(failed_repo)
+    end
+  end
+
+  test "Gmail resolver and configured providers fail closed on Postgrex errors" do
+    configure_microsoft!()
+    failed_repo = start_isolated_repo!()
+
+    try do
+      on_repo(failed_repo, fn ->
+        Repo.query!("SET search_path TO pg_temp")
+
+        assert_database_unavailable(ProviderConfig.fetch("gmail"))
+        assert Connectors.configured_providers() == ["microsoft"]
+      end)
+    after
+      Supervisor.stop(failed_repo)
+    end
+  end
+
+  test "Gmail resolver and configured providers fail closed on a dead dynamic repository" do
+    configure_microsoft!()
+    failed_repo = start_isolated_repo!()
+    Supervisor.stop(failed_repo)
+
+    on_repo(failed_repo, fn ->
+      assert_database_unavailable(ProviderConfig.fetch("gmail"))
+      assert Connectors.configured_providers() == ["microsoft"]
+    end)
+  end
+
+  test "Gmail resolver reraises registry errors for a live PID that is not a repository" do
+    unrelated_process = spawn(fn -> Process.sleep(:infinity) end)
+
+    try do
+      on_repo(unrelated_process, fn ->
+        assert_raise ArgumentError, fn -> ProviderConfig.fetch("gmail") end
+      end)
+    after
+      Process.exit(unrelated_process, :kill)
+    end
+  end
+
   defp put_gmail_setting!(client_id, client_secret) do
     assert {:ok, _view} =
              Connectors.put_oauth_provider_setting(
@@ -185,6 +245,54 @@ defmodule Manifold.Connectors.ProviderConfigTest do
              )
 
     Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+  end
+
+  defp start_isolated_repo!(opts \\ []) do
+    {:ok, repo} =
+      Repo.start_link(
+        Keyword.merge([name: nil, pool: DBConnection.ConnectionPool, pool_size: 1], opts)
+      )
+
+    Process.unlink(repo)
+    repo
+  end
+
+  defp on_repo(repo, fun) do
+    previous_repo = Repo.put_dynamic_repo(repo)
+
+    try do
+      fun.()
+    after
+      Repo.put_dynamic_repo(previous_repo)
+    end
+  end
+
+  defp assert_database_unavailable(result) do
+    secret = "database-secret-not-for-errors"
+
+    assert {:error,
+            %Error{
+              class: :temporary,
+              reason: :database_unavailable,
+              message: "OAuth provider settings are temporarily unavailable",
+              details: %{}
+            } = error} = result
+
+    inspected = inspect(error)
+    refute inspected =~ secret
+    refute inspected =~ "connector_oauth_provider_settings"
+    refute inspected =~ "Postgrex"
+    refute inspected =~ "DBConnection"
+  end
+
+  defp configure_microsoft! do
+    Application.put_env(:manifold_connectors, :providers,
+      microsoft: [
+        client_id: "microsoft-client",
+        client_secret: "microsoft-secret",
+        authorization_url: "https://login.example/authorize"
+      ]
+    )
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)
