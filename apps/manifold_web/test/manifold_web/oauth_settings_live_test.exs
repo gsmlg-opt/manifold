@@ -17,6 +17,24 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
 
   alias Manifold.Repo
 
+  @invalid_configured_lock_versions [
+    {"missing", :missing},
+    {"explicit nil", nil},
+    {"empty", ""},
+    {"zero", 0},
+    {"negative", -1},
+    {"nonnumeric", "not-a-version"},
+    {"PostgreSQL integer overflow", 2_147_483_648},
+    {"huge integer", "999999999999999999999999999999999999"},
+    {"stale positive", 2}
+  ]
+
+  @unconfigured_lock_versions [
+    {"missing", :missing},
+    {"explicit nil", nil},
+    {"empty", ""}
+  ]
+
   setup do
     previous_key = Application.get_env(:manifold_connectors, :encryption_key)
 
@@ -268,84 +286,75 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     refute contains_exact_binary?(socket_assigns(view), row.client_secret_ciphertext)
   end
 
-  test "missing and integer stale snapshots reload current state with generic errors", %{
-    conn: conn
-  } do
-    {:ok, missing_view, _html} = live(conn, "/settings/oauth")
-    assert {:ok, created} = put_setting("winner-client", "winner-secret")
+  for {label, lock_version} <- @unconfigured_lock_versions do
+    test "unconfigured save accepts #{label} lock version as an explicit nil snapshot", %{
+      conn: conn
+    } do
+      lock_version = unquote(lock_version)
+      {:ok, view, _html} = live(conn, "/settings/oauth")
+      secret = "unconfigured-version-secret-#{unquote(label)}"
 
-    missing_secret = "stale-missing-secret-never-render"
-
-    html =
-      missing_view
-      |> form("#oauth-provider-gmail-form",
-        provider: "gmail",
-        oauth_provider_setting: %{
-          client_id: "loser-client",
-          client_secret: missing_secret,
-          lock_version: ""
+      params =
+        %{
+          "client_id" => "unconfigured-client",
+          "client_secret" => secret
         }
-      )
-      |> render_submit()
+        |> maybe_put_lock_version(lock_version)
 
-    assert html =~ "OAuth configuration could not be saved."
-    assert html =~ "winner-client"
-    refute html =~ missing_secret
-    refute html =~ "stale_oauth_provider_setting"
-    refute contains_binary?(socket_assigns(missing_view), missing_secret)
+      html =
+        render_click(view, "save-provider", %{
+          "provider" => "gmail",
+          "oauth_provider_setting" => params
+        })
 
-    {:ok, stale_view, _html} = live(conn, "/settings/oauth")
+      assert html =~ "Google OAuth configuration saved."
+      assert has_element?(view, "#oauth-provider-gmail-client-secret[value='']")
+      refute html =~ secret
 
-    assert {:ok, current} =
-             Connectors.put_oauth_provider_setting(
-               "gmail",
-               %{"client_id" => "current-client", "client_secret" => "current-secret"},
-               expected_lock_version: created.lock_version
-             )
+      row = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+      assert row.client_id == "unconfigured-client"
 
-    stale_secret = "stale-integer-secret-never-render"
-
-    html =
-      stale_view
-      |> form("#oauth-provider-gmail-form",
-        provider: "gmail",
-        oauth_provider_setting: %{
-          client_id: "stale-client",
-          client_secret: stale_secret,
-          lock_version: Integer.to_string(created.lock_version)
-        }
-      )
-      |> render_submit()
-
-    assert html =~ "OAuth configuration could not be saved."
-    assert html =~ "current-client"
-    assert html =~ ~s(value="#{current.lock_version}")
-    refute html =~ stale_secret
-    refute html =~ "stale_oauth_provider_setting"
-    refute contains_binary?(socket_assigns(stale_view), stale_secret)
+      assert {:ok, ^secret} =
+               Crypto.decrypt(
+                 row.client_secret_ciphertext,
+                 "oauth_provider_setting:#{row.id}:client_secret"
+               )
+    end
   end
 
-  test "malformed lock versions remount without retaining the submitted secret", %{conn: conn} do
-    assert {:ok, configured} = put_setting("current-client", "current-secret")
-    {:ok, view, _html} = live(conn, "/settings/oauth")
-    secret = "malformed-version-secret-never-render"
+  for {label, lock_version} <- @invalid_configured_lock_versions do
+    test "configured save rejects #{label} lock version with a safe remount", %{conn: conn} do
+      lock_version = unquote(lock_version)
+      assert {:ok, _configured} = put_setting("current-client", "current-secret")
+      before = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+      before_snapshot = provider_setting_storage_snapshot(before)
+      {:ok, view, _html} = live(conn, "/settings/oauth")
+      secret = "rejected-version-secret-#{unquote(label)}"
 
-    _html =
-      render_click(view, "save-provider", %{
-        "provider" => "gmail",
-        "oauth_provider_setting" => %{
+      params =
+        %{
           "client_id" => "attacker-client",
-          "client_secret" => secret,
-          "lock_version" => "not-a-version"
+          "client_secret" => secret
         }
-      })
+        |> maybe_put_lock_version(lock_version)
 
-    assert_redirect(view, "/settings/oauth")
+      result =
+        render_click(view, "save-provider", %{
+          "provider" => "gmail",
+          "oauth_provider_setting" => params
+        })
 
-    row = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
-    assert row.client_id == "current-client"
-    assert row.lock_version == configured.lock_version
-    refute inspect(row) =~ secret
+      assert {"/settings/oauth", %{"error" => "OAuth configuration could not be saved."}} =
+               assert_redirect(view)
+
+      assert {:ok, fresh_view, html} = follow_redirect(result, conn, "/settings/oauth")
+      assert html =~ "OAuth configuration could not be saved."
+      assert has_element?(fresh_view, "#oauth-provider-gmail-client-secret[value='']")
+      refute html =~ secret
+
+      after_attempt = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+      assert provider_setting_storage_snapshot(after_attempt) == before_snapshot
+    end
   end
 
   test "corrupt stored credentials show a generic configuration error", %{conn: conn} do
@@ -643,6 +652,22 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     |> :sys.get_state()
     |> Map.fetch!(:socket)
     |> Map.fetch!(:assigns)
+  end
+
+  defp maybe_put_lock_version(params, :missing), do: params
+
+  defp maybe_put_lock_version(params, lock_version),
+    do: Map.put(params, "lock_version", lock_version)
+
+  defp provider_setting_storage_snapshot(setting) do
+    Map.take(setting, [
+      :id,
+      :client_id,
+      :client_secret_ciphertext,
+      :key_version,
+      :lock_version,
+      :updated_at
+    ])
   end
 
   defp contains_exact_binary?(value, sentinel) when is_binary(value), do: value == sentinel

@@ -224,9 +224,15 @@ start.
   events, or public errors.
 - The secret input always renders empty. Submitted secret material is cleared on
   validation and persistence errors.
-- Malformed provider payloads and malformed setting lock versions are rejected
-  with a fresh LiveView navigation so browser-local secret input cannot survive
-  a no-op diff.
+- A not-configured form accepts only a missing, `nil`, or empty lock-version
+  value and maps it to an explicit missing-generation snapshot. Once a setting
+  exists, the lock version is required and must be a positive PostgreSQL integer
+  no greater than `2_147_483_647`.
+- Validation changesets receive a secret-redacted focused patch. Every other
+  rejected save—including stale, unsupported, malformed, database, and provider
+  configuration errors—uses a generic-flash replacement navigation to a fresh
+  OAuth LiveView, ensuring browser-local secret input cannot survive a no-op
+  diff or add a duplicate OAuth entry to browser history.
 - Credential structs redact secret inspection; safe view structs expose only the
   client ID and boolean secret state.
 - OAuth/sync/submission telemetry uses bounded `provider_not_configured` for a

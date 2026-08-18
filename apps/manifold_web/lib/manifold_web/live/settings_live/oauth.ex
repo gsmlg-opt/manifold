@@ -5,6 +5,8 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
   alias Manifold.Connectors.OAuthProviderCatalog
   alias Manifold.Connectors.ProviderSettings.Form
 
+  @postgres_integer_max 2_147_483_647
+
   @impl Phoenix.LiveView
   def mount(_params, _session, socket) do
     definitions = OAuthProviderCatalog.list()
@@ -29,8 +31,8 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
       )
       when is_binary(provider) and is_map(params) do
     with {:ok, _definition} <- OAuthProviderCatalog.fetch(provider),
-         expected_lock_version when expected_lock_version != :invalid <-
-           parse_lock_version(params["lock_version"]) do
+         {:ok, expected_lock_version} <-
+           expected_save_lock_version(socket, provider, params) do
       result =
         Connectors.put_oauth_provider_setting(provider, params,
           expected_lock_version: expected_lock_version
@@ -47,16 +49,10 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
           {:noreply, assign_provider_form(socket, provider, safe_changeset(changeset))}
 
         {:error, _error} ->
-          {:noreply,
-           socket
-           |> reload_provider(provider)
-           |> put_flash(:error, "OAuth configuration could not be saved.")}
+          reject_save(socket)
       end
     else
       {:error, _error} ->
-        reject_save(socket)
-
-      :invalid ->
         reject_save(socket)
     end
   end
@@ -310,11 +306,14 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
 
   defp parse_lock_version(nil), do: nil
   defp parse_lock_version(""), do: nil
-  defp parse_lock_version(version) when is_integer(version) and version > 0, do: version
+
+  defp parse_lock_version(version)
+       when is_integer(version) and version > 0 and version <= @postgres_integer_max,
+       do: version
 
   defp parse_lock_version(version) when is_binary(version) do
     case Integer.parse(version) do
-      {parsed, ""} when parsed > 0 -> parsed
+      {parsed, ""} when parsed > 0 and parsed <= @postgres_integer_max -> parsed
       _invalid -> :invalid
     end
   end
@@ -325,7 +324,41 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
     {:noreply,
      socket
      |> put_flash(:error, "OAuth configuration could not be saved.")
-     |> push_navigate(to: ~p"/settings/oauth")}
+     |> push_navigate(to: ~p"/settings/oauth", replace: true)}
+  end
+
+  defp expected_save_lock_version(socket, provider, params) do
+    case Enum.find(socket.assigns.providers, &(&1.definition.key == provider)) do
+      %{view: %{lock_version: nil}} ->
+        optional_missing_lock_version(params)
+
+      %{view: %{lock_version: lock_version}} when is_integer(lock_version) ->
+        required_lock_version(params)
+
+      _missing ->
+        {:error, :invalid_lock_version}
+    end
+  end
+
+  defp optional_missing_lock_version(params) do
+    case Map.fetch(params, "lock_version") do
+      :error -> {:ok, nil}
+      {:ok, lock_version} when lock_version in [nil, ""] -> {:ok, nil}
+      {:ok, _invalid} -> {:error, :invalid_lock_version}
+    end
+  end
+
+  defp required_lock_version(params) do
+    case Map.fetch(params, "lock_version") do
+      {:ok, lock_version} ->
+        case parse_lock_version(lock_version) do
+          parsed when is_integer(parsed) -> {:ok, parsed}
+          _invalid -> {:error, :invalid_lock_version}
+        end
+
+      :error ->
+        {:error, :invalid_lock_version}
+    end
   end
 
   defp provider_title(socket, provider) do
