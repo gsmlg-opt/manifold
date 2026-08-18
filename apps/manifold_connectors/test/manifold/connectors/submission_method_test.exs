@@ -223,13 +223,16 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
   end
 
   test "Gmail send checkout stops at a corrupt stored setting", %{account: account} do
+    sentinel = "send-checkout-corrupt-secret-#{System.unique_integer([:positive])}"
+
     gmail =
       insert_gmail_method!(account, "sender-subject", expires_at: ~U[2026-08-11 01:00:00.000000Z])
 
     setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+    {:ok, corrupt_ciphertext} = Crypto.encrypt(sentinel, "wrong-provider-setting-context")
 
     setting
-    |> Ecto.Changeset.change(client_secret_ciphertext: <<1, 2, 3>>)
+    |> Ecto.Changeset.change(client_secret_ciphertext: corrupt_ciphertext)
     |> Repo.update!()
 
     assert {:error, %CoreError{reason: :provider_configuration_error} = corrupt_error} =
@@ -238,7 +241,7 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
                provider_opts: [test_pid: self(), refresh_result: {:ok, send_refresh_token()}]
              )
 
-    refute inspect(corrupt_error) =~ "corrupt-secret"
+    refute inspect(corrupt_error) =~ sentinel
     refute inspect(corrupt_error) =~ "ciphertext"
     refute_receive {:send_refresh_config, _config}
   end

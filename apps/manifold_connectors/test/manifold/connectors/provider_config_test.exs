@@ -108,12 +108,15 @@ defmodule Manifold.Connectors.ProviderConfigTest do
   end
 
   test "corrupt Gmail settings return a generic permanent configuration error" do
-    secret = "corrupt-secret-not-for-errors"
+    secret = "resolver-corrupt-setting-secret-#{System.unique_integer([:positive])}"
     setting = put_gmail_setting!("db-client", secret)
+
+    {:ok, corrupt_ciphertext} =
+      Manifold.Connectors.Crypto.encrypt(secret, "wrong-provider-setting-context")
 
     OAuthProviderSetting
     |> where([provider_setting], provider_setting.id == ^setting.id)
-    |> Repo.update_all(set: [client_secret_ciphertext: <<1, 2, 3>>])
+    |> Repo.update_all(set: [client_secret_ciphertext: corrupt_ciphertext])
 
     assert {:error, %Error{class: :permanent, reason: :provider_configuration_error} = error} =
              ProviderConfig.fetch("gmail")

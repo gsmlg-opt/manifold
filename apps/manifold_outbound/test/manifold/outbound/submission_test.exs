@@ -318,6 +318,41 @@ defmodule Manifold.Outbound.SubmissionTest do
     refute_receive {:provider_submit, _, _}
   end
 
+  test "corrupt Gmail settings emit exact secret-free submission telemetry" do
+    attach_submit_telemetry()
+    sentinel = "outbound-corrupt-setting-secret-#{System.unique_integer([:positive])}"
+    %{message: message} = queued_operational_fixture("gmail")
+    setting = Repo.get_by!(Manifold.Connectors.Schema.OAuthProviderSetting, provider: "gmail")
+    {:ok, corrupt_ciphertext} = Crypto.encrypt(sentinel, "wrong-provider-setting-context")
+
+    setting
+    |> Ecto.Changeset.change(client_secret_ciphertext: corrupt_ciphertext)
+    |> Repo.update!()
+
+    result =
+      Outbound.submit_message(message.id,
+        provider: TestProvider,
+        provider_config: [test_pid: self(), result: :unused]
+      )
+
+    assert {:error, %Provider.Error{code: "provider_configuration_error"}} = result
+    refute_receive {:provider_submit, _, _}
+
+    assert_receive {:telemetry, [:manifold, :outbound, :submit, :stop], measurements,
+                    %{outcome: :failed, error_code: "provider_configuration_error"} = metadata}
+
+    assert_secret_free_telemetry(measurements, metadata, [sentinel])
+    assert_secret_absent([result, measurements, metadata], sentinel)
+  end
+
+  test "recursive secret assertion detects a nested sentinel" do
+    sentinel = "nested-leak-sentinel-#{System.unique_integer([:positive])}"
+
+    assert_raise ExUnit.AssertionError, fn ->
+      assert_secret_absent(%{outer: [safe: %{secret: sentinel}]}, sentinel)
+    end
+  end
+
   test "provider acceptance commit failure is returned as a temporary database error" do
     message = queued_message_fixture()
 
@@ -2321,7 +2356,9 @@ defmodule Manifold.Outbound.SubmissionTest do
   end
 
   defp telemetry_terms(map) when is_map(map) do
-    Enum.flat_map(map, fn {key, value} -> [key | telemetry_terms(value)] end)
+    map
+    |> Map.to_list()
+    |> Enum.flat_map(fn {key, value} -> [key | telemetry_terms(value)] end)
   end
 
   defp telemetry_terms(list) when is_list(list), do: Enum.flat_map(list, &telemetry_terms/1)
@@ -2330,6 +2367,17 @@ defmodule Manifold.Outbound.SubmissionTest do
     do: tuple |> Tuple.to_list() |> telemetry_terms()
 
   defp telemetry_terms(value), do: [value]
+
+  defp assert_secret_absent(term, sentinel) do
+    term
+    |> telemetry_terms()
+    |> Enum.each(fn
+      value when is_binary(value) -> assert :binary.match(value, sentinel) == :nomatch
+      value -> refute inspect(value) =~ sentinel
+    end)
+
+    refute inspect(term) =~ sentinel
+  end
 
   defp attach_submit_telemetry do
     handler_id = "submission-stop-#{System.unique_integer([:positive])}"

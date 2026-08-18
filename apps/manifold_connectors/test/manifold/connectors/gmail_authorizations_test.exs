@@ -1470,16 +1470,19 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
 
     refute_receive {:refresh_config, _config}
 
+    sentinel = "refresh-corrupt-setting-secret-#{System.unique_integer([:positive])}"
+
     assert {:ok, _setting} =
              Connectors.put_oauth_provider_setting("gmail", %{
                "client_id" => "corrupt-client",
-               "client_secret" => "corrupt-secret"
+               "client_secret" => sentinel
              })
 
     setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+    {:ok, corrupt_ciphertext} = Crypto.encrypt(sentinel, "wrong-provider-setting-context")
 
     setting
-    |> Ecto.Changeset.change(client_secret_ciphertext: <<1, 2, 3>>)
+    |> Ecto.Changeset.change(client_secret_ciphertext: corrupt_ciphertext)
     |> Repo.update!()
 
     assert {:error, %CoreError{reason: :provider_configuration_error} = error} =
@@ -1492,7 +1495,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
                ]
              )
 
-    refute inspect(error) =~ "corrupt-secret"
+    refute inspect(error) =~ sentinel
     refute inspect(error) =~ "ciphertext"
     refute_receive {:refresh_config, _config}
   end

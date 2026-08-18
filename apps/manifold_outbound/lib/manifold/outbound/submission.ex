@@ -56,6 +56,7 @@ defmodule Manifold.Outbound.Submission do
     message_rejected
     not_found
     outbound_not_found
+    provider_configuration_error
     provider_not_configured
     provider_unavailable
     rate_limited

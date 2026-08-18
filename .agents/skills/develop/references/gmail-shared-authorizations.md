@@ -54,6 +54,9 @@
   normalized, secret-free configuration errors. Legacy application client
   credentials are ignored; only trusted endpoint and test-transport overrides
   are merged into the stored credentials by `ProviderConfig`.
+- Sync and outbound stop telemetry preserve the bounded
+  `provider_configuration_error` code for corrupt settings without exposing the
+  stored secret or encryption details.
 - Direct Gmail receive deletion cancels pending sync work and disconnects and
   clears the authorization only when no live receive or send method remains.
 - When Google omits `scope` from an authorization-code response, the adapter uses

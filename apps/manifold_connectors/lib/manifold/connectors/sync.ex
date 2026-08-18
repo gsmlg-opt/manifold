@@ -43,6 +43,7 @@ defmodule Manifold.Connectors.Sync do
     invalid_grant
     invalid_provider_response
     not_found
+    provider_configuration_error
     provider_not_configured
     provider_unavailable
     rate_limited

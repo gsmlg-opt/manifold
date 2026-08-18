@@ -308,22 +308,25 @@ defmodule Manifold.Connectors.SyncTest do
 
   test "a corrupt Gmail setting stops sync before provider I/O", %{account: account} do
     attach_sync_telemetry()
+    sentinel = "sync-corrupt-setting-secret-#{System.unique_integer([:positive])}"
     setting = Repo.get_by!(Manifold.Connectors.Schema.OAuthProviderSetting, provider: "gmail")
+    {:ok, corrupt_ciphertext} = Crypto.encrypt(sentinel, "wrong-provider-setting-context")
 
     setting
-    |> Ecto.Changeset.change(client_secret_ciphertext: <<1, 2, 3>>)
+    |> Ecto.Changeset.change(client_secret_ciphertext: corrupt_ciphertext)
     |> Repo.update!()
 
-    assert {:cancel, :provider_configuration_error} =
-             Connectors.sync_account(account.id, provider_opts: [test_pid: self()])
+    result = Connectors.sync_account(account.id, provider_opts: [test_pid: self()])
+    assert {:cancel, :provider_configuration_error} = result
 
     refute_receive {:sync_config, _config}
 
     assert_receive {:sync_telemetry, [:manifold, :connectors, :sync, :stop], measurements,
-                    metadata}
+                    %{error_code: :provider_configuration_error} = metadata}
 
-    refute inspect({measurements, metadata}) =~ "corrupt-secret"
-    refute inspect({measurements, metadata}) =~ "ciphertext"
+    persisted = Repo.get!(ReceiveMethod, account.id)
+    assert_secret_absent([result, persisted, measurements, metadata], sentinel)
+    refute inspect([result, persisted, measurements, metadata]) =~ "ciphertext"
   end
 
   test "imports raw mail before advancing the provider cursor", %{
@@ -2415,6 +2418,24 @@ defmodule Manifold.Connectors.SyncTest do
 
   defp restore_env(app, key, nil), do: Application.delete_env(app, key)
   defp restore_env(app, key, value), do: Application.put_env(app, key, value)
+
+  defp assert_secret_absent(term, sentinel) do
+    term
+    |> nested_terms()
+    |> Enum.each(fn
+      value when is_binary(value) -> assert :binary.match(value, sentinel) == :nomatch
+      value -> refute inspect(value) =~ sentinel
+    end)
+
+    refute inspect(term) =~ sentinel
+  end
+
+  defp nested_terms(map) when is_map(map),
+    do: map |> Map.to_list() |> Enum.flat_map(fn {key, value} -> [key | nested_terms(value)] end)
+
+  defp nested_terms(list) when is_list(list), do: Enum.flat_map(list, &nested_terms/1)
+  defp nested_terms(tuple) when is_tuple(tuple), do: tuple |> Tuple.to_list() |> nested_terms()
+  defp nested_terms(value), do: [value]
 end
 
 defmodule Manifold.Connectors.RemoteStateJobsWithoutObanTest do
