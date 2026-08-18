@@ -57,6 +57,11 @@
 - Sync and outbound stop telemetry preserve the bounded
   `provider_configuration_error` code for corrupt settings without exposing the
   stored secret or encryption details.
+- Receive sync snapshots the method after entering `syncing`; configuration or
+  token preflight failures may write `failed` only while the locked method still
+  matches that binding, enabled state, phase, and lock version. Concurrent
+  provider-setting rotation/removal therefore preserves the newer
+  `reconnect_required` lifecycle and encrypted OAuth tokens.
 - Direct Gmail receive deletion cancels pending sync work and disconnects and
   clears the authorization only when no live receive or send method remains.
 - When Google omits `scope` from an authorization-code response, the adapter uses

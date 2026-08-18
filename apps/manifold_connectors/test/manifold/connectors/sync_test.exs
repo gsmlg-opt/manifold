@@ -325,8 +325,91 @@ defmodule Manifold.Connectors.SyncTest do
                     %{error_code: :provider_configuration_error} = metadata}
 
     persisted = Repo.get!(ReceiveMethod, account.id)
+    assert persisted.status == "failed"
+    assert persisted.last_error_code == "provider_configuration_error"
     assert_secret_absent([result, persisted, measurements, metadata], sentinel)
     refute inspect([result, persisted, measurements, metadata]) =~ "ciphertext"
+  end
+
+  test "Gmail setting rotation during preflight cannot overwrite reconnect lifecycle", %{
+    account: account
+  } do
+    send_method = insert_gmail_send_method!(account)
+    authorization = Repo.get!(OAuthAuthorization, account.oauth_authorization_id)
+    tokens = Map.take(authorization, [:access_token_ciphertext, :refresh_token_ciphertext])
+
+    setting =
+      Repo.get_by!(Manifold.Connectors.Schema.OAuthProviderSetting, provider: "gmail")
+
+    attach_sync_telemetry()
+    {sync, sync_pid, gate} = start_paused_sync(account.id)
+
+    assert Repo.get!(ReceiveMethod, account.id).status == "syncing"
+
+    assert {:ok, rotated} =
+             Connectors.put_oauth_provider_setting(
+               "gmail",
+               %{"client_id" => "rotated-sync-client", "client_secret" => "rotated-sync-secret"},
+               expected_lock_version: setting.lock_version
+             )
+
+    assert rotated.lock_version == setting.lock_version + 1
+    send(sync_pid, {:release_sync_preflight, gate})
+
+    assert {:cancel, :reconnect_required} = Task.await(sync, 5_000)
+    refute_receive {:sync_page_called, _gate, _access_token, _cursor}, 100
+    refute_receive {:sync_config, _config}, 100
+
+    assert_provider_setting_reconnect_lifecycle(
+      account.id,
+      authorization.id,
+      send_method.id,
+      tokens
+    )
+
+    refute Repo.get_by(ConnectorEvent, external_account_id: account.id, event_type: "sync_failed")
+
+    assert_receive {:sync_telemetry, [:manifold, :connectors, :sync, :stop], _measurements,
+                    %{error_code: :reauthorization_required}}
+  end
+
+  test "Gmail setting removal during preflight cannot overwrite reconnect lifecycle", %{
+    account: account
+  } do
+    send_method = insert_gmail_send_method!(account)
+    authorization = Repo.get!(OAuthAuthorization, account.oauth_authorization_id)
+    tokens = Map.take(authorization, [:access_token_ciphertext, :refresh_token_ciphertext])
+
+    setting =
+      Repo.get_by!(Manifold.Connectors.Schema.OAuthProviderSetting, provider: "gmail")
+
+    attach_sync_telemetry()
+    {sync, sync_pid, gate} = start_paused_sync(account.id)
+
+    assert Repo.get!(ReceiveMethod, account.id).status == "syncing"
+
+    assert {:ok, %{status: :not_configured}} =
+             Connectors.remove_oauth_provider_setting("gmail",
+               expected_lock_version: setting.lock_version
+             )
+
+    send(sync_pid, {:release_sync_preflight, gate})
+
+    assert {:cancel, :reconnect_required} = Task.await(sync, 5_000)
+    refute_receive {:sync_page_called, _gate, _access_token, _cursor}, 100
+    refute_receive {:sync_config, _config}, 100
+
+    assert_provider_setting_reconnect_lifecycle(
+      account.id,
+      authorization.id,
+      send_method.id,
+      tokens
+    )
+
+    refute Repo.get_by(ConnectorEvent, external_account_id: account.id, event_type: "sync_failed")
+
+    assert_receive {:sync_telemetry, [:manifold, :connectors, :sync, :stop], _measurements,
+                    %{error_code: :provider_not_configured}}
   end
 
   test "imports raw mail before advancing the provider cursor", %{
@@ -2337,6 +2420,56 @@ defmodule Manifold.Connectors.SyncTest do
       )
 
     on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp start_paused_sync(receive_method_id) do
+    test_pid = self()
+    gate = make_ref()
+
+    sync =
+      Task.async(fn ->
+        Connectors.sync_account(receive_method_id,
+          after_begin_sync: fn snapshot ->
+            send(test_pid, {:sync_preflight_started, self(), gate, snapshot})
+
+            receive do
+              {:release_sync_preflight, ^gate} -> :ok
+            end
+          end,
+          provider_opts: [test_pid: test_pid]
+        )
+      end)
+
+    assert_receive {:sync_preflight_started, sync_pid, ^gate,
+                    %ReceiveMethod{id: ^receive_method_id, status: "syncing"}},
+                   5_000
+
+    {sync, sync_pid, gate}
+  end
+
+  defp assert_provider_setting_reconnect_lifecycle(
+         receive_method_id,
+         authorization_id,
+         send_method_id,
+         tokens
+       ) do
+    authorization = Repo.get!(OAuthAuthorization, authorization_id)
+    assert authorization.status == "reconnect_required"
+    assert authorization.last_error_code == "oauth_provider_configuration_changed"
+
+    assert Map.take(authorization, [:access_token_ciphertext, :refresh_token_ciphertext]) ==
+             tokens
+
+    receive_method = Repo.get!(ReceiveMethod, receive_method_id)
+    assert receive_method.status == "reconnect_required"
+    refute receive_method.enabled
+    refute receive_method.sync_enabled
+    assert receive_method.last_error_code == "oauth_provider_configuration_changed"
+
+    send_method = Repo.get!(SendMethod, send_method_id)
+    assert send_method.status == "reconnect_required"
+    refute send_method.enabled
+    assert send_method.last_error_code == "oauth_provider_configuration_changed"
   end
 
   defp attach_sync_telemetry do

@@ -125,7 +125,33 @@ defmodule Manifold.Connectors.Sync do
   def push_imap_read(remote_message_id, read?), do: push_remote_read(remote_message_id, read?)
 
   defp do_run(account_id, now, opts) do
-    with {:ok, account, cursor} <- begin_sync(account_id, now),
+    case begin_sync(account_id, now) do
+      {:ok, account, cursor} ->
+        continue_sync(account, cursor, now, opts)
+
+      {:error, {:cursor_provider_error, cursor, %ProviderError{} = error}} ->
+        {:error, "imap", error, handle_cursor_provider_error(account_id, cursor, error, now)}
+
+      {:error, %ProviderError{} = error} ->
+        {:error, receive_method_kind(account_id), error,
+         handle_provider_error(account_id, error, now)}
+
+      {:error, %Error{} = error} ->
+        {:error, "unknown", error, handle_core_error(account_id, error, now)}
+
+      {:error, reason} ->
+        error =
+          Error.new(:temporary, :sync_failed, "connector synchronization failed", %{
+            reason: inspect(reason)
+          })
+
+        record_failure(account_id, error.class, error.reason, error.message, now)
+        {:error, "unknown", error, {:error, error}}
+    end
+  end
+
+  defp continue_sync(account, cursor, now, opts) do
+    with :ok <- maybe_after_begin_sync(account, opts),
          :ok <- repair_received_at(account),
          {:ok, adapter, config} <- runtime(account.kind),
          {:ok, config} <- enrich_runtime_config(account, config),
@@ -183,22 +209,22 @@ defmodule Manifold.Connectors.Sync do
                 reason: inspect(reason)
               })
 
-            record_failure(account_id, error.class, error.reason, error.message, now)
-            {:error, account.kind, error, {:error, error}}
+            {:error, account.kind, error, handle_account_core_error(account, error, now, auth)}
         end
       after
         release_provider_session(adapter)
       end
     else
       {:error, {:cursor_provider_error, cursor, %ProviderError{} = error}} ->
-        {:error, "imap", error, handle_cursor_provider_error(account_id, cursor, error, now)}
+        {:error, account.kind, error,
+         handle_cursor_provider_error(account.id, cursor, error, now)}
 
       {:error, %ProviderError{} = error} ->
-        {:error, receive_method_kind(account_id), error,
-         handle_provider_error(account_id, error, now)}
+        {:error, account.kind, error, handle_provider_error(account.id, error, now)}
 
       {:error, %Error{} = error} ->
-        {:error, "unknown", error, handle_core_error(account_id, error, now)}
+        {:error, account.kind, error,
+         handle_account_core_error(account, error, now, {:sync_snapshot, account.lock_version})}
 
       {:error, reason} ->
         error =
@@ -206,8 +232,8 @@ defmodule Manifold.Connectors.Sync do
             reason: inspect(reason)
           })
 
-        record_failure(account_id, error.class, error.reason, error.message, now)
-        {:error, "unknown", error, {:error, error}}
+        {:error, account.kind, error,
+         handle_account_core_error(account, error, now, {:sync_snapshot, account.lock_version})}
     end
   end
 
@@ -1469,6 +1495,40 @@ defmodule Manifold.Connectors.Sync do
     end
   end
 
+  defp lock_current_failure_authorization(
+         %ReceiveMethod{
+           id: method_id,
+           account_id: account_id,
+           oauth_authorization_id: authorization_id,
+           kind: provider,
+           enabled: enabled,
+           sync_enabled: sync_enabled
+         },
+         {:sync_snapshot, expected_lock_version}
+       ) do
+    current =
+      ReceiveMethod
+      |> where([method], method.id == ^method_id)
+      |> lock("FOR UPDATE")
+      |> Repo.one()
+
+    case current do
+      %ReceiveMethod{
+        account_id: ^account_id,
+        oauth_authorization_id: ^authorization_id,
+        kind: ^provider,
+        status: "syncing",
+        enabled: ^enabled,
+        sync_enabled: ^sync_enabled,
+        lock_version: ^expected_lock_version
+      } ->
+        :ok
+
+      _changed_or_missing ->
+        :lifecycle_changed
+    end
+  end
+
   defp lock_current_failure_authorization(%ReceiveMethod{kind: provider}, _auth)
        when provider in ["gmail", "microsoft"],
        do: :lifecycle_changed
@@ -1501,6 +1561,13 @@ defmodule Manifold.Connectors.Sync do
   defp credential_context(account_id, kind), do: "credential:#{account_id}:#{kind}"
   defp provider_opts(opts), do: Keyword.get(opts, :provider_opts, [])
   defp ingest_opts(opts), do: Keyword.take(opts, [:spool_opts])
+
+  defp maybe_after_begin_sync(account, opts) do
+    case Keyword.get(opts, :after_begin_sync) do
+      callback when is_function(callback, 1) -> callback.(account)
+      nil -> :ok
+    end
+  end
 
   defp maybe_fault(opts, point) do
     if Keyword.get(opts, :fail_at) == point do
