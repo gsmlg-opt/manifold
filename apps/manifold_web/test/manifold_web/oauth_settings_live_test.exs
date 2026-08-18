@@ -455,17 +455,89 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
 
     assert flash["error"] == "OAuth provider help is unavailable."
     assert_raise ArgumentError, fn -> String.to_existing_atom(provider) end
+
+    malformed_provider = "not valid!#{System.unique_integer([:positive])}"
+    assert_raise ArgumentError, fn -> String.to_existing_atom(malformed_provider) end
+
+    assert {:error, {:live_redirect, %{to: "/settings/oauth", flash: malformed_flash}}} =
+             live(conn, "/settings/oauth/#{URI.encode(malformed_provider)}/help")
+
+    assert malformed_flash["error"] == "OAuth provider help is unavailable."
+    assert_raise ArgumentError, fn -> String.to_existing_atom(malformed_provider) end
   end
 
-  test "Gmail help renders safe metadata and exact callback with OAuth navigation current", %{
+  test "Gmail help renders catalog setup instructions and exact callback accessibly", %{
     conn: conn
   } do
     {:ok, view, html} = live(conn, "/settings/oauth/gmail/help")
 
-    assert html =~ "Gmail"
-    assert html =~ "http://localhost:4002/connectors/gmail/callback"
+    callback_uri = "http://localhost:4002/connectors/gmail/callback"
+
     assert html =~ ~s(data-current="oauth")
-    assert has_element?(view, "a[href='/settings/oauth']", "Back to OAuth settings")
+    assert has_element?(view, "h1", "Set up Google OAuth")
+    assert has_element?(view, "h2", "Setup checklist")
+    assert has_element?(view, "ol > li", "Create or select a Google Cloud project.")
+    assert has_element?(view, "ol > li", "Enable the Gmail API.")
+    assert has_element?(view, "ol > li", "Configure OAuth branding and audience.")
+
+    assert has_element?(
+             view,
+             "ol > li",
+             "Add only openid, email, gmail.readonly, and gmail.send."
+           )
+
+    assert has_element?(view, "ol > li", "Add test users when the app is in Testing mode.")
+    assert has_element?(view, "ol > li", "Create a Web application OAuth client.")
+    assert has_element?(view, "ol > li", "Register the exact callback URI shown below.")
+    assert has_element?(view, "ol > li", "Copy the client ID and secret into Settings OAuth.")
+
+    assert has_element?(
+             view,
+             "ol > li",
+             "Complete Google verification before public use when required."
+           )
+
+    assert has_element?(view, "h2", "Callback URI")
+
+    assert has_element?(
+             view,
+             "#oauth-provider-gmail-help-callback[readonly][value='#{callback_uri}']"
+           )
+
+    assert has_element?(view, "h2", "Required scopes")
+    assert html =~ "openid"
+    assert html =~ "email"
+    assert html =~ "https://www.googleapis.com/auth/gmail.readonly"
+    assert html =~ "Receive mail by reading Gmail messages without modifying them."
+    assert html =~ "https://www.googleapis.com/auth/gmail.send"
+    assert html =~ "Send mail through Gmail."
+    assert html =~ "Testing-mode authorizations can expire after seven days."
+
+    assert html =~
+             "Sensitive or restricted scopes may require Google verification before public use."
+
+    assert has_element?(view, "h2", "Official Google documentation")
+
+    for {label, href} <- [
+          {"Manage app audience", "https://support.google.com/cloud/answer/15549945?hl=en"},
+          {"OAuth verification", "https://support.google.com/cloud/answer/13463073?hl=en"},
+          {"Request minimum scopes", "https://support.google.com/cloud/answer/13807380?hl=en"}
+        ] do
+      assert has_element?(
+               view,
+               "a[href='#{href}'][target='_blank'][rel='noopener noreferrer'][aria-label='#{label} (opens in a new tab)']",
+               label
+             )
+    end
+
+    assert has_element?(
+             view,
+             "a[href='/settings/oauth#oauth-provider-gmail']",
+             "Back to Google OAuth configuration"
+           )
+
+    refute has_element?(view, "input[type='password']")
+    refute html =~ "Client secret"
     refute html =~ "MANIFOLD_GMAIL_CLIENT_SECRET"
     refute html =~ "client_secret_ciphertext"
   end
