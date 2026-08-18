@@ -90,8 +90,8 @@ not an OAuth provider credential and must not be stored beside the ciphertext.
 
 Row existence means the provider is configured only when the catalog contains
 that provider, the row is valid, and the secret decrypts successfully. Corrupt
-or undecryptable configuration fails
-closed and is reported as a configuration error without exposing ciphertext,
+or undecryptable configuration fails closed and is reported as a configuration
+error without exposing ciphertext,
 secret text, or crypto details.
 
 ## Connector Boundaries
@@ -160,9 +160,10 @@ stable order inside one database transaction.
 
 ## OAuth Transaction Version Fence
 
-OAuth transactions snapshot the provider-setting `lock_version` at authorization
-start. Callback consumption requires the same version. If credentials were saved,
-rotated, or removed while consent was in flight, completion fails with a generic
+OAuth transactions snapshot both the provider-setting UUID and `lock_version` at
+authorization start. Callback consumption requires the same setting generation.
+If credentials were saved, rotated, removed, or removed and recreated while
+consent was in flight, completion fails with a generic
 `provider_configuration_changed` result and the user must restart authorization.
 
 This closes the race where an authorization code created for one client could be
@@ -264,9 +265,9 @@ control as a separate feature before treating browser-managed secrets as safe.
 
 ## Migration and Rollout
 
-The migration creates the provider-settings table and adds a provider-setting
-version field to OAuth transactions. It does not read process environment or
-backfill credentials.
+The migration creates the provider-settings table and adds provider-setting ID
+and version snapshot fields to OAuth transactions. It does not read process
+environment or backfill credentials.
 
 This is a non-rolling configuration cutover. Before migration, drain old Phoenix,
 connector, and Oban workers so old nodes cannot continue using environment-backed
