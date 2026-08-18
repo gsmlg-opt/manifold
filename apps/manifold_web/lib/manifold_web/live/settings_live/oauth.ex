@@ -170,7 +170,13 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
             helper={secret_helper(provider.view)}
           />
 
-          <.dm_btn type="submit" variant="primary">Save changes</.dm_btn>
+          <button
+            id={"save-oauth-provider-#{provider.definition.key}"}
+            type="submit"
+            class="settings-action settings-action-primary"
+          >
+            Save changes
+          </button>
         </.form>
 
         <p :if={provider.view.client_secret_configured?} class="settings-hint">

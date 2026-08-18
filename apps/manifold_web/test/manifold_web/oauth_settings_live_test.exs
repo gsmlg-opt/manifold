@@ -102,6 +102,14 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
 
     assert has_element?(
              view,
+             "button#save-oauth-provider-gmail.settings-action-primary[type='submit']",
+             "Save changes"
+           )
+
+    refute has_element?(view, "#oauth-provider-gmail-form el-dm-button")
+
+    assert has_element?(
+             view,
              "#oauth-provider-gmail-client-secret[type='password'][autocomplete='new-password'][value=''][phx-patch-focused]"
            )
 
