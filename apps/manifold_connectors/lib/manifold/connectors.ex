@@ -45,7 +45,8 @@ defmodule Manifold.Connectors do
   alias Manifold.Mail.Schema.MailboxEntry
   alias Manifold.Repo
 
-  @spec list_oauth_provider_settings() :: [ProviderSettings.safe_view()]
+  @spec list_oauth_provider_settings() ::
+          {:ok, [ProviderSettings.safe_view()]} | {:error, Error.t()}
   def list_oauth_provider_settings, do: ProviderSettings.list()
 
   @spec get_oauth_provider_setting(String.t()) ::

@@ -41,7 +41,7 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
              lock_version: nil
            }
 
-    assert [^missing] = Connectors.list_oauth_provider_settings()
+    assert {:ok, [^missing]} = Connectors.list_oauth_provider_settings()
 
     secret = "google-secret-do-not-expose"
 
@@ -81,7 +81,7 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
                "oauth_provider_setting:#{row.id}:wrong"
              )
 
-    assert [^view] = Connectors.list_oauth_provider_settings()
+    assert {:ok, [^view]} = Connectors.list_oauth_provider_settings()
 
     assert {:ok, credentials} =
              Manifold.Connectors.ProviderSettings.runtime_credentials("gmail")
@@ -105,6 +105,45 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
     assert %Ecto.Changeset{} = changeset
     refute inspect(changeset) =~ secret
     refute Map.get(changeset.changes, :client_secret) == secret
+  end
+
+  test "public form changesets structurally exclude plaintext and persisted ciphertext" do
+    plaintext = "structural-plaintext-secret"
+    assert {:ok, _view} = put_setting("client", "stored-secret")
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+
+    change =
+      Connectors.change_oauth_provider_setting("gmail", %{
+        "client_id" => "client",
+        "client_secret" => plaintext
+      })
+
+    assert %Ecto.Changeset{} = change
+    refute_changeset_contains(change, [plaintext, setting.client_secret_ciphertext])
+
+    assert {:error, %Ecto.Changeset{} = invalid} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               "client_id" => "",
+               "client_secret" => plaintext
+             })
+
+    refute_changeset_contains(invalid, [plaintext, setting.client_secret_ciphertext])
+  end
+
+  test "list returns a generic temporary error when its repository is unavailable" do
+    {:ok, failed_repo} =
+      Repo.start_link(name: nil, pool: DBConnection.ConnectionPool, pool_size: 1)
+
+    Process.unlink(failed_repo)
+    Supervisor.stop(failed_repo)
+    previous_repo = Repo.put_dynamic_repo(failed_repo)
+
+    try do
+      assert {:error, %Error{class: :temporary, reason: :database_unavailable}} =
+               Connectors.list_oauth_provider_settings()
+    after
+      Repo.put_dynamic_repo(previous_repo)
+    end
   end
 
   test "same trimmed client ID with a blank secret is an exact no-op" do
@@ -530,6 +569,134 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
       Repo.get!(ReceiveMethod, family.receive.id),
       Repo.get!(SendMethod, family.send.id)
     }
+  end
+
+  defp refute_changeset_contains(changeset, sentinels) do
+    Enum.each([changeset.data, changeset.changes, changeset.params], fn value ->
+      Enum.each(sentinels, fn sentinel ->
+        refute contains_binary?(value, sentinel)
+      end)
+    end)
+  end
+
+  defp contains_binary?(value, sentinel) when is_binary(value),
+    do: :binary.match(value, sentinel) != :nomatch
+
+  defp contains_binary?(value, sentinel) when is_struct(value),
+    do: value |> Map.from_struct() |> contains_binary?(sentinel)
+
+  defp contains_binary?(value, sentinel) when is_map(value),
+    do:
+      Enum.any?(value, fn {key, item} ->
+        contains_binary?(key, sentinel) or contains_binary?(item, sentinel)
+      end)
+
+  defp contains_binary?(value, sentinel) when is_list(value),
+    do: Enum.any?(value, &contains_binary?(&1, sentinel))
+
+  defp contains_binary?(value, sentinel) when is_tuple(value),
+    do: value |> Tuple.to_list() |> contains_binary?(sentinel)
+
+  defp contains_binary?(_value, _sentinel), do: false
+
+  defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)
+  defp restore_env(key, value), do: Application.put_env(:manifold_connectors, key, value)
+end
+
+defmodule Manifold.Connectors.ProviderSettingsConcurrencyTest do
+  use ExUnit.Case, async: false
+
+  import Ecto.Query
+
+  alias Ecto.Adapters.SQL.Sandbox
+  alias Manifold.Connectors
+  alias Manifold.Connectors.ProviderSettings
+  alias Manifold.Connectors.Schema.OAuthProviderSetting
+  alias Manifold.Core.Error
+  alias Manifold.Repo
+
+  setup do
+    :ok = Sandbox.checkout(Repo, sandbox: false)
+    old_key = Application.get_env(:manifold_connectors, :encryption_key)
+
+    Application.put_env(
+      :manifold_connectors,
+      :encryption_key,
+      Base.encode64(:crypto.strong_rand_bytes(32))
+    )
+
+    Repo.delete_all(from(setting in OAuthProviderSetting, where: setting.provider == "gmail"))
+
+    on_exit(fn ->
+      restore_env(:encryption_key, old_key)
+      :ok = Sandbox.checkout(Repo, sandbox: false)
+
+      try do
+        Repo.delete_all(from(setting in OAuthProviderSetting, where: setting.provider == "gmail"))
+      after
+        Sandbox.checkin(Repo)
+      end
+    end)
+
+    :ok
+  end
+
+  test "concurrent missing-row creates serialize and preserve the winner" do
+    test_pid = self()
+    gate = make_ref()
+
+    first =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            Repo.query!(
+              "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+              ["oauth_provider_setting:gmail"]
+            )
+
+            assert :ok = ProviderSettings.lock_provider_for_transaction("gmail")
+            send(test_pid, {:first_holds_provider_lock, self(), gate})
+
+            receive do
+              {:release_first, ^gate} -> :ok
+            end
+
+            Connectors.put_oauth_provider_setting(
+              "gmail",
+              %{"client_id" => "winner", "client_secret" => "winner-secret"},
+              expected_lock_version: nil
+            )
+          end)
+        end)
+      end)
+
+    assert_receive {:first_holds_provider_lock, first_pid, ^gate}, 5_000
+
+    second =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          send(test_pid, {:second_attempting_create, self(), gate})
+
+          Connectors.put_oauth_provider_setting(
+            "gmail",
+            %{"client_id" => "loser", "client_secret" => "loser-secret"},
+            expected_lock_version: nil
+          )
+        end)
+      end)
+
+    assert_receive {:second_attempting_create, _second_pid, ^gate}, 5_000
+    assert is_nil(Task.yield(second, 100))
+    send(first_pid, {:release_first, gate})
+
+    assert {:ok, {:ok, winner}} = Task.await(first, 5_000)
+
+    assert {:error, %Error{class: :permanent, reason: :stale_oauth_provider_setting}} =
+             Task.await(second, 5_000)
+
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+    assert setting.client_id == "winner"
+    assert setting.lock_version == winner.lock_version
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:manifold_connectors, key)

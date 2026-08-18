@@ -31,6 +31,35 @@ defmodule Manifold.Connectors.ProviderSettings do
           }
   end
 
+  defmodule Form do
+    @moduledoc false
+
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:provider, :string)
+      field(:client_id, :string)
+      field(:client_secret, :string, virtual: true, redact: true)
+      field(:lock_version, :integer)
+    end
+
+    @type t :: %__MODULE__{
+            provider: String.t(),
+            client_id: String.t() | nil,
+            client_secret: nil,
+            lock_version: pos_integer() | nil
+          }
+
+    @spec changeset(t(), map()) :: Ecto.Changeset.t()
+    def changeset(form, attrs) do
+      form
+      |> cast(attrs, [:client_id])
+      |> validate_required(:client_id)
+    end
+  end
+
   @type safe_view :: %{
           provider: String.t(),
           client_id: String.t() | nil,
@@ -39,12 +68,22 @@ defmodule Manifold.Connectors.ProviderSettings do
           lock_version: pos_integer() | nil
         }
 
-  @spec list() :: [safe_view()]
+  @spec list() :: {:ok, [safe_view()]} | {:error, Error.t()}
   def list do
-    Enum.map(OAuthProviderCatalog.list(), fn definition ->
-      {:ok, view} = get(definition.key)
-      view
+    OAuthProviderCatalog.list()
+    |> Enum.reduce_while({:ok, []}, fn definition, {:ok, views} ->
+      case get(definition.key) do
+        {:ok, view} -> {:cont, {:ok, [view | views]}}
+        {:error, %Error{} = error} -> {:halt, {:error, error}}
+      end
     end)
+    |> case do
+      {:ok, views} -> {:ok, Enum.reverse(views)}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  rescue
+    _error in [DBConnection.ConnectionError, Postgrex.Error, ArgumentError] ->
+      {:error, database_error()}
   end
 
   @spec get(String.t()) :: {:ok, safe_view()} | {:error, Error.t()}
@@ -56,7 +95,8 @@ defmodule Manifold.Connectors.ProviderSettings do
       |> then(&{:ok, &1})
     end
   rescue
-    DBConnection.ConnectionError -> {:error, database_error()}
+    _error in [DBConnection.ConnectionError, Postgrex.Error, ArgumentError] ->
+      {:error, database_error()}
   end
 
   @spec change(String.t(), map()) :: Ecto.Changeset.t() | {:error, Error.t()}
@@ -67,10 +107,10 @@ defmodule Manifold.Connectors.ProviderSettings do
 
       setting
       |> form_changeset(provider, attrs)
-      |> sanitize_changeset()
     end
   rescue
-    DBConnection.ConnectionError -> {:error, database_error()}
+    _error in [DBConnection.ConnectionError, Postgrex.Error, ArgumentError] ->
+      {:error, database_error()}
   end
 
   @spec put(String.t(), map(), Keyword.t()) ::
@@ -80,9 +120,9 @@ defmodule Manifold.Connectors.ProviderSettings do
       attrs = normalize_attrs(attrs)
 
       Repo.transaction(fn ->
-        setting = lock_setting(provider)
-
-        with :ok <- check_expected_lock_version(setting, opts),
+        with :ok <- acquire_provider_lock(provider),
+             setting <- lock_setting(provider),
+             :ok <- check_expected_lock_version(setting, opts),
              {:ok, result} <- persist_setting(setting, provider, attrs),
              :ok <- maybe_transition_dependencies(result, setting, provider) do
           result
@@ -104,9 +144,9 @@ defmodule Manifold.Connectors.ProviderSettings do
   def remove(provider, opts \\ []) do
     with {:ok, _definition} <- OAuthProviderCatalog.fetch(provider) do
       Repo.transaction(fn ->
-        setting = lock_setting(provider)
-
-        with :ok <- check_expected_lock_version(setting, opts),
+        with :ok <- acquire_provider_lock(provider),
+             setting <- lock_setting(provider),
+             :ok <- check_expected_lock_version(setting, opts),
              {:ok, view} <- delete_setting(setting, provider) do
           view
         else
@@ -118,6 +158,19 @@ defmodule Manifold.Connectors.ProviderSettings do
   rescue
     DBConnection.ConnectionError -> {:error, database_error()}
     error in Postgrex.Error -> {:error, database_error(error)}
+  end
+
+  # Holds the provider-scoped advisory lock until the caller's surrounding transaction ends.
+  @doc false
+  @spec lock_provider_for_transaction(String.t()) :: :ok | {:error, Error.t()}
+  def lock_provider_for_transaction(provider) do
+    with {:ok, _definition} <- OAuthProviderCatalog.fetch(provider),
+         :ok <- require_transaction() do
+      acquire_provider_lock(provider)
+    end
+  rescue
+    _error in [DBConnection.ConnectionError, Postgrex.Error, ArgumentError] ->
+      {:error, database_error()}
   end
 
   @doc false
@@ -158,30 +211,36 @@ defmodule Manifold.Connectors.ProviderSettings do
     id = Ecto.UUID.generate()
     changeset = form_changeset(nil, provider, attrs)
 
-    with true <- changeset.valid? || {:error, sanitize_changeset(changeset)},
-         secret when is_binary(secret) <- Map.get(attrs, "client_secret"),
-         {:ok, ciphertext} <- Crypto.encrypt(secret, secret_context(id)),
-         {:ok, setting} <-
-           %OAuthProviderSetting{id: id}
-           |> OAuthProviderSetting.changeset(%{
-             provider: provider,
-             client_id: get_field(changeset, :client_id),
-             client_secret_ciphertext: ciphertext,
-             key_version: 1,
-             lock_version: 1
-           })
-           |> Repo.insert() do
-      {:ok, {:changed, setting}}
+    if changeset.valid? do
+      with secret when is_binary(secret) <- Map.get(attrs, "client_secret"),
+           {:ok, ciphertext} <- Crypto.encrypt(secret, secret_context(id)),
+           {:ok, setting} <-
+             %OAuthProviderSetting{id: id}
+             |> OAuthProviderSetting.changeset(%{
+               provider: provider,
+               client_id: get_field(changeset, :client_id),
+               client_secret_ciphertext: ciphertext,
+               key_version: 1,
+               lock_version: 1
+             })
+             |> Repo.insert() do
+        {:ok, {:changed, setting}}
+      else
+        {:error, %Ecto.Changeset{} = persistence_changeset} ->
+          {:error, public_persistence_changeset(changeset, persistence_changeset)}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     else
-      {:error, %Ecto.Changeset{} = changeset} -> {:error, sanitize_changeset(changeset)}
-      {:error, reason} -> {:error, reason}
+      {:error, changeset}
     end
   end
 
   defp persist_setting(%OAuthProviderSetting{} = setting, provider, attrs) do
     changeset = form_changeset(setting, provider, attrs)
 
-    with true <- changeset.valid? || {:error, sanitize_changeset(changeset)} do
+    if changeset.valid? do
       client_id = get_field(changeset, :client_id)
       secret = Map.get(attrs, "client_secret")
 
@@ -200,29 +259,28 @@ defmodule Manifold.Connectors.ProviderSettings do
                |> Repo.update() do
           {:ok, {:changed, updated}}
         else
-          {:error, %Ecto.Changeset{} = changeset} -> {:error, sanitize_changeset(changeset)}
-          {:error, reason} -> {:error, reason}
+          {:error, %Ecto.Changeset{} = persistence_changeset} ->
+            {:error, public_persistence_changeset(changeset, persistence_changeset)}
+
+          {:error, reason} ->
+            {:error, reason}
         end
       end
     else
-      {:error, reason} -> {:error, reason}
+      {:error, changeset}
     end
   end
 
   defp form_changeset(setting, provider, attrs) do
-    base =
-      setting ||
-        %OAuthProviderSetting{
-          id: Ecto.UUID.generate(),
-          provider: provider,
-          client_secret_ciphertext: <<0>>,
-          key_version: 1,
-          lock_version: 1
-        }
+    form = %Form{
+      provider: provider,
+      client_id: if(setting, do: setting.client_id),
+      lock_version: if(setting, do: setting.lock_version)
+    }
 
     changeset =
-      OAuthProviderSetting.changeset(base, %{
-        client_id: Map.get(attrs, "client_id", base.client_id)
+      Form.changeset(form, %{
+        "client_id" => Map.get(attrs, "client_id", form.client_id)
       })
 
     client_id = get_field(changeset, :client_id)
@@ -372,6 +430,30 @@ defmodule Manifold.Connectors.ProviderSettings do
     |> Repo.one()
   end
 
+  defp acquire_provider_lock(provider) do
+    case Repo.query(
+           "SELECT pg_advisory_xact_lock(" <>
+             "hashtextextended('oauth_provider_setting:' || $1::text, 0))",
+           [provider]
+         ) do
+      {:ok, _result} -> :ok
+      {:error, _error} -> {:error, database_error()}
+    end
+  end
+
+  defp require_transaction do
+    if Repo.in_transaction?() do
+      :ok
+    else
+      {:error,
+       Error.new(
+         :permanent,
+         :oauth_provider_lock_requires_transaction,
+         "OAuth provider lock requires a database transaction"
+       )}
+    end
+  end
+
   defp get_setting(provider), do: Repo.get_by(OAuthProviderSetting, provider: provider)
 
   defp persisted_setting({_outcome, setting}), do: setting
@@ -441,7 +523,13 @@ defmodule Manifold.Connectors.ProviderSettings do
   defp blank_secret?(secret) when is_binary(secret), do: String.trim(secret) == ""
   defp blank_secret?(_secret), do: false
 
-  defp sanitize_changeset(changeset), do: delete_change(changeset, :client_secret)
+  defp public_persistence_changeset(form_changeset, persistence_changeset) do
+    persistence_changeset.errors
+    |> Enum.reduce(form_changeset, fn {field, {message, options}}, changeset ->
+      add_error(changeset, field, message, options)
+    end)
+    |> Map.put(:action, persistence_changeset.action)
+  end
 
   defp unwrap_transaction({:ok, result}), do: {:ok, result}
   defp unwrap_transaction({:error, reason}), do: {:error, reason}
