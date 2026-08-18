@@ -55,6 +55,8 @@ defmodule ManifoldWeb.Router do
       layout: {ManifoldWeb.Layouts, :settings} do
       live("/settings/general", SettingsLive.General, :index)
       live("/settings/appearance", SettingsLive.Appearance, :index)
+      live("/settings/oauth", SettingsLive.OAuth, :index)
+      live("/settings/oauth/:provider/help", SettingsLive.OAuthHelp, :show)
 
       live("/settings/accounts", AccountLive.Index, :index)
       live("/settings/accounts/new", AccountLive.New, :new)

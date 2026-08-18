@@ -20,6 +20,7 @@ defmodule ManifoldWeb.SettingsLiveTest do
     assert html =~ ~s(id="settings-nav")
     assert html =~ ~p"/settings/general"
     assert html =~ ~p"/settings/accounts"
+    assert html =~ "/settings/oauth"
     assert html =~ ~p"/settings/appearance"
     assert html =~ ~s(data-current="general")
   end
@@ -30,7 +31,15 @@ defmodule ManifoldWeb.SettingsLiveTest do
     assert html =~ "Appearance"
     assert html =~ "Coming soon"
     assert html =~ ~s(id="settings-nav")
+    assert html =~ "/settings/oauth"
     assert html =~ ~s(data-current="appearance")
+  end
+
+  test "accounts settings page renders OAuth navigation with Accounts current", %{conn: conn} do
+    {:ok, _view, html} = live(conn, ~p"/settings/accounts")
+
+    assert html =~ "/settings/oauth"
+    assert html =~ ~s(data-current="accounts")
   end
 
   test "appbar Settings menu points at /settings", %{conn: conn} do

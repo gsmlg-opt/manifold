@@ -17,6 +17,7 @@ defmodule ManifoldWeb.Hooks.SettingsPath do
 
   defp section_from_path("/settings/general"), do: :general
   defp section_from_path("/settings/appearance"), do: :appearance
+  defp section_from_path("/settings/oauth" <> _), do: :oauth
   defp section_from_path("/settings/accounts" <> _), do: :accounts
   defp section_from_path(_), do: :general
 end
