@@ -46,10 +46,14 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
     secret = "google-secret-do-not-expose"
 
     assert {:ok, view} =
-             Connectors.put_oauth_provider_setting("gmail", %{
-               "client_id" => "  google-client  ",
-               "client_secret" => secret
-             })
+             Connectors.put_oauth_provider_setting(
+               "gmail",
+               %{
+                 "client_id" => "  google-client  ",
+                 "client_secret" => secret
+               },
+               expected_lock_version: nil
+             )
 
     row = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
     assert row.client_id == "google-client"
@@ -146,8 +150,7 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
     assert {:ok, rotated} =
              Connectors.put_oauth_provider_setting(
                "gmail",
-               %{"client_id" => "client-one", "client_secret" => "secret-two"},
-               expected_lock_version: initial.lock_version
+               %{"client_id" => "client-one", "client_secret" => "secret-two"}
              )
 
     rotated_row = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
@@ -332,6 +335,47 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
              )
 
     assert {:ok, ^current} = Connectors.get_oauth_provider_setting("gmail")
+  end
+
+  test "explicit nil expected version cannot overwrite a setting created after a missing snapshot" do
+    assert {:ok, %{status: :not_configured, lock_version: nil}} =
+             Connectors.get_oauth_provider_setting("gmail")
+
+    assert {:ok, created} = put_setting("first-client", "first-secret")
+    before = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+
+    assert {:error, %Error{class: :permanent, reason: :stale_oauth_provider_setting}} =
+             Connectors.put_oauth_provider_setting(
+               "gmail",
+               %{"client_id" => "second-client", "client_secret" => "second-secret"},
+               expected_lock_version: nil
+             )
+
+    after_attempt = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+    assert after_attempt.id == before.id
+    assert after_attempt.client_id == before.client_id
+    assert after_attempt.client_secret_ciphertext == before.client_secret_ciphertext
+    assert after_attempt.lock_version == created.lock_version
+
+    assert {:ok, "first-secret"} =
+             Crypto.decrypt(
+               after_attempt.client_secret_ciphertext,
+               "oauth_provider_setting:#{after_attempt.id}:client_secret"
+             )
+  end
+
+  test "explicit integer expected version is stale after the setting is removed" do
+    assert {:ok, created} = put_setting("client", "secret")
+    assert {:ok, %{status: :not_configured}} = Connectors.remove_oauth_provider_setting("gmail")
+
+    assert {:error, %Error{class: :permanent, reason: :stale_oauth_provider_setting}} =
+             Connectors.put_oauth_provider_setting(
+               "gmail",
+               %{"client_id" => "replacement", "client_secret" => "replacement-secret"},
+               expected_lock_version: created.lock_version
+             )
+
+    assert is_nil(Repo.get_by(OAuthProviderSetting, provider: "gmail"))
   end
 
   defp put_setting(client_id, client_secret) do

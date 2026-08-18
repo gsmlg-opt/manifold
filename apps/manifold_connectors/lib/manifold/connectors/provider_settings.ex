@@ -350,10 +350,18 @@ defmodule Manifold.Connectors.ProviderSettings do
   end
 
   defp check_expected_lock_version(setting, opts) do
-    case Keyword.get(opts, :expected_lock_version) do
-      nil -> :ok
-      expected when not is_nil(setting) and expected == setting.lock_version -> :ok
-      _expected -> {:error, stale_error()}
+    case Keyword.fetch(opts, :expected_lock_version) do
+      :error ->
+        :ok
+
+      {:ok, nil} when is_nil(setting) ->
+        :ok
+
+      {:ok, expected} when not is_nil(setting) and expected == setting.lock_version ->
+        :ok
+
+      {:ok, _expected} ->
+        {:error, stale_error()}
     end
   end
 
