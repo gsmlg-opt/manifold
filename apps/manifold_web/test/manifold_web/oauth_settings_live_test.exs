@@ -114,7 +114,7 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     assert html =~ "/settings/accounts"
     assert html =~ callback_uri
 
-    assert has_element?(view, "#oauth-provider-gmail")
+    assert has_element?(view, "el-dm-card#oauth-provider-gmail.oauth-provider-card")
     assert has_element?(view, "#oauth-provider-gmail-form[phx-submit='save-provider']")
     refute has_element?(view, "#oauth-provider-gmail-form[phx-change]")
 
@@ -140,6 +140,24 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     refute html =~ "MANIFOLD_GMAIL_CLIENT_SECRET"
     refute html =~ "client_secret_ciphertext"
     refute html =~ "Administrators"
+  end
+
+  test "OAuth cards register their DuskMoon elements and retain a block fallback" do
+    app_js =
+      __DIR__
+      |> Path.join("../../assets/js/app.js")
+      |> File.read!()
+
+    app_css =
+      __DIR__
+      |> Path.join("../../assets/css/app.css")
+      |> File.read!()
+
+    assert app_js =~ ~s(import "@duskmoon-dev/el-card/register";)
+    assert app_js =~ ~s(import "@duskmoon-dev/el-badge/register";)
+    assert app_css =~ ".oauth-provider-card {"
+    assert app_css =~ "display: block;"
+    assert app_css =~ ".oauth-provider-card:not(:defined) {"
   end
 
   test "initial save immediately reloads configured state without retaining the secret", %{
@@ -506,6 +524,7 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     callback_uri = "http://localhost:4002/connectors/gmail/callback"
 
     assert html =~ ~s(data-current="oauth")
+    assert has_element?(view, "el-dm-card#oauth-provider-gmail-help.oauth-provider-card")
     assert has_element?(view, "h1", "Set up Google OAuth")
     assert has_element?(view, "h2", "Setup checklist")
     assert has_element?(view, "ol > li", "Create or select a Google Cloud project.")

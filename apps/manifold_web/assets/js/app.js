@@ -1,4 +1,6 @@
 import "phoenix_html";
+import "@duskmoon-dev/el-badge/register";
+import "@duskmoon-dev/el-card/register";
 import { Socket } from "phoenix";
 import { LiveSocket } from "phoenix_live_view";
 import * as DuskmoonHooks from "phoenix_duskmoon/hooks";

@@ -685,9 +685,13 @@ code {
   color: var(--color-on-surface-variant);
 }
 
-.mailbox-setup-panel {
+.oauth-provider-card {
+  display: block;
   max-width: 760px;
   margin: 28px 0;
+}
+
+.oauth-provider-card:not(:defined) {
   padding: 22px;
   border: 1px solid var(--color-outline-variant);
   border-left: 4px solid var(--color-primary);
@@ -697,7 +701,7 @@ code {
   box-shadow: 0 4px 16px color-mix(in oklch, var(--color-shadow) 12%, transparent);
 }
 
-.mailbox-setup-panel h2 {
+.oauth-provider-card h2 {
   margin: 2px 0 0;
   color: var(--color-on-surface);
 }
@@ -874,7 +878,7 @@ code {
 .settings-action-primary:focus-visible,
 .add-account-choice:focus-visible,
 .add-account-panel .settings-action:focus-visible,
-.mailbox-setup-panel .settings-action:focus-visible {
+.oauth-provider-card .settings-action:focus-visible {
   outline: 2px solid color-mix(in oklch, var(--color-primary) 55%, transparent);
   outline-offset: 2px;
 }

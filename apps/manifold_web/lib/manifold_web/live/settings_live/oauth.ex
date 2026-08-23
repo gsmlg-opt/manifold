@@ -112,7 +112,7 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
         id={"oauth-provider-#{provider.definition.key}"}
         variant="bordered"
         shadow="sm"
-        class="mailbox-setup-panel"
+        class="oauth-provider-card"
       >
         <:title>
           <span>{card_title(provider.definition)}</span>

@@ -51,7 +51,7 @@ defmodule ManifoldWeb.SettingsLive.OAuthHelp do
         id={"oauth-provider-#{@definition.key}-help"}
         variant="bordered"
         shadow="sm"
-        class="mailbox-setup-panel"
+        class="oauth-provider-card"
         body_class="grid gap-6"
       >
         <section aria-labelledby={"oauth-provider-#{@definition.key}-help-steps-title"}>

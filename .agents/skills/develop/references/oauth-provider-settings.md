@@ -30,6 +30,17 @@ The Settings routes inherit Manifold's trusted-local-instance boundary. They are
 not administrator-authenticated and must not be exposed as a secure remote admin
 surface without a separate access-control feature.
 
+### OAuth card element registration
+
+The OAuth settings and help pages render `dm_card` and `dm_badge`, which emit the
+`el-dm-card` and `el-dm-badge` custom elements. Their registrations must remain
+imported in `apps/manifold_web/assets/js/app.js`; an unregistered card defaults to
+`display: inline` and fragments its border/background across the form. The shared
+`oauth-provider-card` class provides the block-level width/margin contract, and
+its `:not(:defined)` rule preserves a usable token-styled card while JavaScript is
+unavailable. The focused OAuth LiveView test checks the imports, card class, and
+fallback rule; browser verification must also confirm both elements are defined.
+
 ## Catalog contract and extension
 
 `Manifold.Connectors.OAuthProviderCatalog.list/0` returns definitions in stable
