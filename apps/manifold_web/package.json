@@ -2,8 +2,8 @@
   "name": "manifold_web",
   "private": true,
   "dependencies": {
-    "@duskmoon-dev/core": "1.17.2",
-    "phoenix_duskmoon": "9.9.7"
+    "@duskmoon-dev/core": "1.18.1",
+    "phoenix_duskmoon": "9.12.1"
   },
   "devDependencies": {}
 }
