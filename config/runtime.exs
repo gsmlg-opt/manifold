@@ -286,21 +286,6 @@ if not edge_release? do
     end
   end
 
-  provider_credentials! = fn provider, client_id_env, client_secret_env, build_config ->
-    case {System.get_env(client_id_env), System.get_env(client_secret_env)} do
-      {nil, nil} ->
-        nil
-
-      {client_id, client_secret}
-      when is_binary(client_id) and client_id != "" and is_binary(client_secret) and
-             client_secret != "" ->
-        build_config.(client_id, client_secret)
-
-      _incomplete ->
-        raise "#{client_id_env} and #{client_secret_env} must be configured together for #{provider}"
-    end
-  end
-
   gmail_config = [
     authorization_url:
       https_endpoint!.(
@@ -324,46 +309,29 @@ if not edge_release? do
       )
   ]
 
-  microsoft_tenant = System.get_env("MANIFOLD_MICROSOFT_TENANT", "organizations")
+  microsoft_tenant = "organizations"
+  microsoft_tenant_base = "https://login.microsoftonline.com/#{microsoft_tenant}/oauth2/v2.0"
 
-  unless Regex.match?(~r/\A[A-Za-z0-9.-]+\z/, microsoft_tenant) do
-    raise "MANIFOLD_MICROSOFT_TENANT contains unsupported characters"
-  end
+  microsoft_config = [
+    authorization_url:
+      https_endpoint!.(
+        "MANIFOLD_MICROSOFT_AUTHORIZATION_URL",
+        microsoft_tenant_base <> "/authorize"
+      ),
+    token_url:
+      https_endpoint!.(
+        "MANIFOLD_MICROSOFT_TOKEN_URL",
+        microsoft_tenant_base <> "/token"
+      ),
+    base_url:
+      https_endpoint!.(
+        "MANIFOLD_MICROSOFT_API_BASE_URL",
+        "https://graph.microsoft.com/v1.0"
+      ),
+    tenant: microsoft_tenant
+  ]
 
-  microsoft_config =
-    provider_credentials!.(
-      "Microsoft",
-      "MANIFOLD_MICROSOFT_CLIENT_ID",
-      "MANIFOLD_MICROSOFT_CLIENT_SECRET",
-      fn client_id, client_secret ->
-        tenant_base = "https://login.microsoftonline.com/#{microsoft_tenant}/oauth2/v2.0"
-
-        [
-          client_id: client_id,
-          client_secret: client_secret,
-          authorization_url:
-            https_endpoint!.(
-              "MANIFOLD_MICROSOFT_AUTHORIZATION_URL",
-              tenant_base <> "/authorize"
-            ),
-          token_url:
-            https_endpoint!.(
-              "MANIFOLD_MICROSOFT_TOKEN_URL",
-              tenant_base <> "/token"
-            ),
-          base_url:
-            https_endpoint!.(
-              "MANIFOLD_MICROSOFT_API_BASE_URL",
-              "https://graph.microsoft.com/v1.0"
-            ),
-          tenant: microsoft_tenant
-        ]
-      end
-    )
-
-  connector_providers =
-    [gmail: gmail_config, microsoft: microsoft_config]
-    |> Enum.reject(fn {_provider, provider_config} -> is_nil(provider_config) end)
+  connector_providers = [gmail: gmail_config, microsoft: microsoft_config]
 
   connector_config =
     [providers: connector_providers]

@@ -101,11 +101,13 @@ defmodule Manifold.ConfigTest do
 
     assert connectors[:providers][:gmail][:base_url] == "https://gmail.invalid"
     assert connectors[:providers][:microsoft][:base_url] == "https://graph.microsoft.invalid/v1.0"
+    refute Keyword.has_key?(connectors[:providers][:gmail], :client_id)
     refute Keyword.has_key?(connectors[:providers][:gmail], :client_secret)
+    refute Keyword.has_key?(connectors[:providers][:microsoft], :client_id)
     refute Keyword.has_key?(connectors[:providers][:microsoft], :client_secret)
   end
 
-  test "production runtime ignores legacy Gmail credentials and parses endpoint overrides" do
+  test "production runtime ignores legacy OAuth credentials and parses endpoint overrides" do
     encryption_key = Base.encode64(:crypto.strong_rand_bytes(32))
 
     put_runtime_env(%{
@@ -119,7 +121,7 @@ defmodule Manifold.ConfigTest do
       "MANIFOLD_GMAIL_API_BASE_URL" => "https://gmail.example",
       "MANIFOLD_MICROSOFT_CLIENT_ID" => "microsoft-id",
       "MANIFOLD_MICROSOFT_CLIENT_SECRET" => "microsoft-secret",
-      "MANIFOLD_MICROSOFT_TENANT" => "tenant-id",
+      "MANIFOLD_MICROSOFT_TENANT" => "consumers",
       "MANIFOLD_MICROSOFT_AUTHORIZATION_URL" => "https://login.example/authorize",
       "MANIFOLD_MICROSOFT_TOKEN_URL" => "https://login.example/token",
       "MANIFOLD_MICROSOFT_API_BASE_URL" => "https://graph.example/v1.0",
@@ -138,29 +140,30 @@ defmodule Manifold.ConfigTest do
            ]
 
     assert connectors[:providers][:microsoft] == [
-             client_id: "microsoft-id",
-             client_secret: "microsoft-secret",
              authorization_url: "https://login.example/authorize",
              token_url: "https://login.example/token",
              base_url: "https://graph.example/v1.0",
-             tenant: "tenant-id"
+             tenant: "organizations"
            ]
   end
 
-  test "Microsoft runtime defaults an unset tenant to organizations" do
-    put_runtime_env(%{
-      "RELEASE_NAME" => "manifold",
-      "MANIFOLD_CONNECTOR_ENCRYPTION_KEY" => Base.encode64(:crypto.strong_rand_bytes(32)),
-      "MANIFOLD_MICROSOFT_CLIENT_ID" => "microsoft-id",
-      "MANIFOLD_MICROSOFT_CLIENT_SECRET" => "microsoft-secret",
-      "SECRET_KEY_BASE" => String.duplicate("s", 64)
-    })
+  test "development runtime ignores all legacy Microsoft credential combinations" do
+    for legacy_env <- [
+          %{"MANIFOLD_MICROSOFT_CLIENT_ID" => "microsoft-dev-id"},
+          %{"MANIFOLD_MICROSOFT_CLIENT_SECRET" => "microsoft-dev-secret"},
+          %{
+            "MANIFOLD_MICROSOFT_CLIENT_ID" => "microsoft-dev-id",
+            "MANIFOLD_MICROSOFT_CLIENT_SECRET" => "microsoft-dev-secret"
+          }
+        ] do
+      put_runtime_env(legacy_env)
 
-    microsoft = read_runtime(:prod)[:manifold_connectors][:providers][:microsoft]
+      microsoft = read_runtime(:dev)[:manifold_connectors][:providers][:microsoft]
 
-    assert microsoft[:tenant] == "organizations"
-    assert microsoft[:authorization_url] =~ "/organizations/"
-    assert microsoft[:token_url] =~ "/organizations/"
+      refute Keyword.has_key?(microsoft, :client_id)
+      refute Keyword.has_key?(microsoft, :client_secret)
+      assert microsoft[:tenant] == "organizations"
+    end
   end
 
   test "development runtime ignores complete legacy Gmail credentials" do
