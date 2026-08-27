@@ -1552,16 +1552,23 @@ consent publication and scope-verification process. The connector encryption key
 must remain stable across releases; real client credentials and deployment
 endpoints are never stored in this design document or the repository.
 
-Migration `20260818000100_add_oauth_provider_settings.exs` and the later Microsoft
-catalog adoption are non-rolling cutovers. Before the Settings-only Microsoft
-release, stop new Microsoft submissions, drain queued and executing Microsoft
-send work, and then drain all old Phoenix, connector, and Oban processes. There is
-no environment import or fallback: each provider remains unavailable until an
-operator saves its credentials in Settings → OAuth, and existing grants require
-reconnect. Rollback refuses while provider-setting rows or fenced OAuth
-transactions exist. Staging must verify immediate picker enablement after save,
-the exact help callbacks, receive and send, rotation/removal reconnect behavior,
-and absence of automatic method resumption.
+Migration `20260818000100_add_oauth_provider_settings.exs` was the original
+non-rolling Gmail cutover. Drain old Phoenix, connector, and Oban processes before
+applying it. There is no environment import or fallback: Gmail remains unavailable
+until Google credentials are saved in Settings → OAuth, and existing Gmail grants
+require reconnect. Rollback refuses while provider-setting rows or fenced OAuth
+transactions exist.
+
+The 2026-08-27 Microsoft catalog adoption is a separate code-only, non-rolling
+cutover with no migration. Stop new Microsoft submissions, drain queued and
+executing Microsoft send work, then drain all old Phoenix, connector, and Oban
+processes before deploying the new binary. Only Microsoft remains unavailable
+until its Settings credentials are saved, and existing Microsoft grants and
+methods require reconnect. The existing Google setting, grants, and methods remain
+valid; operators must not rotate or remove Google credentials for this Microsoft
+cutover. Staging must verify immediate Microsoft picker enablement after save, the
+exact Microsoft help callback, receive and send, rotation/removal reconnect
+behavior, and absence of automatic method resumption.
 
 Microsoft uses the fixed `organizations` tenant, so the registration is limited
 to work/school accounts and does not include Outlook.com personal accounts.

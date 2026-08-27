@@ -295,16 +295,21 @@ Gmail or SMTP provider submissions exist. Do not bypass these preflights.
 
 ### Non-rolling OAuth provider-settings cutover
 
-Migration `20260818000100_add_oauth_provider_settings.exs` and the later Microsoft
-catalog adoption form a non-rolling provider-settings cutover. Before deploying
-the Settings-only Microsoft release, stop new Microsoft submissions, drain all
-queued and executing Microsoft send work, then drain and stop every old Phoenix
-instance, connector process, and Oban worker. Old nodes must not continue using
-legacy client credentials while new nodes resolve database settings. No client
-credentials are imported from environment or used as fallback. After deployment,
-Gmail and Microsoft are unavailable until their credentials are saved at
-`/settings/oauth`, and existing grants must reconnect to the saved OAuth
-applications.
+Migration `20260818000100_add_oauth_provider_settings.exs` was the original
+non-rolling Gmail cutover. Before applying it, drain and stop every old Phoenix,
+connector, and Oban process. It performs no environment import or fallback;
+afterward Gmail is unavailable until Google credentials are saved at
+`/settings/oauth`, and existing Gmail grants must reconnect.
+
+The 2026-08-27 Microsoft catalog adoption is a separate code-only, non-rolling
+cutover and adds no migration. Before deploying that binary, stop new Microsoft
+submissions, drain all queued and executing Microsoft send work, then drain and
+stop every old Phoenix instance, connector process, and Oban worker. After the
+new binary starts, only Microsoft is unavailable until its credentials are saved
+at `/settings/oauth`, and existing Microsoft grants and methods require
+reconnect. The existing Google setting, grants, and methods remain valid and must
+be left untouched: do not rotate or remove Google credentials as part of the
+Microsoft cutover.
 
 Before promoting staging, verify all of the following without restarting:
 
@@ -317,7 +322,25 @@ Before promoting staging, verify all of the following without restarting:
   the affected provider without deleting or revoking its remote grant;
 - previously disabled or reconnect-required methods do not resume automatically.
 
-#### Guarded rollback runbook
+#### Microsoft-only code rollback before the 2026-08-27 binary
+
+The Microsoft Settings adoption added no migration, so rolling only the
+application binary back to a pre-2026-08-27 release does not require rolling back
+`20260818000100`. Leave the Google provider setting, grants, and methods in place;
+do not rotate or remove Google for this rollback. The older binary ignores the
+stored Microsoft provider setting and instead expects the exact historical
+`MANIFOLD_MICROSOFT_CLIENT_ID`, `MANIFOLD_MICROSOFT_CLIENT_SECRET`, and
+`MANIFOLD_MICROSOFT_TENANT` values.
+
+Before switching binaries, verify the presence and provenance of that exact
+historical Microsoft credential pair and tenant in the approved deployment
+secret store without displaying their values. If they cannot be verified, either
+stop the rollback or deliberately accept that Microsoft will be unavailable by
+leaving both client credential variables absent. Never provide only half of the
+pair, guess or recreate a credential or tenant, or delete the stored Settings row
+directly. The database-backed Microsoft setting can remain for a later upgrade.
+
+#### Full guarded rollback below `20260818000100`
 
 Rollback of `20260818000100` is destructive and non-rolling. It drops the OAuth
 provider-settings table and the setting-generation columns from OAuth transaction
@@ -419,18 +442,26 @@ exactly `20260818000100`. If a setting remains or any later migration is applied
 stop; this runbook does not authorize deleting the setting directly or rolling
 back later migrations.
 
-Before any destructive `DELETE`, also confirm through the approved deployment
-secret store that the older release's original
-`MANIFOLD_GMAIL_CLIENT_ID`/`MANIFOLD_GMAIL_CLIENT_SECRET` pair is complete and
-recoverable, without displaying either value. Confirm that the exact existing
+Before any destructive `DELETE`, decide which providers the older release must
+keep operational and verify their exact historical values through the approved
+deployment secret store without displaying them. Gmail requires the original
+`MANIFOLD_GMAIL_CLIENT_ID`/`MANIFOLD_GMAIL_CLIENT_SECRET` pair. Microsoft requires
+the original `MANIFOLD_MICROSOFT_CLIENT_ID`/
+`MANIFOLD_MICROSOFT_CLIENT_SECRET` pair and `MANIFOLD_MICROSOFT_TENANT`. If both
+providers must continue, all five provider values must have verified provenance
+and be recoverable. Also confirm that the exact existing
 `MANIFOLD_CONNECTOR_ENCRYPTION_KEY` and its secret-store version are retained; the
 older release still needs that unchanged key to decrypt preserved connector
-credentials. If any one of these three values is missing or its provenance is
-uncertain, stop and do not delete transaction history.
+credentials.
 
-This is rollback-only compatibility for a release that predates Settings-managed
-Google credentials. The current release ignores the two legacy Gmail variables;
-they are not a current configuration source, import path, or fallback.
+If any value required for a provider is missing or its provenance is uncertain,
+stop and do not delete transaction history. A provider that does not need to
+continue may instead be deliberately left unavailable by omitting its complete
+credential set; never supply a partial pair, guess or recreate a credential or
+tenant, or copy values from the Settings ciphertext. These environment names are
+rollback-only compatibility for a release that predates Settings-managed Google
+and Microsoft credentials. The current release ignores them; they are not a
+current configuration source, import path, or fallback.
 
 Deleting fenced transactions permanently destroys one-time OAuth state and its
 consumed audit history. Only after the operator has reviewed the transaction list,
@@ -518,10 +549,11 @@ The first result must be `NULL`, and the other two queries must return no rows.
 Any unexpected result is a stop condition; restore the backup or the compatible
 release rather than forcing the migration guard.
 
-Before starting the older release, restore/export the complete legacy Gmail
-client pair through the deployment's approved secret mechanism and bind the same,
-unchanged connector encryption-key secret version. Verify presence without
-printing values in the exact environment that will launch the older release:
+Before starting the older release, restore/export each required, provenance-
+verified provider set through the deployment's approved secret mechanism and bind
+the same, unchanged connector encryption-key secret version. If both Google and
+Microsoft must remain operational, verify all of these values are present without
+printing them in the exact environment that will launch the older release:
 
 ```sh
 test -n "${MANIFOLD_GMAIL_CLIENT_ID:-}" || {
@@ -532,16 +564,31 @@ test -n "${MANIFOLD_GMAIL_CLIENT_SECRET:-}" || {
   echo "MANIFOLD_GMAIL_CLIENT_SECRET is missing" >&2
   exit 1
 }
+test -n "${MANIFOLD_MICROSOFT_CLIENT_ID:-}" || {
+  echo "MANIFOLD_MICROSOFT_CLIENT_ID is missing" >&2
+  exit 1
+}
+test -n "${MANIFOLD_MICROSOFT_CLIENT_SECRET:-}" || {
+  echo "MANIFOLD_MICROSOFT_CLIENT_SECRET is missing" >&2
+  exit 1
+}
+test -n "${MANIFOLD_MICROSOFT_TENANT:-}" || {
+  echo "MANIFOLD_MICROSOFT_TENANT is missing" >&2
+  exit 1
+}
 test -n "${MANIFOLD_CONNECTOR_ENCRYPTION_KEY:-}" || {
   echo "MANIFOLD_CONNECTOR_ENCRYPTION_KEY is missing" >&2
   exit 1
 }
 ```
 
-The presence check does not prove key continuity: separately compare the
-connector-key secret-store version/metadata with the recorded pre-rollback
-version, without printing the key. Start the older release only after both Gmail
-values are present and the connector key is confirmed unchanged.
+If a provider is intentionally unavailable, omit its complete credential set and
+document that outcome; never launch with only one client credential or an
+unverified tenant. Presence alone does not prove provenance or key continuity.
+Separately compare provider secret metadata and the connector-key secret-store
+version with the recorded pre-rollback versions, without printing values. Start
+the older release only after every required provider set is verified and the
+connector key is confirmed unchanged.
 
 ## Development
 

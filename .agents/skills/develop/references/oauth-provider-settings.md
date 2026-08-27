@@ -270,13 +270,17 @@ save, rotate, remove, or remove/recreate race therefore ends as
 ## Non-rolling cutover and rollback
 
 Before applying `20260818000100`, drain and stop every old Phoenix instance,
-connector process, and Oban worker. For the later Settings-only Microsoft
-cutover, first stop new Microsoft submissions and drain all queued and executing
-Microsoft send work, then drain the old Phoenix, connector, and Oban processes.
-Do not allow an old node to keep using legacy client credentials while a new node
-reads database settings. There is no environment import or fallback. Each
-provider is unavailable until its credentials are saved in Settings → OAuth, and
-all existing grants for that provider require reconnect.
+connector process, and Oban worker. That migration performs no environment import
+or fallback; Gmail is unavailable until Google credentials are saved in Settings
+→ OAuth, and existing Gmail grants require reconnect.
+
+The 2026-08-27 Microsoft catalog adoption adds no migration. For its code-only,
+non-rolling cutover, first stop new Microsoft submissions and drain all queued
+and executing Microsoft send work, then drain the old Phoenix, connector, and
+Oban processes before deploying the new binary. Only Microsoft is unavailable
+until its Settings credentials are saved, and existing Microsoft grants and
+methods require reconnect. The existing Google setting, grants, and methods stay
+valid; do not rotate or remove Google credentials for this Microsoft cutover.
 
 The down migration refuses before DDL when any provider setting exists or any
 OAuth transaction has a setting UUID/version fence. The Settings UI removes only

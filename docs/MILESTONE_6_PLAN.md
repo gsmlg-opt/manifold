@@ -218,14 +218,22 @@ OAuth, refresh, receive, send, and lifecycle integration.
 
 ### Provider-settings cutover
 
-`20260818000100_add_oauth_provider_settings.exs` and the later Microsoft catalog
-adoption are non-rolling. Before the Settings-only Microsoft release, stop new
-Microsoft submissions, drain queued and executing Microsoft send work, then
-drain old Phoenix, connector, and Oban processes. There is no environment import
-or fallback; each provider remains unavailable until its credentials are saved in
-Settings → OAuth, and existing grants require reconnect. Saving, rotating, or
-removing settings takes effect without restart and never auto-resumes disabled
-methods; removal does not revoke remote provider access.
+`20260818000100_add_oauth_provider_settings.exs` was the original non-rolling
+Gmail cutover. Drain old Phoenix, connector, and Oban processes before applying
+it. There is no environment import or fallback; Gmail remains unavailable until
+Google credentials are saved in Settings → OAuth, and existing Gmail grants
+require reconnect.
+
+The 2026-08-27 Microsoft catalog adoption is a separate code-only, non-rolling
+cutover with no migration. Before that binary is deployed, stop new Microsoft
+submissions, drain queued and executing Microsoft send work, then drain old
+Phoenix, connector, and Oban processes. Only Microsoft remains unavailable until
+its Settings credentials are saved, and existing Microsoft grants and methods
+require reconnect. The existing Google setting, grants, and methods remain valid;
+do not rotate or remove Google credentials for the Microsoft cutover. Saving,
+rotating, or removing either provider's setting takes effect without restart and
+never auto-resumes disabled methods; removal does not revoke remote provider
+access.
 
 OAuth start snapshots the setting UUID and lock version. Completion revalidates
 that generation before provider exchange and, under the provider advisory lock,
@@ -233,9 +241,10 @@ again in the final database transaction after external I/O; no database lock is
 held across the network request. Rollback refuses while a provider setting or a
 fenced OAuth transaction exists.
 
-Staging must confirm immediate receive/send picker enablement after save, both
-help pages and exact callbacks, real receive and send, reconnect after
-client-ID/secret rotation, removal behavior, and no automatic method resumption.
+Staging for the Microsoft adoption must confirm immediate Microsoft receive/send
+picker enablement after save, the Microsoft help page and exact callback, real
+receive and send, reconnect after client-ID/secret rotation, removal behavior,
+and no automatic method resumption while Google remains untouched.
 
 ## Synchronization Flow
 
