@@ -354,12 +354,16 @@ Verify the dump files exist and record their checksums according to the deployme
 backup policy. The narrow dump can be restored only after the provider-settings
 migration has been reapplied; it is not compatible with the rolled-back schema.
 
-While one current-version Phoenix instance is still available, remove the Gmail
-configuration through `/settings/oauth` so the supported lifecycle path marks
-dependent Gmail grants and methods reconnect-required. If the UI cannot remove a
-remaining setting, stop and restore a compatible release; do not bypass lifecycle
-effects with a direct table delete. Then drain and stop every Phoenix instance,
-connector process, and Oban worker before inspecting or changing the database.
+While one current-version Phoenix instance is still available, remove every
+configured OAuth provider setting through `/settings/oauth`. Explicitly remove
+both Google and Microsoft when present, using each provider's normal confirmed
+removal action so the supported lifecycle marks its dependent grants and methods
+reconnect-required. Do not proceed until every catalog provider shows **Not
+configured**; a surviving Microsoft setting would block the zero-row preflight
+below. If the UI cannot remove any remaining setting, stop and restore a
+compatible release; do not bypass lifecycle effects with a direct table delete.
+Then drain and stop every Phoenix instance, connector process, and Oban worker
+before inspecting or changing the database.
 
 Use the deployment's approved libpq service and passfile for SQL sessions. If the
 deployment supplies only `DATABASE_URL`, pass it through libpq's environment

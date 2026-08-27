@@ -333,8 +333,9 @@ fence cannot be represented by the old schema without losing active configuratio
 ### Regression
 
 - Existing Gmail receive/send, uncertainty, and account-isolation suites pass.
-- Google and Microsoft provider settings resolve current encrypted credentials
-  and enforce their setting-generation fences.
+- **2026-08-27 addendum:** Google and Microsoft provider settings resolve current
+  encrypted credentials and enforce their setting-generation fences. This is a
+  superseding regression criterion, not part of the original Gmail-only scope.
 - Format, strict compile, scoped application suites, and migration up/down checks
   pass.
 
