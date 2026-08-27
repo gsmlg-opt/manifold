@@ -42,7 +42,15 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
              lock_version: nil
            }
 
-    assert {:ok, [^missing]} = Connectors.list_oauth_provider_settings()
+    microsoft_missing = %{
+      provider: "microsoft",
+      client_id: nil,
+      client_secret_configured?: false,
+      status: :not_configured,
+      lock_version: nil
+    }
+
+    assert {:ok, [^missing, ^microsoft_missing]} = Connectors.list_oauth_provider_settings()
 
     secret = "google-secret-do-not-expose"
 
@@ -82,7 +90,7 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
                "oauth_provider_setting:#{row.id}:wrong"
              )
 
-    assert {:ok, [^view]} = Connectors.list_oauth_provider_settings()
+    assert {:ok, [^view, ^microsoft_missing]} = Connectors.list_oauth_provider_settings()
 
     assert {:ok, credentials} =
              Manifold.Connectors.ProviderSettings.runtime_credentials("gmail")
@@ -308,6 +316,43 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
     assert_reconnect_required(gmail)
     assert token_snapshot(gmail.authorization) == tokens
     assert Repo.get!(OAuthTransaction, transaction.id).id == transaction.id
+  end
+
+  test "Microsoft save rotation and removal affect only Microsoft dependencies" do
+    gmail = insert_oauth_family!("gmail", "microsoft-isolation")
+    microsoft = insert_oauth_family!("microsoft", "microsoft-isolation")
+    gmail_snapshot = family_snapshot(gmail)
+
+    assert {:ok, created} =
+             Connectors.put_oauth_provider_setting(
+               "microsoft",
+               %{"client_id" => "microsoft-client", "client_secret" => "secret-one"},
+               expected_lock_version: nil
+             )
+
+    assert_reconnect_required(microsoft)
+    assert family_snapshot(gmail) == gmail_snapshot
+
+    second_microsoft = insert_oauth_family!("microsoft", "microsoft-isolation-second")
+
+    assert {:ok, rotated} =
+             Connectors.put_oauth_provider_setting(
+               "microsoft",
+               %{"client_id" => "microsoft-client", "client_secret" => "secret-two"},
+               expected_lock_version: created.lock_version
+             )
+
+    assert rotated.lock_version == created.lock_version + 1
+    assert_reconnect_required(second_microsoft)
+    assert family_snapshot(gmail) == gmail_snapshot
+
+    assert {:ok, %{provider: "microsoft", status: :not_configured}} =
+             Connectors.remove_oauth_provider_setting("microsoft",
+               expected_lock_version: rotated.lock_version
+             )
+
+    assert is_nil(Repo.get_by(OAuthProviderSetting, provider: "microsoft"))
+    assert family_snapshot(gmail) == gmail_snapshot
   end
 
   test "corrupt ciphertext is reported as a generic configuration error" do
