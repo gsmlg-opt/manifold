@@ -194,6 +194,31 @@ defmodule Manifold.Connectors.ProviderConfigTest do
     refute Keyword.has_key?(resolved.config, :untrusted_extra)
   end
 
+  test "Microsoft resolver ignores invalid endpoint overrides" do
+    secret = "microsoft-db-secret-not-for-inspection"
+    put_setting!("microsoft", "microsoft-db-client", secret)
+
+    Application.put_env(:manifold_connectors, :providers,
+      microsoft: [
+        authorization_url: nil,
+        token_url: "",
+        base_url: %{untrusted: "endpoint"}
+      ]
+    )
+
+    assert {:ok, %ProviderConfig.Resolved{} = resolved} = ProviderConfig.fetch("microsoft")
+
+    assert Map.new(resolved.config) == %{
+             authorization_url:
+               "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
+             token_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+             base_url: "https://graph.microsoft.com/v1.0",
+             tenant: "organizations",
+             client_id: "microsoft-db-client",
+             client_secret: secret
+           }
+  end
+
   test "legacy application credentials cannot configure Microsoft" do
     secret = "legacy-microsoft-secret-not-for-errors"
 

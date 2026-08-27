@@ -62,6 +62,7 @@ defmodule Manifold.Connectors.ProviderConfig do
       application_config
       |> Keyword.take(@endpoint_keys)
       |> Keyword.take(Keyword.keys(definition.runtime_config))
+      |> Enum.filter(fn {_key, value} -> is_binary(value) and value != "" end)
 
     safe_req_options =
       application_config
