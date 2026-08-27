@@ -101,7 +101,7 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     refute log =~ sentinel
   end
 
-  test "OAuth settings renders the catalog Gmail card and a secret-safe form", %{conn: conn} do
+  test "OAuth settings renders catalog cards and secret-safe forms", %{conn: conn} do
     {:ok, view, html} = live(conn, "/settings/oauth")
 
     callback_uri = "http://localhost:4002/connectors/gmail/callback"
@@ -109,12 +109,15 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     assert html =~ ~s(data-current="oauth")
     assert html =~ "OAuth"
     assert html =~ "Google OAuth"
+    assert html =~ "Microsoft OAuth"
     assert html =~ "Not configured"
     assert html =~ "/settings/oauth/gmail/help"
+    assert html =~ "/settings/oauth/microsoft/help"
     assert html =~ "/settings/accounts"
     assert html =~ callback_uri
 
     assert has_element?(view, "el-dm-card#oauth-provider-gmail.oauth-provider-card")
+    assert has_element?(view, "el-dm-card#oauth-provider-microsoft.oauth-provider-card")
     assert has_element?(view, "#oauth-provider-gmail-form[phx-submit='save-provider']")
     refute has_element?(view, "#oauth-provider-gmail-form[phx-change]")
 
@@ -136,8 +139,22 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
              "#oauth-provider-gmail-callback[readonly][value='#{callback_uri}']"
            )
 
+    microsoft_callback_uri = "http://localhost:4002/connectors/microsoft/callback"
+
+    assert has_element?(
+             view,
+             "#oauth-provider-microsoft-client-secret[type='password'][autocomplete='new-password'][value=''][phx-patch-focused]"
+           )
+
+    assert has_element?(
+             view,
+             "#oauth-provider-microsoft-callback[readonly][value='#{microsoft_callback_uri}']"
+           )
+
     refute html =~ "MANIFOLD_GMAIL_CLIENT_ID"
     refute html =~ "MANIFOLD_GMAIL_CLIENT_SECRET"
+    refute html =~ "MANIFOLD_MICROSOFT_CLIENT_ID"
+    refute html =~ "MANIFOLD_MICROSOFT_CLIENT_SECRET"
     refute html =~ "client_secret_ciphertext"
     refute html =~ "Administrators"
   end
@@ -598,6 +615,30 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     refute html =~ "Client secret"
     refute html =~ "MANIFOLD_GMAIL_CLIENT_SECRET"
     refute html =~ "client_secret_ciphertext"
+  end
+
+  test "Microsoft help renders catalog setup instructions and exact callback accessibly", %{
+    conn: conn
+  } do
+    {:ok, view, html} = live(conn, "/settings/oauth/microsoft/help")
+
+    callback_uri = "http://localhost:4002/connectors/microsoft/callback"
+
+    assert has_element?(view, "h1", "Set up Microsoft OAuth")
+
+    assert has_element?(
+             view,
+             "#oauth-provider-microsoft-help-callback[readonly][value='#{callback_uri}']"
+           )
+
+    for scope <- ["openid", "profile", "User.Read", "Mail.Read", "Mail.Send", "offline_access"] do
+      assert has_element?(view, "[data-scope='#{scope}']")
+    end
+
+    assert html =~ "work/school"
+    assert html =~ "organizations"
+    assert html =~ "personal Outlook.com accounts are not supported"
+    assert html =~ "Do not add Mail.ReadWrite"
   end
 
   defp put_setting(client_id, client_secret) do

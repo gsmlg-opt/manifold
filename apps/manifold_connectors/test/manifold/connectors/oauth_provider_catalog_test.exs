@@ -4,8 +4,9 @@ defmodule Manifold.Connectors.OAuthProviderCatalogTest do
   alias Manifold.Connectors.OAuthProviderCatalog
   alias Manifold.Core.Error
 
-  test "catalog exposes Gmail as the first and only settings provider" do
-    assert [%{key: "gmail", name: "Gmail"} = gmail] = OAuthProviderCatalog.list()
+  test "catalog exposes Gmail followed by Microsoft 365 settings providers" do
+    assert [%{key: "gmail", name: "Gmail"} = gmail, %{key: "microsoft", name: "Microsoft 365"}] =
+             OAuthProviderCatalog.list()
 
     assert gmail.icon == "gmail"
     assert gmail.callback_path == "/connectors/gmail/callback"
@@ -64,6 +65,39 @@ defmodule Manifold.Connectors.OAuthProviderCatalogTest do
            }
 
     assert {:ok, ^gmail} = OAuthProviderCatalog.fetch("gmail")
+
+    assert {:ok, microsoft} = OAuthProviderCatalog.fetch("microsoft")
+
+    assert microsoft.icon == "microsoft"
+    assert microsoft.callback_path == "/connectors/microsoft/callback"
+    assert microsoft.capabilities == [:receive, :send]
+
+    assert microsoft.scopes == [
+             "openid",
+             "profile",
+             "User.Read",
+             "Mail.Read",
+             "Mail.Send",
+             "offline_access"
+           ]
+
+    assert microsoft.runtime_config == [
+             authorization_url:
+               "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
+             token_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+             base_url: "https://graph.microsoft.com/v1.0",
+             tenant: "organizations"
+           ]
+
+    assert microsoft.help.configuration_title == "Microsoft OAuth"
+    assert microsoft.help.documentation_name == "Microsoft"
+
+    assert Enum.any?(microsoft.help.steps, &String.contains?(&1, "work/school"))
+
+    assert Enum.any?(
+             microsoft.help.steps,
+             &String.contains?(&1, "Do not add Mail.ReadWrite")
+           )
   end
 
   test "unknown providers return a permanent error without creating atoms" do
