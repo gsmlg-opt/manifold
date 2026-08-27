@@ -26,17 +26,29 @@
 - `manifold_data`: `20260812000100_add_sent_system_folders.exs`,
   `20260812000200_add_shared_microsoft_authorizations.exs`, and
   `20260812000300_add_microsoft_provider_payloads.exs` own Sent, shared auth, and
-  immutable payload constraints/backfills.
+  immutable payload constraints/backfills;
+  `20260818000100_add_oauth_provider_settings.exs` owns the generic encrypted
+  provider-setting row and OAuth transaction generation fence.
 - `manifold_accounts`: Own canonical account address and active-account
   lifecycle checks used during OAuth and queueing.
-- `manifold_connectors`: Own Microsoft OAuth, identity binding, encrypted
-  credentials, serialized refresh, receive sync, folder mapping, and token
+- `manifold_connectors`: `Manifold.Connectors.OAuthProvider.Microsoft`,
+  `Manifold.Connectors.OAuthProviderCatalog`,
+  `Manifold.Connectors.ProviderSettings`, and
+  `Manifold.Connectors.ProviderConfig` own the Microsoft Settings definition,
+  encrypted client credential resolution, and generation fence. Connector OAuth,
+  `Manifold.Connectors.OAuthAuthorizations`,
+  `Manifold.Connectors.Provider.MicrosoftGraph`, and
+  `Manifold.Connectors.MicrosoftFolderMapping` own identity binding, encrypted
+  user grants, serialized refresh, receive sync, folder mapping, and token
   checkout.
 - `manifold_mail`: Own the provider-neutral Sent system folder and projected
   mailbox-entry placement.
-- `manifold_web`: Own receive/send setup, incremental consent, reconnect,
-  compose blocking, projected Sent navigation, renamed Send activity routes,
-  and legacy outbound-route redirects.
+- `manifold_web`: `ManifoldWeb.SettingsLive.OAuth` and
+  `ManifoldWeb.SettingsLive.OAuthHelp` own Microsoft client credential management
+  at `/settings/oauth` and setup help at `/settings/oauth/microsoft/help`. Web also
+  owns receive/send setup, incremental consent, reconnect, compose blocking,
+  projected Sent navigation, renamed Send activity routes, and legacy
+  outbound-route redirects.
 - `manifold_api`: No behavior change is planned.
 - `manifold_smtp`: No behavior change is planned.
 - `manifold_outbound`: Own send-method snapshots, deterministic MIME, the Graph
@@ -63,9 +75,11 @@
   MIME `/me/sendMail`; resolve and persist well-known folder IDs; repair existing
   Graph folder placement during normal sync; no webhook or new recurring job is
   planned.
-- **Config / env impact**: Reuse the existing Microsoft client ID, client secret,
-  `organizations` tenant, endpoint overrides, callback, and connector encryption
-  key.
+- **Config / env impact**: Save the Microsoft client ID and encrypted secret at
+  `/settings/oauth`. Legacy credential and tenant environment values are ignored,
+  with no import or fallback. The tenant is fixed to `organizations`; only the
+  authorization URL, token URL, and Graph base URL environment overrides remain.
+  Keep the exact callback and the stable connector encryption key.
 - **Security / auth / trust-boundary impact**: Use delegated `Mail.Read` and
   `Mail.Send`, exact sender/Graph-address binding, PKCE, encrypted tokens, and no
   credential or message content in logs, telemetry, metadata, or job args.
@@ -80,7 +94,10 @@
   Send activity have distinct models/routes. Account-disable fences and safe
   fixed-code telemetry cover the new state. Account purge drains provider
   submissions before connector send methods and removes target Oban rows in
-  bounded, account-scoped passes after fencing executing work.
+  bounded, account-scoped passes after fencing executing work. Microsoft client
+  credentials now resolve from the same encrypted Settings store as Google;
+  save, rotation, and removal take effect immediately, invalidate in-flight
+  generation-fenced OAuth, disable affected methods, and require reconnect.
 - **Why this approach**: Extending the post-Gmail shared OAuth and outbound
   foundation avoids duplicate token stores and preserves the implemented Graph
   receive path. Direct `sendMail` keeps permissions narrower than a
@@ -90,9 +107,12 @@
 - **Alternatives considered**: Independent Microsoft send authorization and a
   complete combined-connector rewrite were rejected. Draft-then-send was
   rejected because it requires `Mail.ReadWrite`.
-- **Rollback notes**: The cutover is non-rolling. Migration rollback guards
-  refuse unsafe live Microsoft authorizations or immutable payload state. Legacy
-  receive state and Resend provider snapshots are not silently rerouted.
+- **Rollback notes**: The cutover is non-rolling. Before the Settings-only
+  Microsoft release, stop new Microsoft submissions, drain queued and executing
+  Microsoft send work, then drain old Phoenix, connector, and Oban workers.
+  Migration rollback guards refuse unsafe live Microsoft authorizations or
+  immutable payload state. Legacy receive state and Resend provider snapshots are
+  not silently rerouted.
 
 ## Validation
 
@@ -105,7 +125,8 @@
 - `mix format --check-formatted`
 - `mix compile --warnings-as-errors`
 - `mix duskmoon_bundler.js.check` (only if implementation changes JavaScript)
-- **Result summary**: Formatting and strict compilation passed. The final scoped
+- **Previously recorded receive/send result summary (not rerun for the 2026-08-27
+  Settings change)**: Formatting and strict compilation passed. The final scoped
   suites passed: Mail 69, Connectors 349, Outbound 172, Web 104, Account
   Lifecycle 37, and Data 15 (746 tests total, zero failures). Focused acceptance
   coverage proves legacy receive continuity, well-known folder repair, one Sent
@@ -144,7 +165,11 @@
 
 - **Follow-ups**: Run the credentialed staging smoke checklist when two matching
   non-production Microsoft 365 work/school identities and app credentials are
-  available.
+  available. Save those credentials at `/settings/oauth`, verify the exact
+  production callback `https://<host>/connectors/microsoft/callback` and local
+  callback `http://localhost:4290/connectors/microsoft/callback`, and exercise
+  save/rotate/remove reconnect behavior without expanding to Outlook.com personal
+  accounts.
 - **Opened issues / TODOs**: No local or upstream implementation blocker remains.
 - **Docs updated**: design/spec/plan, ADR 0007, ADR 0010, ADR 0011,
   `docs/DESIGN.md`, `README.md`, and this/Gmail feature references.

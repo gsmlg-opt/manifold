@@ -51,10 +51,13 @@ For PRs, include:
 
 ## Security & Configuration Tips
 
-Treat secrets as required production inputs in local shell files and CI:
-`MANIFOLD_CONNECTOR_ENCRYPTION_KEY`, `MANIFOLD_GMAIL_CLIENT_*`, `MANIFOLD_MICROSOFT_*`, `RESEND_API_KEY`, and DB/env keys in `config/runtime.exs`.
+Treat non-OAuth secrets as required production inputs in local shell files and
+CI: `MANIFOLD_CONNECTOR_ENCRYPTION_KEY`, `RESEND_API_KEY`, and DB/env keys in
+`config/runtime.exs`. Google and Microsoft OAuth client credentials are managed
+only through Settings at `/settings/oauth`; do not put them in environment files
+or CI variables.
 
-Do not commit real secrets. Keep local credentials in untracked env files and never paste production endpoints in public bug reports.
+Do not commit real secrets. Keep other local credentials in untracked env files and never paste production endpoints in public bug reports.
 
 ## Skill and Feature Documentation Rule
 

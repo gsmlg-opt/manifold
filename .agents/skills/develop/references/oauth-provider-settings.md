@@ -2,10 +2,13 @@
 
 ## Feature
 
-- **Date:** 2026-08-18
-- **Status:** implemented; live Google staging verification remains operator work
-- **Design:** `docs/superpowers/specs/2026-08-18-oauth-provider-settings-design.md`
-- **Plan:** `docs/superpowers/plans/2026-08-18-oauth-provider-settings.md`
+- **Date:** 2026-08-18; Microsoft catalog adoption updated 2026-08-27
+- **Status:** implemented; live Google and Microsoft staging verification remains
+  operator work
+- **Original design:** `docs/superpowers/specs/2026-08-18-oauth-provider-settings-design.md`
+- **Microsoft design:** `docs/superpowers/specs/2026-08-27-microsoft-oauth-provider-settings-design.md`
+- **Original plan:** `docs/superpowers/plans/2026-08-18-oauth-provider-settings.md`
+- **Microsoft plan:** `docs/superpowers/plans/2026-08-27-microsoft-oauth-provider-settings.md`
 - **Migration:** `20260818000100_add_oauth_provider_settings.exs`
 
 ## Ownership and routes
@@ -16,15 +19,19 @@
   `Manifold.Connectors.Schema.OAuthProviderSetting`,
   `Manifold.Connectors.OAuthProviderCatalog`,
   `Manifold.Connectors.OAuthProvider.Gmail`,
+  `Manifold.Connectors.OAuthProvider.Microsoft`,
   `Manifold.Connectors.ProviderSettings`, and
   `Manifold.Connectors.ProviderConfig`.
 - `manifold_web` owns `ManifoldWeb.SettingsLive.OAuth` at `/settings/oauth` and
   `ManifoldWeb.SettingsLive.OAuthHelp` at `/settings/oauth/:provider/help`.
-  Gmail's concrete help route is `/settings/oauth/gmail/help`.
-- The Google provider callback remains exactly
-  `https://<host>/connectors/gmail/callback`, derived from the configured Phoenix
-  Endpoint URL. Local development normally uses
-  `http://localhost:4290/connectors/gmail/callback`.
+  Concrete help routes are `/settings/oauth/gmail/help` and
+  `/settings/oauth/microsoft/help`.
+- Production callbacks remain exactly
+  `https://<host>/connectors/gmail/callback` and
+  `https://<host>/connectors/microsoft/callback`, derived from the configured
+  Phoenix Endpoint URL. Local development callbacks are exactly
+  `http://localhost:4290/connectors/gmail/callback` and
+  `http://localhost:4290/connectors/microsoft/callback`.
 
 The Settings routes inherit Manifold's trusted-local-instance boundary. They are
 not administrator-authenticated and must not be exposed as a secure remote admin
@@ -43,9 +50,10 @@ fallback rule; browser verification must also confirm both elements are defined.
 
 ## Catalog contract and extension
 
-`Manifold.Connectors.OAuthProviderCatalog.list/0` returns definitions in stable
-display order and `fetch/1` rejects unknown keys. The Gmail definition in
-`Manifold.Connectors.OAuthProvider.Gmail` supplies:
+`Manifold.Connectors.OAuthProviderCatalog.list/0` returns Gmail followed by
+Microsoft in stable display order, and `fetch/1` rejects unknown keys. Definitions
+in `Manifold.Connectors.OAuthProvider.Gmail` and
+`Manifold.Connectors.OAuthProvider.Microsoft` supply:
 
 - stable `key`, display `name`, and `icon`;
 - `callback_path` and supported `capabilities`;
@@ -59,11 +67,11 @@ Endpoint override environment variables remain static operator/development
 configuration and are allowlisted by the resolver.
 
 The catalog currently drives provider-setting validation/listing, the Settings
-cards and help pages, and Gmail's non-secret runtime endpoint defaults in
-`ProviderConfig`. Registering a module in the catalog does **not** make the
-provider usable for OAuth, account setup, receive sync, or outbound submission.
-Those paths still contain explicit provider registries, guards, ordering, labels,
-and database constraints.
+cards and help pages, and Gmail and Microsoft's non-secret runtime endpoint
+defaults in `ProviderConfig`. Registering a module in the catalog does **not**
+make a future provider usable for OAuth, account setup, receive sync, or outbound
+submission. Those paths still contain explicit provider registries, guards,
+ordering, labels, and database constraints.
 
 ### Complete provider-extension checklist
 
@@ -157,8 +165,10 @@ devenv shell -- mix test \
   apps/manifold_outbound/test/manifold/outbound/provider/microsoft_graph_test.exs
 ```
 
-Microsoft is intentionally unchanged and remains environment-backed until its own
-catalog/lifecycle migration.
+Gmail and Microsoft are both catalog-backed. Microsoft credentials have no
+environment source, import, or fallback; its tenant is fixed to `organizations`
+for work/school accounts only. Only the Microsoft authorization URL, token URL,
+and Graph base URL environment overrides remain.
 
 ## Persistence and public APIs
 
@@ -175,7 +185,8 @@ oauth_provider_setting:<setting-id>:client_secret
 `MANIFOLD_CONNECTOR_ENCRYPTION_KEY` remains the stable, out-of-database master
 key. The legacy `MANIFOLD_GMAIL_CLIENT_ID` and
 `MANIFOLD_GMAIL_CLIENT_SECRET` variables are ignored, are not imported, and are
-never a fallback.
+never a fallback. Legacy Microsoft client-credential and tenant environment
+values are likewise ignored, not imported, and never used as fallback.
 
 The supported safe context API is:
 
@@ -198,15 +209,16 @@ without returning plaintext credentials.
 - With an unchanged client ID, a blank secret is a safe no-op that preserves the
   ciphertext. A nonblank secret rotates it.
 - Changing the client ID requires a new secret.
-- Every actual credential save, rotation, client-ID change, or removal marks
-  existing Gmail authorizations and receive/send methods `reconnect_required` and
-  disables the methods in the same transaction. Nothing resumes automatically.
+- Every actual credential save, rotation, client-ID change, or removal marks the
+  affected provider's authorizations and receive/send methods
+  `reconnect_required` and disables the methods in the same transaction. Nothing
+  resumes automatically.
 - Removal deletes only the provider setting. Encrypted user grants remain local,
-  and Manifold does not revoke access at Google.
+  and Manifold does not revoke access at Google or Microsoft.
 - Save/removal effects are visible immediately; no process restart is required.
-- Missing settings make Gmail unavailable. Undecryptable/corrupt settings fail
-  closed as `provider_configuration_error`; stale form versions return
-  `stale_oauth_provider_setting`.
+- Missing settings make the affected provider unavailable. Undecryptable/corrupt
+  settings fail closed as `provider_configuration_error`; stale form versions
+  return `stale_oauth_provider_setting`.
 
 All setting mutations take the provider-scoped PostgreSQL advisory transaction
 lock, then lock the setting and affected lifecycle rows in a stable order. The UI
@@ -214,24 +226,24 @@ submits the expected `lock_version`, preventing silent overwrites.
 
 ## Resolver and OAuth generation fence
 
-All Gmail consumers go through `Manifold.Connectors.ProviderConfig`: configured
-receive/send provider discovery, OAuth start, authorization-code exchange and
-identity lookup, access-token refresh, receive sync, send-method checkout, and
-Gmail submission. There is no credential cache.
+All Google and Microsoft consumers go through
+`Manifold.Connectors.ProviderConfig`: configured receive/send provider discovery,
+OAuth start, authorization-code exchange and identity lookup, access-token
+refresh, receive sync, send-method checkout, and provider submission. There is no
+credential cache.
 
 OAuth start snapshots `oauth_provider_setting_id` and
 `oauth_provider_setting_lock_version` on `connector_oauth_transactions`.
-After the database-credential cutover, Gmail transaction rows without both
-generation fields are atomically removed and rejected as
-`provider_configuration_changed`, so a second consume is an OAuth state mismatch;
-only Microsoft transactions retain nil generation fields. Initial Gmail setting
-save starts the generation at one, and every real credential rotation advances it.
-Completion revalidates the snapshot before code exchange. External Google I/O is
-performed without holding a database/advisory lock. The final persistence
-transaction then takes the provider advisory lock and revalidates the same UUID,
-lock version, and decryptability. A save, rotate, remove, or remove/recreate race
-therefore ends as `provider_configuration_changed` and requires a fresh OAuth
-start.
+After each provider's database-credential cutover, Google and Microsoft
+transaction rows without both generation fields are atomically removed and
+rejected as `provider_configuration_changed`, so a second consume is an OAuth
+state mismatch. Initial provider-setting save starts the generation at one, and
+every real credential rotation advances it. Completion revalidates the snapshot
+before code exchange. External provider I/O is performed without holding a
+database/advisory lock. The final persistence transaction then takes the provider
+advisory lock and revalidates the same UUID, lock version, and decryptability. A
+save, rotate, remove, or remove/recreate race therefore ends as
+`provider_configuration_changed` and requires a fresh OAuth start.
 
 ## Secret and observability invariants
 
@@ -258,11 +270,13 @@ start.
 ## Non-rolling cutover and rollback
 
 Before applying `20260818000100`, drain and stop every old Phoenix instance,
-connector process, and Oban worker. Do not allow an old node to keep using the
-removed environment client credentials while a new node reads database settings.
-The migration performs no environment backfill. After migration Gmail is
-unavailable until Google credentials are saved in Settings → OAuth, and all
-existing Gmail grants require reconnect.
+connector process, and Oban worker. For the later Settings-only Microsoft
+cutover, first stop new Microsoft submissions and drain all queued and executing
+Microsoft send work, then drain the old Phoenix, connector, and Oban processes.
+Do not allow an old node to keep using legacy client credentials while a new node
+reads database settings. There is no environment import or fallback. Each
+provider is unavailable until its credentials are saved in Settings → OAuth, and
+all existing grants for that provider require reconnect.
 
 The down migration refuses before DDL when any provider setting exists or any
 OAuth transaction has a setting UUID/version fence. The Settings UI removes only
@@ -291,6 +305,7 @@ For a faster focused loop:
 
 ```sh
 devenv shell -- mix test \
+  apps/manifold_data/test/manifold/config_test.exs \
   apps/manifold_data/test/manifold/migrations/add_oauth_provider_settings_test.exs \
   apps/manifold_connectors/test/manifold/connectors/oauth_provider_catalog_test.exs \
   apps/manifold_connectors/test/manifold/connectors/schema/oauth_provider_setting_test.exs \
@@ -298,25 +313,33 @@ devenv shell -- mix test \
   apps/manifold_connectors/test/manifold/connectors/provider_config_test.exs \
   apps/manifold_connectors/test/manifold/connectors/oauth_test.exs \
   apps/manifold_connectors/test/manifold/connectors/gmail_authorizations_test.exs \
+  apps/manifold_connectors/test/manifold/connectors/microsoft_authorizations_test.exs \
+  apps/manifold_connectors/test/manifold/connectors/submission_method_test.exs \
+  apps/manifold_connectors/test/manifold/connectors/sync_test.exs \
+  apps/manifold_connectors/test/manifold/connectors_test.exs \
+  apps/manifold_outbound/test/manifold/outbound/jobs/submit_outbound_test.exs \
+  apps/manifold_outbound/test/manifold/outbound/submission_test.exs \
+  apps/manifold_web/test/manifold_web/account_live_test.exs \
+  apps/manifold_web/test/manifold_web/external_accounts_web_test.exs \
   apps/manifold_web/test/manifold_web/oauth_settings_live_test.exs
 ```
 
 ## Browser and staging smoke
 
-- [ ] With Gmail not configured, confirm both Add receive and Add send pickers
-      show Gmail unavailable.
-- [ ] Open `/settings/oauth/gmail/help`; verify the exact deployed callback, four
-      scopes, testing note, production note, and official links.
-- [ ] Save staging Google credentials and confirm both pickers enable immediately
-      without restarting Phoenix or workers.
-- [ ] Connect receive, complete an import, add/upgrade send, submit one message,
-      and verify it through the approved staging Gmail identity.
-- [ ] Submit a blank secret with unchanged client ID and confirm the connection is
-      not disrupted.
-- [ ] Rotate the secret and change the client ID with a new secret; confirm
-      existing Gmail grants and methods require reconnect.
-- [ ] Remove the setting and confirm Gmail disables immediately, no method resumes,
-      stored grants remain local, and no Google revoke occurs.
+- [ ] With Google and Microsoft not configured, confirm both Add receive and Add
+      send pickers show each provider unavailable.
+- [ ] Open both provider help routes; verify each exact deployed callback, scopes,
+      testing note, production note, and official links.
+- [ ] Save staging Google and Microsoft credentials and confirm both pickers
+      enable immediately without restarting Phoenix or workers.
+- [ ] For each provider, connect receive, complete an import, add/upgrade send,
+      submit one message, and verify it through the approved staging identity.
+- [ ] For each provider, submit a blank secret with unchanged client ID and
+      confirm the connection is not disrupted.
+- [ ] For each provider, rotate the secret and change the client ID with a new
+      secret; confirm existing grants and methods require reconnect.
+- [ ] Remove each setting and confirm that provider disables immediately, no
+      method resumes, stored grants remain local, and no remote revoke occurs.
 - [ ] Use a unique sentinel secret and confirm it appears in neither rendered
       HTML, LiveView error output, logs, telemetry, nor database plaintext fields.
 

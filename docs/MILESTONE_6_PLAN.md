@@ -29,6 +29,9 @@ remains read-only with respect to remote Gmail and Microsoft mailboxes.
 - [x] Add OAuth controllers and the no-auth `/settings/accounts` LiveView.
 - [x] Move Google client credentials into encrypted, database-backed
       `/settings/oauth` configuration with provider-specific setup help.
+- [x] Move Microsoft client credentials into the same encrypted,
+      database-backed `/settings/oauth` configuration with a fixed
+      `organizations` tenant and provider-specific setup help.
 - [x] Add periodic polling and missing-job reconciliation.
 - [x] Normalize provider raw-fetch disappearance into a deletion reconciliation
       path.
@@ -105,7 +108,8 @@ refresh tokens plus token expiry. `OAuthProviderSetting` stores the code-defined
 provider key, plaintext client ID, encrypted client secret, key version, and lock
 version. `OAuthTransaction` stores a hashed one-time state, provider, mailbox ID,
 encrypted PKCE verifier, exact redirect URI, expiry, consumed timestamp, and the
-provider-setting UUID/version snapshot used to start Gmail authorization.
+provider-setting UUID/version snapshot used to start Google or Microsoft
+authorization.
 
 `SyncCursor` stores one serialized synchronization lane per provider scope:
 
@@ -164,9 +168,6 @@ MANIFOLD_GMAIL_AUTHORIZATION_URL
 MANIFOLD_GMAIL_TOKEN_URL
 MANIFOLD_GMAIL_USERINFO_URL
 MANIFOLD_GMAIL_API_BASE_URL
-MANIFOLD_MICROSOFT_CLIENT_ID
-MANIFOLD_MICROSOFT_CLIENT_SECRET
-MANIFOLD_MICROSOFT_TENANT
 MANIFOLD_MICROSOFT_AUTHORIZATION_URL
 MANIFOLD_MICROSOFT_TOKEN_URL
 MANIFOLD_MICROSOFT_API_BASE_URL
@@ -180,25 +181,28 @@ https://<PHX_HOST>/connectors/microsoft/callback
 ```
 
 Development uses the same paths at `http://localhost:4290`. The routes are not
-registered with provider consoles automatically. Microsoft defaults to the
-`organizations` tenant and Graph API `https://graph.microsoft.com/v1.0`.
+registered with provider consoles automatically. Microsoft uses the fixed
+`organizations` tenant for work/school accounts only and Graph API
+`https://graph.microsoft.com/v1.0`.
 Endpoint overrides must be absolute HTTPS URLs without credentials or
 fragments.
 
-Google client credentials are configured at `/settings/oauth`, with instructions
-and the deployed exact callback at `/settings/oauth/gmail/help`. The client ID is
-stored plaintext and the secret is encrypted with
+Google and Microsoft client credentials are configured at `/settings/oauth`,
+with instructions and deployed exact callbacks at `/settings/oauth/gmail/help`
+and `/settings/oauth/microsoft/help`. A client ID is stored plaintext and the
+secret is encrypted with
 `oauth_provider_setting:<setting-id>:client_secret` associated data. A blank
 secret preserves the stored secret only when the client ID is unchanged; changing
-the client ID requires a new secret. The legacy `MANIFOLD_GMAIL_CLIENT_ID` and
-`MANIFOLD_GMAIL_CLIENT_SECRET` variables are ignored and are not imported or used
-as fallback. Endpoint overrides remain static operator configuration. Microsoft
-environment behavior is unchanged.
+the client ID requires a new secret. Legacy provider client-credential environment
+variables are ignored and are not imported or used as fallback. Endpoint
+overrides remain static operator configuration; only the Microsoft authorization,
+token, and Graph base URL overrides remain.
 
 Development has a non-production encryption key but no default OAuth client
 credentials. Production requires a stable `MANIFOLD_CONNECTOR_ENCRYPTION_KEY` as
-the out-of-database master key. Missing Gmail settings fail closed as
-`provider_not_configured`; corrupt settings use `provider_configuration_error`.
+the out-of-database master key. Missing Google or Microsoft settings fail closed
+as `provider_not_configured`; corrupt settings use
+`provider_configuration_error`.
 Browser output, logs, telemetry, and activity events never include secrets or
 ciphertext. The Settings routes retain the trusted-local-instance boundary and
 do not add administrator authentication.
@@ -214,12 +218,14 @@ OAuth, refresh, receive, send, and lifecycle integration.
 
 ### Provider-settings cutover
 
-`20260818000100_add_oauth_provider_settings.exs` is non-rolling. Drain old
-Phoenix, connector, and Oban processes before migration. There is no environment
-backfill, Gmail remains unavailable until Settings → OAuth is saved, and existing
-Gmail grants require reconnect. Saving, rotating, or removing settings takes
-effect without restart and never auto-resumes disabled methods; removal does not
-revoke Google access.
+`20260818000100_add_oauth_provider_settings.exs` and the later Microsoft catalog
+adoption are non-rolling. Before the Settings-only Microsoft release, stop new
+Microsoft submissions, drain queued and executing Microsoft send work, then
+drain old Phoenix, connector, and Oban processes. There is no environment import
+or fallback; each provider remains unavailable until its credentials are saved in
+Settings → OAuth, and existing grants require reconnect. Saving, rotating, or
+removing settings takes effect without restart and never auto-resumes disabled
+methods; removal does not revoke remote provider access.
 
 OAuth start snapshots the setting UUID and lock version. Completion revalidates
 that generation before provider exchange and, under the provider advisory lock,
@@ -227,9 +233,9 @@ again in the final database transaction after external I/O; no database lock is
 held across the network request. Rollback refuses while a provider setting or a
 fenced OAuth transaction exists.
 
-Staging must confirm immediate receive/send picker enablement after save, the help
-page and exact callback, real receive and send, reconnect after client-ID/secret
-rotation, removal behavior, and no automatic method resumption.
+Staging must confirm immediate receive/send picker enablement after save, both
+help pages and exact callbacks, real receive and send, reconnect after
+client-ID/secret rotation, removal behavior, and no automatic method resumption.
 
 ## Synchronization Flow
 

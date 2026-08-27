@@ -1371,9 +1371,6 @@ MANIFOLD_GMAIL_AUTHORIZATION_URL
 MANIFOLD_GMAIL_TOKEN_URL
 MANIFOLD_GMAIL_USERINFO_URL
 MANIFOLD_GMAIL_API_BASE_URL
-MANIFOLD_MICROSOFT_CLIENT_ID
-MANIFOLD_MICROSOFT_CLIENT_SECRET
-MANIFOLD_MICROSOFT_TENANT
 MANIFOLD_MICROSOFT_AUTHORIZATION_URL
 MANIFOLD_MICROSOFT_TOKEN_URL
 MANIFOLD_MICROSOFT_API_BASE_URL
@@ -1384,14 +1381,13 @@ PHX_HOST
 Development should default to a non-privileged SMTP port such as 2525.
 The production local release requires
 `MANIFOLD_CONNECTOR_ENCRYPTION_KEY` to decode to exactly 32 bytes. It remains the
-out-of-database master key for connector ciphertext. Gmail client credentials are
-stored through Settings → OAuth; the legacy `MANIFOLD_GMAIL_CLIENT_ID` and
-`MANIFOLD_GMAIL_CLIENT_SECRET` values are ignored and never imported. Gmail
-endpoint overrides remain static operator configuration. Microsoft environment
-configuration is unchanged: an absent complete Microsoft client pair leaves it
-unavailable, while a partial pair fails startup. Provider endpoint overrides must
-be absolute HTTPS URLs without credentials or fragments. The Microsoft tenant
-defaults to `organizations` for work/school accounts.
+out-of-database master key for connector ciphertext. Google and Microsoft client
+credentials are stored through Settings → OAuth; legacy client-credential
+environment values are ignored and never imported or used as fallback. Provider
+endpoint overrides remain static operator configuration and must be absolute
+HTTPS URLs without credentials or fragments. For Microsoft, only authorization,
+token, and Graph base URL overrides remain; the tenant is fixed to
+`organizations` for work/school accounts only.
 
 ### 20.3 Nix development environment
 
@@ -1474,9 +1470,8 @@ durable spool -> manifold_ingest -> raw store -> mailbox projection
 
 ### 22.1 OAuth and credential boundary
 
-- Connector OAuth remains limited to trusted, code-defined providers. Gmail is
-  the first database-backed settings provider; Microsoft keeps its existing
-  environment-backed behavior until a separate migration.
+- Connector OAuth remains limited to trusted, code-defined providers. Gmail and
+  Microsoft both resolve their client credentials from database-backed Settings.
 - Authorization uses the OAuth 2.0 authorization-code flow and PKCE `S256`.
 - The random state value is persisted only as a SHA-256 digest, expires after a
   bounded interval, and is consumed once under a database lock.
@@ -1499,18 +1494,18 @@ durable spool -> manifold_ingest -> raw store -> mailbox projection
   provider omits a replacement.
 - A provider account identity is permanently bound to its first active local
   mailbox and reauthorization cannot silently move that account.
-- Gmail OAuth start, code exchange, refresh, receive sync, configured-provider
-  discovery, and send checkout all resolve the current database setting through
-  `Manifold.Connectors.ProviderConfig`; there is no credential cache, so saves and
-  removals take effect without restart.
+- Gmail and Microsoft OAuth start, code exchange, refresh, receive sync,
+  configured-provider discovery, and send checkout all resolve the current
+  database setting through `Manifold.Connectors.ProviderConfig`; there is no
+  credential cache, so saves and removals take effect without restart.
 - OAuth start snapshots the provider-setting UUID and `lock_version`. Callback
   completion revalidates that generation before exchange and again after external
   provider I/O inside the final persistence transaction. The provider advisory
   lock is transaction-scoped and is never held during network I/O.
-- Missing Gmail settings fail closed as `provider_not_configured`; undecryptable
-  settings use `provider_configuration_error` in sanitized telemetry. Browser
-  HTML, LiveView assigns, logs, telemetry, activity events, and errors must
-  contain neither plaintext secrets nor ciphertext.
+- Missing Google or Microsoft settings fail closed as `provider_not_configured`;
+  undecryptable settings use `provider_configuration_error` in sanitized
+  telemetry. Browser HTML, LiveView assigns, logs, telemetry, activity events,
+  and errors must contain neither plaintext secrets nor ciphertext.
 
 The intended callback URLs are:
 
@@ -1523,19 +1518,20 @@ Local development uses the same paths at `http://localhost:4290`. The exact
 redirect URI is stored with the OAuth transaction and must match on callback.
 The Phoenix controller derives the callback from the configured Endpoint URL.
 
-Operators configure Google at `/settings/oauth`; Gmail-specific setup help is at
-`/settings/oauth/gmail/help`. The help route and settings card are resolved only
-from `Manifold.Connectors.OAuthProviderCatalog`, so users cannot supply arbitrary
-OAuth endpoints or scopes. The current Settings surface is a trusted-local
-boundary, not an authenticated administrator interface.
+Operators configure Google and Microsoft at `/settings/oauth`; provider-specific
+setup help is at `/settings/oauth/gmail/help` and
+`/settings/oauth/microsoft/help`. The help routes and settings cards are resolved
+only from `Manifold.Connectors.OAuthProviderCatalog`, so users cannot supply
+arbitrary OAuth endpoints or scopes. The current Settings surface is a
+trusted-local boundary, not an authenticated administrator interface.
 
-Changing the Gmail client ID requires a new secret. With an unchanged client ID,
-a blank secret safely preserves the current ciphertext and a nonblank secret
-rotates it. Save, rotation, client-ID change, and removal serialize through a
-provider advisory lock. Every actual credential change or removal marks existing
-Gmail grants and receive/send methods `reconnect_required` and disables the
-methods; no method resumes automatically. Removal does not revoke the Google
-grant.
+Changing either provider's client ID requires a new secret. With an unchanged
+client ID, a blank secret safely preserves the current ciphertext and a nonblank
+secret rotates it. Save, rotation, client-ID change, and removal serialize through
+a provider advisory lock. Every actual credential change or removal marks the
+affected provider's grants and receive/send methods `reconnect_required` and
+disables the methods; no method resumes automatically. Removal does not revoke
+the remote Google or Microsoft grant.
 
 Provider definitions live in
 `Manifold.Connectors.OAuthProviderCatalog` and
@@ -1556,23 +1552,26 @@ consent publication and scope-verification process. The connector encryption key
 must remain stable across releases; real client credentials and deployment
 endpoints are never stored in this design document or the repository.
 
-Migration `20260818000100_add_oauth_provider_settings.exs` is a non-rolling
-cutover. Drain all old Phoenix, connector, and Oban processes before applying it.
-There is no environment backfill: Gmail remains unavailable until an operator
-saves Google credentials in Settings → OAuth, and existing Gmail grants require
+Migration `20260818000100_add_oauth_provider_settings.exs` and the later Microsoft
+catalog adoption are non-rolling cutovers. Before the Settings-only Microsoft
+release, stop new Microsoft submissions, drain queued and executing Microsoft
+send work, and then drain all old Phoenix, connector, and Oban processes. There is
+no environment import or fallback: each provider remains unavailable until an
+operator saves its credentials in Settings → OAuth, and existing grants require
 reconnect. Rollback refuses while provider-setting rows or fenced OAuth
 transactions exist. Staging must verify immediate picker enablement after save,
-the exact help callback, receive and send, rotation/removal reconnect behavior,
+the exact help callbacks, receive and send, rotation/removal reconnect behavior,
 and absence of automatic method resumption.
 
-Microsoft uses the `organizations` tenant by default, so the registration is
-restricted to work/school accounts. Operators must register the exact production
-HTTPS callback, configure delegated `User.Read`, `Mail.Read`, and `Mail.Send`,
-restrict staging to a non-production app registration, tenant, and approved test
-users, and obtain tenant admin consent where the tenant disables user consent.
-An absent complete client pair leaves Microsoft visible but unavailable; a
-partial pair fails startup. The connector encryption key must be backed up and
-rotated only through a coordinated credential migration.
+Microsoft uses the fixed `organizations` tenant, so the registration is limited
+to work/school accounts and does not include Outlook.com personal accounts.
+Operators must register the exact production HTTPS callback, configure delegated
+`User.Read`, `Mail.Read`, and `Mail.Send`, save the client ID and secret at
+`/settings/oauth`, restrict staging to a non-production app registration and
+approved test users, and obtain tenant admin consent where the tenant disables
+user consent. Only Microsoft authorization, token, and Graph base URL environment
+overrides remain. The connector encryption key must be backed up and rotated only
+through a coordinated credential migration.
 
 ### 22.2 Provider synchronization
 

@@ -231,6 +231,14 @@ Initial official references:
 
 ## Runtime Configuration Changes
 
+> **Superseded on 2026-08-27:** The same encrypted Settings-managed provider
+> store now owns Microsoft client credentials. Legacy Microsoft credential and
+> tenant environment values are ignored, with no import or fallback, and the
+> tenant is fixed to `organizations` for Microsoft 365 work/school accounts only.
+> Only Microsoft authorization URL, token URL, and Graph base URL environment
+> overrides remain. Google and Microsoft settings both take effect immediately
+> and fence OAuth callbacks by provider-setting UUID and version.
+
 Remove the Gmail client ID and secret loader from `config/runtime.exs`. Remove
 `MANIFOLD_GMAIL_CLIENT_ID` and `MANIFOLD_GMAIL_CLIENT_SECRET` from operator
 instructions and supported-environment lists; retain them only in tests that
@@ -240,8 +248,9 @@ Code-defined Google endpoint defaults remain static application configuration.
 Endpoint override environment variables are outside the browser credential form
 and remain an operator/development concern unless separately removed.
 
-Microsoft runtime configuration remains unchanged in this feature. It is not
-listed as a configurable OAuth module until it is migrated to the catalog.
+Microsoft runtime configuration remained unchanged in the 2026-08-18 feature;
+that historical limitation was removed by the 2026-08-27 Microsoft catalog
+adoption described above.
 
 ## Error Handling and Secret Safety
 
@@ -324,7 +333,8 @@ fence cannot be represented by the old schema without losing active configuratio
 ### Regression
 
 - Existing Gmail receive/send, uncertainty, and account-isolation suites pass.
-- Microsoft configuration behavior remains unchanged.
+- Google and Microsoft provider settings resolve current encrypted credentials
+  and enforce their setting-generation fences.
 - Format, strict compile, scoped application suites, and migration up/down checks
   pass.
 

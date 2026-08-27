@@ -54,8 +54,9 @@ Microsoft Graph, or SMTP submission:
   transactions and credentials, durable provider-message identity, bounded
   cursor pages, and idempotent raw-message import through the normal spool and
   ingest boundary.
-- Trusted-local OAuth provider settings at `/settings/oauth`, with an encrypted
-  database-backed Gmail client secret and catalog-defined setup help.
+- Trusted-local OAuth provider settings at `/settings/oauth`, with encrypted
+  database-backed Google and Microsoft client secrets and catalog-defined setup
+  help.
 
 ## Out Of Scope
 
@@ -104,8 +105,9 @@ The current implementation includes:
   mailbox projection, and a retryable remote-state application job.
 - A no-auth `/settings/accounts` LiveView with OAuth start/callback routes,
   sync-now, status, and disconnect controls.
-- A trusted-local `/settings/oauth` LiveView for Google client credentials and
-  `/settings/oauth/gmail/help` for the exact callback, scopes, and setup steps.
+- A trusted-local `/settings/oauth` LiveView for Google and Microsoft client
+  credentials, with `/settings/oauth/gmail/help` and
+  `/settings/oauth/microsoft/help` for exact callbacks, scopes, and setup steps.
 - A local-release `connectors` Oban queue and five-minute polling job that
   recreates missing active-account sync work.
 
@@ -139,9 +141,6 @@ MANIFOLD_GMAIL_AUTHORIZATION_URL
 MANIFOLD_GMAIL_TOKEN_URL
 MANIFOLD_GMAIL_USERINFO_URL
 MANIFOLD_GMAIL_API_BASE_URL
-MANIFOLD_MICROSOFT_CLIENT_ID
-MANIFOLD_MICROSOFT_CLIENT_SECRET
-MANIFOLD_MICROSOFT_TENANT
 MANIFOLD_MICROSOFT_AUTHORIZATION_URL
 MANIFOLD_MICROSOFT_TOKEN_URL
 MANIFOLD_MICROSOFT_API_BASE_URL
@@ -156,22 +155,23 @@ provider-setting, OAuth-token, and PKCE ciphertext. Generate one with:
 openssl rand -base64 32
 ```
 
-Configure the Google client ID and secret in **Settings → OAuth** at
+Configure Google and Microsoft client IDs and secrets in **Settings → OAuth** at
 `/settings/oauth`; provider-specific instructions are at
-`/settings/oauth/gmail/help`. The client ID is stored as plaintext because it is
-sent in browser authorization requests. The client secret is encrypted in
-PostgreSQL and is never returned to the browser. On an existing configuration,
-leaving the secret field blank preserves it when the client ID is unchanged.
-Changing the client ID requires a new secret. Changing either credential or
-removing the configuration immediately disables affected Gmail receive/send
-methods and requires reconnect. Removal is local only and does not revoke the
-grant at Google.
+`/settings/oauth/gmail/help` and `/settings/oauth/microsoft/help`. A client ID is
+stored as plaintext because it is sent in browser authorization requests. Each
+client secret is encrypted in PostgreSQL and is never returned to the browser.
+On an existing configuration, leaving the secret field blank preserves it when
+the client ID is unchanged. Changing the client ID requires a new secret.
+Changing either credential or removing a configuration immediately disables
+that provider's affected receive/send methods and requires reconnect. Removal is
+local only and does not revoke the grant at Google or Microsoft.
 
-The legacy `MANIFOLD_GMAIL_CLIENT_ID` and `MANIFOLD_GMAIL_CLIENT_SECRET`
-variables are ignored and are never imported or used as a fallback. Gmail
-endpoint override variables remain static operator/development configuration.
-Microsoft client credentials and endpoint environment behavior are unchanged.
-No application restart is required after a Google credential save or removal.
+Legacy Google and Microsoft client-credential environment variables are ignored
+and are never imported or used as a fallback. Provider endpoint override
+variables remain static operator/development configuration. For Microsoft, only
+the authorization URL, token URL, and Graph base URL overrides are retained. No
+application restart is required after either provider's credential save,
+rotation, or removal.
 
 The provider application registrations use these exact callback paths:
 
@@ -200,25 +200,23 @@ Gmail token:         https://oauth2.googleapis.com/token
 Gmail API:           https://gmail.googleapis.com
 
 Microsoft authorization:
-  https://login.microsoftonline.com/<tenant>/oauth2/v2.0/authorize
+  https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize
 Microsoft token:
-  https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token
+  https://login.microsoftonline.com/organizations/oauth2/v2.0/token
 Microsoft Graph:
   https://graph.microsoft.com/v1.0
 ```
 
-Use `organizations` as the Microsoft tenant default for work/school accounts.
+Microsoft uses the fixed `organizations` tenant for work/school accounts only;
+Outlook.com personal accounts are not supported.
 Authorization, token, and API endpoint overrides must be absolute HTTPS URLs
-without credentials or fragments. Gmail is unavailable until a complete,
+without credentials or fragments. Each provider is unavailable until a complete,
 decryptable setting has been saved; a corrupt setting fails closed as a provider
-configuration error. Microsoft remains enabled only when its client ID and secret
-are both set; an absent complete Microsoft pair leaves it unavailable, while a
-partial pair fails startup.
+configuration error.
 Development and test configuration use non-production encryption keys;
 development has no default provider client credentials and test uses inert
-endpoints. Save Google credentials through Settings → OAuth to exercise Gmail in
-`MIX_ENV=dev`; continue to set the Microsoft variables before
-`devenv processes start` when exercising Microsoft.
+endpoints. Save Google or Microsoft credentials through Settings → OAuth before
+exercising that provider in `MIX_ENV=dev`.
 The configured Gmail OAuth consent screen must include the receive and send
 scopes used by the application:
 
@@ -244,11 +242,14 @@ they are not an authenticated administrator surface. Network-exposed deployments
 must add access control before treating browser-managed secrets as safe.
 
 Register the exact Microsoft callback
-`https://<host>/connectors/microsoft/callback`. The tenant default is
-`organizations`, which permits work/school accounts only. Restrict staging to a
-non-production app registration, tenant, and approved test users, and obtain
-tenant admin consent when the tenant's user-consent policy requires it. Existing
-receive-only accounts grant `Mail.Send` incrementally when Send is added.
+`https://<host>/connectors/microsoft/callback`; local development uses
+`http://localhost:4290/connectors/microsoft/callback`. The fixed `organizations`
+tenant permits work/school accounts only. Restrict staging to a non-production
+app registration, tenant, and approved test users, and obtain tenant admin
+consent when the tenant's user-consent policy requires it. Save the client ID and
+secret at `/settings/oauth`, using `/settings/oauth/microsoft/help` for the exact
+deployed callback and required scopes. Existing receive-only accounts grant
+`Mail.Send` incrementally when Send is added.
 Provider acceptance is immediate in Send activity; the authoritative Sent copy
 appears after normal/manual Graph polling when Receive is enabled. Back up
 `MANIFOLD_CONNECTOR_ENCRYPTION_KEY`; changing it without a coordinated rotation
@@ -294,23 +295,26 @@ Gmail or SMTP provider submissions exist. Do not bypass these preflights.
 
 ### Non-rolling OAuth provider-settings cutover
 
-Migration `20260818000100_add_oauth_provider_settings.exs` is also a non-rolling
-cutover. Drain and stop every old Phoenix instance, connector process, and Oban
-worker before migrating; otherwise old nodes can keep using removed environment
-credentials while new nodes resolve the database row. The migration does not
-backfill from environment. Gmail is unavailable after deployment until Google
-credentials are saved at `/settings/oauth`, and all existing Gmail grants must be
-reconnected to the saved OAuth application.
+Migration `20260818000100_add_oauth_provider_settings.exs` and the later Microsoft
+catalog adoption form a non-rolling provider-settings cutover. Before deploying
+the Settings-only Microsoft release, stop new Microsoft submissions, drain all
+queued and executing Microsoft send work, then drain and stop every old Phoenix
+instance, connector process, and Oban worker. Old nodes must not continue using
+legacy client credentials while new nodes resolve database settings. No client
+credentials are imported from environment or used as fallback. After deployment,
+Gmail and Microsoft are unavailable until their credentials are saved at
+`/settings/oauth`, and existing grants must reconnect to the saved OAuth
+applications.
 
 Before promoting staging, verify all of the following without restarting:
 
-- saving Google credentials immediately enables Gmail in both receive and send
-  method pickers;
-- `/settings/oauth/gmail/help` shows the deployed exact callback URI and required
+- saving Google or Microsoft credentials immediately enables that provider in
+  both receive and send method pickers;
+- each provider help page shows its deployed exact callback URI and required
   scopes;
-- receive connection and Gmail API send work with an approved staging identity;
+- receive and provider send work with approved staging identities;
 - secret rotation and client-ID change require reconnect, and removal disables
-  Gmail without deleting or revoking the Google grant;
+  the affected provider without deleting or revoking its remote grant;
 - previously disabled or reconnect-required methods do not resume automatically.
 
 #### Guarded rollback runbook

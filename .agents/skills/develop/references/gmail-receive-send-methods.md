@@ -140,8 +140,8 @@ current ciphertext; changing the client ID requires a new secret.
 
 The legacy `MANIFOLD_GMAIL_CLIENT_ID` and `MANIFOLD_GMAIL_CLIENT_SECRET`
 variables are ignored, not imported, and never used as fallback. Gmail endpoint
-overrides remain static operator/development settings; Microsoft environment
-behavior is unchanged. Gmail is unavailable until the database setting is saved.
+overrides remain static operator/development settings. Gmail is unavailable until
+the database setting is saved.
 
 Enable the Gmail API, configure only `openid`, `email`, `gmail.readonly`, and
 `gmail.send` on the Google consent screen, and use

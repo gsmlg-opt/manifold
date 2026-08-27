@@ -506,7 +506,16 @@ An explicit user resend/resolution workflow remains outside this feature.
 
 ## Configuration and operations
 
-Continue using the existing Microsoft configuration:
+> **Superseded on 2026-08-27:** Microsoft OAuth client credentials now use the
+> encrypted provider store managed at `/settings/oauth`. The legacy credential
+> and tenant environment variables named below are ignored and are not imported
+> or used as fallback. The tenant is fixed to `organizations` for Microsoft 365
+> work/school accounts only. Only the Microsoft authorization URL, token URL, and
+> Graph base URL environment overrides remain. Save, rotation, and removal take
+> effect immediately and require affected Microsoft methods to reconnect.
+
+At the time this design was approved, it continued using this Microsoft
+configuration:
 
 - `MANIFOLD_MICROSOFT_CLIENT_ID`
 - `MANIFOLD_MICROSOFT_CLIENT_SECRET`
@@ -514,8 +523,10 @@ Continue using the existing Microsoft configuration:
 - Existing Microsoft authorization, token, Graph base, and callback endpoints
 - `MANIFOLD_CONNECTOR_ENCRYPTION_KEY`
 
-Only a complete client ID/secret pair enables Microsoft. A partial pair must
-fail startup; an absent pair leaves the provider visible but unavailable.
+The complete-pair startup behavior was part of the historical environment-backed
+design and no longer describes the active runtime. The current runtime resolves a
+complete, decryptable Settings row and fails closed when that row is absent or
+invalid.
 
 Operator documentation must cover:
 
