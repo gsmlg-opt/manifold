@@ -220,16 +220,16 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
         address: "picker@microsoft.example"
       })
 
+    receive_microsoft_selector =
+      "button[phx-click='choose-kind'][phx-value-kind='microsoft']"
+
     {:ok, receive_before, _html} =
       live(conn, ~p"/settings/accounts/#{account.id}/receive_methods/new")
 
     {:ok, send_before, _html} =
       live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
 
-    assert has_element?(
-             receive_before,
-             "button[phx-click='choose-kind'][phx-value-kind='microsoft'][disabled]"
-           )
+    assert has_element?(receive_before, receive_microsoft_selector <> "[disabled]")
 
     assert has_element?(send_before, "#send-method-microsoft[disabled]")
 
@@ -267,11 +267,10 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     {:ok, send_after_save, _html} =
       live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
 
-    refute has_element?(
-             receive_after_save,
-             "button[phx-click='choose-kind'][phx-value-kind='microsoft'][disabled]"
-           )
+    assert has_element?(receive_after_save, receive_microsoft_selector)
+    refute has_element?(receive_after_save, receive_microsoft_selector <> "[disabled]")
 
+    assert has_element?(send_after_save, "#send-method-microsoft")
     refute has_element?(send_after_save, "#send-method-microsoft[disabled]")
 
     remove_html =
@@ -289,10 +288,7 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     {:ok, send_after_remove, _html} =
       live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
 
-    assert has_element?(
-             receive_after_remove,
-             "button[phx-click='choose-kind'][phx-value-kind='microsoft'][disabled]"
-           )
+    assert has_element?(receive_after_remove, receive_microsoft_selector <> "[disabled]")
 
     assert has_element?(send_after_remove, "#send-method-microsoft[disabled]")
   end
