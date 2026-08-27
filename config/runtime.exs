@@ -286,64 +286,67 @@ if not edge_release? do
     end
   end
 
-  if config_env() != :test do
-    gmail_config = [
-      authorization_url:
-        https_endpoint!.(
-          "MANIFOLD_GMAIL_AUTHORIZATION_URL",
-          "https://accounts.google.com/o/oauth2/v2/auth"
-        ),
-      token_url:
-        https_endpoint!.(
-          "MANIFOLD_GMAIL_TOKEN_URL",
-          "https://oauth2.googleapis.com/token"
-        ),
-      userinfo_url:
-        https_endpoint!.(
-          "MANIFOLD_GMAIL_USERINFO_URL",
-          "https://openidconnect.googleapis.com/v1/userinfo"
-        ),
-      base_url:
-        https_endpoint!.(
-          "MANIFOLD_GMAIL_API_BASE_URL",
-          "https://gmail.googleapis.com"
-        )
-    ]
+  gmail_config = [
+    authorization_url:
+      https_endpoint!.(
+        "MANIFOLD_GMAIL_AUTHORIZATION_URL",
+        "https://accounts.google.com/o/oauth2/v2/auth"
+      ),
+    token_url:
+      https_endpoint!.(
+        "MANIFOLD_GMAIL_TOKEN_URL",
+        "https://oauth2.googleapis.com/token"
+      ),
+    userinfo_url:
+      https_endpoint!.(
+        "MANIFOLD_GMAIL_USERINFO_URL",
+        "https://openidconnect.googleapis.com/v1/userinfo"
+      ),
+    base_url:
+      https_endpoint!.(
+        "MANIFOLD_GMAIL_API_BASE_URL",
+        "https://gmail.googleapis.com"
+      )
+  ]
 
-    microsoft_tenant = "organizations"
-    microsoft_tenant_base = "https://login.microsoftonline.com/#{microsoft_tenant}/oauth2/v2.0"
+  connector_providers =
+    if config_env() == :test do
+      [gmail: gmail_config]
+    else
+      microsoft_tenant = "organizations"
+      microsoft_tenant_base = "https://login.microsoftonline.com/#{microsoft_tenant}/oauth2/v2.0"
 
-    microsoft_config = [
-      authorization_url:
-        https_endpoint!.(
-          "MANIFOLD_MICROSOFT_AUTHORIZATION_URL",
-          microsoft_tenant_base <> "/authorize"
-        ),
-      token_url:
-        https_endpoint!.(
-          "MANIFOLD_MICROSOFT_TOKEN_URL",
-          microsoft_tenant_base <> "/token"
-        ),
-      base_url:
-        https_endpoint!.(
-          "MANIFOLD_MICROSOFT_API_BASE_URL",
-          "https://graph.microsoft.com/v1.0"
-        ),
-      tenant: microsoft_tenant
-    ]
+      microsoft_config = [
+        authorization_url:
+          https_endpoint!.(
+            "MANIFOLD_MICROSOFT_AUTHORIZATION_URL",
+            microsoft_tenant_base <> "/authorize"
+          ),
+        token_url:
+          https_endpoint!.(
+            "MANIFOLD_MICROSOFT_TOKEN_URL",
+            microsoft_tenant_base <> "/token"
+          ),
+        base_url:
+          https_endpoint!.(
+            "MANIFOLD_MICROSOFT_API_BASE_URL",
+            "https://graph.microsoft.com/v1.0"
+          ),
+        tenant: microsoft_tenant
+      ]
 
-    connector_providers = [gmail: gmail_config, microsoft: microsoft_config]
+      [gmail: gmail_config, microsoft: microsoft_config]
+    end
 
-    connector_config =
-      [providers: connector_providers]
-      |> then(fn config ->
-        if connector_encryption_key,
-          do: Keyword.put(config, :encryption_key, connector_encryption_key),
-          else: config
-      end)
+  connector_config =
+    [providers: connector_providers]
+    |> then(fn config ->
+      if connector_encryption_key,
+        do: Keyword.put(config, :encryption_key, connector_encryption_key),
+        else: config
+    end)
 
-    config :manifold_connectors, connector_config
-  end
+  config :manifold_connectors, connector_config
 
   if config_env() == :prod do
     secret_key_base =

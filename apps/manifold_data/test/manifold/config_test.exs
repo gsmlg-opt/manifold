@@ -116,10 +116,10 @@ defmodule Manifold.ConfigTest do
       |> then(& &1[:manifold_connectors])
 
     assert connectors[:providers][:gmail] == [
-             authorization_url: "https://accounts.google.invalid/authorize",
-             token_url: "https://accounts.google.invalid/token",
-             userinfo_url: "https://openidconnect.invalid/v1/userinfo",
-             base_url: "https://gmail.invalid"
+             authorization_url: "https://accounts.google.com/o/oauth2/v2/auth",
+             token_url: "https://oauth2.googleapis.com/token",
+             userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo",
+             base_url: "https://gmail.googleapis.com"
            ]
 
     assert connectors[:providers][:microsoft] == [
