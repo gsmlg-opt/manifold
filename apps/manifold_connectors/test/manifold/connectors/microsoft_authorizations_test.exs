@@ -18,6 +18,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
     OAuthAuthorization,
+    OAuthProviderSetting,
     ReceiveMethod,
     SendMethod,
     SyncCursor
@@ -34,16 +35,30 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     @behaviour Manifold.Connectors.Provider
 
     @impl true
-    def exchange_code(_code, _verifier, _redirect_uri, _config, opts) do
+    def exchange_code(_code, _verifier, _redirect_uri, config, opts) do
+      notify_config(opts, :exchange_config, config)
+
       if test_pid = Keyword.get(opts, :test_pid) do
         send(test_pid, {:exchange_required_scopes, Keyword.get(opts, :required_scopes)})
+      end
+
+      if gate = Keyword.get(opts, :exchange_gate) do
+        test_pid = Keyword.fetch!(opts, :test_pid)
+        send(test_pid, {:oauth_code_exchange_started, self(), gate})
+
+        receive do
+          {:release_oauth_exchange, ^gate} -> :ok
+        end
       end
 
       Keyword.fetch!(opts, :token)
     end
 
     @impl true
-    def identity(_access_token, _config, opts), do: Keyword.fetch!(opts, :identity)
+    def identity(_access_token, config, opts) do
+      notify_config(opts, :identity_config, config)
+      Keyword.fetch!(opts, :identity)
+    end
 
     @impl true
     def initial_cursors(access_token, _config, opts) do
@@ -91,6 +106,12 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     @impl true
     def fetch_raw(_access_token, _message_id, _config, _opts),
       do: {:ok, %RawMessage{bytes: "Subject: test\r\n\r\nBody\r\n"}}
+
+    defp notify_config(opts, event, config) do
+      if test_pid = Keyword.get(opts, :test_pid) do
+        send(test_pid, {event, config})
+      end
+    end
   end
 
   defmodule FailingMicrosoft do
@@ -138,11 +159,20 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
     Application.put_env(:manifold_connectors, :providers,
       microsoft: [
-        client_id: "client",
-        client_secret: "secret",
-        authorization_url: "https://login.microsoft.test/authorize"
+        authorization_url: "https://login.microsoft.test/authorize",
+        token_url: "https://login.microsoft.test/token",
+        userinfo_url: "https://graph.microsoft.test/oidc/userinfo",
+        base_url: "https://graph.microsoft.test/v1.0"
       ]
     )
+
+    assert {:ok, microsoft_setting_view} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "db-client",
+               "client_secret" => "db-secret"
+             })
+
+    microsoft_setting = Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
 
     on_exit(fn ->
       restore_env(:encryption_key, old_key)
@@ -155,7 +185,76 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     {:ok, account} = Accounts.create_account(domain, %{local_part: "person"})
     account = Repo.preload(account, :domain)
 
-    {:ok, account: account, address: Accounts.account_address(account)}
+    {:ok,
+     account: account,
+     address: Accounts.account_address(account),
+     microsoft_setting: microsoft_setting,
+     microsoft_setting_view: microsoft_setting_view}
+  end
+
+  test "unchanged Microsoft setting generation completes through the public context", %{
+    account: account,
+    address: address,
+    microsoft_setting: microsoft_setting
+  } do
+    consumed = start_and_consume_microsoft!(account.id, :receive)
+
+    assert consumed.oauth_provider_setting_id == microsoft_setting.id
+    assert consumed.oauth_provider_setting_lock_version == microsoft_setting.lock_version
+
+    assert {:ok, %ReceiveMethod{status: "connected"}} =
+             Connectors.complete_authorization("microsoft", "authorization-code", consumed,
+               now: @now,
+               provider_opts: completion_provider_opts(address, :receive, test_pid: self())
+             )
+
+    assert_receive {:exchange_config, config}
+    assert_receive {:identity_config, ^config}
+    assert config[:client_id] == "db-client"
+    assert config[:client_secret] == "db-secret"
+  end
+
+  test "rotating the Microsoft setting during exchange rejects completion without persistence", %{
+    account: account,
+    address: address,
+    microsoft_setting_view: microsoft_setting_view
+  } do
+    consumed = start_and_consume_microsoft!(account.id, :receive)
+    test_pid = self()
+    gate = make_ref()
+
+    completion =
+      Task.async(fn ->
+        Connectors.complete_authorization("microsoft", "authorization-code", consumed,
+          now: @now,
+          provider_opts:
+            completion_provider_opts(address, :receive,
+              test_pid: test_pid,
+              exchange_gate: gate
+            )
+        )
+      end)
+
+    assert_receive {:oauth_code_exchange_started, completion_pid, ^gate}, 5_000
+
+    assert {:ok, _rotated} =
+             Connectors.put_oauth_provider_setting(
+               "microsoft",
+               %{"client_id" => "rotated-client", "client_secret" => "rotated-secret"},
+               expected_lock_version: microsoft_setting_view.lock_version
+             )
+
+    send(completion_pid, {:release_oauth_exchange, gate})
+
+    assert {:error, %{class: :permanent, reason: :provider_configuration_changed}} =
+             Task.await(completion, 5_000)
+
+    assert Repo.aggregate(OAuthAuthorization, :count) == 0
+    assert Repo.aggregate(ReceiveMethod, :count) == 0
+    assert Repo.aggregate(SendMethod, :count) == 0
+    assert Repo.aggregate(ConnectorEvent, :count) == 0
+    assert Repo.aggregate(SyncCursor, :count) == 0
+    assert Repo.aggregate(Oban.Job, :count) == 0
   end
 
   for {label, sequence, expected_scopes, receive_count, send_count} <- [
@@ -1979,6 +2078,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
   defp complete(purpose, account, address, opts \\ []) do
     required_scopes = Keyword.get(opts, :required_scopes, purpose_scopes(purpose))
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
 
     consumed = %Consumed{
       provider: "microsoft",
@@ -1986,7 +2086,9 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
       purpose: purpose,
       required_scopes: required_scopes,
       redirect_uri: "https://mail.example.test/connectors/microsoft/callback",
-      pkce_verifier: "verifier-secret"
+      pkce_verifier: "verifier-secret",
+      oauth_provider_setting_id: setting.id,
+      oauth_provider_setting_lock_version: setting.lock_version
     }
 
     token = %Token{
@@ -2014,6 +2116,37 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
       consumed,
       now: @now,
       provider_opts: provider_opts
+    )
+  end
+
+  defp start_and_consume_microsoft!(account_id, purpose) do
+    redirect_uri = "https://mail.example.test/connectors/microsoft/callback"
+
+    assert {:ok, authorization} =
+             OAuth.start("microsoft", account_id, redirect_uri, purpose: purpose)
+
+    assert {:ok, consumed} =
+             OAuth.consume("microsoft", authorization.state, redirect_uri)
+
+    consumed
+  end
+
+  defp completion_provider_opts(address, purpose, extra) do
+    required_scopes = purpose_scopes(purpose)
+
+    token = %Token{
+      access_token: "access-secret",
+      refresh_token: "refresh-secret",
+      expires_at: @expires_at,
+      scopes: access_token_scopes(required_scopes)
+    }
+
+    Keyword.merge(
+      [
+        token: {:ok, token},
+        identity: {:ok, %Identity{id: @subject, email_address: address}}
+      ],
+      extra
     )
   end
 

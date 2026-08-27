@@ -31,6 +31,7 @@ defmodule Manifold.Connectors.SyncTest do
     ConnectorEvent,
     Credential,
     OAuthAuthorization,
+    OAuthProviderSetting,
     ReceiveMethod,
     RemoteMessage,
     SendMethod,
@@ -230,13 +231,24 @@ defmodule Manifold.Connectors.SyncTest do
       microsoft: FakeProvider
     )
 
-    Application.put_env(:manifold_connectors, :providers, microsoft: [client_id: "client"])
+    Application.put_env(:manifold_connectors, :providers,
+      microsoft: [base_url: "https://graph.microsoft.test/v1.0"]
+    )
 
     assert {:ok, _setting} =
              Connectors.put_oauth_provider_setting("gmail", %{
                "client_id" => "client",
                "client_secret" => "secret"
              })
+
+    assert {:ok, _setting} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "microsoft-db-client",
+               "client_secret" => "microsoft-db-secret"
+             })
+
+    assert %OAuthProviderSetting{} =
+             Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
 
     Application.put_env(:manifold_storage, :spool_dir, Path.join(tmp_dir, "spool"))
     Application.put_env(:manifold_storage, :raw_store_dir, Path.join(tmp_dir, "raw"))
@@ -981,8 +993,12 @@ defmodule Manifold.Connectors.SyncTest do
 
     refute Repo.get_by(Credential, external_account_id: microsoft.id)
 
-    assert :ok = Connectors.sync_account(microsoft.id)
+    assert :ok = Connectors.sync_account(microsoft.id, provider_opts: [test_pid: self()])
     assert_receive {:sync_access_token, "initial-access"}
+    assert_receive {:sync_config, config}
+    assert config[:client_id] == "microsoft-db-client"
+    assert config[:client_secret] == "microsoft-db-secret"
+    assert config[:base_url] == "https://graph.microsoft.test/v1.0"
     refute Repo.get_by(Credential, external_account_id: microsoft.id)
   end
 
@@ -2376,6 +2392,7 @@ defmodule Manifold.Connectors.SyncTest do
              )
 
     required_scopes = Enum.sort([MicrosoftScopes.read(), MicrosoftScopes.offline()])
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
 
     consumed = %Consumed{
       provider: "microsoft",
@@ -2383,7 +2400,9 @@ defmodule Manifold.Connectors.SyncTest do
       purpose: :receive,
       required_scopes: required_scopes,
       redirect_uri: "https://mail.example.test/connectors/microsoft/callback",
-      pkce_verifier: "verifier"
+      pkce_verifier: "verifier",
+      oauth_provider_setting_id: setting.id,
+      oauth_provider_setting_lock_version: setting.lock_version
     }
 
     token = %Token{

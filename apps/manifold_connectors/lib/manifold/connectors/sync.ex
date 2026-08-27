@@ -1107,17 +1107,12 @@ defmodule Manifold.Connectors.Sync do
 
   defp runtime("microsoft") do
     adapters = Application.get_env(:manifold_connectors, :adapters, [])
-    providers = Application.get_env(:manifold_connectors, :providers, [])
 
     adapter =
       Keyword.get(adapters, :microsoft) || Manifold.Connectors.Provider.MicrosoftGraph
 
-    case Keyword.get(providers, :microsoft) do
-      config when is_list(config) ->
-        {:ok, adapter, config}
-
-      _missing ->
-        {:error, Error.new(:permanent, :provider_not_configured, "provider is not configured")}
+    with {:ok, %ProviderConfig.Resolved{config: config}} <- ProviderConfig.fetch("microsoft") do
+      {:ok, adapter, config}
     end
   end
 

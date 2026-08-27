@@ -1327,14 +1327,12 @@ defmodule Manifold.Connectors do
 
   defp adapter_config("microsoft") do
     adapters = Application.get_env(:manifold_connectors, :adapters, [])
-    providers = Application.get_env(:manifold_connectors, :providers, [])
 
     adapter =
       Keyword.get(adapters, :microsoft) || Manifold.Connectors.Provider.MicrosoftGraph
 
-    case Keyword.get(providers, :microsoft) do
-      config when is_list(config) -> {:ok, adapter, config}
-      _missing -> provider_not_configured()
+    with {:ok, %ProviderConfig.Resolved{config: config}} <- ProviderConfig.fetch("microsoft") do
+      {:ok, adapter, config}
     end
   end
 
@@ -1363,26 +1361,41 @@ defmodule Manifold.Connectors do
     end
   end
 
-  defp completion_adapter_config("microsoft", %Consumed{}) do
-    case adapter_config("microsoft") do
-      {:ok, adapter, config} -> {:ok, adapter, config, []}
-      {:error, %Error{} = error} -> {:error, error}
+  defp completion_adapter_config("microsoft", %Consumed{} = consumed) do
+    adapters = Application.get_env(:manifold_connectors, :adapters, [])
+
+    adapter =
+      Keyword.get(adapters, :microsoft) || Manifold.Connectors.Provider.MicrosoftGraph
+
+    with {:ok, %ProviderConfig.Resolved{} = resolved} <- ProviderConfig.fetch("microsoft"),
+         :ok <- validate_completion_generation(consumed, resolved) do
+      {:ok, adapter, resolved.config,
+       expected_oauth_provider_setting_id: resolved.setting_id,
+       expected_oauth_provider_setting_lock_version: resolved.setting_lock_version}
+    else
+      {:error, %Error{reason: reason}}
+      when reason in [:provider_not_configured, :provider_configuration_error] ->
+        provider_configuration_changed()
+
+      {:error, %Error{} = error} ->
+        {:error, error}
     end
   end
 
   defp validate_completion_generation(
          %Consumed{
-           provider: "gmail",
+           provider: provider,
            oauth_provider_setting_id: setting_id,
            oauth_provider_setting_lock_version: setting_lock_version
          },
          %ProviderConfig.Resolved{
-           provider: "gmail",
+           provider: provider,
            setting_id: setting_id,
            setting_lock_version: setting_lock_version
          }
        )
-       when is_binary(setting_id) and is_integer(setting_lock_version),
+       when provider in ["gmail", "microsoft"] and is_binary(setting_id) and
+              is_integer(setting_lock_version),
        do: :ok
 
   defp validate_completion_generation(
@@ -1396,9 +1409,11 @@ defmodule Manifold.Connectors do
        do: :ok
 
   defp validate_completion_generation(
-         %Consumed{provider: "gmail"},
-         %ProviderConfig.Resolved{provider: "gmail"}
-       ),
+         %Consumed{provider: consumed_provider},
+         %ProviderConfig.Resolved{provider: resolved_provider}
+       )
+       when consumed_provider in ["gmail", "microsoft"] and
+              resolved_provider in ["gmail", "microsoft"],
        do: provider_configuration_changed()
 
   defp validate_completion_generation(%Consumed{}, %ProviderConfig.Resolved{}), do: :ok

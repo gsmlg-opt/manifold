@@ -1230,13 +1230,14 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
   end
 
   defp lock_and_validate_provider_generation(
-         "gmail",
+         provider,
          {setting_id, setting_lock_version}
        )
-       when is_binary(setting_id) and is_integer(setting_lock_version) do
-    with :ok <- ProviderSettings.lock_provider_for_transaction("gmail") do
+       when provider in @providers and is_binary(setting_id) and
+              is_integer(setting_lock_version) do
+    with :ok <- ProviderSettings.lock_provider_for_transaction(provider) do
       ProviderSettings.validate_generation_for_transaction(
-        "gmail",
+        provider,
         setting_id,
         setting_lock_version
       )
@@ -1249,7 +1250,8 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
        ),
        do: :ok
 
-  defp lock_and_validate_provider_generation("gmail", {_setting_id, _setting_lock_version}) do
+  defp lock_and_validate_provider_generation(provider, {_setting_id, _setting_lock_version})
+       when provider in @providers do
     {:error,
      CoreError.new(
        :permanent,
