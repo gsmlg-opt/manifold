@@ -115,6 +115,12 @@ defmodule ManifoldWeb.OutboundMailLiveTest do
   end
 
   test "send-only Microsoft acceptance stays out of projected Sent", %{conn: conn} do
+    assert {:ok, _setting} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "microsoft-web-client",
+               "client_secret" => "microsoft-web-secret"
+             })
+
     mailbox = mailbox_fixture()
     method = add_microsoft_send_method(mailbox)
     assert Connectors.list_receive_methods_for_account(mailbox.id) == []
