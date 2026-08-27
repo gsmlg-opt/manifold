@@ -346,11 +346,20 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
     assert_reconnect_required(second_microsoft)
     assert family_snapshot(gmail) == gmail_snapshot
 
+    removal_microsoft = insert_oauth_family!("microsoft", "microsoft-isolation-removal")
+
+    assert Repo.get!(OAuthAuthorization, removal_microsoft.authorization.id).status == "connected"
+    assert Repo.get!(ReceiveMethod, removal_microsoft.receive.id).status == "connected"
+    assert Repo.get!(ReceiveMethod, removal_microsoft.receive.id).enabled
+    assert Repo.get!(SendMethod, removal_microsoft.send.id).status == "connected"
+    assert Repo.get!(SendMethod, removal_microsoft.send.id).enabled
+
     assert {:ok, %{provider: "microsoft", status: :not_configured}} =
              Connectors.remove_oauth_provider_setting("microsoft",
                expected_lock_version: rotated.lock_version
              )
 
+    assert_reconnect_required(removal_microsoft)
     assert is_nil(Repo.get_by(OAuthProviderSetting, provider: "microsoft"))
     assert family_snapshot(gmail) == gmail_snapshot
   end
