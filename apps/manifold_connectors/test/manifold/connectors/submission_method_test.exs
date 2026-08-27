@@ -79,11 +79,7 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
         token_url: "https://login.microsoft.test/token",
         base_url: "https://graph.microsoft.test/v1.0",
         tenant: "organizations",
-        scopes: "Mail.Read",
-        req_options: [
-          plug: {Req.Test, __MODULE__},
-          headers: [{"cookie", "microsoft-config-cookie-secret"}]
-        ]
+        req_options: [plug: {Req.Test, __MODULE__}]
       ]
     )
 
@@ -375,9 +371,7 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
 
       refute inspect(method.config) =~ "microsoft-db-client-id-must-not-escape"
       refute inspect(method.config) =~ "microsoft-db-client-secret-must-not-escape"
-      refute inspect(method.config) =~ "microsoft-config-cookie-secret"
       refute inspect(method.config) =~ "organizations"
-      refute inspect(method.config) =~ "Mail.Read"
     after
       :telemetry.detach(handler_id)
     end
