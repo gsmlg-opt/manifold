@@ -19,6 +19,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
   alias Manifold.Connectors.Schema.{
     ConnectorEvent,
     OAuthAuthorization,
+    OAuthProviderSetting,
     ReceiveMethod,
     RemoteMessage,
     SendMethod,
@@ -108,6 +109,14 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
     {:ok, target} = Accounts.create_account(domain, %{local_part: "target"})
     target = Repo.preload(target, :domain)
     address = Accounts.account_address(target)
+
+    assert {:ok, _setting_view} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "deactivation-test-client",
+               "client_secret" => "deactivation-test-secret"
+             })
+
+    microsoft_setting = Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
     fixture = microsoft_connector_fixture!(target.id, address, "deactivation")
 
     {:ok, draft} =
@@ -125,7 +134,9 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
       purpose: :send,
       required_scopes: [MicrosoftScopes.send(), MicrosoftScopes.offline()],
       redirect_uri: "https://mail.example.test/connectors/microsoft/callback",
-      pkce_verifier: "deactivation-verifier-sentinel"
+      pkce_verifier: "deactivation-verifier-sentinel",
+      oauth_provider_setting_id: microsoft_setting.id,
+      oauth_provider_setting_lock_version: microsoft_setting.lock_version
     }
 
     token = %Token{
