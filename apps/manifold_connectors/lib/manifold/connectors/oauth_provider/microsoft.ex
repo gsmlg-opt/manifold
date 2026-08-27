@@ -19,23 +19,23 @@ defmodule Manifold.Connectors.OAuthProvider.Microsoft do
       configuration_title: "Microsoft OAuth",
       documentation_name: "Microsoft",
       steps: [
-        "Create or select an Entra application registration.",
-        "Select Accounts in any organizational directory for work/school accounts.",
-        "Add a Web callback URI using the exact address shown below.",
+        "Create or select a Microsoft Entra application registration.",
+        "Select accounts in any organizational directory for work/school access.",
+        "Add a Web platform and register the exact callback URI shown below.",
         "Add delegated User.Read, Mail.Read, and Mail.Send permissions.",
         "Do not add Mail.ReadWrite; Manifold does not create or modify Graph drafts.",
-        "Allow offline_access.",
-        "Create and copy a client secret.",
+        "Allow offline_access so Manifold can refresh the delegated grant.",
+        "Create a client secret and copy its value before leaving the Entra page.",
         "Copy the application client ID and secret into Settings OAuth.",
-        "Obtain tenant admin consent if required."
+        "Obtain tenant administrator consent when the tenant policy requires it."
       ],
       scopes: [
-        %{value: "openid", purpose: "Sign in with the Microsoft identity platform."},
-        %{value: "profile", purpose: "Read basic profile information."},
-        %{value: "User.Read", purpose: "Read the signed-in user's profile."},
-        %{value: "Mail.Read", purpose: "Receive mail without modifying messages."},
-        %{value: "Mail.Send", purpose: "Send mail through Microsoft Graph."},
-        %{value: "offline_access", purpose: "Maintain access by refreshing authorization tokens."}
+        %{value: "openid", purpose: "Confirm the Microsoft identity."},
+        %{value: "profile", purpose: "Read the signed-in account profile."},
+        %{value: "User.Read", purpose: "Read and bind the signed-in Graph identity."},
+        %{value: "Mail.Read", purpose: "Receive mail without modifying the remote mailbox."},
+        %{value: "Mail.Send", purpose: "Send mail as the signed-in user."},
+        %{value: "offline_access", purpose: "Refresh the delegated grant when access expires."}
       ],
       testing_note:
         "Use non-production Microsoft 365 work/school accounts; personal Outlook.com accounts are not supported.",
