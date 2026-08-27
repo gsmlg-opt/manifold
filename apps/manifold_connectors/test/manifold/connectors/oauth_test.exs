@@ -31,13 +31,9 @@ defmodule Manifold.Connectors.OAuthTest do
 
     Application.put_env(:manifold_connectors, :providers,
       gmail: [
-        client_id: "gmail-client",
-        client_secret: "gmail-secret",
         authorization_url: "https://accounts.google.test/o/oauth2/v2/auth"
       ],
       microsoft: [
-        client_id: "microsoft-client",
-        client_secret: "microsoft-secret",
         authorization_url: "https://login.microsoft.test/oauth2/v2.0/authorize"
       ]
     )
@@ -48,7 +44,14 @@ defmodule Manifold.Connectors.OAuthTest do
                "client_secret" => "gmail-db-secret"
              })
 
+    assert {:ok, _setting_view} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "microsoft-db-client",
+               "client_secret" => "microsoft-db-secret"
+             })
+
     gmail_setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+    microsoft_setting = Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
 
     on_exit(fn ->
       restore_env(:encryption_key, old_key)
@@ -58,7 +61,8 @@ defmodule Manifold.Connectors.OAuthTest do
     suffix = System.unique_integer([:positive])
     {:ok, domain} = Accounts.create_domain(%{name: "oauth#{suffix}.test"})
     {:ok, mailbox} = Accounts.create_account(domain, %{local_part: "person"})
-    {:ok, mailbox: mailbox, gmail_setting: gmail_setting}
+
+    {:ok, mailbox: mailbox, gmail_setting: gmail_setting, microsoft_setting: microsoft_setting}
   end
 
   test "starts Gmail OAuth with the database client and snapshots its exact generation", %{
@@ -270,7 +274,8 @@ defmodule Manifold.Connectors.OAuthTest do
   end
 
   test "Microsoft receive and send starts snapshot least-privilege purpose scopes", %{
-    mailbox: mailbox
+    mailbox: mailbox,
+    microsoft_setting: microsoft_setting
   } do
     assert {:ok, receive} =
              OAuth.start("microsoft", mailbox.id, @microsoft_redirect, purpose: :receive)
@@ -278,11 +283,21 @@ defmodule Manifold.Connectors.OAuthTest do
     assert MapSet.new(authorization_scopes(receive.url)) ==
              MapSet.new(~w(openid profile offline_access User.Read Mail.Read))
 
+    refute String.contains?(receive.url, "Mail.ReadWrite")
+
+    receive_transaction = Repo.get_by!(OAuthTransaction, purpose: "receive")
+    assert receive_transaction.oauth_provider_setting_id == microsoft_setting.id
+
+    assert receive_transaction.oauth_provider_setting_lock_version ==
+             microsoft_setting.lock_version
+
     assert {:ok, consumed_receive} =
              OAuth.consume("microsoft", receive.state, @microsoft_redirect)
 
-    assert is_nil(consumed_receive.oauth_provider_setting_id)
-    assert is_nil(consumed_receive.oauth_provider_setting_lock_version)
+    assert consumed_receive.oauth_provider_setting_id == microsoft_setting.id
+
+    assert consumed_receive.oauth_provider_setting_lock_version ==
+             microsoft_setting.lock_version
 
     assert {:ok, send} =
              OAuth.start("microsoft", mailbox.id, @microsoft_redirect, purpose: :send)
@@ -292,11 +307,17 @@ defmodule Manifold.Connectors.OAuthTest do
 
     refute String.contains?(send.url, "Mail.ReadWrite")
 
-    assert Repo.all(OAuthTransaction)
-           |> Enum.all?(fn transaction ->
-             is_nil(transaction.oauth_provider_setting_id) and
-               is_nil(transaction.oauth_provider_setting_lock_version)
-           end)
+    send_transaction = Repo.get_by!(OAuthTransaction, purpose: "send")
+    assert send_transaction.oauth_provider_setting_id == microsoft_setting.id
+
+    assert send_transaction.oauth_provider_setting_lock_version ==
+             microsoft_setting.lock_version
+
+    assert {:ok, consumed_send} =
+             OAuth.consume("microsoft", send.state, @microsoft_redirect)
+
+    assert consumed_send.oauth_provider_setting_id == microsoft_setting.id
+    assert consumed_send.oauth_provider_setting_lock_version == microsoft_setting.lock_version
   end
 
   test "rotation after Gmail start invalidates the state exactly once", %{
@@ -324,6 +345,35 @@ defmodule Manifold.Connectors.OAuthTest do
 
     assert {:error, %{reason: :oauth_state_replayed}} =
              OAuth.consume("gmail", authorization.state, redirect_uri)
+  end
+
+  test "rotation after Microsoft start invalidates the state exactly once", %{
+    mailbox: mailbox,
+    microsoft_setting: microsoft_setting
+  } do
+    assert {:ok, authorization} =
+             OAuth.start("microsoft", mailbox.id, @microsoft_redirect)
+
+    assert {:ok, _rotated} =
+             Connectors.put_oauth_provider_setting(
+               "microsoft",
+               %{
+                 "client_id" => "rotated-microsoft-client",
+                 "client_secret" => "rotated-microsoft-secret"
+               },
+               expected_lock_version: microsoft_setting.lock_version
+             )
+
+    assert {:error,
+            %{
+              class: :permanent,
+              reason: :provider_configuration_changed,
+              message: "OAuth provider configuration changed",
+              details: %{}
+            }} = OAuth.consume("microsoft", authorization.state, @microsoft_redirect)
+
+    assert {:error, %{reason: :oauth_state_replayed}} =
+             OAuth.consume("microsoft", authorization.state, @microsoft_redirect)
   end
 
   test "remove and recreate with the same version invalidates the old Gmail state", %{
@@ -484,21 +534,28 @@ defmodule Manifold.Connectors.OAuthTest do
              OAuth.consume("gmail", state, redirect_uri, now: DateTime.add(now, 61, :second))
   end
 
-  test "consumes a legacy Microsoft receive transaction with canonical scopes", %{
+  test "rejects and consumes a pre-cutover Microsoft transaction after database configuration", %{
     mailbox: mailbox
   } do
     redirect_uri = "https://mail.example.test/connectors/microsoft/callback"
     now = ~U[2026-08-11 01:00:00.000000Z]
 
-    {state, verifier} =
+    {state, _verifier} =
       insert_legacy_transaction!("microsoft", mailbox.id, redirect_uri, now)
 
-    assert {:ok, consumed} =
+    assert {:error,
+            %{
+              class: :permanent,
+              reason: :provider_configuration_changed,
+              message: "OAuth provider configuration changed",
+              details: %{}
+            }} =
              OAuth.consume("microsoft", state, redirect_uri, now: DateTime.add(now, 60, :second))
 
-    assert consumed.purpose == :receive
-    assert consumed.required_scopes == ["Mail.Read", "offline_access"]
-    assert consumed.pkce_verifier == verifier
+    assert Repo.aggregate(OAuthTransaction, :count) == 0
+
+    assert {:error, %{reason: :oauth_state_mismatch}} =
+             OAuth.consume("microsoft", state, redirect_uri, now: DateTime.add(now, 61, :second))
   end
 
   test "rejects invalid purpose without creating a transaction", %{mailbox: mailbox} do

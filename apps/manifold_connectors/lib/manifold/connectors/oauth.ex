@@ -273,12 +273,12 @@ defmodule Manifold.Connectors.OAuth do
   end
 
   defp validate_transaction_generation(%OAuthTransaction{
-         provider: "gmail",
+         provider: provider,
          oauth_provider_setting_id: setting_id,
          oauth_provider_setting_lock_version: setting_lock_version
        })
-       when is_binary(setting_id) and is_integer(setting_lock_version) do
-    case ProviderConfig.fetch("gmail") do
+       when provider in @providers and is_binary(setting_id) and is_integer(setting_lock_version) do
+    case ProviderConfig.fetch(provider) do
       {:ok,
        %ProviderConfig.Resolved{
          setting_id: ^setting_id,
@@ -298,27 +298,22 @@ defmodule Manifold.Connectors.OAuth do
     end
   end
 
-  defp validate_transaction_generation(%OAuthTransaction{
-         provider: "gmail",
-         oauth_provider_setting_id: nil,
-         oauth_provider_setting_lock_version: nil
-       }),
+  defp validate_transaction_generation(%OAuthTransaction{provider: provider})
+       when provider in @providers,
        do: provider_configuration_changed()
-
-  defp validate_transaction_generation(%OAuthTransaction{provider: "gmail"}),
-    do: provider_configuration_changed()
 
   defp validate_transaction_generation(%OAuthTransaction{}), do: :ok
 
   defp consume_invalidated_transaction(
          %OAuthTransaction{
-           provider: "gmail",
+           provider: provider,
            oauth_provider_setting_id: nil,
            oauth_provider_setting_lock_version: nil
          } = transaction,
          _now,
          error
-       ) do
+       )
+       when provider in @providers do
     Repo.delete!(transaction)
     {:error, error}
   end
