@@ -281,6 +281,7 @@ defmodule Manifold.Connectors.OAuth do
     case ProviderConfig.fetch(provider) do
       {:ok,
        %ProviderConfig.Resolved{
+         provider: ^provider,
          setting_id: ^setting_id,
          setting_lock_version: ^setting_lock_version
        }} ->
