@@ -553,6 +553,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
   end
 
   test "cleanup resolves an eighth-attempt acceptance commit failure without resending" do
+    configure_microsoft_oauth_provider_setting!()
     message = microsoft_message_fixture()
     submission = set_completed_provider_attempts!(message.id, 7)
 
@@ -578,6 +579,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
   end
 
   test "cleanup resolves an eighth-attempt provider error commit failure without resending" do
+    configure_microsoft_oauth_provider_setting!()
     message = microsoft_message_fixture()
     submission = set_completed_provider_attempts!(message.id, 7)
 
@@ -605,6 +607,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
   end
 
   test "cleanup resolves an eighth-attempt unexpected exception without resending" do
+    configure_microsoft_oauth_provider_setting!()
     message = microsoft_message_fixture()
     submission = set_completed_provider_attempts!(message.id, 7)
 
@@ -632,6 +635,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
   end
 
   test "cleanup snoozes durably when interrupted-state recovery cannot commit" do
+    configure_microsoft_oauth_provider_setting!()
     message = microsoft_message_fixture()
     submission = set_completed_provider_attempts!(message.id, 7)
 
@@ -786,6 +790,8 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
   end
 
   defp configure_microsoft_req_test! do
+    configure_microsoft_oauth_provider_setting!()
+
     previous = Application.get_env(:manifold_connectors, :providers, [])
 
     configured =
@@ -796,6 +802,14 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
 
     Application.put_env(:manifold_connectors, :providers, configured)
     on_exit(fn -> Application.put_env(:manifold_connectors, :providers, previous) end)
+  end
+
+  defp configure_microsoft_oauth_provider_setting! do
+    assert {:ok, _setting} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "microsoft-worker-client",
+               "client_secret" => "microsoft-worker-secret"
+             })
   end
 
   defp explicit_request_payload(submission_id) do

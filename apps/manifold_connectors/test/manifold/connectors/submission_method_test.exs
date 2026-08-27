@@ -75,8 +75,6 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
         ]
       ],
       microsoft: [
-        client_id: "microsoft-client-id-must-not-escape",
-        client_secret: "microsoft-client-secret-must-not-escape",
         authorization_url: "https://login.microsoft.test/authorize",
         token_url: "https://login.microsoft.test/token",
         base_url: "https://graph.microsoft.test/v1.0",
@@ -93,6 +91,12 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
              Connectors.put_oauth_provider_setting("gmail", %{
                "client_id" => "db-client-id-must-not-escape",
                "client_secret" => "db-client-secret-must-not-escape"
+             })
+
+    assert {:ok, _setting} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "microsoft-db-client-id-must-not-escape",
+               "client_secret" => "microsoft-db-client-secret-must-not-escape"
              })
 
     on_exit(fn ->
@@ -348,8 +352,12 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
                  microsoft.id,
                  Accounts.account_address(account),
                  now: ~U[2026-08-12 03:00:00.000000Z],
-                 provider_opts: [refresh_result: {:ok, refreshed}]
+                 provider_opts: [test_pid: self(), refresh_result: {:ok, refreshed}]
                )
+
+      assert_receive {:send_refresh_config, refresh_config}
+      assert refresh_config[:client_id] == "microsoft-db-client-id-must-not-escape"
+      assert refresh_config[:client_secret] == "microsoft-db-client-secret-must-not-escape"
 
       assert Enum.sort(Keyword.keys(config)) == [:base_url, :req_options]
       assert config[:base_url] == "https://graph.microsoft.test/v1.0"
@@ -365,8 +373,8 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
       refute inspect(Repo.all(Oban.Job)) =~ sentinel
       refute inspect({measurements, metadata}) =~ sentinel
 
-      refute inspect(method.config) =~ "microsoft-client-id-must-not-escape"
-      refute inspect(method.config) =~ "microsoft-client-secret-must-not-escape"
+      refute inspect(method.config) =~ "microsoft-db-client-id-must-not-escape"
+      refute inspect(method.config) =~ "microsoft-db-client-secret-must-not-escape"
       refute inspect(method.config) =~ "microsoft-config-cookie-secret"
       refute inspect(method.config) =~ "organizations"
       refute inspect(method.config) =~ "Mail.Read"

@@ -714,6 +714,7 @@ defmodule Manifold.Outbound.SubmissionTest do
   end
 
   test "Microsoft retries the persisted snapshot and accepts a bodyless 202" do
+    configure_microsoft_oauth_provider!()
     %{message: message, method: method} = queued_operational_fixture("microsoft")
     submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
     persisted_payload = explicit_request_payload(submission.id)
@@ -779,6 +780,7 @@ defmodule Manifold.Outbound.SubmissionTest do
   end
 
   test "empty provider IDs skip reconciliation without confusing correlation metadata" do
+    configure_microsoft_oauth_provider!()
     %{message: message} = queued_operational_fixture("microsoft")
 
     accepted =
@@ -801,6 +803,7 @@ defmodule Manifold.Outbound.SubmissionTest do
   end
 
   test "bodyless Microsoft 202 stores nil provider ID and sanitized correlation metadata" do
+    configure_microsoft_oauth_provider!()
     %{message: message} = queued_operational_fixture("microsoft")
 
     expected_payload =
@@ -837,6 +840,7 @@ defmodule Manifold.Outbound.SubmissionTest do
   end
 
   test "unknown Microsoft transport loss becomes terminal uncertainty without another call" do
+    configure_microsoft_oauth_provider!()
     %{message: message} = queued_operational_fixture("microsoft")
 
     Req.Test.expect(__MODULE__, fn conn -> Req.Test.transport_error(conn, :timeout) end)
@@ -1050,6 +1054,8 @@ defmodule Manifold.Outbound.SubmissionTest do
   end
 
   test "Microsoft send revocation marks its shared authorization and both methods" do
+    configure_microsoft_oauth_provider!()
+
     %{message: message, method: method, account: account, address: address} =
       queued_operational_fixture("microsoft",
         scopes: [MicrosoftScopes.read(), MicrosoftScopes.send()]
@@ -1085,6 +1091,7 @@ defmodule Manifold.Outbound.SubmissionTest do
   end
 
   test "a stale Microsoft rejection retries with the rotated authorization" do
+    configure_microsoft_oauth_provider!()
     %{message: message, method: method} = queued_operational_fixture("microsoft")
 
     Req.Test.expect(__MODULE__, fn conn ->
@@ -1150,6 +1157,7 @@ defmodule Manifold.Outbound.SubmissionTest do
   end
 
   test "Gmail, SMTP, and Microsoft submission telemetry identifies the method without leaking message data" do
+    configure_microsoft_oauth_provider!()
     handler_id = "submission-telemetry-#{System.unique_integer([:positive])}"
     test_pid = self()
 
@@ -1228,6 +1236,7 @@ defmodule Manifold.Outbound.SubmissionTest do
   end
 
   test "Microsoft submission outcomes keep telemetry and durable metadata content-free" do
+    configure_microsoft_oauth_provider!()
     attach_submit_telemetry()
     suffix = System.unique_integer([:positive])
     subject = "telemetry-subject-sentinel-#{suffix}"
@@ -2209,6 +2218,14 @@ defmodule Manifold.Outbound.SubmissionTest do
 
     {:ok, message} = Outbound.queue_draft(account.id, draft.id)
     %{message: message, method: method, account: account, address: address}
+  end
+
+  defp configure_microsoft_oauth_provider! do
+    assert {:ok, _setting} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "outbound-microsoft-db-client",
+               "client_secret" => "outbound-microsoft-db-secret"
+             })
   end
 
   defp insert_gmail_method!(account, address) do

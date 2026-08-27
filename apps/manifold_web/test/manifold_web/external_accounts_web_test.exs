@@ -9,7 +9,13 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Connectors.Provider.{Identity, Page, RawMessage, Token}
   alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
-  alias Manifold.Connectors.Schema.{OAuthAuthorization, OAuthTransaction}
+
+  alias Manifold.Connectors.Schema.{
+    OAuthAuthorization,
+    OAuthProviderSetting,
+    OAuthTransaction
+  }
+
   alias Manifold.Repo
 
   defmodule GmailProvider do
@@ -146,8 +152,6 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
         authorization_url: "https://accounts.google.test/o/oauth2/v2/auth"
       ],
       microsoft: [
-        client_id: "microsoft-client-secret-id",
-        client_secret: "microsoft-client-secret",
         authorization_url: "https://login.microsoft.test/oauth2/v2.0/authorize"
       ]
     )
@@ -173,6 +177,14 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
                "client_secret" => "gmail-client-secret"
              })
 
+    assert {:ok, _microsoft_view} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "microsoft-client-secret-id",
+               "client_secret" => "microsoft-client-secret"
+             })
+
+    microsoft_setting = Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
+
     on_exit(fn ->
       restore_env(:encryption_key, old_key)
       restore_env(:adapters, old_adapters)
@@ -191,7 +203,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
         address: "person@gmail.example"
       })
 
-    {:ok, account: account, gmail_setting: gmail_setting}
+    {:ok, account: account, gmail_setting: gmail_setting, microsoft_setting: microsoft_setting}
   end
 
   test "settings accounts lists local accounts", %{conn: conn, account: account} do
@@ -421,7 +433,8 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
   test "Microsoft Send OAuth is purpose-correct, account-scoped, and returns to the selected account",
        %{
          conn: conn,
-         account: account
+         account: account,
+         microsoft_setting: microsoft_setting
        } do
     set_microsoft_identity!(Accounts.account_address(account), "microsoft-account-1")
 
@@ -448,6 +461,8 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     transaction = Repo.get_by!(OAuthTransaction, state_digest: :crypto.hash(:sha256, state))
     assert transaction.mailbox_id == account.id
     assert transaction.purpose == "send"
+    assert transaction.oauth_provider_setting_id == microsoft_setting.id
+    assert transaction.oauth_provider_setting_lock_version == microsoft_setting.lock_version
 
     callback_conn =
       conn

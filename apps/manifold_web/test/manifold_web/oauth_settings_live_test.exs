@@ -211,6 +211,92 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
              )
   end
 
+  test "Microsoft save and removal immediately update fresh receive and send pickers", %{
+    conn: conn
+  } do
+    {:ok, account} =
+      Accounts.create_account(%{
+        name: "Microsoft picker",
+        address: "picker@microsoft.example"
+      })
+
+    {:ok, receive_before, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/receive_methods/new")
+
+    {:ok, send_before, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
+
+    assert has_element?(
+             receive_before,
+             "button[phx-click='choose-kind'][phx-value-kind='microsoft'][disabled]"
+           )
+
+    assert has_element?(send_before, "#send-method-microsoft[disabled]")
+
+    {:ok, settings_view, _html} = live(conn, "/settings/oauth")
+    secret = "microsoft-picker-secret-never-render"
+
+    save_html =
+      settings_view
+      |> form("#oauth-provider-microsoft-form",
+        provider: "microsoft",
+        oauth_provider_setting: %{
+          client_id: "microsoft-picker-client",
+          client_secret: secret,
+          lock_version: ""
+        }
+      )
+      |> render_submit()
+
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
+
+    assert save_html =~ "Microsoft OAuth configuration saved."
+    refute save_html =~ secret
+    refute contains_binary?(socket_assigns(settings_view), secret)
+    refute setting.client_secret_ciphertext =~ secret
+
+    assert {:ok, ^secret} =
+             Crypto.decrypt(
+               setting.client_secret_ciphertext,
+               "oauth_provider_setting:#{setting.id}:client_secret"
+             )
+
+    {:ok, receive_after_save, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/receive_methods/new")
+
+    {:ok, send_after_save, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
+
+    refute has_element?(
+             receive_after_save,
+             "button[phx-click='choose-kind'][phx-value-kind='microsoft'][disabled]"
+           )
+
+    refute has_element?(send_after_save, "#send-method-microsoft[disabled]")
+
+    remove_html =
+      render_click(settings_view, "remove-provider", %{
+        "provider" => "microsoft",
+        "lock_version" => Integer.to_string(setting.lock_version)
+      })
+
+    assert remove_html =~ "Microsoft OAuth configuration removed."
+    assert is_nil(Repo.get_by(OAuthProviderSetting, provider: "microsoft"))
+
+    {:ok, receive_after_remove, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/receive_methods/new")
+
+    {:ok, send_after_remove, _html} =
+      live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
+
+    assert has_element?(
+             receive_after_remove,
+             "button[phx-click='choose-kind'][phx-value-kind='microsoft'][disabled]"
+           )
+
+    assert has_element?(send_after_remove, "#send-method-microsoft[disabled]")
+  end
+
   test "blank secret retains configured credentials and generation", %{conn: conn} do
     assert {:ok, initial} = put_setting("unchanged-client", "stored-secret-never-render")
     before = Repo.get_by!(OAuthProviderSetting, provider: "gmail")

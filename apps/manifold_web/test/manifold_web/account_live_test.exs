@@ -12,7 +12,14 @@ defmodule ManifoldWeb.AccountLiveTest do
   alias Manifold.Connectors.{GmailScopes, MicrosoftScopes}
   alias Manifold.Connectors.Provider.{Page, RawMessage}
   alias Manifold.Connectors.Provider.SyncCursor, as: ProviderCursor
-  alias Manifold.Connectors.Schema.{OAuthAuthorization, ReceiveMethod, SendMethod}
+
+  alias Manifold.Connectors.Schema.{
+    OAuthAuthorization,
+    OAuthProviderSetting,
+    ReceiveMethod,
+    SendMethod
+  }
+
   alias Manifold.Repo
 
   defmodule MicrosoftSetupProvider do
@@ -175,10 +182,7 @@ defmodule ManifoldWeb.AccountLiveTest do
   test "Microsoft 365 send remains visible and disabled when provider config is absent", %{
     conn: conn
   } do
-    previous_providers = Application.get_env(:manifold_connectors, :providers)
-    Application.put_env(:manifold_connectors, :providers, [])
-
-    on_exit(fn -> restore_smtp_env(:providers, previous_providers) end)
+    assert is_nil(Repo.get_by(OAuthProviderSetting, provider: "microsoft"))
 
     {:ok, account} =
       Accounts.create_account(%{name: "No Microsoft", address: "no-microsoft@example.test"})
@@ -896,11 +900,15 @@ defmodule ManifoldWeb.AccountLiveTest do
       :manifold_connectors,
       :providers,
       Keyword.put(previous_providers || [], :microsoft,
-        client_id: "microsoft-client-id",
-        client_secret: "microsoft-client-secret",
         authorization_url: "https://login.microsoft.test/authorize"
       )
     )
+
+    assert {:ok, _setting} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "microsoft-client-id",
+               "client_secret" => "microsoft-client-secret"
+             })
 
     on_exit(fn ->
       restore_smtp_env(:encryption_key, previous_key)

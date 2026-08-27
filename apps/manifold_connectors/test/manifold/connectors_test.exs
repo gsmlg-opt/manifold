@@ -18,6 +18,7 @@ defmodule Manifold.ConnectorsTest do
     ConnectorEvent,
     Credential,
     OAuthAuthorization,
+    OAuthProviderSetting,
     OAuthTransaction,
     ReceiveMethod,
     RemoteMessage,
@@ -56,12 +57,17 @@ defmodule Manifold.ConnectorsTest do
     def refresh_token(_refresh_token, _config, _opts), do: raise("not used")
 
     @impl true
-    def identity("access-secret", config, opts) do
+    def identity("access-secret", _config, opts) do
       {:ok,
        %Identity{
          id: "microsoft-subject-1",
          email_address:
-           Keyword.get(opts, :identity_address, Keyword.fetch!(config, :identity_address))
+           Keyword.get_lazy(opts, :identity_address, fn ->
+             :manifold_connectors
+             |> Application.fetch_env!(:providers)
+             |> Keyword.fetch!(:microsoft)
+             |> Keyword.fetch!(:identity_address)
+           end)
        }}
     end
 
@@ -115,12 +121,16 @@ defmodule Manifold.ConnectorsTest do
 
     Application.put_env(:manifold_connectors, :providers,
       microsoft: [
-        client_id: "client",
-        client_secret: "secret",
         authorization_url: "https://accounts.google.test/authorize",
         identity_address: address
       ]
     )
+
+    assert {:ok, _setting} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "client",
+               "client_secret" => "secret"
+             })
 
     {:ok, address: address, domain: domain, mailbox: mailbox}
   end
@@ -965,11 +975,15 @@ defmodule Manifold.ConnectorsTest do
   end
 
   defp consumed(mailbox_id) do
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
+
     %Consumed{
       provider: "microsoft",
       mailbox_id: mailbox_id,
       redirect_uri: "https://mail.example.test/connectors/microsoft/callback",
-      pkce_verifier: "verifier"
+      pkce_verifier: "verifier",
+      oauth_provider_setting_id: setting.id,
+      oauth_provider_setting_lock_version: setting.lock_version
     }
   end
 
