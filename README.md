@@ -332,13 +332,40 @@ stored Microsoft provider setting and instead expects the exact historical
 `MANIFOLD_MICROSOFT_CLIENT_ID`, `MANIFOLD_MICROSOFT_CLIENT_SECRET`, and
 `MANIFOLD_MICROSOFT_TENANT` values.
 
-Before switching binaries, verify the presence and provenance of that exact
-historical Microsoft credential pair and tenant in the approved deployment
-secret store without displaying their values. If they cannot be verified, either
-stop the rollback or deliberately accept that Microsoft will be unavailable by
-leaving both client credential variables absent. Never provide only half of the
-pair, guess or recreate a credential or tenant, or delete the stored Settings row
-directly. The database-backed Microsoft setting can remain for a later upgrade.
+This rollback is non-rolling. First block ingress that can start Microsoft OAuth,
+block new Microsoft submissions, and drain all queued or executing Microsoft
+send, connector, and Oban work. Then stop every current-version Phoenix,
+connector, and Oban process; do not start the older binary alongside any current
+process.
+
+With ingress still blocked and all application processes stopped, run this
+read-only preflight:
+
+```sql
+SELECT id, expires_at
+FROM connector_oauth_transactions
+WHERE provider = 'microsoft'
+  AND consumed_at IS NULL
+  AND oauth_provider_setting_id IS NOT NULL
+  AND expires_at > now()
+ORDER BY expires_at, id;
+```
+
+If any row is returned, do not launch the older binary. Keep ingress blocked and
+processes stopped, wait until after the maximum returned `expires_at`, and repeat
+the query, or abort the rollback. Do not delete transactions or the stored
+Settings row to force the preflight. Expired unfinished rows are safe to retain
+because the older consume path still rejects an expired OAuth transaction.
+
+Also verify the presence and provenance of the exact historical Microsoft
+credential pair and tenant in the approved deployment secret store without
+displaying their values. If they cannot be verified, either abort or deliberately
+accept that Microsoft will be unavailable by verifying that both client
+credential variables are absent. Never provide only half of the pair or guess or
+recreate a credential or tenant. Start the older binary only after the query
+returns zero live setting-backed Microsoft transactions and the selected
+historical environment configuration has been verified. The database-backed
+Microsoft setting can remain for a later upgrade.
 
 #### Full guarded rollback below `20260818000100`
 
