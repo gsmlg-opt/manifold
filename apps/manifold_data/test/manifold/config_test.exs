@@ -107,6 +107,34 @@ defmodule Manifold.ConfigTest do
     refute Keyword.has_key?(connectors[:providers][:microsoft], :client_secret)
   end
 
+  test "test runtime preserves inert connector provider endpoints" do
+    put_runtime_env(%{})
+
+    connectors =
+      read_config(:test)
+      |> Config.Reader.merge(read_runtime(:test))
+      |> then(& &1[:manifold_connectors])
+
+    assert connectors[:providers][:gmail] == [
+             authorization_url: "https://accounts.google.invalid/authorize",
+             token_url: "https://accounts.google.invalid/token",
+             userinfo_url: "https://openidconnect.invalid/v1/userinfo",
+             base_url: "https://gmail.invalid"
+           ]
+
+    assert connectors[:providers][:microsoft] == [
+             authorization_url: "https://login.microsoft.invalid/authorize",
+             token_url: "https://login.microsoft.invalid/token",
+             base_url: "https://graph.microsoft.invalid/v1.0",
+             tenant: "organizations"
+           ]
+
+    refute Keyword.has_key?(connectors[:providers][:gmail], :client_id)
+    refute Keyword.has_key?(connectors[:providers][:gmail], :client_secret)
+    refute Keyword.has_key?(connectors[:providers][:microsoft], :client_id)
+    refute Keyword.has_key?(connectors[:providers][:microsoft], :client_secret)
+  end
+
   test "production runtime ignores legacy OAuth credentials and parses endpoint overrides" do
     encryption_key = Base.encode64(:crypto.strong_rand_bytes(32))
 
