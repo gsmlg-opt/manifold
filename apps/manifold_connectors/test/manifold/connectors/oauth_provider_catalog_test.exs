@@ -123,7 +123,7 @@ defmodule Manifold.Connectors.OAuthProviderCatalogTest do
              testing_note:
                "Use non-production Microsoft 365 work/school accounts; personal Outlook.com accounts are not supported.",
              production_note:
-               "The organizations tenant accepts work/school identities, and tenant policy may require admin consent.",
+               "The organizations tenant accepts work/school identities, and tenant policy may require administrator consent.",
              links: [
                {"Register an Entra application",
                 "https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app"},
