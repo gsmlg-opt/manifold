@@ -332,12 +332,13 @@ devenv shell -- mix test \
 
 The Microsoft Settings adoption is implemented. This verification was run from
 the `codex/microsoft-oauth-provider-settings` worktree at
-`a575b32660b22614b6691f33987be3ac615b465b`, without starting or restarting a
+`a575b32660b22614b6691f33987be3ac615b465b`, against the pinned `main` baseline
+`7a5fe1b993793d051c3e0a4e83d337ecea7d294b`, without starting or restarting a
 process.
 
-- Formatting passed for every changed Elixir file relative to `main`; the full
-  `mix format --check-formatted`, `mix compile --warnings-as-errors`, and
-  `git diff --check` checks also passed.
+- Formatting passed for every changed Elixir file relative to the pinned
+  baseline; the full `mix format --check-formatted`,
+  `mix compile --warnings-as-errors`, and `git diff --check` checks also passed.
 - Focused acceptance tests passed with exact totals: `manifold_data` config 14,
   `manifold_connectors` catalog/provider-settings/provider-config/OAuth/Microsoft
   authorizations/submission-method/sync/connectors 200, `manifold_outbound`
@@ -348,8 +349,8 @@ process.
   `manifold_mail` 69, and `manifold_account_lifecycle` 37 tests. Every suite
   reported 0 failures.
 - The Microsoft provider-settings adoption adds no migration: the migration-path
-  diff against `main` is empty. The existing generic provider-settings migration
-  remains documented above.
+  diff against `7a5fe1b993793d051c3e0a4e83d337ecea7d294b` is empty. The existing
+  generic provider-settings migration remains documented above.
 - Source scans found no `System.get_env` reads for Microsoft client ID, client
   secret, or tenant in `config/` or `apps/`. The direct Microsoft
   `ProviderConfig.fetch/1` consumers are OAuth start and completion in
@@ -366,8 +367,39 @@ process.
   process was started. External Microsoft OAuth staging was not run because
   Microsoft staging credentials were unavailable in the verification shell.
 
-There are no code or verification blockers in this worktree; browser and
-credentialed staging remain environment-owned operator checks.
+No code or automated-verification blockers remain; browser and credentialed
+staging verification remain outstanding and require the operator environment.
+
+### Fresh command manifest
+
+```sh
+# Changed Elixir files relative to the pinned baseline, then full formatting.
+devenv shell -- mix format --check-formatted $(git diff --name-only 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...HEAD -- '*.ex' '*.exs')
+devenv shell -- mix format --check-formatted
+devenv shell -- mix compile --warnings-as-errors
+git diff --check
+
+# Focused acceptance suites.
+devenv shell -- mix test apps/manifold_data/test/manifold/config_test.exs
+devenv shell -- mix test apps/manifold_connectors/test/manifold/connectors/oauth_provider_catalog_test.exs apps/manifold_connectors/test/manifold/connectors/provider_settings_test.exs apps/manifold_connectors/test/manifold/connectors/provider_config_test.exs apps/manifold_connectors/test/manifold/connectors/oauth_test.exs apps/manifold_connectors/test/manifold/connectors/microsoft_authorizations_test.exs apps/manifold_connectors/test/manifold/connectors/submission_method_test.exs apps/manifold_connectors/test/manifold/connectors/sync_test.exs apps/manifold_connectors/test/manifold/connectors_test.exs
+devenv shell -- mix test apps/manifold_outbound/test/manifold/outbound/jobs/submit_outbound_test.exs apps/manifold_outbound/test/manifold/outbound/submission_test.exs
+devenv shell -- mix test apps/manifold_web/test/manifold_web/oauth_settings_live_test.exs apps/manifold_web/test/manifold_web/account_live_test.exs apps/manifold_web/test/manifold_web/external_accounts_web_test.exs
+
+# Full suites, run in this order and not in parallel.
+devenv shell -- mix test apps/manifold_data/test
+devenv shell -- mix test apps/manifold_connectors/test
+devenv shell -- mix test apps/manifold_outbound/test
+devenv shell -- mix test apps/manifold_web/test
+devenv shell -- mix test apps/manifold_mail/test
+devenv shell -- mix test apps/manifold_account_lifecycle/test
+
+# Source, history/guidance, migration, and merge-marker scans.
+rg -n -i 'System\.get_env\([^\n]*(MANIFOLD_)?MICROSOFT_(CLIENT_ID|CLIENT_SECRET|TENANT)' config apps || true
+rg -n 'ProviderConfig\.fetch\([^\n]*:microsoft|ProviderConfig\.fetch\([^\n]*"microsoft"' apps config || true
+rg -n -i '(MANIFOLD_)?MICROSOFT_(CLIENT_ID|CLIENT_SECRET|TENANT)|microsoft oauth|microsoft.*(client id|client secret|tenant)' --glob '*.md' --glob 'README*' --glob '*.exs' --glob '*.sh' . || true
+git diff --name-status 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...HEAD -- apps/manifold_data/priv/repo/migrations
+rg -n '^(<<<<<<<|=======|>>>>>>>)' --glob '!deps/**' --glob '!_build/**' . || true
+```
 
 ## Browser and staging smoke
 
