@@ -374,10 +374,10 @@ staging verification remain outstanding and require the operator environment.
 
 ```sh
 # Changed Elixir files relative to the pinned baseline, then full formatting.
-devenv shell -- mix format --check-formatted $(git diff --name-only 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...HEAD -- '*.ex' '*.exs')
+devenv shell -- mix format --check-formatted $(git diff --name-only 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...a575b32660b22614b6691f33987be3ac615b465b -- '*.ex' '*.exs')
 devenv shell -- mix format --check-formatted
 devenv shell -- mix compile --warnings-as-errors
-git diff --check
+git diff --check 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...a575b32660b22614b6691f33987be3ac615b465b
 
 # Focused acceptance suites.
 devenv shell -- mix test apps/manifold_data/test/manifold/config_test.exs
@@ -397,7 +397,7 @@ devenv shell -- mix test apps/manifold_account_lifecycle/test
 rg -n -i 'System\.get_env\([^\n]*(MANIFOLD_)?MICROSOFT_(CLIENT_ID|CLIENT_SECRET|TENANT)' config apps || true
 rg -n 'ProviderConfig\.fetch\([^\n]*:microsoft|ProviderConfig\.fetch\([^\n]*"microsoft"' apps config || true
 rg -n -i '(MANIFOLD_)?MICROSOFT_(CLIENT_ID|CLIENT_SECRET|TENANT)|microsoft oauth|microsoft.*(client id|client secret|tenant)' --glob '*.md' --glob 'README*' --glob '*.exs' --glob '*.sh' . || true
-git diff --name-status 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...HEAD -- apps/manifold_data/priv/repo/migrations
+git diff --name-status 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...a575b32660b22614b6691f33987be3ac615b465b -- apps/manifold_data/priv/repo/migrations
 rg -n '^(<<<<<<<|=======|>>>>>>>)' --glob '!deps/**' --glob '!_build/**' . || true
 ```
 
