@@ -328,6 +328,47 @@ devenv shell -- mix test \
   apps/manifold_web/test/manifold_web/oauth_settings_live_test.exs
 ```
 
+## Fresh verification (2026-08-28)
+
+The Microsoft Settings adoption is implemented. This verification was run from
+the `codex/microsoft-oauth-provider-settings` worktree at
+`a575b32660b22614b6691f33987be3ac615b465b`, without starting or restarting a
+process.
+
+- Formatting passed for every changed Elixir file relative to `main`; the full
+  `mix format --check-formatted`, `mix compile --warnings-as-errors`, and
+  `git diff --check` checks also passed.
+- Focused acceptance tests passed with exact totals: `manifold_data` config 14,
+  `manifold_connectors` catalog/provider-settings/provider-config/OAuth/Microsoft
+  authorizations/submission-method/sync/connectors 200, `manifold_outbound`
+  submit-job/submission 68, and `manifold_web` OAuth-settings/account-live/
+  external-accounts 66. Every focused suite reported 0 failures.
+- Full suites ran sequentially and passed: `manifold_data` 23,
+  `manifold_connectors` 421, `manifold_outbound` 175, `manifold_web` 134,
+  `manifold_mail` 69, and `manifold_account_lifecycle` 37 tests. Every suite
+  reported 0 failures.
+- The Microsoft provider-settings adoption adds no migration: the migration-path
+  diff against `main` is empty. The existing generic provider-settings migration
+  remains documented above.
+- Source scans found no `System.get_env` reads for Microsoft client ID, client
+  secret, or tenant in `config/` or `apps/`. The direct Microsoft
+  `ProviderConfig.fetch/1` consumers are OAuth start and completion in
+  `Manifold.Connectors`, and receive sync runtime resolution in
+  `Manifold.Connectors.Sync`; focused and full connector suites cover those
+  paths.
+- Operator guidance scan confirms the current README directs Settings-managed
+  credentials and says legacy Microsoft credential environment variables are
+  ignored. Historical legacy-variable references are confined to the explicitly
+  named Microsoft rollback runbook or dated/superseded design and plan records.
+  No conflict markers were found.
+- Browser smoke was not run: this worktree has no isolated Devenv runtime (the
+  process manager socket refused the read-only status connection), and no
+  process was started. External Microsoft OAuth staging was not run because
+  Microsoft staging credentials were unavailable in the verification shell.
+
+There are no code or verification blockers in this worktree; browser and
+credentialed staging remain environment-owned operator checks.
+
 ## Browser and staging smoke
 
 - [ ] With Google and Microsoft not configured, confirm both Add receive and Add
