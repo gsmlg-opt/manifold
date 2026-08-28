@@ -332,7 +332,7 @@ devenv shell -- mix test \
 
 The Microsoft Settings adoption is implemented. This verification was run from
 the `codex/microsoft-oauth-provider-settings` worktree at
-`a575b32660b22614b6691f33987be3ac615b465b`, against the pinned `main` baseline
+`d2bc54efe189c09467b4dd25c6c48a29bed2aa77`, against the pinned `main` baseline
 `7a5fe1b993793d051c3e0a4e83d337ecea7d294b`, without starting or restarting a
 process.
 
@@ -341,20 +341,24 @@ process.
   `mix compile --warnings-as-errors`, and `git diff --check` checks also passed.
 - Focused acceptance tests passed with exact totals: `manifold_data` config 14,
   `manifold_connectors` catalog/provider-settings/provider-config/OAuth/Microsoft
-  authorizations/submission-method/sync/connectors 200, `manifold_outbound`
+  authorizations/submission-method/sync/connectors 202, `manifold_outbound`
   submit-job/submission 68, and `manifold_web` OAuth-settings/account-live/
   external-accounts 66. Every focused suite reported 0 failures.
 - Full suites ran sequentially and passed: `manifold_data` 23,
-  `manifold_connectors` 421, `manifold_outbound` 175, `manifold_web` 134,
+  `manifold_connectors` 423, `manifold_outbound` 175, `manifold_web` 134,
   `manifold_mail` 69, and `manifold_account_lifecycle` 37 tests. Every suite
   reported 0 failures.
 - The Microsoft provider-settings adoption adds no migration: the migration-path
   diff against `7a5fe1b993793d051c3e0a4e83d337ecea7d294b` is empty. The existing
   generic provider-settings migration remains documented above.
 - Source scans found no `System.get_env` reads for Microsoft client ID, client
-  secret, or tenant in `config/` or `apps/`. The direct Microsoft
-  `ProviderConfig.fetch/1` consumers are OAuth start and completion in
-  `Manifold.Connectors`, and receive sync runtime resolution in
+  secret, or tenant in `config/` or `apps/`. Microsoft authorization-code
+  exchange and token refresh receive the complete resolved OAuth configuration.
+  Graph identity, cursor/folder initialization, sync-page, membership, and
+  raw-fetch operations receive only `base_url` plus the allowlisted Req `:plug`;
+  they receive no client credentials, OAuth endpoints, or tenant. The direct
+  Microsoft `ProviderConfig.fetch/1` consumers are OAuth start and completion
+  in `Manifold.Connectors`, and receive-sync runtime resolution in
   `Manifold.Connectors.Sync`; focused and full connector suites cover those
   paths.
 - Operator guidance scan confirms the current README directs Settings-managed
@@ -374,10 +378,10 @@ staging verification remain outstanding and require the operator environment.
 
 ```sh
 # Changed Elixir files relative to the pinned baseline, then full formatting.
-devenv shell -- mix format --check-formatted $(git diff --name-only 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...a575b32660b22614b6691f33987be3ac615b465b -- '*.ex' '*.exs')
+devenv shell -- mix format --check-formatted $(git diff --name-only 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...d2bc54efe189c09467b4dd25c6c48a29bed2aa77 -- '*.ex' '*.exs')
 devenv shell -- mix format --check-formatted
 devenv shell -- mix compile --warnings-as-errors
-git diff --check 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...a575b32660b22614b6691f33987be3ac615b465b
+git diff --check 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...d2bc54efe189c09467b4dd25c6c48a29bed2aa77
 
 # Focused acceptance suites.
 devenv shell -- mix test apps/manifold_data/test/manifold/config_test.exs
@@ -397,7 +401,7 @@ devenv shell -- mix test apps/manifold_account_lifecycle/test
 rg -n -i 'System\.get_env\([^\n]*(MANIFOLD_)?MICROSOFT_(CLIENT_ID|CLIENT_SECRET|TENANT)' config apps || true
 rg -n 'ProviderConfig\.fetch\([^\n]*:microsoft|ProviderConfig\.fetch\([^\n]*"microsoft"' apps config || true
 rg -n -i '(MANIFOLD_)?MICROSOFT_(CLIENT_ID|CLIENT_SECRET|TENANT)|microsoft oauth|microsoft.*(client id|client secret|tenant)' --glob '*.md' --glob 'README*' --glob '*.exs' --glob '*.sh' . || true
-git diff --name-status 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...a575b32660b22614b6691f33987be3ac615b465b -- apps/manifold_data/priv/repo/migrations
+git diff --name-status 7a5fe1b993793d051c3e0a4e83d337ecea7d294b...d2bc54efe189c09467b4dd25c6c48a29bed2aa77 -- apps/manifold_data/priv/repo/migrations
 rg -n '^(<<<<<<<|=======|>>>>>>>)' --glob '!deps/**' --glob '!_build/**' . || true
 ```
 
