@@ -159,6 +159,7 @@ defmodule Manifold.Connectors.Sync do
            auth_material(account, adapter, config, now, provider_opts(opts)) do
       opts = prepare_provider_session(account, adapter, opts)
       provider_auth = provider_auth(auth)
+      operation_config = ProviderConfig.provider_operation_config(account.kind, config)
 
       try do
         with {:ok, cursor} <-
@@ -167,18 +168,24 @@ defmodule Manifold.Connectors.Sync do
                  cursor,
                  provider_auth,
                  adapter,
-                 config,
+                 operation_config,
                  provider_opts(opts)
                ),
              {:ok, %Page{} = page} <-
-               sync_page(adapter, provider_auth, cursor, config, provider_opts(opts)),
+               sync_page(
+                 adapter,
+                 provider_auth,
+                 cursor,
+                 operation_config,
+                 provider_opts(opts)
+               ),
              messages = collapse_messages(page.messages),
              :ok <-
                process_messages(
                  messages,
                  account,
                  adapter,
-                 config,
+                 operation_config,
                  provider_auth,
                  now,
                  opts

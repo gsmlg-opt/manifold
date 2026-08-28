@@ -61,7 +61,9 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     end
 
     @impl true
-    def initial_cursors(access_token, _config, opts) do
+    def initial_cursors(access_token, config, opts) do
+      notify_config(opts, :initial_cursors_config, config)
+
       if test_pid = Keyword.get(opts, :test_pid) do
         send(test_pid, :initial_cursors)
       end
@@ -79,10 +81,12 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     end
 
     @impl true
-    def refresh_token(refresh_token, _config, opts) do
+    def refresh_token(refresh_token, config, opts) do
       if counter = Keyword.get(opts, :refresh_count) do
         Agent.update(counter, &(&1 + 1))
       end
+
+      notify_config(opts, :refresh_config, config)
 
       if test_pid = Keyword.get(opts, :test_pid) do
         send(
@@ -162,7 +166,11 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
         authorization_url: "https://login.microsoft.test/authorize",
         token_url: "https://login.microsoft.test/token",
         userinfo_url: "https://graph.microsoft.test/oidc/userinfo",
-        base_url: "https://graph.microsoft.test/v1.0"
+        base_url: "https://graph.microsoft.test/v1.0",
+        req_options: [
+          plug: {Req.Test, __MODULE__},
+          headers: [{"authorization", "unsafe-request-secret"}]
+        ]
       ]
     )
 
@@ -208,10 +216,15 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
                provider_opts: completion_provider_opts(address, :receive, test_pid: self())
              )
 
-    assert_receive {:exchange_config, config}
-    assert_receive {:identity_config, ^config}
-    assert config[:client_id] == "db-client"
-    assert config[:client_secret] == "db-secret"
+    assert_receive {:exchange_config, exchange_config}
+    assert exchange_config[:client_id] == "db-client"
+    assert exchange_config[:client_secret] == "db-secret"
+
+    assert_receive {:identity_config, identity_config}
+    assert_microsoft_operation_config(identity_config)
+
+    assert_receive {:initial_cursors_config, initial_cursors_config}
+    assert_microsoft_operation_config(initial_cursors_config)
   end
 
   test "rotating the Microsoft setting during exchange rejects completion without persistence", %{
@@ -1489,16 +1502,36 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
       scopes: access_token_scopes(all_scopes())
     }
 
+    full_config = [
+      client_id: "authorized-add-client",
+      client_secret: "authorized-add-secret",
+      authorization_url: "https://login.microsoft.test/authorize",
+      token_url: "https://login.microsoft.test/token",
+      tenant: "organizations",
+      base_url: "https://graph.microsoft.test/v1.0",
+      req_options: [
+        plug: {Req.Test, __MODULE__},
+        headers: [{"authorization", "unsafe-authorized-add-secret"}]
+      ]
+    ]
+
     assert {:ok, %ReceiveMethod{status: "connected"} = receive} =
              OAuthAuthorizations.add_authorized_method(
                "microsoft",
                account.id,
                :receive,
                FakeMicrosoft,
-               [],
+               full_config,
                now: @refresh_now,
-               provider_opts: [refresh_result: {:ok, refreshed}]
+               provider_opts: [
+                 refresh_result: {:ok, refreshed},
+                 test_pid: self()
+               ]
              )
+
+    assert_receive {:refresh_config, ^full_config}
+    assert_receive {:initial_cursors_config, initial_cursors_config}
+    assert_microsoft_operation_config(initial_cursors_config)
 
     advanced = Repo.get!(OAuthAuthorization, authorization.id)
     assert advanced.lock_version > authorization.lock_version
@@ -2163,6 +2196,18 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     scopes
     |> Enum.reject(&(&1 == MicrosoftScopes.offline()))
     |> Enum.sort()
+  end
+
+  defp assert_microsoft_operation_config(config) do
+    assert config == [
+             base_url: "https://graph.microsoft.test/v1.0",
+             req_options: [plug: {Req.Test, __MODULE__}]
+           ]
+
+    refute Enum.any?(
+             [:client_id, :client_secret, :authorization_url, :token_url, :tenant],
+             &Keyword.has_key?(config, &1)
+           )
   end
 
   defp authorization_snapshot(authorization) do

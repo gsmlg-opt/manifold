@@ -55,6 +55,19 @@ defmodule Manifold.Connectors.ProviderConfig do
     {:error, Error.new(:permanent, :unsupported_provider, "OAuth provider is not supported")}
   end
 
+  @spec provider_operation_config(String.t(), term()) :: term()
+  def provider_operation_config("microsoft", config) when is_list(config) do
+    if Keyword.keyword?(config) do
+      [operation_base_url(config), operation_req_options(config)]
+      |> Enum.reject(&is_nil/1)
+    else
+      []
+    end
+  end
+
+  def provider_operation_config("microsoft", _config), do: []
+  def provider_operation_config(_provider, config), do: config
+
   defp provider_runtime_config(definition, provider) do
     application_config = provider_application_config(provider)
 
@@ -81,6 +94,29 @@ defmodule Manifold.Connectors.ProviderConfig do
 
   defp maybe_put_req_options(config, req_options),
     do: Keyword.put(config, :req_options, req_options)
+
+  defp operation_base_url(config) do
+    case Keyword.fetch(config, :base_url) do
+      {:ok, base_url} when is_binary(base_url) and base_url != "" -> {:base_url, base_url}
+      _missing_or_invalid -> nil
+    end
+  end
+
+  defp operation_req_options(config) do
+    case Keyword.fetch(config, :req_options) do
+      {:ok, req_options} when is_list(req_options) -> operation_req_plug(req_options)
+      _missing_or_invalid -> nil
+    end
+  end
+
+  defp operation_req_plug(req_options) do
+    if Keyword.keyword?(req_options) do
+      case Keyword.fetch(req_options, :plug) do
+        {:ok, plug} -> {:req_options, [plug: plug]}
+        :error -> nil
+      end
+    end
+  end
 
   defp provider_application_config(provider) when provider in @providers do
     providers = Application.get_env(:manifold_connectors, :providers, [])

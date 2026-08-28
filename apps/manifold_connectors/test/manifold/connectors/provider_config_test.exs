@@ -194,6 +194,57 @@ defmodule Manifold.Connectors.ProviderConfigTest do
     refute Keyword.has_key?(resolved.config, :untrusted_extra)
   end
 
+  test "Microsoft provider operation config keeps only Graph transport options" do
+    secret = "microsoft-operation-secret-not-for-graph"
+    put_setting!("microsoft", "microsoft-operation-client", secret)
+
+    Application.put_env(:manifold_connectors, :providers,
+      microsoft: [
+        authorization_url: "https://login.example/authorize",
+        token_url: "https://login.example/token",
+        base_url: "https://graph.example/v1.0",
+        req_options: [
+          plug: {Req.Test, __MODULE__},
+          headers: [{"authorization", "unsafe-request-secret"}]
+        ]
+      ]
+    )
+
+    assert {:ok, %ProviderConfig.Resolved{} = resolved} = ProviderConfig.fetch("microsoft")
+
+    assert ProviderConfig.provider_operation_config("microsoft", resolved.config) == [
+             base_url: "https://graph.example/v1.0",
+             req_options: [plug: {Req.Test, __MODULE__}]
+           ]
+
+    operation_config = ProviderConfig.provider_operation_config("microsoft", resolved.config)
+    refute inspect(operation_config) =~ secret
+    refute inspect(operation_config) =~ "unsafe-request-secret"
+
+    refute Enum.any?(
+             [:client_id, :client_secret, :authorization_url, :token_url, :tenant],
+             &Keyword.has_key?(operation_config, &1)
+           )
+  end
+
+  test "provider operation config passes through other providers and safely handles malformed Microsoft config" do
+    config = [client_id: "existing-client", base_url: "https://provider.example"]
+
+    assert ProviderConfig.provider_operation_config("gmail", config) == config
+    assert ProviderConfig.provider_operation_config("future-provider", config) == config
+    assert ProviderConfig.provider_operation_config("microsoft", :invalid) == []
+
+    assert ProviderConfig.provider_operation_config("microsoft",
+             req_options: :invalid,
+             base_url: nil
+           ) == []
+
+    assert ProviderConfig.provider_operation_config("microsoft",
+             req_options: [headers: [{"authorization", "unsafe"}]],
+             base_url: "https://graph.example/v1.0"
+           ) == [base_url: "https://graph.example/v1.0"]
+  end
+
   test "Microsoft resolver ignores invalid endpoint overrides" do
     secret = "microsoft-db-secret-not-for-inspection"
     put_setting!("microsoft", "microsoft-db-client", secret)

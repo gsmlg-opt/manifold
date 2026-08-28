@@ -65,8 +65,9 @@ defmodule Manifold.Connectors.SyncTest do
     end
 
     @impl true
-    def refresh_token("initial-refresh", _config, opts) do
+    def refresh_token("initial-refresh", config, opts) do
       now = Keyword.get(opts, :now, DateTime.utc_now())
+      notify_config(opts, :refresh_config, config)
 
       default =
         {:ok,
@@ -111,7 +112,9 @@ defmodule Manifold.Connectors.SyncTest do
     end
 
     @impl true
-    def resolve_folder_mapping(access_token, _config, opts) do
+    def resolve_folder_mapping(access_token, config, opts) do
+      notify_config(opts, :folder_mapping_config, config)
+
       case Keyword.get(opts, :folder_mapping_gate) do
         nil ->
           Process.put(:folder_mapping_count, Process.get(:folder_mapping_count, 0) + 1)
@@ -167,7 +170,8 @@ defmodule Manifold.Connectors.SyncTest do
     end
 
     @impl true
-    def fetch_raw(access_token, message_id, _config, _opts) do
+    def fetch_raw(access_token, message_id, config, opts) do
+      notify_config(opts, :raw_config, config)
       Process.put(:raw_fetch_count, Process.get(:raw_fetch_count, 0) + 1)
       send(self(), {:raw_access_token, access_token, message_id})
 
@@ -232,7 +236,13 @@ defmodule Manifold.Connectors.SyncTest do
     )
 
     Application.put_env(:manifold_connectors, :providers,
-      microsoft: [base_url: "https://graph.microsoft.test/v1.0"]
+      microsoft: [
+        base_url: "https://graph.microsoft.test/v1.0",
+        req_options: [
+          plug: {Req.Test, __MODULE__},
+          headers: [{"authorization", "unsafe-request-secret"}]
+        ]
+      ]
     )
 
     assert {:ok, _setting} =
@@ -990,15 +1000,63 @@ defmodule Manifold.Connectors.SyncTest do
          account: account
        } do
     microsoft = account.id |> then(&Repo.get!(ReceiveMethod, &1)) |> convert_to_microsoft!()
+    authorization = Repo.get!(OAuthAuthorization, microsoft.oauth_authorization_id)
+
+    authorization
+    |> OAuthAuthorization.changeset(%{
+      token_expires_at: DateTime.add(DateTime.utc_now(), -60, :second)
+    })
+    |> Repo.update!()
+
+    microsoft.id
+    |> then(&Repo.get_by!(SyncCursor, external_account_id: &1))
+    |> SyncCursor.changeset(%{metadata: %{"folder_mapping_refresh_required" => true}})
+    |> Repo.update!()
+
+    Process.put(
+      :refresh_result,
+      {:ok,
+       %Token{
+         access_token: "microsoft-refreshed-access",
+         refresh_token: "microsoft-rotated-refresh",
+         expires_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
+         scopes: [MicrosoftScopes.read()]
+       }}
+    )
+
+    Process.put(
+      :sync_page_result,
+      {:ok,
+       %Page{
+         messages: [remote_message("microsoft-config-boundary")],
+         cursor: %ProviderCursor{
+           scope: "folders",
+           phase: "incremental",
+           committed_cursor: "https://graph.microsoft.test/folders/delta"
+         }
+       }}
+    )
 
     refute Repo.get_by(Credential, external_account_id: microsoft.id)
 
     assert :ok = Connectors.sync_account(microsoft.id, provider_opts: [test_pid: self()])
-    assert_receive {:sync_access_token, "initial-access"}
-    assert_receive {:sync_config, config}
-    assert config[:client_id] == "microsoft-db-client"
-    assert config[:client_secret] == "microsoft-db-secret"
-    assert config[:base_url] == "https://graph.microsoft.test/v1.0"
+    assert_receive {:sync_access_token, "microsoft-refreshed-access"}
+
+    assert_receive {:refresh_config, refresh_config}
+    assert refresh_config[:client_id] == "microsoft-db-client"
+    assert refresh_config[:client_secret] == "microsoft-db-secret"
+    assert refresh_config[:authorization_url]
+    assert refresh_config[:token_url]
+    assert refresh_config[:tenant] == "organizations"
+
+    assert_receive {:folder_mapping_config, folder_mapping_config}
+    assert_microsoft_operation_config(folder_mapping_config)
+
+    assert_receive {:sync_config, sync_config}
+    assert_microsoft_operation_config(sync_config)
+
+    assert_receive {:raw_config, raw_config}
+    assert_microsoft_operation_config(raw_config)
     refute Repo.get_by(Credential, external_account_id: microsoft.id)
   end
 
@@ -2605,6 +2663,18 @@ defmodule Manifold.Connectors.SyncTest do
     |> Repo.update!()
 
     microsoft
+  end
+
+  defp assert_microsoft_operation_config(config) do
+    assert config == [
+             base_url: "https://graph.microsoft.test/v1.0",
+             req_options: [plug: {Req.Test, __MODULE__}]
+           ]
+
+    refute Enum.any?(
+             [:client_id, :client_secret, :authorization_url, :token_url, :tenant],
+             &Keyword.has_key?(config, &1)
+           )
   end
 
   defp attach_sync_stop do

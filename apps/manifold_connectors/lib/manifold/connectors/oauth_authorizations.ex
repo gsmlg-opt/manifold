@@ -6,7 +6,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
 
   alias Manifold.Accounts
   alias Manifold.Accounts.Schema.Account
-  alias Manifold.Connectors.{Crypto, MicrosoftFolderMapping, ProviderSettings}
+  alias Manifold.Connectors.{Crypto, MicrosoftFolderMapping, ProviderConfig, ProviderSettings}
   alias Manifold.Connectors.Jobs.SyncAccount
   alias Manifold.Connectors.MicrosoftScopes
   alias Manifold.Connectors.OAuth.Consumed
@@ -88,8 +88,9 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
                     config,
                     provider_opts
                   ),
+                operation_config = ProviderConfig.provider_operation_config(provider, config),
                 {:ok, %Identity{} = identity} <-
-                  adapter.identity(token.access_token, config, provider_opts),
+                  adapter.identity(token.access_token, operation_config, provider_opts),
                 {:ok, provider_address} <- Address.parse(identity.email_address),
                 {:ok, cursors} <-
                   initial_cursors(
@@ -98,7 +99,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
                     consumed,
                     adapter,
                     token,
-                    config,
+                    operation_config,
                     provider_opts
                   ),
                 :ok <- validate_cursors(purpose, cursors) do
@@ -343,8 +344,9 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
                  now,
                  provider_opts
                ),
+             operation_config = ProviderConfig.provider_operation_config(provider, config),
              {:ok, cursors} <-
-               adapter.initial_cursors(checkout.access_token, config, provider_opts),
+               adapter.initial_cursors(checkout.access_token, operation_config, provider_opts),
              :ok <- validate_cursors(:receive, cursors) do
           persist_authorized_receive_method(snapshot, checkout, cursors, required_scope, now)
         end
