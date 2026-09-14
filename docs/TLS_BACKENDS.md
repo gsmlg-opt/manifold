@@ -8,7 +8,7 @@ client API for an implemented subset, not a universal SSL replacement.
 
 The consumer baseline is `c21ea5d4e41b367bf2fa0b94dea54552cfa60af6`. The ex_ssl
 baseline was `04180a504c55c65d4f339d459e011e2e2307bc49`; the dependency pins the
-authenticated client implementation at `cddd84499a73c9e12f35683ad1bcb821af24b428`.
+authenticated client implementation at `75ad1da8832a24f0d7f730e54ec80717b7346664`.
 Library and consumer changes are reviewed separately. No release or production
 configuration change is required by this development change.
 
@@ -126,7 +126,7 @@ unrecognized valid extensions are ignored and trailers remain separate headers.
 | --- | --- |
 | Pure protocol/crypto/PKIX/profile components | ex_ssl deterministic vectors, framing properties, negative authentication tests and golden wire checks. |
 | Public SSL API | Direct TLS, STARTTLS, repeated/large traffic, exact/available-byte receive semantics, deadlines/cancellation, owner death, application shutdown and cleanup regressions. |
-| Independent interoperability | ex_ssl gate: 280 tests and 15 properties passed on OTP 28 and OTP 29 with integration enabled. Dedicated CI executes 42 OTP/OpenSSL/reference/lifecycle tests; live Caddy fingerprint CI passes through public SSL. |
+| Independent interoperability | ex_ssl gate: 282 tests and 15 properties passed on OTP 28 and OTP 29 with integration enabled. Dedicated CI executes 44 OTP/OpenSSL/reference/lifecycle tests; live Caddy fingerprint CI passes through public SSL. |
 | IMAP workflow | Controlled local OTP and ex_ssl peers pass LOGIN, SELECT, literal FETCH and LOGOUT over direct TLS and STARTTLS, plus failed authentication/certificate/transport and plaintext-boundary cleanup. |
 | SMTP submission workflow | Controlled local OTP and ex_ssl peers pass EHLO, AUTH, envelope, DATA and QUIT over direct TLS and STARTTLS; existing submission outcome/account-routing regressions pass. |
 | EAS HTTP/WBXML workflow | Real TLS OPTIONS/FolderSync exchanges preserve auth, cookies and binary WBXML. ClientHello is observed through EAS.Client; large/fragmented/framed responses, deadlines, redirect refusal, mutation replay prevention and redacted failures pass. |
@@ -149,7 +149,7 @@ mix test --include integration
 mix test --include integration test/ssl/connection_lifecycle_test.exs test/ssl/otp_reference_test.exs test/ssl/connection_interop_test.exs
 ```
 
-Results: 280 tests and 15 properties passed in the full suite; 42 tests passed
+Results: 282 tests and 15 properties passed in the full suite; 44 tests passed
 in the dedicated suite. No interoperability tests were skipped. Local production
 compilation (`MIX_ENV=prod mix compile --warnings-as-errors`) also passed.
 OTP 29 used Docker image
@@ -157,10 +157,10 @@ OTP 29 used Docker image
 mount, `MIX_BUILD_PATH=/tmp/ex_ssl_build`, and installed OpenSSL, CA certificates
 and `libsctp1`. Its `e2e` directory passed formatting and strict compilation.
 
-The [live Caddy fingerprint test](https://github.com/gsmlg-dev/ex_ssl/actions/runs/34841770436)
+The [live Caddy fingerprint test](https://github.com/gsmlg-dev/ex_ssl/actions/runs/34843914989)
 passed in CI through the public API (one test), and the
-[dedicated OTP/OpenSSL job](https://github.com/gsmlg-dev/ex_ssl/actions/runs/34841770471)
-passed all 42 tests on the pinned library revision. Live Caddy was not run
+[dedicated OTP/OpenSSL job](https://github.com/gsmlg-dev/ex_ssl/actions/runs/34843914948)
+passed all 44 tests on the pinned library revision. Live Caddy was not run
 locally, following the library's existing e2e policy.
 
 Manifold validation uses its configured Devenv Elixir 1.18.4 / OTP 28.5.0.3,
@@ -176,6 +176,13 @@ passed **462 connector tests and 7 SMTP submission provider tests**, with no
 skipped tests. The focused EAS adapter/safety/existing protocol run passed
 **31 tests**. The new dedicated consumer CI job selects 46 boundary/mail/EAS/
 submission tests and has no optional integration tag or skip path.
+
+At consumer revision `91a9d8d`, the
+[mandatory TLS workflow job](https://github.com/gsmlg-opt/manifold/actions/runs/34843650692)
+and [full umbrella ExUnit job](https://github.com/gsmlg-opt/manifold/actions/runs/34843650595)
+also passed in CI, together with formatting, strict compilation, JavaScript
+checks and the configured frontend asset build. The final library-pin update
+was revalidated locally with the same 469 affected tests before pushing.
 
 An initial test attempt used the host toolchain/default database and failed
 before running tests; it was rerun successfully in Devenv with the isolated

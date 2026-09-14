@@ -27,7 +27,7 @@ defmodule Manifold.Connectors.MixProject do
       {:manifold_mail, in_umbrella: true},
       {:oban, "~> 2.23"},
       {:req, "~> 0.7"},
-      {:ex_ssl, github: "gsmlg-dev/ex_ssl", ref: "cddd84499a73c9e12f35683ad1bcb821af24b428"},
+      {:ex_ssl, github: "gsmlg-dev/ex_ssl", ref: "75ad1da8832a24f0d7f730e54ec80717b7346664"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.3"}
     ]
