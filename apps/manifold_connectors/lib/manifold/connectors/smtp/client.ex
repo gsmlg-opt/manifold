@@ -4,6 +4,7 @@ defmodule Manifold.Connectors.SMTP.Client do
   @behaviour Manifold.Connectors.SMTP.Transport
 
   alias Manifold.Connectors.Provider.Error
+  alias Manifold.Connectors.TLS
 
   defstruct [:socket, :buffer]
 
@@ -28,14 +29,33 @@ defmodule Manifold.Connectors.SMTP.Client do
 
   @impl true
   def connect(settings) when is_map(settings) do
-    with {:ok,
-          %{host: host, port: port, tls_mode: tls_mode, username: username, password: password}} <-
-           connection_settings(settings),
-         {:ok, conn} <- open_and_greet_safe(host, port, tls_mode),
-         {:ok, conn} <- ehlo(conn, host),
-         {:ok, conn} <- maybe_starttls(conn, host, tls_mode),
-         {:ok, conn} <- authenticate(conn, username, password) do
-      {:ok, conn}
+    case TLS.config(settings) do
+      {:ok, tls_config} ->
+        with {:ok,
+              %{
+                host: host,
+                port: port,
+                tls_mode: tls_mode,
+                username: username,
+                password: password
+              }} <-
+               connection_settings(settings),
+             {:ok, conn} <- open_and_greet_safe(host, port, tls_mode, tls_config),
+             {:ok, conn} <- ehlo(conn, host),
+             {:ok, conn} <- maybe_starttls(conn, host, tls_mode, tls_config),
+             authentication <- authenticate(conn, username, password) do
+          case authentication do
+            {:ok, conn} ->
+              {:ok, conn}
+
+            {:error, reason} ->
+              close_socket(conn.socket)
+              {:error, reason}
+          end
+        end
+
+      {:error, reason} ->
+        {:error, connect_error(reason)}
     end
   end
 
@@ -266,8 +286,8 @@ defmodule Manifold.Connectors.SMTP.Client do
   defp format_response(code, [line | _rest]), do: "#{code} #{String.slice(line, 0, 500)}"
   defp format_response(code, []), do: Integer.to_string(code)
 
-  defp open_and_greet_safe(host, port, tls_mode) do
-    case open_and_greet(host, port, tls_mode) do
+  defp open_and_greet_safe(host, port, tls_mode, tls_config) do
+    case open_and_greet(host, port, tls_mode, tls_config) do
       {:ok, conn} -> {:ok, conn}
       {:error, %Error{} = error} -> {:error, error}
       {:error, reason} -> {:error, connect_error(reason)}
@@ -281,25 +301,42 @@ defmodule Manifold.Connectors.SMTP.Client do
       {:error, connect_failed_error()}
   end
 
-  defp open_and_greet(host, port, tls_mode)
+  defp open_and_greet(host, port, tls_mode, tls_config)
        when tls_mode in ["ssl", "tls"] and is_binary(host) and is_integer(port) do
     host_charlist = String.to_charlist(host)
 
     with {:ok, socket} <-
-           :ssl.connect(host_charlist, port, ssl_opts(host_charlist), @connect_timeout) do
-      read_greeting(%__MODULE__{socket: socket, buffer: ""})
+           TLS.connect(host_charlist, port, ssl_opts(host_charlist), @connect_timeout, tls_config) do
+      case read_greeting(%__MODULE__{socket: socket, buffer: ""}) do
+        {:ok, conn} ->
+          {:ok, conn}
+
+        {:error, reason} ->
+          _ = TLS.close(socket)
+          {:error, reason}
+      end
     end
   end
 
-  defp open_and_greet(host, port, "starttls") when is_binary(host) and is_integer(port) do
+  defp open_and_greet(host, port, "starttls", _tls_config)
+       when is_binary(host) and is_integer(port) do
     host_charlist = String.to_charlist(host)
 
     with {:ok, tcp} <- :gen_tcp.connect(host_charlist, port, tcp_opts(), @connect_timeout) do
-      read_greeting(%__MODULE__{socket: {:tcp, tcp}, buffer: ""})
+      conn = %__MODULE__{socket: {:tcp, tcp}, buffer: ""}
+
+      case read_greeting(conn) do
+        {:ok, conn} ->
+          {:ok, conn}
+
+        {:error, reason} ->
+          close_socket(conn.socket)
+          {:error, reason}
+      end
     end
   end
 
-  defp open_and_greet(_host, _port, tls_mode) do
+  defp open_and_greet(_host, _port, tls_mode, _tls_config) do
     {:error, {:unsupported_tls_mode, tls_mode}}
   end
 
@@ -320,6 +357,7 @@ defmodule Manifold.Connectors.SMTP.Client do
          }}
 
       {:error, reason} ->
+        close_socket(conn.socket)
         {:error, reason}
     end
   end
@@ -343,20 +381,23 @@ defmodule Manifold.Connectors.SMTP.Client do
          }}
 
       {:error, reason} ->
+        close_socket(conn.socket)
         {:error, reason}
     end
   end
 
-  defp maybe_starttls(conn, _host, tls_mode) when tls_mode in ["ssl", "tls"], do: {:ok, conn}
+  defp maybe_starttls(conn, _host, tls_mode, _tls_config) when tls_mode in ["ssl", "tls"],
+    do: {:ok, conn}
 
-  defp maybe_starttls(conn, host, "starttls") do
+  defp maybe_starttls(conn, host, "starttls", tls_config) do
     conn = get_conn(conn)
     host_charlist = String.to_charlist(host)
 
     with {:ok, conn, 220, _lines} <- send_command(conn, "STARTTLS"),
+         :ok <- ensure_upgrade_boundary(conn),
          {:tcp, tcp} <- conn.socket,
-         {:ok, ssl} <- :ssl.connect(tcp, ssl_opts(host_charlist), @connect_timeout),
-         conn <- %{conn | socket: ssl, buffer: ""},
+         {:ok, ssl} <- TLS.upgrade(tcp, ssl_opts(host_charlist), @connect_timeout, tls_config),
+         conn <- %{conn | socket: ssl},
          {:ok, conn} <- ehlo(conn, host) do
       put_conn(conn)
       {:ok, conn}
@@ -372,14 +413,23 @@ defmodule Manifold.Connectors.SMTP.Client do
          }}
 
       {:error, %Error{} = error} ->
+        close_socket(conn.socket)
         {:error, error}
 
       {:error, reason} ->
+        close_socket(conn.socket)
         {:error, connect_error(reason)}
 
       other ->
         {:error, connect_error(other)}
     end
+  end
+
+  defp ensure_upgrade_boundary(%__MODULE__{socket: {:tcp, _tcp}, buffer: ""}), do: :ok
+
+  defp ensure_upgrade_boundary(%__MODULE__{socket: {:tcp, tcp}}) do
+    :ok = :gen_tcp.close(tcp)
+    {:error, :unexpected_plaintext_before_tls_upgrade}
   end
 
   defp authenticate(conn, username, password) do
@@ -570,6 +620,14 @@ defmodule Manifold.Connectors.SMTP.Client do
 
   defp recv_data({:adapter, module, state}, timeout), do: module.recv(state, timeout)
 
+  defp recv_data(%TLS.Socket{} = socket, timeout) do
+    case TLS.recv(socket, 0, timeout) do
+      {:ok, data} -> {:ok, data}
+      {:error, :timeout} -> {:error, :timeout}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp recv_data(socket, timeout) do
     case :ssl.recv(socket, 0, timeout) do
       {:ok, data} -> {:ok, data}
@@ -580,10 +638,12 @@ defmodule Manifold.Connectors.SMTP.Client do
 
   defp send_data({:adapter, module, state}, data), do: module.send(state, data)
   defp send_data({:tcp, socket}, data), do: :gen_tcp.send(socket, data)
+  defp send_data(%TLS.Socket{} = socket, data), do: TLS.send(socket, data)
   defp send_data(socket, data), do: :ssl.send(socket, data)
 
   defp close_socket({:adapter, module, state}), do: module.close(state)
   defp close_socket({:tcp, socket}), do: :gen_tcp.close(socket)
+  defp close_socket(%TLS.Socket{} = socket), do: TLS.close(socket)
   defp close_socket(socket), do: :ssl.close(socket)
 
   defp put_conn(conn), do: Process.put({__MODULE__, :conn}, conn)

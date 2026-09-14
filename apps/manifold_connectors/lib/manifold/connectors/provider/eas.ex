@@ -341,6 +341,12 @@ defmodule Manifold.Connectors.Provider.EAS do
       req_options: Keyword.get(config, :req_options, [])
     }
 
+    base =
+      case Keyword.get(config, :tls) do
+        nil -> base
+        tls -> Map.put(base, :tls, tls)
+      end
+
     fake = Keyword.get(config, :fake, %{})
     Map.merge(base, if(is_map(fake), do: fake, else: %{}))
   end

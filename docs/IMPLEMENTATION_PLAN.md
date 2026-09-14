@@ -2,6 +2,12 @@
 
 **Status:** Completed
 
+The later opt-in outbound TLS client milestone is tracked by the acceptance
+matrix in [TLS_BACKENDS.md](TLS_BACKENDS.md). It first validates the independent
+ex_ssl library, then adds and validates separate IMAP, SMTP submission and EAS
+consumer paths. It does not reopen this original inbound milestone or change
+production TLS defaults.
+
 ## Scope
 
 This plan covers only the first inbound vertical slice:

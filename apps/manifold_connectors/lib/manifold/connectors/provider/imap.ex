@@ -574,6 +574,12 @@ defmodule Manifold.Connectors.Provider.IMAP do
         _ -> base
       end
 
+    base =
+      case Keyword.get(config, :tls) do
+        tls when is_list(tls) -> Map.put(base, :tls, tls)
+        _ -> base
+      end
+
     case Keyword.get(config, :fake) do
       %{} = fake -> Map.merge(base, fake)
       _ -> base

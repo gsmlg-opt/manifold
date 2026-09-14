@@ -1,0 +1,65 @@
+name: TLS client backends
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MIX_ENV: test
+  DATABASE_URL: postgres://manifold_dev:manifold_dev@localhost:5432/manifold_dev
+  TEST_DATABASE_URL: postgres://manifold_dev:manifold_dev@localhost:5432/manifold_test
+
+jobs:
+  local-tls-workflows:
+    name: IMAP, SMTP and EAS over verified TLS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: manifold_dev
+          POSTGRES_PASSWORD: manifold_dev
+          POSTGRES_DB: manifold_dev
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.18.4"
+      - uses: actions/cache@v5
+        with:
+          path: |
+            deps
+            _build
+            ~/.hex
+            ~/.mix
+          key: ${{ runner.os }}-mix-tls-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-tls-
+      - name: Fetch pinned dependencies
+        run: mix deps.get
+      - name: Compile with warnings as errors
+        run: mix compile --warnings-as-errors
+      - name: Create isolated test database
+        run: psql "$DATABASE_URL" -c 'CREATE DATABASE manifold_test;'
+      - name: Run mandatory local TLS workflows
+        run: >-
+          mix test
+          apps/manifold_connectors/test/manifold/connectors/tls_test.exs
+          apps/manifold_connectors/test/manifold/connectors/mail_tls_integration_test.exs
+          apps/manifold_connectors/test/manifold/connectors/eas/http_adapter_test.exs
+          apps/manifold_connectors/test/manifold/connectors/eas/ex_ssl_client_safety_test.exs
+          apps/manifold_outbound/test/manifold/outbound/provider/smtp_test.exs
