@@ -55,5 +55,29 @@ defmodule Manifold.Connectors.OAuthProvider.Microsoft do
   }
 
   @spec definition() :: map()
-  def definition, do: @definition
+  def definition do
+    device_help =
+      Map.merge(@definition.help, %{
+        steps: [
+          "Create or select a Microsoft Entra application registration.",
+          "Select accounts in any organizational directory for work/school access.",
+          "Under Authentication, enable Allow public client flows.",
+          "Add delegated User.Read, Mail.Read, and Mail.Send permissions.",
+          "Do not add Mail.ReadWrite; Manifold does not create or modify Graph drafts.",
+          "Allow offline_access so Manifold can refresh the delegated grant.",
+          "Select Device code in Settings OAuth and save the application client ID.",
+          "No callback URL or client secret is needed.",
+          "Connect an account, open the Microsoft verification website, and enter the displayed code.",
+          "Obtain tenant administrator consent when the tenant policy requires it."
+        ],
+        links:
+          @definition.help.links ++
+            [
+              {"Device authorization grant",
+               "https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code"}
+            ]
+      })
+
+    Map.put(@definition, :device_help, device_help)
+  end
 end

@@ -30,7 +30,7 @@ defmodule Manifold.Connectors.ProviderConfig do
         definition
         |> provider_runtime_config(provider)
         |> Keyword.put(:client_id, credentials.client_id)
-        |> Keyword.put(:client_secret, credentials.client_secret)
+        |> put_client_credentials(credentials)
 
       {:ok,
        %Resolved{
@@ -54,6 +54,18 @@ defmodule Manifold.Connectors.ProviderConfig do
   def fetch(_provider) do
     {:error, Error.new(:permanent, :unsupported_provider, "OAuth provider is not supported")}
   end
+
+  defp put_client_credentials(config, %{auth_flow: "device_code"}) do
+    device_url =
+      config |> Keyword.fetch!(:token_url) |> URI.merge("devicecode") |> URI.to_string()
+
+    config
+    |> Keyword.put(:auth_flow, "device_code")
+    |> Keyword.put(:device_authorization_url, device_url)
+  end
+
+  defp put_client_credentials(config, credentials),
+    do: Keyword.put(config, :client_secret, credentials.client_secret)
 
   @spec provider_operation_config(String.t(), term()) :: term()
   def provider_operation_config("microsoft", config) when is_list(config) do

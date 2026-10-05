@@ -112,7 +112,7 @@ The current implementation includes:
   sync-now, status, and disconnect controls.
 - A trusted-local `/settings/oauth` LiveView for Google and Microsoft client
   credentials, with `/settings/oauth/gmail/help` and
-  `/settings/oauth/microsoft/help` for exact callbacks, scopes, and setup steps.
+  `/settings/oauth/microsoft/help` for mode-specific login, callbacks, scopes, and setup steps.
 - A local-release `connectors` Oban queue and five-minute polling job that
   recreates missing active-account sync work.
 
@@ -160,14 +160,22 @@ provider-setting, OAuth-token, and PKCE ciphertext. Generate one with:
 openssl rand -base64 32
 ```
 
-Configure Google and Microsoft client IDs and secrets in **Settings → OAuth** at
+Configure provider clients in **Settings → OAuth** at
 `/settings/oauth`; provider-specific instructions are at
-`/settings/oauth/gmail/help` and `/settings/oauth/microsoft/help`. A client ID is
+`/settings/oauth/gmail/help` and `/settings/oauth/microsoft/help`. New Microsoft
+configurations use **Device code**, requiring only the client ID and an Entra
+application with public client flows enabled. No callback URI or client secret is
+needed for this mode; the browser can be on another device. Existing Microsoft
+configurations retain browser redirect login until explicitly switched. Gmail
+retains browser redirect because Google device-flow scopes exclude Gmail read
+and send. See [OAuth setup](docs/OAUTH_SETUP.md) for both setup paths. A client ID is
 stored as plaintext because it is sent in browser authorization requests. Each
 client secret is encrypted in PostgreSQL and is never returned to the browser.
-On an existing configuration, leaving the secret field blank preserves it when
-the client ID is unchanged. Changing the client ID requires a new secret.
-Changing either credential or removing a configuration immediately disables
+For browser redirect configurations, leaving the secret field blank preserves it
+when the client ID is unchanged. Changing that client ID requires a new secret.
+Switching Microsoft to device code clears its stored secret; switching back
+requires a new secret. Changing the login method, either credential, or removing
+a configuration immediately disables
 that provider's affected receive/send methods and requires reconnect. Removal is
 local only and does not revoke the grant at Google or Microsoft.
 
@@ -178,7 +186,8 @@ the authorization URL, token URL, and Graph base URL overrides are retained. No
 application restart is required after either provider's credential save,
 rotation, or removal.
 
-The provider application registrations use these exact callback paths:
+Browser redirect application registrations use these exact callback paths
+(Microsoft device-code login does not use either callback):
 
 ```text
 https://<your-manifold-host>/connectors/gmail/callback
@@ -192,7 +201,9 @@ http://localhost:4290/connectors/gmail/callback
 http://localhost:4290/connectors/microsoft/callback
 ```
 
-Register only the production HTTPS callbacks with provider consoles. Local HTTP
+For browser redirect login, register production HTTPS callbacks with provider
+consoles. The callback derives from the configured Endpoint URL. A localhost
+callback requires the browser and Manifold to run on the same machine. Local HTTP
 callbacks are suitable for provider development registrations where the
 provider permits loopback HTTP. OAuth transactions compare the callback URI
 byte-for-byte with the URI stored at authorization start.
@@ -246,15 +257,17 @@ The Settings routes currently inherit Manifold's trusted-local-instance boundary
 they are not an authenticated administrator surface. Network-exposed deployments
 must add access control before treating browser-managed secrets as safe.
 
-Register the exact Microsoft callback
-`https://<host>/connectors/microsoft/callback`; local development uses
-`http://localhost:4290/connectors/microsoft/callback`. The fixed `organizations`
-tenant permits work/school accounts only. Restrict staging to a non-production
-app registration, tenant, and approved test users, and obtain tenant admin
-consent when the tenant's user-consent policy requires it. Save the client ID and
-secret at `/settings/oauth`, using `/settings/oauth/microsoft/help` for the exact
-deployed callback and required scopes. Existing receive-only accounts grant
-`Mail.Send` incrementally when Send is added.
+For Microsoft device-code login, enable **Allow public client flows** in Entra,
+select **Device code**, and save the application client ID at `/settings/oauth`.
+Connect an account, open Microsoft's verification website, and enter the displayed
+user code. Manifold polls for approval; no callback or client secret is required.
+If retaining **Browser redirect** mode, register the exact Microsoft callback
+`https://<host>/connectors/microsoft/callback` (local development:
+`http://localhost:4290/connectors/microsoft/callback`) and save a client secret.
+The fixed `organizations` tenant permits work/school accounts only. Restrict
+staging to a non-production application and approved users, and obtain tenant
+admin consent when required. Setup help follows the configured login method.
+Existing receive-only accounts grant `Mail.Send` incrementally when Send is added.
 Provider acceptance is immediate in Send activity; the authoritative Sent copy
 appears after normal/manual Graph polling when Receive is enabled. Back up
 `MANIFOLD_CONNECTOR_ENCRYPTION_KEY`; changing it without a coordinated rotation

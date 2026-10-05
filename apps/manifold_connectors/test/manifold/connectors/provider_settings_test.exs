@@ -31,12 +31,160 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
     :ok
   end
 
+  test "Microsoft device settings configure a public client without a secret" do
+    assert {:ok, view} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => " public-client ",
+               "auth_flow" => "device_code"
+             })
+
+    assert view.auth_flow == "device_code"
+    assert view.client_id == "public-client"
+    assert view.status == :configured
+    refute view.client_secret_configured?
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
+    assert is_nil(setting.client_secret_ciphertext)
+    assert {:ok, credentials} = ProviderSettings.runtime_credentials("microsoft")
+    assert credentials.auth_flow == "device_code"
+    assert is_nil(credentials.client_secret)
+    assert "microsoft" in Connectors.configured_providers()
+
+    assert {:ok, :ok} =
+             Repo.transaction(fn ->
+               :ok = ProviderSettings.lock_provider_for_transaction("microsoft")
+
+               ProviderSettings.validate_generation_for_transaction(
+                 "microsoft",
+                 setting.id,
+                 setting.lock_version
+               )
+             end)
+  end
+
+  test "device flow is rejected for Gmail and unknown flows fail safely" do
+    for {provider, flow} <- [{"gmail", "device_code"}, {"microsoft", "unknown"}] do
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               Connectors.put_oauth_provider_setting(provider, %{
+                 "client_id" => "client",
+                 "auth_flow" => flow,
+                 "client_secret" => "sentinel-secret"
+               })
+
+      assert changeset.errors[:auth_flow]
+      refute inspect(changeset) =~ "sentinel-secret"
+      refute Repo.get_by(OAuthProviderSetting, provider: provider)
+    end
+  end
+
+  test "switching Microsoft to device flow clears the secret and fences the old generation" do
+    assert {:ok, initial} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "client",
+               "client_secret" => "old-secret"
+             })
+
+    assert initial.auth_flow == "authorization_code"
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
+    family = insert_oauth_family!("microsoft", "device-switch")
+    tokens = token_snapshot(family.authorization)
+
+    assert {:ok, switched} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "client",
+               "auth_flow" => "device_code"
+             })
+
+    assert switched.lock_version == initial.lock_version + 1
+    assert is_nil(Repo.get!(OAuthProviderSetting, setting.id).client_secret_ciphertext)
+    assert_reconnect_required(family)
+    assert token_snapshot(family.authorization) == tokens
+
+    assert {:ok, {:error, %Error{reason: :provider_configuration_changed}}} =
+             Repo.transaction(fn ->
+               :ok = ProviderSettings.lock_provider_for_transaction("microsoft")
+
+               ProviderSettings.validate_generation_for_transaction(
+                 "microsoft",
+                 setting.id,
+                 initial.lock_version
+               )
+             end)
+  end
+
+  test "device settings preserve their flow on omitted mode and unchanged saves" do
+    assert {:ok, initial} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "device-client",
+               "auth_flow" => "device_code"
+             })
+
+    family = insert_oauth_family!("microsoft", "device-noop")
+
+    assert {:ok, ^initial} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => " device-client ",
+               "client_secret" => ""
+             })
+
+    assert Repo.get!(OAuthAuthorization, family.authorization.id).status == "connected"
+
+    assert {:ok, changed} =
+             Connectors.put_oauth_provider_setting("microsoft", %{"client_id" => "new-client"})
+
+    assert changed.auth_flow == "device_code"
+    assert changed.lock_version == initial.lock_version + 1
+    assert_reconnect_required(family)
+  end
+
+  test "switching a device client to authorization code requires a new secret" do
+    assert {:ok, initial} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "device-client",
+               "auth_flow" => "device_code"
+             })
+
+    assert {:error, %Ecto.Changeset{} = changeset} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "device-client",
+               "auth_flow" => "authorization_code"
+             })
+
+    assert {"can't be blank", _} = changeset.errors[:client_secret]
+    assert {:ok, ^initial} = Connectors.get_oauth_provider_setting("microsoft")
+
+    assert {:ok, switched} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "device-client",
+               "auth_flow" => "authorization_code",
+               "client_secret" => "new-code-secret"
+             })
+
+    assert switched.auth_flow == "authorization_code"
+    assert switched.client_secret_configured?
+    assert switched.lock_version == initial.lock_version + 1
+    assert {:ok, credentials} = ProviderSettings.runtime_credentials("microsoft")
+    assert credentials.client_secret == "new-code-secret"
+  end
+
+  test "device settings reject supplied secrets instead of retaining unused credentials" do
+    assert {:error, %Ecto.Changeset{} = changeset} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "client",
+               "auth_flow" => "device_code",
+               "client_secret" => "unused-secret"
+             })
+
+    assert changeset.errors[:client_secret]
+    refute inspect(changeset) =~ "unused-secret"
+  end
+
   test "creates an encrypted provider setting and returns only safe views" do
     assert {:ok, missing} = Connectors.get_oauth_provider_setting("gmail")
 
     assert missing == %{
              provider: "gmail",
              client_id: nil,
+             auth_flow: "authorization_code",
              client_secret_configured?: false,
              status: :not_configured,
              lock_version: nil
@@ -45,6 +193,7 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
     microsoft_missing = %{
       provider: "microsoft",
       client_id: nil,
+      auth_flow: "authorization_code",
       client_secret_configured?: false,
       status: :not_configured,
       lock_version: nil
@@ -73,6 +222,7 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
     assert view == %{
              provider: "gmail",
              client_id: "google-client",
+             auth_flow: "authorization_code",
              client_secret_configured?: true,
              status: :configured,
              lock_version: row.lock_version

@@ -65,16 +65,24 @@ to use only `Mail.Read` and never creates drafts or mutates remote messages.
 
 ### OAuth and secrets
 
-OAuth uses authorization code plus PKCE `S256`. State is random, stored only as
+Browser redirect OAuth uses authorization code plus PKCE `S256`. State is random, stored only as
 a SHA-256 digest, expires, and is consumed once under a PostgreSQL row lock.
 The exact redirect URI is persisted and compared on callback.
+
+As of 2026-10-06, Microsoft additionally supports public-client device
+authorization without a redirect URI or client secret. New Settings forms select
+this mode; existing configurations retain browser redirect until explicitly
+switched. Encrypted device transactions bind account, purpose, expiry, and
+provider-setting generation and are consumed alongside grant persistence. Gmail
+still uses browser redirect because Google device scopes exclude mail read/send.
+See `docs/OAUTH_SETUP.md` for setup and local callback limitations.
 
 PKCE verifiers, access tokens, and refresh tokens use versioned AES-256-GCM
 envelopes. Associated data binds each envelope to its provider transaction or
 account and credential purpose. Production requires a stable Base64-encoded
 32-byte encryption key.
 
-The intended callback paths are:
+For browser redirect mode, the intended callback paths are:
 
 ```text
 https://<PHX_HOST>/connectors/gmail/callback
@@ -83,8 +91,9 @@ https://<PHX_HOST>/connectors/microsoft/callback
 
 Phoenix controllers derive these active callback routes from the configured
 Endpoint URL. Production runtime configuration requires a valid connector
-encryption key and enables each provider only when its client ID and secret are
-both present.
+encryption key and enables browser redirect clients only when their client ID
+and secret are both present. Microsoft device clients need only their client ID
+and Entra public client flows enabled.
 
 Gmail uses the OpenID UserInfo `sub` as its durable provider account ID. The
 provider email is mutable display metadata. Once connected, a provider account

@@ -11,6 +11,18 @@
 - **Microsoft plan:** `docs/superpowers/plans/2026-08-27-microsoft-oauth-provider-settings.md`
 - **Migration:** `20260818000100_add_oauth_provider_settings.exs`
 
+## Device-code update (2026-10-06)
+
+Microsoft now supports public-client device authorization. New Microsoft Settings
+forms default to device code; existing stored configurations remain authorization
+code until explicitly switched. Device settings need only a client ID, have no
+callback or secret, and reuse the existing generation/reconnect boundary. Gmail
+remains a browser web client: Google's limited-input device scopes exclude Gmail
+read and send. The current behavior and migration ownership are documented in
+[`microsoft-device-oauth.md`](microsoft-device-oauth.md) and `docs/OAUTH_SETUP.md`.
+Historical verification and callback-only details below describe the earlier
+implementation; device-mode overrides supersede those Microsoft requirements.
+
 ## Ownership and routes
 
 - `manifold_data` owns the migration at

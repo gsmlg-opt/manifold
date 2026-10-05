@@ -65,6 +65,18 @@ defmodule Manifold.Connectors.OAuthTest do
     {:ok, mailbox: mailbox, gmail_setting: gmail_setting, microsoft_setting: microsoft_setting}
   end
 
+  test "Microsoft public-client settings cannot start a browser authorization transaction", %{
+    mailbox: mailbox
+  } do
+    assert {:ok, _} =
+             Connectors.put_oauth_provider_setting("microsoft", %{auth_flow: "device_code"})
+
+    assert {:error, %{reason: :device_authorization_required}} =
+             OAuth.start("microsoft", mailbox.id, @microsoft_redirect)
+
+    assert Repo.aggregate(OAuthTransaction, :count) == 0
+  end
+
   test "starts Gmail OAuth with the database client and snapshots its exact generation", %{
     mailbox: mailbox,
     gmail_setting: gmail_setting

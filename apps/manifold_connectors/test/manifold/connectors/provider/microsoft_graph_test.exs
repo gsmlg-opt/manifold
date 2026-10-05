@@ -13,6 +13,91 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
     req_options: [plug: {Req.Test, MicrosoftGraph}]
   ]
 
+  test "device authorization and public-client refresh never send a secret or redirect" do
+    config =
+      Keyword.merge(@config,
+        auth_flow: "device_code",
+        device_authorization_url:
+          "https://login.microsoftonline.test/organizations/oauth2/v2.0/devicecode"
+      )
+
+    Req.Test.expect(MicrosoftGraph, fn conn ->
+      assert conn.request_path == "/organizations/oauth2/v2.0/devicecode"
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+
+      assert Plug.Conn.Query.decode(body) == %{
+               "client_id" => "graph-client",
+               "scope" => "Mail.Read User.Read offline_access openid profile"
+             }
+
+      Req.Test.json(conn, %{
+        "device_code" => "private-device-code",
+        "user_code" => "ABCD-EFGH",
+        "verification_uri" => "https://microsoft.com/devicelogin",
+        "expires_in" => 900,
+        "interval" => 5
+      })
+    end)
+
+    assert {:ok, %{device_code: "private-device-code", interval: 5}} =
+             MicrosoftGraph.request_device_code(config, [])
+
+    Req.Test.expect(MicrosoftGraph, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      form = Plug.Conn.Query.decode(body)
+      refute Map.has_key?(form, "client_secret")
+      refute Map.has_key?(form, "redirect_uri")
+      assert form["grant_type"] == "urn:ietf:params:oauth:grant-type:device_code"
+      assert form["device_code"] == "private-device-code"
+
+      conn
+      |> Plug.Conn.put_status(400)
+      |> Req.Test.json(%{
+        "error" => "authorization_pending",
+        "error_description" => "private description"
+      })
+    end)
+
+    assert {:pending, :authorization_pending} =
+             MicrosoftGraph.poll_device_code("private-device-code", config, [])
+
+    Req.Test.expect(MicrosoftGraph, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      refute Map.has_key?(Plug.Conn.Query.decode(body), "client_secret")
+      Req.Test.json(conn, %{"access_token" => "new", "expires_in" => 3600})
+    end)
+
+    assert {:ok, %Provider.Token{}} = MicrosoftGraph.refresh_token("refresh", config, [])
+  end
+
+  test "device authorization rejects untrusted verification URLs" do
+    config =
+      Keyword.put(
+        @config,
+        :device_authorization_url,
+        "https://login.microsoftonline.test/devicecode"
+      )
+
+    for uri <- [
+          "https://evil.test/devicelogin",
+          "http://microsoft.com/devicelogin",
+          "https://microsoft.com@evil.test/devicelogin",
+          "https://microsoft.com/devicelogin?token=private"
+        ] do
+      Req.Test.expect(MicrosoftGraph, fn conn ->
+        Req.Test.json(conn, %{
+          "device_code" => "private",
+          "user_code" => "CODE",
+          "verification_uri" => uri,
+          "expires_in" => 900
+        })
+      end)
+
+      assert {:error, %Provider.Error{code: :invalid_provider_response}} =
+               MicrosoftGraph.request_device_code(config, [])
+    end
+  end
+
   test "exchanges an authorization code with PKCE and normalizes the token" do
     Req.Test.expect(MicrosoftGraph, fn conn ->
       assert conn.method == "POST"

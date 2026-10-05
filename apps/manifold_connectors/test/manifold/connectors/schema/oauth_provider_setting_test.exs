@@ -68,6 +68,20 @@ defmodule Manifold.Connectors.Schema.OAuthProviderSettingTest do
     assert "oauth_provider_settings_lock_version_positive" in constraints
   end
 
+  test "Microsoft device setting needs no secret while code settings still do" do
+    attrs = %{provider: "microsoft", client_id: "public-client", auth_flow: "device_code"}
+    assert OAuthProviderSetting.changeset(%OAuthProviderSetting{}, attrs).valid?
+
+    for rejected <- [
+          %{attrs | provider: "gmail"},
+          %{attrs | auth_flow: "authorization_code"},
+          Map.put(attrs, :client_secret_ciphertext, <<1>>),
+          %{attrs | auth_flow: "unknown"}
+        ] do
+      refute OAuthProviderSetting.changeset(%OAuthProviderSetting{}, rejected).valid?
+    end
+  end
+
   test "OAuth transaction accepts a paired provider-setting generation" do
     setting_id = Ecto.UUID.generate()
 

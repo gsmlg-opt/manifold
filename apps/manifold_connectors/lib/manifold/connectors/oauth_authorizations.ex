@@ -68,6 +68,37 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
 
   def complete(provider, code, %Consumed{provider: provider} = consumed, adapter, config, opts)
       when provider in @providers do
+    token_fun = fn provider_opts ->
+      adapter.exchange_code(
+        code,
+        consumed.pkce_verifier,
+        consumed.redirect_uri,
+        config,
+        provider_opts
+      )
+    end
+
+    do_complete(provider, consumed, adapter, config, opts, token_fun)
+  end
+
+  def complete(_provider, _code, %Consumed{}, _adapter, _config, _opts) do
+    {:error, CoreError.new(:permanent, :oauth_provider_mismatch, "OAuth provider does not match")}
+  end
+
+  @doc false
+  def complete_token(
+        provider,
+        %Token{} = token,
+        %Consumed{provider: provider} = consumed,
+        adapter,
+        config,
+        opts \\ []
+      )
+      when provider in @providers do
+    do_complete(provider, consumed, adapter, config, opts, fn _ -> {:ok, token} end)
+  end
+
+  defp do_complete(provider, consumed, adapter, config, opts, token_fun) do
     start = System.monotonic_time()
     now = Keyword.get(opts, :now, DateTime.utc_now())
 
@@ -81,13 +112,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     case capture_complete(fn ->
            with {:ok, purpose} <- normalize_purpose(consumed.purpose),
                 {:ok, %Token{} = token} <-
-                  adapter.exchange_code(
-                    code,
-                    consumed.pkce_verifier,
-                    consumed.redirect_uri,
-                    config,
-                    provider_opts
-                  ),
+                  token_fun.(provider_opts),
                 operation_config = ProviderConfig.provider_operation_config(provider, config),
                 {:ok, %Identity{} = identity} <-
                   adapter.identity(token.access_token, operation_config, provider_opts),
@@ -112,7 +137,8 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
                provider_address,
                cursors,
                now,
-               expected_provider_generation
+               expected_provider_generation,
+               Keyword.get(opts, :completion_guard, fn -> :ok end)
              )
            else
              {:error, %ProviderError{} = error} -> {:error, provider_error(error)}
@@ -127,10 +153,6 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
         emit_oauth_complete(consumed, unexpected_complete_result(), start)
         reraise(exception, stacktrace)
     end
-  end
-
-  def complete(_provider, _code, %Consumed{}, _adapter, _config, _opts) do
-    {:error, CoreError.new(:permanent, :oauth_provider_mismatch, "OAuth provider does not match")}
   end
 
   defp capture_complete(fun) do
@@ -1158,11 +1180,13 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
          provider_address,
          cursors,
          now,
-         expected_provider_generation
+         expected_provider_generation,
+         completion_guard
        ) do
     Repo.transaction(fn ->
       with :ok <- lock_and_validate_provider_generation(provider, expected_provider_generation),
            {:ok, account, account_address} <- lock_account(consumed.mailbox_id),
+           :ok <- completion_guard.(),
            :ok <- require_matching_address(account_address, provider_address),
            {account_authorization, subject_authorization} <-
              lock_authorizations(provider, account.id, identity.id),

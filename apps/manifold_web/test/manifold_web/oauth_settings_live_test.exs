@@ -139,17 +139,14 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
              "#oauth-provider-gmail-callback[readonly][value='#{callback_uri}']"
            )
 
-    microsoft_callback_uri = "http://localhost:4002/connectors/microsoft/callback"
-
     assert has_element?(
              view,
-             "#oauth-provider-microsoft-client-secret[type='password'][autocomplete='new-password'][value=''][phx-patch-focused]"
+             "#oauth-provider-microsoft-auth-flow option[value='device_code'][selected]"
            )
 
-    assert has_element?(
-             view,
-             "#oauth-provider-microsoft-callback[readonly][value='#{microsoft_callback_uri}']"
-           )
+    refute has_element?(view, "#oauth-provider-microsoft-client-secret")
+    refute has_element?(view, "#oauth-provider-microsoft-callback")
+    assert html =~ "No callback URL or client secret is needed."
 
     refute html =~ "MANIFOLD_GMAIL_CLIENT_ID"
     refute html =~ "MANIFOLD_GMAIL_CLIENT_SECRET"
@@ -175,6 +172,70 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     assert app_css =~ ".oauth-provider-card {"
     assert app_css =~ "display: block;"
     assert app_css =~ ".oauth-provider-card:not(:defined) {"
+  end
+
+  test "Microsoft device configuration saves with only a client ID and can be removed", %{
+    conn: conn
+  } do
+    {:ok, view, _html} = live(conn, "/settings/oauth")
+
+    html =
+      view
+      |> form("#oauth-provider-microsoft-form",
+        provider: "microsoft",
+        oauth_provider_setting: %{
+          client_id: "device-public-client",
+          auth_flow: "device_code",
+          lock_version: ""
+        }
+      )
+      |> render_submit()
+
+    assert html =~ "Microsoft OAuth configuration saved."
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
+    assert setting.auth_flow == "device_code"
+    assert is_nil(setting.client_secret_ciphertext)
+    assert has_element?(view, "#remove-oauth-provider-microsoft")
+    refute has_element?(view, "#oauth-provider-microsoft-client-secret")
+    render_click(view, "remove-provider", %{"provider" => "microsoft", "lock_version" => "1"})
+    assert is_nil(Repo.get_by(OAuthProviderSetting, provider: "microsoft"))
+  end
+
+  test "existing Microsoft browser configuration retains its secret until explicitly switched", %{
+    conn: conn
+  } do
+    {:ok, _} =
+      Connectors.put_oauth_provider_setting("microsoft", %{
+        client_id: "legacy-client",
+        client_secret: "legacy-secret"
+      })
+
+    {:ok, view, _html} = live(conn, "/settings/oauth")
+    assert has_element?(view, "#oauth-provider-microsoft-client-secret")
+    assert has_element?(view, "#oauth-provider-microsoft-callback")
+
+    view
+    |> form("#oauth-provider-microsoft-form", oauth_provider_setting: %{auth_flow: "device_code"})
+    |> render_change()
+
+    refute has_element?(view, "#oauth-provider-microsoft-client-secret")
+    assert Repo.get_by!(OAuthProviderSetting, provider: "microsoft").client_secret_ciphertext
+
+    view
+    |> form("#oauth-provider-microsoft-form",
+      provider: "microsoft",
+      oauth_provider_setting: %{
+        client_id: "legacy-client",
+        auth_flow: "device_code",
+        lock_version: "1"
+      }
+    )
+    |> render_submit()
+
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "microsoft")
+    assert setting.auth_flow == "device_code"
+    assert setting.lock_version == 2
+    assert is_nil(setting.client_secret_ciphertext)
   end
 
   test "initial save immediately reloads configured state without retaining the secret", %{
@@ -235,6 +296,13 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
 
     {:ok, settings_view, _html} = live(conn, "/settings/oauth")
     secret = "microsoft-picker-secret-never-render"
+
+    settings_view
+    |> form("#oauth-provider-microsoft-form",
+      provider: "microsoft",
+      oauth_provider_setting: %{auth_flow: "authorization_code"}
+    )
+    |> render_change()
 
     save_html =
       settings_view
@@ -699,19 +767,15 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     refute html =~ "client_secret_ciphertext"
   end
 
-  test "Microsoft help renders catalog setup instructions and exact callback accessibly", %{
+  test "Microsoft help defaults to device-code setup without callback or secret", %{
     conn: conn
   } do
     {:ok, view, html} = live(conn, "/settings/oauth/microsoft/help")
 
-    callback_uri = "http://localhost:4002/connectors/microsoft/callback"
-
     assert has_element?(view, "h1", "Set up Microsoft OAuth")
-
-    assert has_element?(
-             view,
-             "#oauth-provider-microsoft-help-callback[readonly][value='#{callback_uri}']"
-           )
+    refute has_element?(view, "#oauth-provider-microsoft-help-callback")
+    assert html =~ "No callback URL or client secret is needed."
+    assert html =~ "Allow public client flows"
 
     for scope <- ["openid", "profile", "User.Read", "Mail.Read", "Mail.Send", "offline_access"] do
       assert has_element?(view, "[data-scope='#{scope}']")
@@ -721,6 +785,24 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     assert html =~ "organizations"
     assert html =~ "personal Outlook.com accounts are not supported"
     assert html =~ "Do not add Mail.ReadWrite"
+  end
+
+  test "Microsoft help retains exact callback for an existing browser configuration", %{
+    conn: conn
+  } do
+    Connectors.put_oauth_provider_setting("microsoft", %{
+      client_id: "legacy-help",
+      client_secret: "legacy-help-secret"
+    })
+
+    {:ok, view, html} = live(conn, "/settings/oauth/microsoft/help")
+
+    assert has_element?(
+             view,
+             "#oauth-provider-microsoft-help-callback[readonly][value='http://localhost:4002/connectors/microsoft/callback']"
+           )
+
+    assert html =~ "switch Login method to Device code"
   end
 
   defp put_setting(client_id, client_secret) do

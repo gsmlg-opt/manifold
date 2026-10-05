@@ -427,6 +427,47 @@ defmodule Manifold.Connectors.ProviderConfigTest do
     end)
   end
 
+  test "Microsoft device resolver omits client secret and exposes the selected grant" do
+    Application.put_env(:manifold_connectors, :providers, :invalid)
+
+    assert {:ok, _view} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "public-device-client",
+               "auth_flow" => "device_code"
+             })
+
+    assert {:ok, %ProviderConfig.Resolved{} = resolved} = ProviderConfig.fetch("microsoft")
+    assert resolved.config[:client_id] == "public-device-client"
+    assert resolved.config[:auth_flow] == "device_code"
+
+    assert resolved.config[:device_authorization_url] ==
+             "https://login.microsoftonline.com/organizations/oauth2/v2.0/devicecode"
+
+    refute Keyword.has_key?(resolved.config, :client_secret)
+
+    refute Keyword.has_key?(
+             ProviderConfig.provider_operation_config("microsoft", resolved.config),
+             :auth_flow
+           )
+  end
+
+  test "Microsoft device authorization endpoint follows the trusted token endpoint override" do
+    assert {:ok, _view} =
+             Connectors.put_oauth_provider_setting("microsoft", %{
+               "client_id" => "public-device-client",
+               "auth_flow" => "device_code"
+             })
+
+    Application.put_env(:manifold_connectors, :providers,
+      microsoft: [token_url: "https://login.example/tenant/oauth2/v2.0/token"]
+    )
+
+    assert {:ok, %ProviderConfig.Resolved{} = resolved} = ProviderConfig.fetch("microsoft")
+
+    assert resolved.config[:device_authorization_url] ==
+             "https://login.example/tenant/oauth2/v2.0/devicecode"
+  end
+
   defp put_setting!(provider, client_id, client_secret) do
     assert {:ok, _view} =
              Connectors.put_oauth_provider_setting(

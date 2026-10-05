@@ -25,6 +25,31 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
 
   @impl Phoenix.LiveView
   def handle_event(
+        "change-provider-flow",
+        %{"provider" => "microsoft", "oauth_provider_setting" => params},
+        socket
+      ) do
+    provider = Enum.find(socket.assigns.providers, &(&1.definition.key == "microsoft"))
+
+    if provider && params["auth_flow"] != provider.form[:auth_flow].value do
+      case Connectors.change_oauth_provider_setting(
+             "microsoft",
+             Map.take(params, ["client_id", "auth_flow"])
+           ) do
+        %Ecto.Changeset{} = changeset ->
+          {:noreply, assign_provider_form(socket, "microsoft", safe_changeset(changeset))}
+
+        {:error, _} ->
+          {:noreply, socket}
+      end
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("change-provider-flow", _params, socket), do: {:noreply, socket}
+
+  def handle_event(
         "save-provider",
         %{"provider" => provider, "oauth_provider_setting" => params},
         socket
@@ -131,6 +156,7 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
         </p>
 
         <.dm_input
+          :if={provider.form[:auth_flow].value != "device_code"}
           id={"oauth-provider-#{provider.definition.key}-callback"}
           name={"oauth_provider_#{provider.definition.key}_callback"}
           label="Callback URI"
@@ -144,6 +170,7 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
           id={"oauth-provider-#{provider.definition.key}-form"}
           class="mailbox-setup-form"
           phx-submit="save-provider"
+          phx-change={if provider.definition.key == "microsoft", do: "change-provider-flow"}
         >
           <input type="hidden" name="provider" value={provider.definition.key} />
           <input
@@ -151,6 +178,26 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
             name={provider.form[:lock_version].name}
             value={provider.form[:lock_version].value}
           />
+
+          <.dm_select
+            :if={provider.definition.key == "microsoft"}
+            id="oauth-provider-microsoft-auth-flow"
+            field={provider.form[:auth_flow]}
+            label="Login method"
+            options={[
+              {"device_code", "Device code (no callback)"},
+              {"authorization_code", "Browser redirect"}
+            ]}
+          />
+          <p :if={provider.form[:auth_flow].value == "device_code"} class="settings-secondary">
+            No callback URL or client secret is needed. Enable public client flows in Microsoft
+            Entra, then save the client ID. Sign in using the code shown when connecting an account.
+          </p>
+          <p :if={provider.definition.key == "gmail"} class="settings-secondary">
+            Gmail requires browser redirect login. Google's device-code flow does not support
+            Gmail read or send permissions. A localhost callback works when your browser and
+            Manifold run on the same machine.
+          </p>
 
           <.dm_input
             id={"oauth-provider-#{provider.definition.key}-client-id"}
@@ -161,6 +208,7 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
           />
 
           <.dm_input
+            :if={provider.form[:auth_flow].value != "device_code"}
             id={"oauth-provider-#{provider.definition.key}-client-secret"}
             field={provider.form[:client_secret]}
             type="password"
@@ -180,8 +228,8 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
           </button>
         </.form>
 
-        <p :if={provider.view.client_secret_configured?} class="settings-hint">
-          Changing the client ID or secret stops {provider.definition.name} receive and send until
+        <p :if={provider.view.lock_version} class="settings-hint">
+          Changing the login method, client ID or secret stops {provider.definition.name} receive and send until
           connected accounts are reconnected.
         </p>
 
@@ -197,7 +245,7 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
           </.link>
           <%!-- WORKAROUND(upstream): duskmoon-dev/phoenix-duskmoon-ui#143 --%>
           <button
-            :if={provider.view.client_secret_configured?}
+            :if={provider.view.lock_version}
             id={"remove-oauth-provider-#{provider.definition.key}"}
             type="button"
             class="settings-action settings-action-error"
@@ -231,7 +279,10 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
   defp load_provider(definition) do
     with {:ok, view} <- Connectors.get_oauth_provider_setting(definition.key),
          %Ecto.Changeset{} = changeset <-
-           Connectors.change_oauth_provider_setting(definition.key) do
+           Connectors.change_oauth_provider_setting(
+             definition.key,
+             default_form_attrs(definition, view)
+           ) do
       {:ok,
        %{
          definition: definition,
@@ -243,6 +294,11 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
       {:error, error} -> {:error, error}
     end
   end
+
+  defp default_form_attrs(%{key: "microsoft"}, %{status: :not_configured}),
+    do: %{"auth_flow" => "device_code"}
+
+  defp default_form_attrs(_definition, _view), do: %{}
 
   defp reload_provider(socket, provider) do
     case Enum.find(socket.assigns.providers, &(&1.definition.key == provider)) do

@@ -21,11 +21,12 @@ defmodule Manifold.Connectors.ProviderSettings do
 
     @derive {Inspect, only: [:client_id, :setting_id, :setting_lock_version]}
     @enforce_keys [:client_id, :client_secret, :setting_id, :setting_lock_version]
-    defstruct [:client_id, :client_secret, :setting_id, :setting_lock_version]
+    defstruct [:client_id, :client_secret, :setting_id, :setting_lock_version, :auth_flow]
 
     @type t :: %__MODULE__{
             client_id: String.t(),
-            client_secret: String.t(),
+            client_secret: String.t() | nil,
+            auth_flow: String.t(),
             setting_id: Ecto.UUID.t(),
             setting_lock_version: pos_integer()
           }
@@ -41,6 +42,7 @@ defmodule Manifold.Connectors.ProviderSettings do
     embedded_schema do
       field(:provider, :string)
       field(:client_id, :string)
+      field(:auth_flow, :string, default: "authorization_code")
       field(:client_secret, :string, virtual: true, redact: true)
       field(:lock_version, :integer)
     end
@@ -48,6 +50,7 @@ defmodule Manifold.Connectors.ProviderSettings do
     @type t :: %__MODULE__{
             provider: String.t(),
             client_id: String.t() | nil,
+            auth_flow: String.t(),
             client_secret: nil,
             lock_version: pos_integer() | nil
           }
@@ -55,14 +58,21 @@ defmodule Manifold.Connectors.ProviderSettings do
     @spec changeset(t(), map()) :: Ecto.Changeset.t()
     def changeset(form, attrs) do
       form
-      |> cast(attrs, [:client_id])
-      |> validate_required(:client_id)
+      |> cast(attrs, [:client_id, :auth_flow])
+      |> validate_required([:client_id, :auth_flow])
+      |> validate_inclusion(:auth_flow, ["authorization_code", "device_code"])
+      |> validate_change(:auth_flow, fn _, flow ->
+        if flow == "device_code" and form.provider != "microsoft",
+          do: [auth_flow: "is not supported by this provider"],
+          else: []
+      end)
     end
   end
 
   @type safe_view :: %{
           provider: String.t(),
           client_id: String.t() | nil,
+          auth_flow: String.t(),
           client_secret_configured?: boolean(),
           status: :configured | :not_configured | :configuration_error,
           lock_version: pos_integer() | nil
@@ -183,7 +193,7 @@ defmodule Manifold.Connectors.ProviderSettings do
          :ok <- require_transaction(),
          %OAuthProviderSetting{} = setting <- lock_setting(provider),
          true <- setting.id == setting_id and setting.lock_version == setting_lock_version do
-      case decrypt_secret(setting) do
+      case resolve_secret(setting) do
         {:ok, _client_secret} -> :ok
         {:error, _crypto_error} -> provider_configuration_changed()
       end
@@ -201,12 +211,13 @@ defmodule Manifold.Connectors.ProviderSettings do
   def runtime_credentials(provider) do
     with {:ok, _definition} <- OAuthProviderCatalog.fetch(provider),
          %OAuthProviderSetting{} = setting <- get_setting(provider) do
-      case decrypt_secret(setting) do
+      case resolve_secret(setting) do
         {:ok, client_secret} ->
           {:ok,
            %Credentials{
              client_id: setting.client_id,
              client_secret: client_secret,
+             auth_flow: setting.auth_flow,
              setting_id: setting.id,
              setting_lock_version: setting.lock_version
            }}
@@ -248,57 +259,32 @@ defmodule Manifold.Connectors.ProviderSettings do
       end
   end
 
-  defp persist_setting(nil, provider, attrs) do
-    id = Ecto.UUID.generate()
-    changeset = form_changeset(nil, provider, attrs)
-
-    if changeset.valid? do
-      with secret when is_binary(secret) <- Map.get(attrs, "client_secret"),
-           {:ok, ciphertext} <- Crypto.encrypt(secret, secret_context(id)),
-           {:ok, setting} <-
-             %OAuthProviderSetting{id: id}
-             |> OAuthProviderSetting.changeset(%{
-               provider: provider,
-               client_id: get_field(changeset, :client_id),
-               client_secret_ciphertext: ciphertext,
-               key_version: 1,
-               lock_version: 1
-             })
-             |> Repo.insert() do
-        {:ok, {:changed, setting}}
-      else
-        {:error, %Ecto.Changeset{} = persistence_changeset} ->
-          {:error, public_persistence_changeset(changeset, persistence_changeset)}
-
-        {:error, reason} ->
-          {:error, reason}
-      end
-    else
-      {:error, changeset}
-    end
-  end
-
-  defp persist_setting(%OAuthProviderSetting{} = setting, provider, attrs) do
+  defp persist_setting(setting, provider, attrs) do
     changeset = form_changeset(setting, provider, attrs)
 
     if changeset.valid? do
       client_id = get_field(changeset, :client_id)
+      auth_flow = get_field(changeset, :auth_flow)
       secret = Map.get(attrs, "client_secret")
 
-      if client_id == setting.client_id and blank_secret?(secret) do
+      if setting && client_id == setting.client_id && auth_flow == setting.auth_flow &&
+           blank_secret?(secret) do
         {:ok, {:unchanged, setting}}
       else
-        with secret when is_binary(secret) <- secret,
-             {:ok, ciphertext} <- Crypto.encrypt(secret, secret_context(setting.id)),
-             {:ok, updated} <-
-               setting
+        row = setting || %OAuthProviderSetting{id: Ecto.UUID.generate()}
+
+        with {:ok, ciphertext} <- setting_ciphertext(row, auth_flow, secret),
+             {:ok, saved} <-
+               row
                |> OAuthProviderSetting.changeset(%{
+                 provider: provider,
                  client_id: client_id,
+                 auth_flow: auth_flow,
                  client_secret_ciphertext: ciphertext,
-                 lock_version: setting.lock_version + 1
+                 lock_version: if(setting, do: setting.lock_version + 1, else: 1)
                })
-               |> Repo.update() do
-          {:ok, {:changed, updated}}
+               |> Repo.insert_or_update() do
+          {:ok, {:changed, saved}}
         else
           {:error, %Ecto.Changeset{} = persistence_changeset} ->
             {:error, public_persistence_changeset(changeset, persistence_changeset)}
@@ -312,23 +298,42 @@ defmodule Manifold.Connectors.ProviderSettings do
     end
   end
 
+  defp setting_ciphertext(_setting, "device_code", _secret), do: {:ok, nil}
+
+  defp setting_ciphertext(setting, "authorization_code", secret) do
+    if blank_secret?(secret),
+      do: {:ok, setting.client_secret_ciphertext},
+      else: Crypto.encrypt(secret, secret_context(setting.id))
+  end
+
   defp form_changeset(setting, provider, attrs) do
     form = %Form{
       provider: provider,
       client_id: if(setting, do: setting.client_id),
+      auth_flow: if(setting, do: setting.auth_flow, else: "authorization_code"),
       lock_version: if(setting, do: setting.lock_version)
     }
 
     changeset =
       Form.changeset(form, %{
-        "client_id" => Map.get(attrs, "client_id", form.client_id)
+        "client_id" => Map.get(attrs, "client_id", form.client_id),
+        "auth_flow" => Map.get(attrs, "auth_flow", form.auth_flow)
       })
 
     client_id = get_field(changeset, :client_id)
+    auth_flow = get_field(changeset, :auth_flow)
     secret = Map.get(attrs, "client_secret")
-    secret_required? = is_nil(setting) or client_id != setting.client_id
 
-    validate_secret(changeset, secret, secret_required?)
+    if auth_flow == "device_code" do
+      if blank_secret?(secret),
+        do: changeset,
+        else: add_error(changeset, :client_secret, "must be blank for device authorization")
+    else
+      secret_required? =
+        is_nil(setting) or client_id != setting.client_id or setting.auth_flow != auth_flow
+
+      validate_secret(changeset, secret, secret_required?)
+    end
   end
 
   defp validate_secret(changeset, secret, required?) do
@@ -503,14 +508,15 @@ defmodule Manifold.Connectors.ProviderSettings do
 
   defp safe_view(%OAuthProviderSetting{} = setting, _provider) do
     status =
-      if match?({:ok, _secret}, decrypt_secret(setting)),
+      if match?({:ok, _secret}, resolve_secret(setting)),
         do: :configured,
         else: :configuration_error
 
     %{
       provider: setting.provider,
       client_id: setting.client_id,
-      client_secret_configured?: true,
+      auth_flow: setting.auth_flow,
+      client_secret_configured?: is_binary(setting.client_secret_ciphertext),
       status: status,
       lock_version: setting.lock_version
     }
@@ -520,6 +526,7 @@ defmodule Manifold.Connectors.ProviderSettings do
     %{
       provider: provider,
       client_id: nil,
+      auth_flow: "authorization_code",
       client_secret_configured?: false,
       status: :not_configured,
       lock_version: nil
@@ -530,16 +537,30 @@ defmodule Manifold.Connectors.ProviderSettings do
     Crypto.decrypt(setting.client_secret_ciphertext, secret_context(setting.id))
   end
 
+  defp resolve_secret(%OAuthProviderSetting{
+         provider: "microsoft",
+         auth_flow: "device_code",
+         client_secret_ciphertext: nil
+       }),
+       do: {:ok, nil}
+
+  defp resolve_secret(%OAuthProviderSetting{auth_flow: "authorization_code"} = setting),
+    do: decrypt_secret(setting)
+
+  defp resolve_secret(_setting), do: {:error, configuration_error()}
+
   defp secret_context(setting_id),
     do: "oauth_provider_setting:#{setting_id}:client_secret"
 
   defp normalize_attrs(attrs) when is_map(attrs) do
     client_id = fetch_attr(attrs, "client_id", :client_id)
     client_secret = fetch_attr(attrs, "client_secret", :client_secret)
+    auth_flow = fetch_attr(attrs, "auth_flow", :auth_flow)
 
     %{}
     |> maybe_put("client_id", normalize_client_id(client_id))
     |> maybe_put("client_secret", client_secret)
+    |> maybe_put("auth_flow", auth_flow)
   end
 
   defp normalize_attrs(_attrs), do: %{}

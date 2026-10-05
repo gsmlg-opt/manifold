@@ -3,6 +3,7 @@ defmodule ManifoldWeb.ConnectorOAuthController do
 
   alias Manifold.Connectors
   alias Manifold.Connectors.OAuth
+  alias Manifold.Connectors.ProviderConfig
 
   @providers ~w(gmail microsoft)
 
@@ -11,7 +12,10 @@ defmodule ManifoldWeb.ConnectorOAuthController do
 
     with true <- is_binary(account_id) and account_id != "",
          {:ok, purpose} <- purpose(params) do
-      case OAuth.start(provider, account_id, callback_url(provider), purpose: purpose) do
+      case start_authorization(provider, account_id, purpose) do
+        {:device, path} ->
+          redirect(conn, to: path)
+
         {:ok, authorization} ->
           redirect(conn, external: authorization.url)
 
@@ -89,6 +93,23 @@ defmodule ManifoldWeb.ConnectorOAuthController do
 
   defp error_path(nil), do: ~p"/settings/accounts"
   defp error_path(account_id), do: ~p"/settings/accounts/#{account_id}"
+
+  defp start_authorization("microsoft", account_id, purpose) do
+    case ProviderConfig.fetch("microsoft") do
+      {:ok, resolved} ->
+        if Keyword.get(resolved.config, :auth_flow) == "device_code" do
+          {:device, ~p"/settings/accounts/#{account_id}/microsoft/device?#{[purpose: purpose]}"}
+        else
+          OAuth.start("microsoft", account_id, callback_url("microsoft"), purpose: purpose)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp start_authorization(provider, account_id, purpose),
+    do: OAuth.start(provider, account_id, callback_url(provider), purpose: purpose)
 
   defp callback_url(provider), do: url(~p"/connectors/#{provider}/callback")
 

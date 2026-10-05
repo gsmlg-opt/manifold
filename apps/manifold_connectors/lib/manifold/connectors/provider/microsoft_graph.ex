@@ -241,10 +241,129 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
     end
   end
 
+  @doc "Requests a Microsoft public-client device authorization."
+  def request_device_code(config, opts) do
+    with {:ok, url} <- fetch_config(config, :device_authorization_url),
+         {:ok, client_id} <- fetch_config(config, :client_id) do
+      scopes = requested_scopes(config, opts)
+
+      case request(:post, url, config,
+             form: [client_id: client_id, scope: Enum.join(scopes, " ")]
+           ) do
+        {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
+          normalize_device_authorization(body)
+
+        {:ok, %Req.Response{} = response} ->
+          {:error, classify_response(response)}
+
+        {:error, reason} ->
+          {:error, transport_error(reason)}
+      end
+    end
+  end
+
+  @doc "Polls an existing Microsoft device authorization without replaying failed requests."
+  def poll_device_code(device_code, config, opts) do
+    with {:ok, url} <- fetch_config(config, :token_url),
+         {:ok, client_id} <- fetch_config(config, :client_id) do
+      response =
+        request(:post, url, config,
+          form: [
+            client_id: client_id,
+            device_code: device_code,
+            grant_type: "urn:ietf:params:oauth:grant-type:device_code"
+          ]
+        )
+
+      case response do
+        {:ok, %Req.Response{status: 400, body: %{"error" => error}}}
+        when error in ["authorization_pending", "slow_down"] ->
+          {:pending, if(error == "slow_down", do: :slow_down, else: :authorization_pending)}
+
+        {:ok, %Req.Response{status: status, body: %{"error" => error}}}
+        when status in 400..499 and
+               error in [
+                 "authorization_declined",
+                 "access_denied",
+                 "expired_token",
+                 "bad_verification_code"
+               ] ->
+          {:error,
+           %Error{
+             class: :permanent,
+             code: :device_authorization_failed,
+             message: "Microsoft device authorization was denied or expired"
+           }}
+
+        result ->
+          normalize_token_response(
+            result,
+            Keyword.get(opts, :now, DateTime.utc_now()),
+            requested_scopes(config, opts)
+          )
+      end
+    end
+  end
+
+  defp normalize_device_authorization(
+         %{
+           "device_code" => device_code,
+           "user_code" => user_code,
+           "verification_uri" => uri,
+           "expires_in" => expires_in
+         } = body
+       )
+       when is_binary(device_code) and byte_size(device_code) in 1..8192 and
+              is_binary(user_code) and byte_size(user_code) in 1..128 and
+              is_binary(uri) and is_integer(expires_in) and expires_in in 1..1800 do
+    interval = Map.get(body, "interval", 5)
+    parsed = URI.parse(uri)
+
+    valid_uri? =
+      parsed.scheme == "https" and parsed.port == 443 and is_nil(parsed.userinfo) and
+        is_nil(parsed.query) and is_nil(parsed.fragment) and
+        ((parsed.host in ["microsoft.com", "www.microsoft.com"] and parsed.path == "/devicelogin") or
+           (parsed.host == "login.microsoftonline.com" and
+              parsed.path in ["/common/oauth2/deviceauth", "/organizations/oauth2/deviceauth"]))
+
+    if valid_uri? and is_integer(interval) and interval in 1..60 do
+      {:ok,
+       %{
+         device_code: device_code,
+         user_code: user_code,
+         verification_uri: uri,
+         expires_in: expires_in,
+         interval: interval
+       }}
+    else
+      {:error, invalid_response("Microsoft device authorization response is invalid")}
+    end
+  end
+
+  defp normalize_device_authorization(_),
+    do: {:error, invalid_response("Microsoft device authorization response is invalid")}
+
+  defp requested_scopes(config, opts) do
+    case Keyword.fetch(opts, :required_scopes) do
+      {:ok, scopes} -> scopes |> Enum.uniq() |> Enum.sort()
+      :error -> config |> Keyword.get(:scopes, @default_scopes) |> String.split() |> Enum.sort()
+    end
+  end
+
+  defp client_credentials(config) do
+    with {:ok, client_id} <- fetch_config(config, :client_id) do
+      if Keyword.get(config, :auth_flow) == "device_code" do
+        {:ok, [client_id: client_id]}
+      else
+        with {:ok, client_secret} <- fetch_config(config, :client_secret),
+             do: {:ok, [client_id: client_id, client_secret: client_secret]}
+      end
+    end
+  end
+
   defp token_request(grant, config, opts) do
     with {:ok, token_url} <- fetch_config(config, :token_url),
-         {:ok, client_id} <- fetch_config(config, :client_id),
-         {:ok, client_secret} <- fetch_config(config, :client_secret) do
+         {:ok, credentials} <- client_credentials(config) do
       requested_scopes =
         case Keyword.fetch(opts, :required_scopes) do
           {:ok, scopes} -> scopes |> Enum.uniq() |> Enum.sort()
@@ -252,11 +371,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
         end
 
       form =
-        [
-          client_id: client_id,
-          client_secret: client_secret,
-          scope: Enum.join(requested_scopes, " ")
-        ] ++ grant
+        credentials ++ [scope: Enum.join(requested_scopes, " ")] ++ grant
 
       request(:post, token_url, config, form: form)
       |> normalize_token_response(

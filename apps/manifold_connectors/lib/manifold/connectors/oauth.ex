@@ -74,6 +74,7 @@ defmodule Manifold.Connectors.OAuth do
     ttl_seconds = Keyword.get(opts, :ttl_seconds, @default_ttl_seconds)
 
     with {:ok, %ProviderConfig.Resolved{} = resolved} <- ProviderConfig.fetch(provider),
+         :ok <- browser_flow(resolved.config),
          {:ok, purpose} <- normalize_purpose(Keyword.get(opts, :purpose, :receive)),
          {:ok, purpose_scopes} <- required_scopes(provider, purpose),
          :ok <- validate_redirect_uri(redirect_uri),
@@ -127,6 +128,19 @@ defmodule Manifold.Connectors.OAuth do
   rescue
     DBConnection.ConnectionError ->
       {:error, Error.new(:temporary, :database_unavailable, "OAuth database is unavailable")}
+  end
+
+  defp browser_flow(config) do
+    if Keyword.get(config, :auth_flow) == "device_code" do
+      {:error,
+       Error.new(
+         :permanent,
+         :device_authorization_required,
+         "Use Microsoft device-code login for this configuration"
+       )}
+    else
+      :ok
+    end
   end
 
   defp emit_start_stop(provider, mailbox_id, result, start) do

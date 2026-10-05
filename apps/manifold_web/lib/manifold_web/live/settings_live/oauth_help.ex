@@ -2,16 +2,20 @@ defmodule ManifoldWeb.SettingsLive.OAuthHelp do
   use ManifoldWeb, :live_view
 
   alias Manifold.Connectors.OAuthProviderCatalog
+  alias Manifold.Connectors
 
   @impl Phoenix.LiveView
   def mount(%{"provider" => provider}, _session, socket) do
     case OAuthProviderCatalog.fetch(provider) do
       {:ok, definition} ->
+        flow = help_flow(definition)
+
         {:ok,
          assign(socket,
            page_title: definition.help.title,
            definition: definition,
-           help: definition.help,
+           help: if(flow == "device_code", do: definition.device_help, else: definition.help),
+           auth_flow: flow,
            callback_uri:
              ManifoldWeb.Endpoint.url()
              |> URI.merge(definition.callback_path)
@@ -61,7 +65,17 @@ defmodule ManifoldWeb.SettingsLive.OAuthHelp do
           </ol>
         </section>
 
-        <section aria-labelledby={"oauth-provider-#{@definition.key}-help-callback-title"}>
+        <section :if={@auth_flow == "device_code"}>
+          <h2>Device-code login</h2>
+          <p>No callback URL or client secret is needed. Your browser can be on another device.</p>
+          <p>
+            Manifold displays a user code and waits for you to approve access on Microsoft's website.
+          </p>
+        </section>
+        <section
+          :if={@auth_flow != "device_code"}
+          aria-labelledby={"oauth-provider-#{@definition.key}-help-callback-title"}
+        >
           <h2 id={"oauth-provider-#{@definition.key}-help-callback-title"}>Callback URI</h2>
           <p class="settings-secondary">
             Register this exact callback URI in the OAuth client.
@@ -75,6 +89,18 @@ defmodule ManifoldWeb.SettingsLive.OAuthHelp do
             helper="Copy this exact URI into the provider's OAuth application settings."
           />
         </section>
+
+        <section :if={@definition.key == "gmail"}>
+          <h2>Without a fixed public hostname</h2>
+          <p>Google's device-code flow does not support Gmail read or send permissions.</p>
+          <p>Use the registered localhost callback when your browser and Manifold run on the same
+            machine. A browser on another device needs a reachable, exactly registered callback.
+            Google Desktop-client loopback login is a different flow and is not implemented here.</p>
+        </section>
+        <p :if={@definition.key == "microsoft" && @auth_flow != "device_code"}>
+          If you have no fixed callback URL, switch Login method to Device code in Settings OAuth.
+          Existing accounts will need to reconnect.
+        </p>
 
         <section aria-labelledby={"oauth-provider-#{@definition.key}-help-scopes-title"}>
           <h2 id={"oauth-provider-#{@definition.key}-help-scopes-title"}>Required scopes</h2>
@@ -116,4 +142,14 @@ defmodule ManifoldWeb.SettingsLive.OAuthHelp do
     </section>
     """
   end
+
+  defp help_flow(%{key: "microsoft"}) do
+    case Connectors.get_oauth_provider_setting("microsoft") do
+      {:ok, %{status: :not_configured}} -> "device_code"
+      {:ok, %{auth_flow: flow}} -> flow
+      _ -> "authorization_code"
+    end
+  end
+
+  defp help_flow(_definition), do: "authorization_code"
 end
