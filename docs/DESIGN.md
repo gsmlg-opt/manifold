@@ -1869,6 +1869,23 @@ connectors extend interoperability; they do not define the core user
 experience. Read-only IMAP and EAS receive are implemented after the original
 Milestone 6 scope; JMAP remains a future extension point.
 
+### Explicit outbound TLS backend
+
+`Manifold.Connectors.TLS` owns backend selection for outbound IMAP, authenticated
+SMTP submission and EAS. OTP is the default; account-scoped operator configuration
+or an explicit connection setting can select ex_ssl. The opaque handle records
+the backend so all later operations dispatch consistently. Selection never
+triggers fallback or replay after a failure. STARTTLS requires a completely
+consumed positive response and rejects unexpected buffered plaintext.
+
+EAS uses a supported Req adapter for ex_ssl and a bounded HTTP/1.1 exchange on a
+fresh connection per request. HTTP framing and EAS behavior stay in Manifold;
+the TLS library contains neither. The adapter disables redirects and retries,
+preserves verified peer identity, and distinguishes authenticated TLS closure
+from abrupt transport loss. Unrelated HTTP consumers and inbound/server/database
+TLS keep their existing transports. See [TLS_BACKENDS.md](TLS_BACKENDS.md) for the
+acceptance contract, supported options and independently validated scope.
+
 ---
 
 ## 25. Release 0.1 Acceptance Criteria

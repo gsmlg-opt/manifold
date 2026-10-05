@@ -57,9 +57,11 @@ defmodule Manifold.Outbound.Provider.SMTPTest do
 
     assert provider_message_id == stable_provider_id(@message_id)
     refute inspect(submission) =~ "private-server-extra-response"
+    account_id = method.account_id
 
     assert_receive {:smtp_fake_connect,
                     %{
+                      account_id: ^account_id,
                       host: "smtp.example.net",
                       port: 587,
                       tls_mode: "starttls",

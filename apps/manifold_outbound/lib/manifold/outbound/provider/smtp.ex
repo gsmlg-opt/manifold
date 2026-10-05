@@ -61,13 +61,14 @@ defmodule Manifold.Outbound.Provider.SMTP do
   end
 
   defp connection_settings(%SubmissionMethod{
+         account_id: account_id,
          credential: {:password, password},
          config: config
        }) do
     required = [:host, :port, :tls_mode, :username]
 
     if Enum.all?(required, &Map.has_key?(config, &1)) do
-      {:ok, Map.put(config, :password, password)}
+      {:ok, config |> Map.put(:password, password) |> Map.put(:account_id, account_id)}
     else
       {:error, provider_error(:permanent, "provider_not_configured")}
     end

@@ -4,6 +4,7 @@ defmodule Manifold.Connectors.IMAP.Client do
   @behaviour Manifold.Connectors.IMAP.Transport
 
   alias Manifold.Connectors.Provider.Error
+  alias Manifold.Connectors.TLS
 
   defstruct [:socket, :tag_seq, :buffer]
 
@@ -24,7 +25,8 @@ defmodule Manifold.Connectors.IMAP.Client do
 
     with {:ok, host} <- require_host(host),
          {:ok, port} <- require_port(port),
-         {:ok, conn} <- open_and_greet_safe(host, port, tls_mode) do
+         {:ok, tls_config} <- TLS.config(settings),
+         {:ok, conn} <- open_and_greet_safe(host, port, tls_mode, tls_config) do
       emit_imap([:manifold, :connectors, :imap, :connect, :stop], connect_start, base_meta, :ok)
       Process.put({__MODULE__, :activity_meta}, base_meta)
 
@@ -38,6 +40,7 @@ defmodule Manifold.Connectors.IMAP.Client do
           {:ok, conn}
 
         {:error, %Error{} = error} ->
+          close_socket(conn.socket)
           emit_imap([:manifold, :connectors, :imap, :auth, :stop], auth_start, auth_meta, error)
           {:error, error}
       end
@@ -371,8 +374,18 @@ defmodule Manifold.Connectors.IMAP.Client do
 
   # --- Socket / protocol ---
 
+  # Exposed for unit tests covering ArgumentError → {:error, _} conversion.
+  @doc false
+  def open_and_greet_for_test(host, port, tls_mode), do: open_and_greet_safe(host, port, tls_mode)
+
   defp open_and_greet_safe(host, port, tls_mode) do
-    open_and_greet(host, port, tls_mode)
+    with {:ok, config} <- TLS.config(%{}) do
+      open_and_greet_safe(host, port, tls_mode, config)
+    end
+  end
+
+  defp open_and_greet_safe(host, port, tls_mode, tls_config) do
+    open_and_greet(host, port, tls_mode, tls_config)
   rescue
     e in [ArgumentError, ErlangError, FunctionClauseError] ->
       {:error, connect_failed_error(e)}
@@ -390,35 +403,59 @@ defmodule Manifold.Connectors.IMAP.Client do
       {:error, connect_failed_error(reason)}
   end
 
-  # Exposed for unit tests covering ArgumentError → {:error, _} conversion.
-  @doc false
-  def open_and_greet_for_test(host, port, tls_mode), do: open_and_greet_safe(host, port, tls_mode)
-
-  defp open_and_greet(host, port, tls_mode)
+  defp open_and_greet(host, port, tls_mode, tls_config)
        when tls_mode in ["ssl", "tls"] and is_binary(host) and is_integer(port) do
     host_charlist = String.to_charlist(host)
 
     with {:ok, socket} <-
-           :ssl.connect(host_charlist, port, ssl_opts(host_charlist), @connect_timeout) do
-      read_greeting(%__MODULE__{socket: socket, tag_seq: 0, buffer: ""})
+           TLS.connect(host_charlist, port, ssl_opts(host_charlist), @connect_timeout, tls_config) do
+      case read_greeting(%__MODULE__{socket: socket, tag_seq: 0, buffer: ""}) do
+        {:ok, conn} ->
+          {:ok, conn}
+
+        {:error, reason} ->
+          _ = TLS.close(socket)
+          {:error, reason}
+      end
     end
   end
 
-  defp open_and_greet(host, port, "starttls") when is_binary(host) and is_integer(port) do
+  defp open_and_greet(host, port, "starttls", tls_config)
+       when is_binary(host) and is_integer(port) do
     host_charlist = String.to_charlist(host)
 
-    with {:ok, tcp} <- :gen_tcp.connect(host_charlist, port, tcp_opts(), @connect_timeout),
-         conn <- %__MODULE__{socket: {:tcp, tcp}, tag_seq: 0, buffer: ""},
-         {:ok, conn} <- read_greeting(conn),
-         {:ok, conn, _lines} <- command(conn, "STARTTLS"),
-         {:tcp, tcp} <- conn.socket,
-         {:ok, ssl} <- :ssl.connect(tcp, ssl_opts(host_charlist), @connect_timeout) do
-      {:ok, %{conn | socket: ssl, buffer: ""}}
+    with {:ok, tcp} <- :gen_tcp.connect(host_charlist, port, tcp_opts(), @connect_timeout) do
+      starttls_connection(
+        %__MODULE__{socket: {:tcp, tcp}, tag_seq: 0, buffer: ""},
+        host_charlist,
+        tls_config
+      )
     end
   end
 
-  defp open_and_greet(_host, _port, tls_mode) do
+  defp open_and_greet(_host, _port, tls_mode, _tls_config) do
     {:error, {:unsupported_tls_mode, tls_mode}}
+  end
+
+  defp ensure_upgrade_boundary(%__MODULE__{socket: {:tcp, _tcp}, buffer: ""}), do: :ok
+
+  defp ensure_upgrade_boundary(%__MODULE__{socket: {:tcp, tcp}}) do
+    :ok = :gen_tcp.close(tcp)
+    {:error, :unexpected_plaintext_before_tls_upgrade}
+  end
+
+  defp starttls_connection(conn, host_charlist, tls_config) do
+    with {:ok, conn} <- read_greeting(conn),
+         {:ok, conn, _lines} <- command(conn, "STARTTLS"),
+         :ok <- ensure_upgrade_boundary(conn),
+         {:tcp, tcp} <- conn.socket,
+         {:ok, ssl} <- TLS.upgrade(tcp, ssl_opts(host_charlist), @connect_timeout, tls_config) do
+      {:ok, %{conn | socket: ssl}}
+    else
+      {:error, reason} ->
+        close_socket(conn.socket)
+        {:error, reason}
+    end
   end
 
   defp normalize_host(host) when is_binary(host), do: String.trim(host)
@@ -517,14 +554,14 @@ defmodule Manifold.Connectors.IMAP.Client do
     case recv_line(conn) do
       {:ok, conn, line} ->
         cond do
-          String.starts_with?(line, tag <> " OK") ->
+          tagged_status?(line, tag, "OK") ->
             result_lines = Enum.reverse(acc)
             if auth?, do: {:ok, conn}, else: {:ok, conn, result_lines}
 
-          String.starts_with?(line, tag <> " NO") ->
+          tagged_status?(line, tag, "NO") ->
             {:error, classify_no(line, auth?)}
 
-          String.starts_with?(line, tag <> " BAD") ->
+          tagged_status?(line, tag, "BAD") ->
             {:error, %Error{class: :permanent, code: :bad_command, message: "IMAP BAD: #{line}"}}
 
           true ->
@@ -567,6 +604,11 @@ defmodule Manifold.Connectors.IMAP.Client do
     end
   end
 
+  defp tagged_status?(line, tag, status) do
+    prefix = tag <> " " <> status
+    line == prefix or String.starts_with?(line, prefix <> " ")
+  end
+
   defp classify_no(_line, true) do
     %Error{class: :reconnect, code: :auth_failed, message: "IMAP authentication failed"}
   end
@@ -606,10 +648,18 @@ defmodule Manifold.Connectors.IMAP.Client do
   end
 
   defp send_data({:tcp, socket}, data), do: :gen_tcp.send(socket, data)
+  defp send_data(%TLS.Socket{} = socket, data), do: TLS.send(socket, data)
   defp send_data(socket, data), do: :ssl.send(socket, data)
 
   defp recv_data({:tcp, socket}) do
     case :gen_tcp.recv(socket, 0, @recv_timeout) do
+      {:ok, data} -> {:ok, data}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp recv_data(%TLS.Socket{} = socket) do
+    case TLS.recv(socket, 0, @recv_timeout) do
       {:ok, data} -> {:ok, data}
       {:error, reason} -> {:error, reason}
     end
@@ -623,6 +673,7 @@ defmodule Manifold.Connectors.IMAP.Client do
   end
 
   defp close_socket({:tcp, socket}), do: :gen_tcp.close(socket)
+  defp close_socket(%TLS.Socket{} = socket), do: TLS.close(socket)
   defp close_socket(socket), do: :ssl.close(socket)
 
   defp quote_string(value) when is_binary(value) do

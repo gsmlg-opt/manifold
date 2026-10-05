@@ -4,12 +4,15 @@ defmodule Manifold.Connectors.EAS.Client do
   @behaviour Manifold.Connectors.EAS.Transport
 
   alias Manifold.Connectors.EAS.WBXML
+  alias Manifold.Connectors.EAS.HTTPAdapter
   alias Manifold.Connectors.Provider.Error
+  alias Manifold.Connectors.TLS
 
   defstruct [
     :settings,
     :policy_key,
     :req_options,
+    :tls_config,
     # Sticky MS-ASHTTP query encoding after the first success on this connection.
     :query_mode,
     cookies: []
@@ -38,11 +41,13 @@ defmodule Manifold.Connectors.EAS.Client do
     base_meta = base_meta(settings)
     Process.put({__MODULE__, :emit_activity}, Map.get(settings, :emit_activity, true))
 
-    with :ok <- validate_settings(settings) do
+    with :ok <- validate_settings(settings),
+         {:ok, tls_config} <- tls_config(settings) do
       conn = %__MODULE__{
         settings: settings,
         policy_key: Map.get(settings, :policy_key) || "0",
         req_options: Map.get(settings, :req_options, []),
+        tls_config: tls_config,
         query_mode: Map.get(settings, :force_query_mode),
         cookies: []
       }
@@ -79,7 +84,7 @@ defmodule Manifold.Connectors.EAS.Client do
     start = System.monotonic_time()
     body = WBXML.encode(provision_request_doc(conn))
 
-    case request(conn, "Provision", body) do
+    case request(conn, "Provision", body, :state_changing) do
       {:ok, conn, root} ->
         outer_status = WBXML.text(WBXML.child(root, "Status")) || "1"
 
@@ -105,7 +110,7 @@ defmodule Manifold.Connectors.EAS.Client do
               conn = %{conn | policy_key: to_string(policy_key)}
               ack = WBXML.encode(provision_ack_doc(policy_key))
 
-              case request(conn, "Provision", ack) do
+              case request(conn, "Provision", ack, :state_changing) do
                 {:ok, conn, ack_root} ->
                   final_key =
                     WBXML.text(WBXML.find(ack_root, "PolicyKey")) || to_string(policy_key)
@@ -316,7 +321,7 @@ defmodule Manifold.Connectors.EAS.Client do
          ]}
       )
 
-    case request(conn, "Sync", body) do
+    case request(conn, "Sync", body, :state_changing) do
       {:ok, conn, root} ->
         status = WBXML.text(WBXML.find(root, "Status")) || "1"
 
@@ -416,9 +421,8 @@ defmodule Manifold.Connectors.EAS.Client do
     end)
   end
 
-  # OPTIONS is best-effort: many on-prem servers answer poorly. Auth is validated
-  # by subsequent Provision / FolderSync. When present, MS-ASProtocolVersions is
-  # used to pick a mutually supported protocol version.
+  # A successful OPTIONS authenticates the configured credentials. When present,
+  # MS-ASProtocolVersions is used to pick a mutually supported protocol version.
   defp options_request(conn) do
     preferred = preferred_protocol_version(conn.settings)
     conn = %{conn | settings: Map.put(conn.settings, :protocol_version, preferred)}
@@ -440,11 +444,11 @@ defmodule Manifold.Connectors.EAS.Client do
            body: "",
            user_agent: @user_agent
          ) do
-      {:ok, %{status: 401}} ->
+      {:ok, %{status: status}} when status in [401, 403] ->
         {:error,
          %Error{class: :reconnect, code: :auth_failed, message: "EAS authentication failed"}}
 
-      {:ok, %{headers: headers} = response} ->
+      {:ok, %{status: status, headers: headers} = response} when status in 200..299 ->
         version = pick_protocol_version(headers, preferred)
 
         conn =
@@ -454,6 +458,9 @@ defmodule Manifold.Connectors.EAS.Client do
 
         {:ok, conn}
 
+      {:ok, %{status: status, body: body}} ->
+        {:error, http_error(conn, "OPTIONS", status, body)}
+
       {:error, %Error{} = error} ->
         # http_request/2 wraps all transport failures as Error; surface them so
         # DNS / TLS / connect problems are not treated as "OPTIONS optional".
@@ -462,6 +469,11 @@ defmodule Manifold.Connectors.EAS.Client do
   end
 
   defp request(conn, cmd, body) when is_binary(cmd) and is_binary(body) do
+    request(conn, cmd, body, :read_only)
+  end
+
+  defp request(conn, cmd, body, request_kind)
+       when is_binary(cmd) and is_binary(body) and request_kind in [:read_only, :state_changing] do
     versions = protocol_fallback_versions(conn.settings.protocol_version)
 
     modes =
@@ -470,11 +482,12 @@ defmodule Manifold.Connectors.EAS.Client do
         _ -> query_mode_order(conn.settings)
       end
 
-    request(conn, cmd, body, versions, modes)
+    request(conn, cmd, body, versions, modes, request_kind)
   end
 
-  defp request(conn, cmd, body, versions, [query_mode | rest_modes] = modes)
-       when is_list(versions) and query_mode in [:plain, :base64] do
+  defp request(conn, cmd, body, versions, [query_mode | rest_modes] = modes, request_kind)
+       when is_list(versions) and query_mode in [:plain, :base64] and
+              request_kind in [:read_only, :state_changing] do
     [version | remaining] = versions
     conn = %{conn | settings: Map.put(conn.settings, :protocol_version, version)}
     url = command_url(conn.settings, cmd, query_mode, conn.policy_key)
@@ -517,31 +530,49 @@ defmodule Manifold.Connectors.EAS.Client do
           |> store_cookies(response)
           |> then(fn c -> %{c | query_mode: query_mode} end)
 
-        if is_binary(resp_body) and byte_size(resp_body) > 0 do
-          case WBXML.decode(resp_body) do
-            {:ok, root} ->
-              {:ok, conn, root}
+        cond do
+          is_binary(resp_body) and byte_size(resp_body) > 0 ->
+            case WBXML.decode(resp_body) do
+              {:ok, root} ->
+                {:ok, conn, root}
 
-            {:error, _} ->
-              {:error, invalid_wbxml_error(cmd, resp_body)}
-          end
-        else
-          # Empty success body (rare).
-          {:ok, conn, {0, "Sync", []}}
+              {:error, _} ->
+                {:error, invalid_wbxml_error(conn, cmd, resp_body)}
+            end
+
+          resp_body == <<>> ->
+            # Empty success body (rare).
+            {:ok, conn, {0, "Sync", []}}
+
+          match?(%TLS.Config{backend: :ex_ssl}, conn.tls_config) ->
+            {:error, invalid_response_type_error(cmd)}
+
+          true ->
+            {:ok, conn, {0, "Sync", []}}
         end
 
       {:ok, %{status: 400, body: resp_body}} ->
         cond do
+          not protocol_fallback_allowed?(conn, request_kind) ->
+            {:error, http_error(conn, cmd, 400, resp_body)}
+
           remaining != [] and not gateway_html_400?(resp_body) ->
             # Unsupported protocol versions commonly surface as HTTP 400 (non-HTML).
-            request(conn, cmd, body, remaining, modes)
+            request(conn, cmd, body, remaining, modes, request_kind)
 
           gateway_html_400?(resp_body) and rest_modes != [] ->
             # QQ / nginx gateways often require the other MS-ASHTTP query encoding.
-            request(conn, cmd, body, protocol_fallback_versions(version), rest_modes)
+            request(
+              conn,
+              cmd,
+              body,
+              protocol_fallback_versions(version),
+              rest_modes,
+              request_kind
+            )
 
           remaining != [] ->
-            request(conn, cmd, body, remaining, modes)
+            request(conn, cmd, body, remaining, modes, request_kind)
 
           rest_modes != [] ->
             request(
@@ -549,27 +580,36 @@ defmodule Manifold.Connectors.EAS.Client do
               cmd,
               body,
               protocol_fallback_versions(conn.settings.protocol_version),
-              rest_modes
+              rest_modes,
+              request_kind
             )
 
           true ->
-            {:error, http_error(cmd, 400, resp_body, conn.settings.host)}
+            {:error, http_error(conn, cmd, 400, resp_body)}
         end
 
       {:ok, %{status: status, body: resp_body}} ->
-        {:error, http_error(cmd, status, resp_body, conn.settings.host)}
+        {:error, http_error(conn, cmd, status, resp_body)}
 
       {:error, %Error{} = error} ->
         {:error, error}
     end
   end
 
+  defp protocol_fallback_allowed?(
+         %{tls_config: %TLS.Config{backend: :ex_ssl}},
+         :state_changing
+       ),
+       do: false
+
+  defp protocol_fallback_allowed?(_conn, _request_kind), do: true
+
   defp http_request(conn, opts) do
     options =
       [
         receive_timeout: @receive_timeout,
         connect_options: [timeout: @connect_timeout, protocols: [:http1]],
-        decode_body: true,
+        decode_body: decode_body_default(conn.tls_config),
         compressed: false,
         # Use Req's user_agent option so we do not end up with "Apple…, req/x.y".
         user_agent: @user_agent
@@ -577,7 +617,26 @@ defmodule Manifold.Connectors.EAS.Client do
       |> Keyword.merge(conn.req_options || [])
       |> Keyword.merge(opts)
 
-    case Req.request(options) do
+    result =
+      case conn.tls_config do
+        %TLS.Config{backend: :ex_ssl} = tls_config ->
+          with :ok <- HTTPAdapter.validate_options(options, tls_config) do
+            options
+            |> Keyword.put(:adapter, HTTPAdapter)
+            |> Keyword.put(:retry, false)
+            |> Keyword.put(:redirect, false)
+            |> Req.new()
+            |> HTTPAdapter.put_tls_config(tls_config)
+            |> Req.request()
+          else
+            {:error, reason} -> {:error, reason}
+          end
+
+        _ ->
+          Req.request(options)
+      end
+
+    case result do
       {:ok, %Req.Response{} = response} ->
         {:ok, %{status: response.status, body: response.body, headers: response.headers}}
 
@@ -586,7 +645,13 @@ defmodule Manifold.Connectors.EAS.Client do
     end
   rescue
     e in [ArgumentError, ErlangError, RuntimeError] ->
-      {:error, connect_failed_error(e)}
+      reason =
+        case conn.tls_config do
+          %TLS.Config{backend: :ex_ssl} -> :invalid_ex_ssl_http_request
+          _ -> e
+        end
+
+      {:error, connect_failed_error(reason)}
   end
 
   @doc false
@@ -605,6 +670,9 @@ defmodule Manifold.Connectors.EAS.Client do
         message
     end
   end
+
+  defp decode_body_default(%TLS.Config{backend: :ex_ssl}), do: false
+  defp decode_body_default(_tls_config), do: true
 
   defp connect_failed_error(reason) do
     %Error{
@@ -680,7 +748,15 @@ defmodule Manifold.Connectors.EAS.Client do
     end
   end
 
-  defp invalid_wbxml_error(cmd, body) when is_binary(body) do
+  defp invalid_wbxml_error(%{tls_config: %TLS.Config{backend: :ex_ssl}}, cmd, _body) do
+    %Error{
+      class: :temporary,
+      code: :invalid_response,
+      message: "EAS #{cmd} returned invalid WBXML"
+    }
+  end
+
+  defp invalid_wbxml_error(_conn, cmd, body) when is_binary(body) do
     trimmed = String.trim_leading(body)
     snippet = body_snippet(body)
 
@@ -697,6 +773,26 @@ defmodule Manifold.Connectors.EAS.Client do
       end
 
     %Error{class: :temporary, code: :invalid_response, message: message}
+  end
+
+  defp invalid_response_type_error(cmd) do
+    %Error{
+      class: :temporary,
+      code: :invalid_response,
+      message: "EAS #{cmd} returned a non-binary response body"
+    }
+  end
+
+  defp http_error(%{tls_config: %TLS.Config{backend: :ex_ssl}}, cmd, status, _body) do
+    %Error{
+      class: :temporary,
+      code: :http_error,
+      message: "EAS #{cmd} failed with HTTP #{status}"
+    }
+  end
+
+  defp http_error(%__MODULE__{} = conn, cmd, status, body) do
+    http_error(cmd, status, body, conn.settings.host)
   end
 
   defp http_error(cmd, status, body, host) do
@@ -920,7 +1016,7 @@ defmodule Manifold.Connectors.EAS.Client do
              ]}
           )
 
-        case request(conn, "Settings", body) do
+        case request(conn, "Settings", body, :state_changing) do
           {:ok, conn, _root} -> {:ok, conn}
           {:error, %Error{} = error} -> {:error, error}
         end
@@ -1174,6 +1270,21 @@ defmodule Manifold.Connectors.EAS.Client do
        }}
     else
       :ok
+    end
+  end
+
+  defp tls_config(settings) do
+    case TLS.config(settings) do
+      {:ok, config} ->
+        {:ok, config}
+
+      {:error, _reason} ->
+        {:error,
+         %Error{
+           class: :permanent,
+           code: :invalid_eas_settings,
+           message: "EAS TLS backend configuration is invalid"
+         }}
     end
   end
 

@@ -78,6 +78,11 @@ authorized send uses direct MIME Graph `sendMail`.
 
 ## External Mailbox Connectors
 
+An experimental ex_ssl TLS 1.3 backend can be selected explicitly for controlled
+IMAP, SMTP submission and EAS connections. OTP remains the default. See
+[TLS backend scope, configuration and validation](docs/TLS_BACKENDS.md) before
+enabling an account; backend selection never falls back after a security failure.
+
 Milestone 6 imports provider-hosted mail into an existing local Manifold
 mailbox. It does not make Gmail or Microsoft 365 the metadata source of truth
 for Manifold and does not bypass the durable local acceptance pipeline.
