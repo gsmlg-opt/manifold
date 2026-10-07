@@ -11,9 +11,6 @@ window.addEventListener("phx:focus-oauth-provider", ({ detail: { provider } }) =
   document.getElementById(`oauth-provider-${provider}-client-id`)?.focus();
 });
 
-// Prefer localStorage over an empty/default server theme so LiveView remounts
-// do not clobber an explicit sunshine/moonlight choice with OS auto.
-const UpstreamThemeSwitcher = DuskmoonHooks.ThemeSwitcher;
 const THEME_STORAGE_KEY = "theme";
 
 function resolveAutoTheme() {
@@ -33,6 +30,11 @@ function readStoredTheme() {
   }
 }
 
+// Keep auto mode responsive to the OS even outside Appearance settings.
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if ((readStoredTheme() || "default") === "default") applyTheme("default");
+});
+
 function writeStoredTheme(theme) {
   try {
     localStorage.setItem(THEME_STORAGE_KEY, theme);
@@ -41,52 +43,32 @@ function writeStoredTheme(theme) {
   }
 }
 
-function resolvePreferredTheme(serverTheme) {
-  const stored = readStoredTheme();
-  // Only honor an explicit non-default server theme; otherwise keep local choice.
-  if (serverTheme && serverTheme !== "default") return serverTheme;
-  return stored || serverTheme || "default";
-}
-
-const ThemeSwitcher = {
-  ...UpstreamThemeSwitcher,
+const ThemePreference = {
   mounted() {
-    const theme = resolvePreferredTheme(this.el.dataset.theme || "");
+    const theme = readStoredTheme() || "default";
     applyTheme(theme);
-    this.syncRadios(theme);
+    this.syncButtons(theme);
 
-    this._mediaListener = () => {
-      const current = readStoredTheme() || "default";
-      if (current === "default") applyTheme("default");
+    this._clickListener = (event) => {
+      const button = event.target.closest("button.segment-item");
+      if (!button || !this.el.contains(button) || button.disabled) return;
+
+      const next = button.value;
+      writeStoredTheme(next);
+      applyTheme(next);
+      this.syncButtons(next);
+      this.pushEvent("theme_changed", { theme: next });
     };
-    window
-      .matchMedia("(prefers-color-scheme: dark)")
-      .addEventListener("change", this._mediaListener);
-
-    this._changeListeners = [];
-    this.el.querySelectorAll(".theme-controller-item").forEach((input) => {
-      const listener = (event) => {
-        const next = event.target.value;
-        requestAnimationFrame(() => {
-          applyTheme(next);
-          writeStoredTheme(next);
-          this.pushEvent("theme_changed", { theme: next });
-          this.el.removeAttribute("open");
-        });
-      };
-      input.addEventListener("change", listener);
-      this._changeListeners.push({ element: input, listener });
-    });
+    this.el.addEventListener("click", this._clickListener);
   },
-  updated() {
-    // With phx-update="ignore" this rarely runs; keep localStorage authoritative.
-    const theme = resolvePreferredTheme(this.el.dataset.theme || "");
-    applyTheme(theme);
-    this.syncRadios(theme);
+  destroyed() {
+    this.el.removeEventListener("click", this._clickListener);
   },
-  syncRadios(theme) {
-    this.el.querySelectorAll(".theme-controller-item").forEach((input) => {
-      input.checked = theme === input.value;
+  syncButtons(theme) {
+    this.el.querySelectorAll("button.segment-item").forEach((button) => {
+      const active = theme === button.value;
+      button.classList.toggle("segment-item-active", active);
+      button.setAttribute("aria-pressed", String(active));
     });
   },
 };
@@ -95,7 +77,7 @@ let csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("
 
 let liveSocket = new LiveSocket("/live", Socket, {
   params: { _csrf_token: csrfToken },
-  hooks: { ...DuskmoonHooks, ThemeSwitcher, ConversationRow },
+  hooks: { ...DuskmoonHooks, ThemePreference, ConversationRow },
 });
 
 liveSocket.connect();

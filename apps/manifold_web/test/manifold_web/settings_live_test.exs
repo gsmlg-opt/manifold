@@ -25,14 +25,31 @@ defmodule ManifoldWeb.SettingsLiveTest do
     assert html =~ ~s(data-current="general")
   end
 
-  test "appearance settings page renders placeholder with Appearance current", %{conn: conn} do
-    {:ok, _view, html} = live(conn, ~p"/settings/appearance")
+  test "appearance settings page offers persistent themes with Appearance current", %{conn: conn} do
+    {:ok, view, html} = live(conn, ~p"/settings/appearance")
 
     assert html =~ "Appearance"
-    assert html =~ "Coming soon"
+    refute html =~ "Coming soon"
     assert html =~ ~s(id="settings-nav")
     assert html =~ "/settings/oauth"
     assert html =~ ~s(data-current="appearance")
+
+    assert has_element?(
+             view,
+             "#appearance-theme-switcher.segment-control[phx-hook='ThemePreference'][phx-update='ignore'][role='group'][aria-label='Theme']"
+           )
+
+    for {theme, label} <- [{"default", "System"}, {"sunshine", "Light"}, {"moonlight", "Dark"}] do
+      assert has_element?(
+               view,
+               "#appearance-theme-switcher button[type='button'][value='#{theme}']",
+               label
+             )
+    end
+
+    refute has_element?(view, "#app-appbar .theme-controller-dropdown")
+    refute has_element?(view, "#app-appbar #appearance-theme-switcher")
+    refute has_element?(view, "#appearance-theme-switcher summary")
   end
 
   test "accounts settings page renders OAuth navigation with Accounts current", %{conn: conn} do
@@ -43,7 +60,9 @@ defmodule ManifoldWeb.SettingsLiveTest do
   end
 
   test "appbar Settings menu points at /settings", %{conn: conn} do
-    {:ok, _view, html} = live(conn, ~p"/settings/general")
+    {:ok, view, html} = live(conn, ~p"/settings/general")
     assert html =~ ~s(href="/settings")
+    refute has_element?(view, ".theme-controller-dropdown")
+    refute has_element?(view, "#appearance-theme-switcher")
   end
 end

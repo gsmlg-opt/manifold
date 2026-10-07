@@ -8,8 +8,8 @@ defmodule ManifoldWeb.CloudLiveTest do
 
     assert html =~ "Cloud Ingress"
     assert html =~ "Not configured"
-    assert html =~ ~s(id="app-theme-switcher")
-    assert html =~ "theme-controller-dropdown"
+    refute html =~ "theme-controller-dropdown"
+    refute html =~ "appearance-theme-switcher"
     assert html =~ "appbar-primary"
     refute html =~ "shared_secret"
     refute html =~ "spool_bundle_path"

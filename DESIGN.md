@@ -43,9 +43,6 @@ Both themes must stay imported. Do not remove either, and do not invent a third 
 <div class="app-shell min-h-screen bg-surface text-on-surface">
   <.dm_appbar class="appbar-primary appbar-sticky" …>
     …
-    <:user_profile>
-      <.dm_theme_switcher id="app-theme-switcher" phx-update="ignore" />
-    </:user_profile>
   </.dm_appbar>
   <main class="content">{@inner_content}</main>
 </div>
@@ -54,16 +51,17 @@ Both themes must stay imported. Do not remove either, and do not invent a third 
 | Piece | Required |
 |-------|----------|
 | Appbar | `appbar-primary` + `appbar-sticky` — background `--color-primary`, text `--color-primary-content` |
-| Theme switcher | Always in appbar right (`:user_profile`); `phx-update="ignore"` so LiveView morph does not reset it |
+| Theme switcher | System / Light / Dark segmented control in Settings / Appearance (`/settings/appearance`); `phx-update="ignore"` so LiveView morph does not reset it |
 | Page body | `bg-surface` / `text-on-surface` |
 | Assets | Build with `mix duskmoon_bundler.build manifold_web --tailwind` (via `mix assets.build`) |
 
 ### Theme persistence (non-negotiable)
 
-1. Prefer client `localStorage.theme`; do **not** pass `theme="default"` (or any server theme) into `<.dm_theme_switcher>` in a way that clobbers localStorage on mount.
-2. `ManifoldWeb.Hooks.Theme` may handle `theme_changed` but must not force a concrete theme assign into the switcher.
+1. Prefer client `localStorage.theme`; the `ThemePreference` hook initializes the segmented control from storage. System / Light / Dark map to `default` / `sunshine` / `moonlight` respectively.
+2. `ManifoldWeb.Hooks.Theme` may handle `theme_changed` but must not force a concrete theme assign into the control.
 3. Never reintroduce a moonlight-only override that paints the appbar with `surface-container-*` instead of `primary`.
-4. Avoid JS that breaks the whole `app.js` graph (e.g. class private methods that pull `@oxc-project/runtime` 404s) — ThemeSwitcher never mounts if the bundle fails.
+4. Avoid JS that breaks the whole `app.js` graph (e.g. class private methods that pull `@oxc-project/runtime` 404s) — ThemePreference never mounts if the bundle fails.
+5. Keep the system color-scheme listener global in `app.js` so Auto follows system changes on every page, including when the Appearance switcher is unmounted.
 
 ---
 
@@ -141,7 +139,7 @@ Prefer `dm_*` components from phoenix_duskmoon when one exists.
 | Surface | Pattern |
 |---------|---------|
 | Appbar | `<.dm_appbar class="appbar-primary appbar-sticky">` |
-| Theme | `<.dm_theme_switcher phx-update="ignore" />` |
+| Theme | `<.dm_segment_control phx-hook="ThemePreference" phx-update="ignore" />` with System / Light / Dark items |
 | Icons | `<.dm_mdi …>` — inherit `currentColor` |
 | Buttons | `dm_btn` variants: `primary` / `secondary` / `ghost` / `outline` / `error` |
 | Cards / panels | `surface-container` + `outline-variant` border |
@@ -204,7 +202,7 @@ Keep one gap scale per view. Do not mix decorative card grids into the mail clie
 1. Hardcoded hex/rgb or Tailwind palette colors for themeable UI.
 2. White cards / tables on moonlight page background (token mismatch → light text on light panels).
 3. Appbar not on `primary` (including moonlight “make it dark with surface” overrides).
-4. Passing server `theme="default"` into the theme switcher and wiping localStorage.
+4. Forcing a server-selected theme into the control and wiping localStorage.
 5. Building UI that only looks correct in sunshine.
 6. Custom spinners / one-off icon color systems when `dm_*` covers the case.
 7. Styling untrusted HTML mail with global app CSS.
@@ -216,7 +214,7 @@ Keep one gap scale per view. Do not mix decorative card grids into the mail clie
 
 - [ ] Looks correct in **sunshine** and **moonlight**
 - [ ] No new hardcoded theme colors in HEEX/CSS for app chrome
-- [ ] Appbar still `appbar-primary`; theme switcher still present and persistent
+- [ ] Appbar still `appbar-primary`; theme switcher in Settings / Appearance is persistent
 - [ ] Soft LiveView navigation + hard refresh keep the selected theme
 - [ ] Assets rebuilt if CSS/JS changed (`mix assets.build` / duskmoon_bundler)
 - [ ] Mail chrome themed; HTML body iframe limitation acknowledged if relevant
@@ -229,7 +227,8 @@ Keep one gap scale per view. Do not mix decorative card grids into the mail clie
 |------|----------------|
 | `apps/manifold_web/assets/css/app.css` | Token imports, project chrome, webmail/table/form tokens |
 | `apps/manifold_web/lib/manifold_web/components/layouts/root.html.heex` | `data-theme`, fonts, antiflicker |
-| `apps/manifold_web/lib/manifold_web/components/layouts/app.html.heex` | Appbar + theme switcher |
+| `apps/manifold_web/lib/manifold_web/components/layouts/app.html.heex` | Appbar |
+| `apps/manifold_web/lib/manifold_web/live/settings_live/appearance.ex` | Theme switcher |
 | `apps/manifold_web/lib/manifold_web/hooks/theme.ex` | `theme_changed` hook (no forced default theme) |
-| `apps/manifold_web/assets/js/app.js` | LiveSocket + ThemeSwitcher / localStorage preference |
+| `apps/manifold_web/assets/js/app.js` | LiveSocket + ThemePreference / localStorage preference |
 | `config/config.exs` | Tailwind content paths including phoenix_duskmoon |
