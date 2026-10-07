@@ -29,6 +29,43 @@ defmodule Manifold.Connectors.ProviderConfigTest do
     :ok
   end
 
+  test "callback resolver honors persisted Gmail URL without decrypting secrets" do
+    fallback = "https://current-host.test/connectors/gmail/callback"
+    assert {:ok, ^fallback} = ProviderConfig.callback_url("gmail", fallback)
+    put_setting!("gmail", "client", "secret")
+    assert {:ok, ^fallback} = ProviderConfig.callback_url("gmail", fallback)
+
+    callback = "http://localhost:4290/custom-callback"
+    assert {:ok, _} = Connectors.put_oauth_provider_setting("gmail", %{callback_url: callback})
+    Application.delete_env(:manifold_connectors, :encryption_key)
+    assert {:ok, ^callback} = ProviderConfig.callback_url("gmail", fallback)
+    assert {:ok, ^fallback} = ProviderConfig.callback_url("microsoft", fallback)
+
+    assert {:error, %Error{reason: :unsupported_provider}} =
+             ProviderConfig.callback_url("unknown", fallback)
+  end
+
+  test "configured callback is resolved with credentials without entering provider operation config" do
+    callback = "http://localhost:4290/operator/callback"
+
+    assert {:ok, view} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               client_id: "client",
+               client_secret: "secret",
+               callback_url: callback
+             })
+
+    assert {:ok, resolved} = ProviderConfig.fetch("gmail")
+    assert resolved.callback_url == callback
+    assert resolved.setting_lock_version == view.lock_version
+    refute Keyword.has_key?(resolved.config, :callback_url)
+
+    refute Keyword.has_key?(
+             ProviderConfig.provider_operation_config("gmail", resolved.config),
+             :callback_url
+           )
+  end
+
   test "Gmail resolver combines database credentials with trusted endpoints and generation" do
     secret = "db-secret-not-for-inspection"
     setting = put_setting!("gmail", "db-client", secret)

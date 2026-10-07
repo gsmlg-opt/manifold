@@ -22,6 +22,15 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     @behaviour Manifold.Connectors.Provider
 
     @impl true
+    def exchange_code("callback-probe-code", verifier, redirect_uri, config, opts) do
+      send(
+        Application.fetch_env!(:manifold_connectors, :oauth_exchange_probe),
+        {:gmail_exchange_callback, redirect_uri}
+      )
+
+      exchange_code("valid-code", verifier, redirect_uri, config, opts)
+    end
+
     def exchange_code("valid-code", _verifier, _redirect_uri, _config, opts) do
       {:ok,
        %Token{
@@ -244,6 +253,82 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
     assert method.enabled
   end
 
+  test "Google uses the saved callback for authorization and exchange when routing is forwarded",
+       %{
+         conn: conn,
+         account: account,
+         gmail_setting: gmail_setting
+       } do
+    callback_url = "http://localhost:9876/forwarded/google/callback"
+    Application.put_env(:manifold_connectors, :oauth_exchange_probe, self())
+
+    assert {:ok, _} =
+             Connectors.put_oauth_provider_setting("gmail", %{callback_url: callback_url},
+               expected_lock_version: gmail_setting.lock_version
+             )
+
+    started =
+      get(conn, "/connectors/gmail/start", %{
+        "account_id" => account.id,
+        "callback_url" => "https://ignored.example/callback"
+      })
+
+    query =
+      started |> redirected_to(302) |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
+    assert query["redirect_uri"] == callback_url
+
+    assert Repo.get_by!(OAuthTransaction, state_digest: :crypto.hash(:sha256, query["state"])).redirect_uri ==
+             callback_url
+
+    callback_conn =
+      conn
+      |> recycle()
+      |> get("/connectors/gmail/callback", %{
+        "code" => "callback-probe-code",
+        "state" => query["state"]
+      })
+
+    assert redirected_to(callback_conn, 302) == "/settings/accounts/#{account.id}"
+    assert_received {:gmail_exchange_callback, ^callback_url}
+    assert [%{enabled: true}] = Connectors.list_receive_methods_for_account(account.id)
+  end
+
+  test "changing the Google callback invalidates login started with the old URL", %{
+    conn: conn,
+    account: account,
+    gmail_setting: gmail_setting
+  } do
+    Application.put_env(:manifold_connectors, :oauth_exchange_probe, self())
+    started = get(conn, "/connectors/gmail/start", %{"account_id" => account.id})
+    state = started |> redirected_to(302) |> oauth_state()
+
+    assert {:ok, _} =
+             Connectors.put_oauth_provider_setting(
+               "gmail",
+               %{
+                 callback_url: "http://localhost:9876/forwarded/google/callback"
+               },
+               expected_lock_version: gmail_setting.lock_version
+             )
+
+    callback_conn =
+      conn
+      |> recycle()
+      |> get("/connectors/gmail/callback", %{
+        "code" => "callback-probe-code",
+        "state" => state
+      })
+
+    assert redirected_to(callback_conn, 302) == "/settings/accounts"
+
+    assert Phoenix.Flash.get(callback_conn.assigns.flash, :error) ==
+             "The Gmail authorization request is invalid or expired."
+
+    refute_received {:gmail_exchange_callback, _}
+    assert Connectors.list_receive_methods_for_account(account.id) == []
+  end
+
   test "Gmail generation changes return only the generic invalid authorization response", %{
     conn: conn,
     account: account,
@@ -335,7 +420,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     assert has_element?(
              receive_view,
-             ~s|a[href*="/connectors/gmail/start?account_id=#{account.id}&purpose=receive"]|
+             ~s|a[href="/settings/accounts/#{account.id}/google/login?purpose=receive"]|
            )
 
     {:ok, send_view, html} = live(conn, ~p"/settings/accounts/#{account.id}/send_methods/new")
@@ -345,7 +430,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     assert has_element?(
              send_view,
-             ~s|a[href*="/connectors/gmail/start?account_id=#{account.id}&purpose=send"]|
+             ~s|a[href="/settings/accounts/#{account.id}/google/login?purpose=send"]|
            )
   end
 
@@ -376,7 +461,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     assert has_element?(
              view,
-             ~s|#upgrade-gmail-access[href*="account_id=#{account.id}&purpose=send"]|
+             ~s|#upgrade-gmail-access[href="/settings/accounts/#{account.id}/google/login?purpose=send"]|
            )
   end
 
@@ -405,7 +490,7 @@ defmodule ManifoldWeb.ExternalAccountsWebTest do
 
     assert has_element?(
              view,
-             ~s|#reconnect-gmail[href*="account_id=#{account.id}&purpose=receive"]|,
+             ~s|#reconnect-gmail[href="/settings/accounts/#{account.id}/google/login?purpose=receive"]|,
              "Reconnect Gmail"
            )
   end

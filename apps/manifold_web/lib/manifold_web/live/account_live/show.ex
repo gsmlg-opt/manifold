@@ -122,7 +122,7 @@ defmodule ManifoldWeb.AccountLive.Show do
             :if={oauth_reconnect?(provider, @methods, @send_methods)}
             id={"reconnect-#{provider}"}
             href={
-              ~p"/connectors/#{provider}/start?account_id=#{@account.id}&purpose=#{oauth_reconnect_purpose(provider, @methods)}"
+              oauth_start_path(provider, @account.id, oauth_reconnect_purpose(provider, @methods))
             }
             class="settings-action settings-action-primary"
           >
@@ -132,7 +132,7 @@ defmodule ManifoldWeb.AccountLive.Show do
             :for={provider <- @oauth_providers}
             :if={oauth_upgrade?(provider, @methods, @send_methods)}
             id={"upgrade-#{provider}-access"}
-            href={~p"/connectors/#{provider}/start?account_id=#{@account.id}&purpose=send"}
+            href={oauth_start_path(provider, @account.id, "send")}
             class="settings-action settings-action-primary"
           >
             Upgrade {oauth_provider_label(provider)} access
@@ -368,6 +368,12 @@ defmodule ManifoldWeb.AccountLive.Show do
 
   defp oauth_provider_label("gmail"), do: "Gmail"
   defp oauth_provider_label("microsoft"), do: "Microsoft"
+
+  defp oauth_start_path("gmail", account_id, purpose),
+    do: ~p"/settings/accounts/#{account_id}/google/login?#{[purpose: purpose]}"
+
+  defp oauth_start_path(provider, account_id, purpose),
+    do: ~p"/connectors/#{provider}/start?#{[account_id: account_id, purpose: purpose]}"
 
   defp oauth_reconnect_copy("gmail") do
     "Reconnect the shared Gmail authorization; both receive and send are paused."

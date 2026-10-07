@@ -31,6 +31,87 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
     :ok
   end
 
+  test "Gmail callback saves trim, preserve omission and noops, and can clear configuration" do
+    url = "http://localhost:4290/custom/google/callback"
+
+    assert {:ok, initial} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               client_id: "client",
+               client_secret: "secret",
+               callback_url: "  #{url}  "
+             })
+
+    assert initial.callback_url == url
+    assert ProviderSettings.change("gmail").data.callback_url == url
+
+    assert {:ok, ^initial} =
+             Connectors.put_oauth_provider_setting("gmail", %{client_id: "client"})
+
+    assert {:ok, ^initial} = Connectors.put_oauth_provider_setting("gmail", %{callback_url: url})
+
+    assert {:ok, cleared} = Connectors.put_oauth_provider_setting("gmail", %{callback_url: " "})
+    assert is_nil(cleared.callback_url)
+    assert cleared.lock_version == initial.lock_version + 1
+  end
+
+  test "callback changes fence pending transactions and reconnect only Gmail grants" do
+    assert {:ok, initial} = put_setting("client", "secret")
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+    gmail = insert_oauth_family!("gmail", "callback-change")
+    microsoft = insert_oauth_family!("microsoft", "callback-other")
+    other_snapshot = family_snapshot(microsoft)
+    tokens = token_snapshot(gmail.authorization)
+    transaction = insert_oauth_transaction!(gmail.authorization.account_id, setting)
+
+    assert {:ok, changed} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               callback_url: "http://localhost:8080/operator-callback"
+             })
+
+    assert changed.lock_version == initial.lock_version + 1
+
+    assert Repo.get_by!(OAuthProviderSetting, provider: "gmail").client_secret_ciphertext ==
+             setting.client_secret_ciphertext
+
+    assert_reconnect_required(gmail)
+    assert token_snapshot(gmail.authorization) == tokens
+    assert family_snapshot(microsoft) == other_snapshot
+    pending = Repo.get!(OAuthTransaction, transaction.id)
+    assert pending.oauth_provider_setting_lock_version == initial.lock_version
+
+    assert {:ok, {:error, %Error{reason: :provider_configuration_changed}}} =
+             Repo.transaction(fn ->
+               :ok = ProviderSettings.lock_provider_for_transaction("gmail")
+
+               ProviderSettings.validate_generation_for_transaction(
+                 "gmail",
+                 pending.oauth_provider_setting_id,
+                 pending.oauth_provider_setting_lock_version
+               )
+             end)
+  end
+
+  test "callback form rejects unsupported providers and unsafe URLs without saving" do
+    for {provider, url} <- [
+          {"microsoft", "http://localhost:4290/custom"},
+          {"gmail", "http://example.test/callback"},
+          {"gmail", "https://user:secret@example.test/callback"},
+          {"gmail", "https://example.test/callback#fragment"},
+          {"gmail", "/relative/callback"},
+          {"gmail", "http://localhost.attacker.test/callback"}
+        ] do
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               Connectors.put_oauth_provider_setting(provider, %{
+                 client_id: "client",
+                 client_secret: "secret",
+                 callback_url: url
+               })
+
+      assert changeset.errors[:callback_url]
+      refute Repo.get_by(OAuthProviderSetting, provider: provider)
+    end
+  end
+
   test "Microsoft device settings configure a public client without a secret" do
     assert {:ok, view} =
              Connectors.put_oauth_provider_setting("microsoft", %{
@@ -185,6 +266,7 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
              provider: "gmail",
              client_id: nil,
              auth_flow: "authorization_code",
+             callback_url: nil,
              client_secret_configured?: false,
              status: :not_configured,
              lock_version: nil
@@ -194,6 +276,7 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
       provider: "microsoft",
       client_id: nil,
       auth_flow: "authorization_code",
+      callback_url: nil,
       client_secret_configured?: false,
       status: :not_configured,
       lock_version: nil
@@ -223,6 +306,7 @@ defmodule Manifold.Connectors.ProviderSettingsTest do
              provider: "gmail",
              client_id: "google-client",
              auth_flow: "authorization_code",
+             callback_url: nil,
              client_secret_configured?: true,
              status: :configured,
              lock_version: row.lock_version

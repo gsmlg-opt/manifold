@@ -104,7 +104,7 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
   test "OAuth settings renders catalog cards and secret-safe forms", %{conn: conn} do
     {:ok, view, html} = live(conn, "/settings/oauth")
 
-    callback_uri = "http://localhost:4002/connectors/gmail/callback"
+    callback_uri = "http://localhost:4290/connectors/gmail/callback"
 
     assert html =~ ~s(data-current="oauth")
     assert html =~ "OAuth"
@@ -136,8 +136,10 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
 
     assert has_element?(
              view,
-             "#oauth-provider-gmail-callback[readonly][value='#{callback_uri}']"
+             "#oauth-provider-gmail-form #oauth-provider-gmail-callback[name='oauth_provider_setting[callback_url]'][value='#{callback_uri}']"
            )
+
+    refute has_element?(view, "#oauth-provider-gmail-callback[readonly]")
 
     assert has_element?(
              view,
@@ -236,6 +238,84 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     assert setting.auth_flow == "device_code"
     assert setting.lock_version == 2
     assert is_nil(setting.client_secret_ciphertext)
+  end
+
+  test "Google callback URL persists across settings and help and can be changed without a new secret",
+       %{
+         conn: conn
+       } do
+    {:ok, view, _html} = live(conn, "/settings/oauth")
+    callback_url = "http://localhost:9876/google/callback"
+
+    view
+    |> form("#oauth-provider-gmail-form",
+      provider: "gmail",
+      oauth_provider_setting: %{
+        client_id: "google-client",
+        client_secret: "google-secret",
+        callback_url: callback_url,
+        lock_version: ""
+      }
+    )
+    |> render_submit()
+
+    assert Repo.get_by!(OAuthProviderSetting, provider: "gmail").callback_url == callback_url
+    {:ok, reloaded, _html} = live(conn, "/settings/oauth")
+    assert has_element?(reloaded, "#oauth-provider-gmail-callback[value='#{callback_url}']")
+    {:ok, help, _html} = live(conn, "/settings/oauth/gmail/help")
+    assert has_element?(help, "#oauth-provider-gmail-help-callback[value='#{callback_url}']")
+
+    changed_url = "http://localhost:8765/forwarded/callback"
+
+    reloaded
+    |> form("#oauth-provider-gmail-form",
+      provider: "gmail",
+      oauth_provider_setting: %{
+        client_id: "google-client",
+        client_secret: "",
+        callback_url: changed_url,
+        lock_version: "1"
+      }
+    )
+    |> render_submit()
+
+    assert %{callback_url: ^changed_url, lock_version: 2} =
+             Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+  end
+
+  test "legacy Google callback stays derived from the Endpoint until saved", %{conn: conn} do
+    assert {:ok, _} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               client_id: "legacy-client",
+               client_secret: "legacy-secret"
+             })
+
+    callback_url = "http://localhost:4002/connectors/gmail/callback"
+    {:ok, view, _html} = live(conn, "/settings/oauth")
+    assert has_element?(view, "#oauth-provider-gmail-callback[value='#{callback_url}']")
+    {:ok, help, _html} = live(conn, "/settings/oauth/gmail/help")
+    assert has_element?(help, "#oauth-provider-gmail-help-callback[value='#{callback_url}']")
+  end
+
+  test "invalid Google callback displays validation and preserves saved settings", %{conn: conn} do
+    {:ok, view, _html} = live(conn, "/settings/oauth")
+
+    html =
+      view
+      |> form("#oauth-provider-gmail-form",
+        provider: "gmail",
+        oauth_provider_setting: %{
+          client_id: "google-client",
+          client_secret: "private-secret",
+          callback_url: "javascript:alert(1)",
+          lock_version: ""
+        }
+      )
+      |> render_submit()
+
+    refute html =~ "private-secret"
+    assert has_element?(view, "#oauth-provider-gmail-callback[value='javascript:alert(1)']")
+    assert Repo.get_by(OAuthProviderSetting, provider: "gmail") == nil
   end
 
   test "initial save immediately reloads configured state without retaining the secret", %{
@@ -688,7 +768,7 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
   } do
     {:ok, view, html} = live(conn, "/settings/oauth/gmail/help")
 
-    callback_uri = "http://localhost:4002/connectors/gmail/callback"
+    callback_uri = "http://localhost:4290/connectors/gmail/callback"
 
     assert html =~ ~s(data-current="oauth")
     assert has_element?(view, "el-dm-card#oauth-provider-gmail-help.oauth-provider-card")

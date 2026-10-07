@@ -168,13 +168,18 @@ application with public client flows enabled. No callback URI or client secret i
 needed for this mode; the browser can be on another device. Existing Microsoft
 configurations retain browser redirect login until explicitly switched. Gmail
 retains browser redirect because Google device-flow scopes exclude Gmail read
-and send. See [OAuth setup](docs/OAUTH_SETUP.md) for both setup paths. A client ID is
+and send. Its editable **Callback URL** defaults to
+`http://localhost:4290/connectors/gmail/callback` for new configurations; register
+the exact value in Google Cloud. When the localhost callback cannot be reached,
+paste Google's final redirect URL into Manifold's Google login page to complete
+authorization.
+See [OAuth setup](docs/OAUTH_SETUP.md) for both setup paths. A client ID is
 stored as plaintext because it is sent in browser authorization requests. Each
 client secret is encrypted in PostgreSQL and is never returned to the browser.
 For browser redirect configurations, leaving the secret field blank preserves it
 when the client ID is unchanged. Changing that client ID requires a new secret.
 Switching Microsoft to device code clears its stored secret; switching back
-requires a new secret. Changing the login method, either credential, or removing
+requires a new secret. Changing the login method, Google callback URL, either credential, or removing
 a configuration immediately disables
 that provider's affected receive/send methods and requires reconnect. Removal is
 local only and does not revoke the grant at Google or Microsoft.
@@ -186,7 +191,7 @@ the authorization URL, token URL, and Graph base URL overrides are retained. No
 application restart is required after either provider's credential save,
 rotation, or removal.
 
-Browser redirect application registrations use these exact callback paths
+Browser redirect application registrations normally use these callback paths
 (Microsoft device-code login does not use either callback):
 
 ```text
@@ -201,12 +206,14 @@ http://localhost:4290/connectors/gmail/callback
 http://localhost:4290/connectors/microsoft/callback
 ```
 
-For browser redirect login, register production HTTPS callbacks with provider
-consoles. The callback derives from the configured Endpoint URL. A localhost
-callback requires the browser and Manifold to run on the same machine. Local HTTP
-callbacks are suitable for provider development registrations where the
-provider permits loopback HTTP. OAuth transactions compare the callback URI
-byte-for-byte with the URI stored at authorization start.
+Register the exact browser redirect URL with the provider. Gmail uses the saved
+Callback URL; existing configurations without one retain the configured Endpoint
+URL. Microsoft browser redirect uses the Endpoint URL. A localhost callback is
+received on the browser's machine. For Google, copy the final browser URL with
+`code` and `state` into Manifold's login page when the callback cannot be reached.
+Local HTTP callbacks are suitable where the provider
+permits loopback HTTP. OAuth transactions compare the callback URI byte-for-byte
+with the URI stored at authorization start.
 
 The provider configuration uses:
 
@@ -244,14 +251,15 @@ Microsoft durable refresh grant: offline_access.
 ```
 
 Enable the Gmail API in the Google Cloud project before connecting an account.
-Register the exact callback `https://<your-manifold-host>/connectors/gmail/callback`,
+Save the Google Callback URL in Settings OAuth and register that exact URL,
 configure both Gmail scopes on the OAuth consent screen, and add development
 accounts as test users while the app remains in testing mode. Keep
 `MANIFOLD_CONNECTOR_ENCRYPTION_KEY` stable across deploys; rotating or losing it
 without a credential migration makes stored OAuth credentials unreadable. Before
 public use, complete Google's consent-screen publication and verification
-requirements for the requested scopes. Never commit client credentials or use a
-callback for a host other than the deployed Manifold endpoint.
+requirements for the requested scopes. Never commit client credentials. Custom
+callbacks, including localhost URLs, can complete through the Google login page's
+**Final Google redirect URL** field without forwarding the browser callback.
 
 The Settings routes currently inherit Manifold's trusted-local-instance boundary;
 they are not an authenticated administrator surface. Network-exposed deployments
@@ -333,7 +341,7 @@ Before promoting staging, verify all of the following without restarting:
 
 - saving Google or Microsoft credentials immediately enables that provider in
   both receive and send method pickers;
-- each provider help page shows its deployed exact callback URI and required
+- each provider help page shows its configured login method, applicable callback URI, and required
   scopes;
 - receive and provider send work with approved staging identities;
 - secret rotation and client-ID change require reconnect, and removal disables

@@ -21,12 +21,20 @@ defmodule Manifold.Connectors.ProviderSettings do
 
     @derive {Inspect, only: [:client_id, :setting_id, :setting_lock_version]}
     @enforce_keys [:client_id, :client_secret, :setting_id, :setting_lock_version]
-    defstruct [:client_id, :client_secret, :setting_id, :setting_lock_version, :auth_flow]
+    defstruct [
+      :client_id,
+      :client_secret,
+      :setting_id,
+      :setting_lock_version,
+      :auth_flow,
+      :callback_url
+    ]
 
     @type t :: %__MODULE__{
             client_id: String.t(),
             client_secret: String.t() | nil,
             auth_flow: String.t(),
+            callback_url: String.t() | nil,
             setting_id: Ecto.UUID.t(),
             setting_lock_version: pos_integer()
           }
@@ -43,6 +51,7 @@ defmodule Manifold.Connectors.ProviderSettings do
       field(:provider, :string)
       field(:client_id, :string)
       field(:auth_flow, :string, default: "authorization_code")
+      field(:callback_url, :string)
       field(:client_secret, :string, virtual: true, redact: true)
       field(:lock_version, :integer)
     end
@@ -51,6 +60,7 @@ defmodule Manifold.Connectors.ProviderSettings do
             provider: String.t(),
             client_id: String.t() | nil,
             auth_flow: String.t(),
+            callback_url: String.t() | nil,
             client_secret: nil,
             lock_version: pos_integer() | nil
           }
@@ -58,7 +68,8 @@ defmodule Manifold.Connectors.ProviderSettings do
     @spec changeset(t(), map()) :: Ecto.Changeset.t()
     def changeset(form, attrs) do
       form
-      |> cast(attrs, [:client_id, :auth_flow])
+      |> cast(attrs, [:client_id, :auth_flow, :callback_url])
+      |> OAuthProviderSetting.validate_callback_url()
       |> validate_required([:client_id, :auth_flow])
       |> validate_inclusion(:auth_flow, ["authorization_code", "device_code"])
       |> validate_change(:auth_flow, fn _, flow ->
@@ -73,6 +84,7 @@ defmodule Manifold.Connectors.ProviderSettings do
           provider: String.t(),
           client_id: String.t() | nil,
           auth_flow: String.t(),
+          callback_url: String.t() | nil,
           client_secret_configured?: boolean(),
           status: :configured | :not_configured | :configuration_error,
           lock_version: pos_integer() | nil
@@ -117,6 +129,23 @@ defmodule Manifold.Connectors.ProviderSettings do
 
       setting
       |> form_changeset(provider, attrs)
+    end
+  rescue
+    _error in [DBConnection.ConnectionError, Postgrex.Error, ArgumentError] ->
+      {:error, database_error()}
+  end
+
+  @doc false
+  @spec callback_url(String.t()) :: {:ok, String.t() | nil} | {:error, Error.t()}
+  def callback_url(provider) do
+    with {:ok, _definition} <- OAuthProviderCatalog.fetch(provider) do
+      url =
+        OAuthProviderSetting
+        |> where([setting], setting.provider == ^provider)
+        |> select([setting], setting.callback_url)
+        |> Repo.one()
+
+      {:ok, url}
     end
   rescue
     _error in [DBConnection.ConnectionError, Postgrex.Error, ArgumentError] ->
@@ -218,6 +247,7 @@ defmodule Manifold.Connectors.ProviderSettings do
              client_id: setting.client_id,
              client_secret: client_secret,
              auth_flow: setting.auth_flow,
+             callback_url: setting.callback_url,
              setting_id: setting.id,
              setting_lock_version: setting.lock_version
            }}
@@ -265,9 +295,11 @@ defmodule Manifold.Connectors.ProviderSettings do
     if changeset.valid? do
       client_id = get_field(changeset, :client_id)
       auth_flow = get_field(changeset, :auth_flow)
+      callback_url = get_field(changeset, :callback_url)
       secret = Map.get(attrs, "client_secret")
 
       if setting && client_id == setting.client_id && auth_flow == setting.auth_flow &&
+           callback_url == setting.callback_url &&
            blank_secret?(secret) do
         {:ok, {:unchanged, setting}}
       else
@@ -280,6 +312,7 @@ defmodule Manifold.Connectors.ProviderSettings do
                  provider: provider,
                  client_id: client_id,
                  auth_flow: auth_flow,
+                 callback_url: callback_url,
                  client_secret_ciphertext: ciphertext,
                  lock_version: if(setting, do: setting.lock_version + 1, else: 1)
                })
@@ -311,13 +344,15 @@ defmodule Manifold.Connectors.ProviderSettings do
       provider: provider,
       client_id: if(setting, do: setting.client_id),
       auth_flow: if(setting, do: setting.auth_flow, else: "authorization_code"),
+      callback_url: if(setting, do: setting.callback_url),
       lock_version: if(setting, do: setting.lock_version)
     }
 
     changeset =
       Form.changeset(form, %{
         "client_id" => Map.get(attrs, "client_id", form.client_id),
-        "auth_flow" => Map.get(attrs, "auth_flow", form.auth_flow)
+        "auth_flow" => Map.get(attrs, "auth_flow", form.auth_flow),
+        "callback_url" => Map.get(attrs, "callback_url", form.callback_url)
       })
 
     client_id = get_field(changeset, :client_id)
@@ -516,6 +551,7 @@ defmodule Manifold.Connectors.ProviderSettings do
       provider: setting.provider,
       client_id: setting.client_id,
       auth_flow: setting.auth_flow,
+      callback_url: setting.callback_url,
       client_secret_configured?: is_binary(setting.client_secret_ciphertext),
       status: status,
       lock_version: setting.lock_version
@@ -527,6 +563,7 @@ defmodule Manifold.Connectors.ProviderSettings do
       provider: provider,
       client_id: nil,
       auth_flow: "authorization_code",
+      callback_url: nil,
       client_secret_configured?: false,
       status: :not_configured,
       lock_version: nil
@@ -556,11 +593,13 @@ defmodule Manifold.Connectors.ProviderSettings do
     client_id = fetch_attr(attrs, "client_id", :client_id)
     client_secret = fetch_attr(attrs, "client_secret", :client_secret)
     auth_flow = fetch_attr(attrs, "auth_flow", :auth_flow)
+    callback_url = fetch_attr(attrs, "callback_url", :callback_url)
 
     %{}
     |> maybe_put("client_id", normalize_client_id(client_id))
     |> maybe_put("client_secret", client_secret)
     |> maybe_put("auth_flow", auth_flow)
+    |> maybe_put("callback_url", normalize_client_id(callback_url))
   end
 
   defp normalize_attrs(_attrs), do: %{}

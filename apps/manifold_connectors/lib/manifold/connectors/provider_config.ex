@@ -12,11 +12,12 @@ defmodule Manifold.Connectors.ProviderConfig do
 
     @derive {Inspect, only: [:provider, :setting_id, :setting_lock_version]}
     @enforce_keys [:provider, :config]
-    defstruct [:provider, :config, :setting_id, :setting_lock_version]
+    defstruct [:provider, :config, :setting_id, :setting_lock_version, :callback_url]
 
     @type t :: %__MODULE__{
             provider: String.t(),
             config: keyword(),
+            callback_url: String.t() | nil,
             setting_id: Ecto.UUID.t() | nil,
             setting_lock_version: pos_integer() | nil
           }
@@ -36,6 +37,7 @@ defmodule Manifold.Connectors.ProviderConfig do
        %Resolved{
          provider: provider,
          config: config,
+         callback_url: credentials.callback_url,
          setting_id: credentials.setting_id,
          setting_lock_version: credentials.setting_lock_version
        }}
@@ -53,6 +55,17 @@ defmodule Manifold.Connectors.ProviderConfig do
 
   def fetch(_provider) do
     {:error, Error.new(:permanent, :unsupported_provider, "OAuth provider is not supported")}
+  end
+
+  @spec callback_url(String.t(), String.t()) :: {:ok, String.t()} | {:error, Error.t()}
+  def callback_url("gmail", fallback) do
+    with {:ok, configured} <- ProviderSettings.callback_url("gmail") do
+      {:ok, configured || fallback}
+    end
+  end
+
+  def callback_url(provider, fallback) do
+    with {:ok, _definition} <- OAuthProviderCatalog.fetch(provider), do: {:ok, fallback}
   end
 
   defp put_client_credentials(config, %{auth_flow: "device_code"}) do

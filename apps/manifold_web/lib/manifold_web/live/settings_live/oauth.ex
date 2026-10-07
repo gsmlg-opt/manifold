@@ -59,7 +59,7 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
          {:ok, expected_lock_version} <-
            expected_save_lock_version(socket, provider, params) do
       result =
-        Connectors.put_oauth_provider_setting(provider, params,
+        Connectors.put_oauth_provider_setting(provider, save_params(socket, provider, params),
           expected_lock_version: expected_lock_version
         )
 
@@ -156,7 +156,7 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
         </p>
 
         <.dm_input
-          :if={provider.form[:auth_flow].value != "device_code"}
+          :if={provider.definition.key != "gmail" && provider.form[:auth_flow].value != "device_code"}
           id={"oauth-provider-#{provider.definition.key}-callback"}
           name={"oauth_provider_#{provider.definition.key}_callback"}
           label="Callback URI"
@@ -195,9 +195,21 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
           </p>
           <p :if={provider.definition.key == "gmail"} class="settings-secondary">
             Gmail requires browser redirect login. Google's device-code flow does not support
-            Gmail read or send permissions. A localhost callback works when your browser and
-            Manifold run on the same machine.
+            Gmail read or send permissions. Set the callback URL below and register the exact
+            same URL in Google Cloud. After signing in, paste Google's final redirect URL
+            into the login page, even if the localhost callback cannot be reached.
           </p>
+
+          <.dm_input
+            :if={provider.definition.key == "gmail"}
+            id="oauth-provider-gmail-callback"
+            field={provider.form[:callback_url]}
+            type="url"
+            label="Callback URL"
+            autocomplete="off"
+            required
+            helper="Register this exact URL in Google Cloud. The login page accepts the final redirect URL."
+          />
 
           <.dm_input
             id={"oauth-provider-#{provider.definition.key}-client-id"}
@@ -229,7 +241,7 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
         </.form>
 
         <p :if={provider.view.lock_version} class="settings-hint">
-          Changing the login method, client ID or secret stops {provider.definition.name} receive and send until
+          Changing the login method, callback URL, client ID or secret stops {provider.definition.name} receive and send until
           connected accounts are reconnected.
         </p>
 
@@ -298,7 +310,28 @@ defmodule ManifoldWeb.SettingsLive.OAuth do
   defp default_form_attrs(%{key: "microsoft"}, %{status: :not_configured}),
     do: %{"auth_flow" => "device_code"}
 
+  defp default_form_attrs(%{key: "gmail"}, %{status: :not_configured}),
+    do: %{"callback_url" => "http://localhost:4290/connectors/gmail/callback"}
+
+  defp default_form_attrs(%{key: "gmail"} = definition, %{callback_url: nil}),
+    do: %{"callback_url" => callback_uri(definition)}
+
   defp default_form_attrs(_definition, _view), do: %{}
+
+  defp save_params(socket, "gmail", params) do
+    case Enum.find(socket.assigns.providers, &(&1.definition.key == "gmail")) do
+      %{definition: definition, view: %{callback_url: nil, lock_version: version}}
+      when is_integer(version) ->
+        if params["callback_url"] == callback_uri(definition),
+          do: Map.delete(params, "callback_url"),
+          else: params
+
+      _ ->
+        params
+    end
+  end
+
+  defp save_params(_socket, _provider, params), do: params
 
   defp reload_provider(socket, provider) do
     case Enum.find(socket.assigns.providers, &(&1.definition.key == provider)) do

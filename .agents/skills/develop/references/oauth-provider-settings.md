@@ -23,6 +23,27 @@ read and send. The current behavior and migration ownership are documented in
 Historical verification and callback-only details below describe the earlier
 implementation; device-mode overrides supersede those Microsoft requirements.
 
+## Google callback update (2026-10-06)
+
+Google Settings includes an editable `callback_url`, defaulting to
+`http://localhost:4290/connectors/gmail/callback` for new forms. Legacy unset
+values retain the Endpoint-derived URL until saved. Omitted API attributes
+preserve the value. Callback changes use the existing generation and reconnect
+boundary. The operator registers the exact URL in Google Cloud. Google login
+supports pasting the final browser redirect when localhost cannot be reached;
+see [`google-oauth-callback-paste.md`](google-oauth-callback-paste.md).
+
+`ProviderSettings` and `Schema.OAuthProviderSetting` own persistence and URL
+validation. `ProviderConfig.callback_url/2` resolves the callback without
+decrypting secrets. `OAuth.start/4` takes the saved callback from the same settings
+snapshot as the credentials and generation. `ConnectorOAuthController` uses the
+resolver for callback comparison; the consumed transaction's same URL is passed
+to token exchange. Settings and help
+render the saved value. Saving an unchanged legacy form preserves its unset URL
+and generation. Migration `20261006000300_add_oauth_provider_callback_url.exs`
+preserves existing settings; rollback requires clearing saved callback URLs first.
+See `docs/OAUTH_SETUP.md` for routing requirements.
+
 ## Ownership and routes
 
 - `manifold_data` owns the migration at
@@ -38,10 +59,11 @@ implementation; device-mode overrides supersede those Microsoft requirements.
   `ManifoldWeb.SettingsLive.OAuthHelp` at `/settings/oauth/:provider/help`.
   Concrete help routes are `/settings/oauth/gmail/help` and
   `/settings/oauth/microsoft/help`.
-- Production callbacks remain exactly
+- Microsoft browser redirect and legacy unset Google callbacks remain
   `https://<host>/connectors/gmail/callback` and
   `https://<host>/connectors/microsoft/callback`, derived from the configured
-  Phoenix Endpoint URL. Local development callbacks are exactly
+  Phoenix Endpoint URL. New Google configurations have an editable callback.
+  Local development callback defaults are
   `http://localhost:4290/connectors/gmail/callback` and
   `http://localhost:4290/connectors/microsoft/callback`.
 
@@ -74,7 +96,9 @@ in `Manifold.Connectors.OAuthProvider.Gmail` and
 - provider help title, checklist, scope purposes, testing/production notes, and
   official links.
 
-The browser never accepts an arbitrary provider, endpoint, callback, or scope.
+The browser never accepts an arbitrary provider, endpoint, or scope. Google
+Callback URL is configurable through Settings, accepting HTTPS or loopback HTTP
+URLs without credentials or fragments; callback routing remains operator-managed.
 Endpoint override environment variables remain static operator/development
 configuration and are allowlisted by the resolver.
 

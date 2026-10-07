@@ -89,8 +89,12 @@ https://<PHX_HOST>/connectors/gmail/callback
 https://<PHX_HOST>/connectors/microsoft/callback
 ```
 
-Phoenix controllers derive these active callback routes from the configured
-Endpoint URL. Production runtime configuration requires a valid connector
+Google's callback URL is editable in Settings OAuth and defaults to
+`http://localhost:4290/connectors/gmail/callback` for new configurations. The
+Google login page accepts the final browser redirect URL to finish the same PKCE
+grant when the browser cannot reach localhost; callback forwarding is optional. Existing
+Google configurations without a saved URL and Microsoft browser redirect derive
+their callback from the configured Endpoint URL. Production runtime configuration requires a valid connector
 encryption key and enables browser redirect clients only when their client ID
 and secret are both present. Microsoft device clients need only their client ID
 and Entra public client flows enabled.

@@ -17,6 +17,7 @@ defmodule Manifold.Connectors.OAuth do
   @mailbox_foreign_key "connector_oauth_transactions_mailbox_id_fkey"
   @telemetry_forbidden_fragments ~w(token password authorization_code raw_message)
   @telemetry_code_pattern ~r/\A[a-z0-9_.:-]{1,128}\z/
+  @callback_response_keys ~w(code state error scope authuser prompt hd error_description error_uri)
 
   @type purpose :: :receive | :send
   @type purpose_input :: purpose() | String.t()
@@ -74,6 +75,7 @@ defmodule Manifold.Connectors.OAuth do
     ttl_seconds = Keyword.get(opts, :ttl_seconds, @default_ttl_seconds)
 
     with {:ok, %ProviderConfig.Resolved{} = resolved} <- ProviderConfig.fetch(provider),
+         redirect_uri = resolved.callback_url || redirect_uri,
          :ok <- browser_flow(resolved.config),
          {:ok, purpose} <- normalize_purpose(Keyword.get(opts, :purpose, :receive)),
          {:ok, purpose_scopes} <- required_scopes(provider, purpose),
@@ -224,6 +226,133 @@ defmodule Manifold.Connectors.OAuth do
     DBConnection.ConnectionError ->
       {:error, database_error(:unavailable)}
   end
+
+  @doc """
+  Consumes a pasted Google callback URL for the account's current authorization attempt.
+  The URL is parsed locally and is never requested over the network.
+  """
+  @spec consume_callback_url(String.t(), String.t(), String.t(), Ecto.UUID.t(), Keyword.t()) ::
+          {:ok, String.t(), Consumed.t()} | {:error, Error.t()}
+  def consume_callback_url(provider, response_url, expected_state, account_id, opts \\ [])
+
+  def consume_callback_url("gmail", response_url, expected_state, account_id, opts)
+      when is_binary(response_url) and is_binary(expected_state) and expected_state != "" do
+    with {:ok, uri, params} <- parse_callback_url(response_url),
+         {:ok, code} <- callback_code(params, expected_state),
+         {:ok, account_id} <- validate_mailbox_id(account_id) do
+      now = Keyword.get(opts, :now, DateTime.utc_now())
+
+      Repo.transaction(fn ->
+        transaction =
+          OAuthTransaction
+          |> where([transaction], transaction.state_digest == ^state_digest(expected_state))
+          |> lock("FOR UPDATE")
+          |> Repo.one()
+
+        with :ok <- validate_pasted_callback(transaction, uri, params, account_id, opts),
+             {:ok, consumed} <-
+               consume_transaction(transaction, "gmail", transaction.redirect_uri, now) do
+          {:ok, code, consumed}
+        end
+      end)
+      |> case do
+        {:ok, {:ok, code, %Consumed{} = consumed}} -> {:ok, code, consumed}
+        {:ok, {:error, %Error{} = error}} -> {:error, error}
+        {:error, %Error{} = error} -> {:error, error}
+        {:error, _reason} -> {:error, database_error(:unavailable)}
+      end
+    end
+  rescue
+    DBConnection.ConnectionError -> {:error, database_error(:unavailable)}
+  end
+
+  def consume_callback_url("gmail", _url, _state, _account_id, _opts),
+    do: invalid_callback_url()
+
+  def consume_callback_url(_provider, _url, _state, _account_id, _opts),
+    do: {:error, oauth_error(:unsupported_provider, "OAuth provider is not supported")}
+
+  defp parse_callback_url(url) do
+    with {:ok, %URI{scheme: scheme, host: host, userinfo: nil, fragment: nil} = uri} <-
+           URI.new(String.trim(url)),
+         true <- scheme in ["http", "https"] and is_binary(host) and host != "",
+         false <- Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, uri.query || "") do
+      {:ok, uri, URI.query_decoder(uri.query || "") |> Enum.to_list()}
+    else
+      _invalid -> invalid_callback_url()
+    end
+  rescue
+    ArgumentError -> invalid_callback_url()
+  end
+
+  defp callback_code(params, expected_state) do
+    grouped = Enum.group_by(params, &elem(&1, 0), &elem(&1, 1))
+
+    cond do
+      Enum.any?(~w(code state error), &(length(Map.get(grouped, &1, [])) > 1)) ->
+        invalid_callback_url()
+
+      Map.get(grouped, "state") != [expected_state] ->
+        invalid_callback_url()
+
+      Map.has_key?(grouped, "error") ->
+        {:error, oauth_error(:oauth_authorization_denied, "OAuth authorization was denied")}
+
+      true ->
+        case {Map.get(grouped, "state"), Map.get(grouped, "code")} do
+          {[^expected_state], [code]} when is_binary(code) ->
+            if String.trim(code) == "", do: invalid_callback_url(), else: {:ok, code}
+
+          _invalid ->
+            invalid_callback_url()
+        end
+    end
+  end
+
+  defp validate_pasted_callback(nil, _uri, _params, _account_id, _opts),
+    do: callback_mismatch()
+
+  defp validate_pasted_callback(transaction, uri, params, account_id, opts) do
+    with true <- transaction.provider == "gmail" and transaction.mailbox_id == account_id,
+         {:ok, registered, static_params} <- parse_callback_url(transaction.redirect_uri),
+         true <- callback_target(uri) == callback_target(registered),
+         true <- callback_static_params(params, static_params) == Enum.sort(static_params),
+         :ok <- validate_callback_purpose(transaction, opts) do
+      :ok
+    else
+      _mismatch -> callback_mismatch()
+    end
+  end
+
+  defp callback_target(uri), do: {uri.scheme, uri.host, uri.port, uri.path}
+
+  defp callback_static_params(params, registered) do
+    static_keys = Enum.map(registered, &elem(&1, 0))
+
+    params
+    |> Enum.reject(fn {key, _value} ->
+      key in @callback_response_keys and key not in static_keys
+    end)
+    |> Enum.sort()
+  end
+
+  defp validate_callback_purpose(transaction, opts) do
+    case Keyword.fetch(opts, :purpose) do
+      :error ->
+        :ok
+
+      {:ok, purpose} ->
+        with {:ok, expected} <- normalize_purpose(purpose),
+             {:ok, ^expected} <- persisted_purpose(transaction.purpose),
+             do: :ok
+    end
+  end
+
+  defp invalid_callback_url,
+    do: {:error, oauth_error(:invalid_oauth_callback, "OAuth callback URL is invalid")}
+
+  defp callback_mismatch,
+    do: {:error, oauth_error(:oauth_state_mismatch, "OAuth state does not match")}
 
   defp consume_transaction(nil, _provider, _redirect_uri, _now) do
     {:error, oauth_error(:oauth_state_mismatch, "OAuth state does not match")}

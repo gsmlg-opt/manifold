@@ -362,7 +362,12 @@ defmodule ManifoldWeb.AccountLive.ReceiveMethodNew do
             <.link
               :if={@oauth_setup.state in [:connect, :upgrade, :reconnect]}
               id="oauth-method-action"
-              href={~p"/connectors/#{@selected_kind}/start?account_id=#{@account.id}&purpose=receive"}
+              href={
+                if @selected_kind == "gmail",
+                  do: ~p"/settings/accounts/#{@account.id}/google/login?purpose=receive",
+                  else:
+                    ~p"/connectors/#{@selected_kind}/start?account_id=#{@account.id}&purpose=receive"
+              }
               class="settings-action settings-action-primary"
             >
               {oauth_action(@selected_kind, @oauth_setup.state)}

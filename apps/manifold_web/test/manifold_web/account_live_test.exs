@@ -450,7 +450,7 @@ defmodule ManifoldWeb.AccountLiveTest do
 
     assert has_element?(
              view,
-             ~s|#reconnect-gmail[href*="account_id=#{account.id}&purpose=send"]|
+             ~s|#reconnect-gmail[href="/settings/accounts/#{account.id}/google/login?purpose=send"]|
            )
 
     refute has_element?(view, ~s|#reconnect-gmail[href*="purpose=receive"]|)

@@ -41,7 +41,8 @@ clears stored secrets; switching back requires a fresh secret. Same-mode unchang
 saves remain no-ops. Existing tokens/cipher contexts and Graph ingest boundaries
 are preserved. Gmail keeps browser authorization with PKCE because Google's
 device flow excludes Gmail permissions. Desktop-client loopback authorization is
-not implemented; web-client localhost callbacks require the same browser/app host.
+not implemented. Gmail's Google login page accepts the full final redirect URL
+when a web-client localhost callback cannot be reached; no forwarding is required.
 
 ## Validation
 

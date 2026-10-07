@@ -33,12 +33,10 @@ defmodule ManifoldWeb.ConnectorOAuthController do
 
   def callback(conn, %{"provider" => provider, "code" => code, "state" => state})
       when provider in @providers do
-    redirect_uri = callback_url(provider)
-
-    case OAuth.consume(provider, state, redirect_uri) do
-      {:ok, consumed} ->
-        complete_authorization(conn, provider, code, consumed)
-
+    with {:ok, redirect_uri} <- callback_url(provider),
+         {:ok, consumed} <- OAuth.consume(provider, state, redirect_uri) do
+      complete_authorization(conn, provider, code, consumed)
+    else
       {:error, _reason} ->
         connector_error(
           conn,
@@ -100,7 +98,7 @@ defmodule ManifoldWeb.ConnectorOAuthController do
         if Keyword.get(resolved.config, :auth_flow) == "device_code" do
           {:device, ~p"/settings/accounts/#{account_id}/microsoft/device?#{[purpose: purpose]}"}
         else
-          OAuth.start("microsoft", account_id, callback_url("microsoft"), purpose: purpose)
+          start_browser_authorization("microsoft", account_id, purpose)
         end
 
       {:error, reason} ->
@@ -109,9 +107,14 @@ defmodule ManifoldWeb.ConnectorOAuthController do
   end
 
   defp start_authorization(provider, account_id, purpose),
-    do: OAuth.start(provider, account_id, callback_url(provider), purpose: purpose)
+    do: start_browser_authorization(provider, account_id, purpose)
 
-  defp callback_url(provider), do: url(~p"/connectors/#{provider}/callback")
+  defp start_browser_authorization(provider, account_id, purpose) do
+    OAuth.start(provider, account_id, url(~p"/connectors/#{provider}/callback"), purpose: purpose)
+  end
+
+  defp callback_url(provider),
+    do: ProviderConfig.callback_url(provider, url(~p"/connectors/#{provider}/callback"))
 
   defp provider_name("gmail"), do: "Gmail"
   defp provider_name("microsoft"), do: "Microsoft 365"

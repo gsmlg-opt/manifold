@@ -106,6 +106,242 @@ defmodule Manifold.Connectors.OAuthTest do
     assert DateTime.compare(transaction.expires_at, now) == :gt
   end
 
+  test "changing Gmail callback invalidates a pending authorization generation", %{
+    mailbox: mailbox
+  } do
+    redirect = "http://localhost:4290/custom-callback"
+    assert {:ok, _} = Connectors.put_oauth_provider_setting("gmail", %{callback_url: redirect})
+    assert {:ok, started} = OAuth.start("gmail", mailbox.id, redirect)
+
+    assert {:ok, _} =
+             Connectors.put_oauth_provider_setting("gmail", %{
+               callback_url: "http://localhost:8080/new-callback"
+             })
+
+    assert {:error, %{reason: :provider_configuration_changed}} =
+             OAuth.consume("gmail", started.state, redirect)
+
+    assert {:error, %{reason: :oauth_state_replayed}} =
+             OAuth.consume("gmail", started.state, redirect)
+  end
+
+  test "Gmail start uses the configured callback from the same credential generation", %{
+    mailbox: mailbox
+  } do
+    callback = "http://localhost:8080/custom/google/callback"
+
+    assert {:ok, configured} =
+             Connectors.put_oauth_provider_setting("gmail", %{callback_url: callback})
+
+    setting = Repo.get_by!(OAuthProviderSetting, provider: "gmail")
+
+    assert {:ok, started} =
+             OAuth.start("gmail", mailbox.id, "https://stale-host.test/connectors/gmail/callback")
+
+    assert URI.decode_query(URI.parse(started.url).query)["redirect_uri"] == callback
+    transaction = Repo.one!(OAuthTransaction)
+    assert transaction.redirect_uri == callback
+    assert transaction.oauth_provider_setting_id == setting.id
+    assert transaction.oauth_provider_setting_lock_version == configured.lock_version
+    assert {:ok, consumed} = OAuth.consume("gmail", started.state, callback)
+    assert consumed.redirect_uri == callback
+  end
+
+  test "pasted localhost callback consumes exact state, static query and PKCE once", %{
+    mailbox: mailbox
+  } do
+    callback = "http://localhost:4290/operator/callback?tenant=team+one&tenant=two"
+    assert {:ok, _} = Connectors.put_oauth_provider_setting("gmail", %{callback_url: callback})
+    assert {:ok, started} = OAuth.start("gmail", mailbox.id, callback, purpose: :send)
+    transaction = Repo.one!(OAuthTransaction)
+
+    response =
+      "http://localhost:4290/operator/callback?tenant=two&tenant=team%20one&" <>
+        URI.encode_query(%{
+          "code" => "paste-only-+code",
+          "state" => started.state,
+          "scope" => "openid email",
+          "authuser" => "0",
+          "prompt" => "consent"
+        })
+
+    assert {:ok, "paste-only-+code", %OAuth.Consumed{} = consumed} =
+             OAuth.consume_callback_url("gmail", response, started.state, mailbox.id,
+               purpose: :send
+             )
+
+    assert consumed.mailbox_id == mailbox.id
+    assert consumed.purpose == :send
+    assert consumed.redirect_uri == callback
+    assert consumed.oauth_provider_setting_id == transaction.oauth_provider_setting_id
+
+    assert {:ok, verifier} =
+             Crypto.decrypt(
+               transaction.pkce_verifier_ciphertext,
+               "oauth:gmail:" <> mailbox.id
+             )
+
+    assert consumed.pkce_verifier == verifier
+
+    assert {:error, %{reason: :oauth_state_replayed}} =
+             OAuth.consume_callback_url("gmail", response, started.state, mailbox.id,
+               purpose: :send
+             )
+  end
+
+  test "malformed or mismatched pasted URLs leave valid authorization state usable", %{
+    mailbox: mailbox
+  } do
+    callback = "http://localhost:4290/operator/callback?tenant=expected"
+    assert {:ok, _} = Connectors.put_oauth_provider_setting("gmail", %{callback_url: callback})
+    assert {:ok, started} = OAuth.start("gmail", mailbox.id, callback)
+    query = URI.encode_query(%{"code" => "never-log-code", "state" => started.state})
+    valid = callback <> "&" <> query
+
+    for response <- [
+          String.replace(valid, "localhost", "example.test"),
+          String.replace(valid, "4290", "8080"),
+          String.replace(valid, "/operator/callback", "/another/callback"),
+          String.replace(valid, "http://", "https://"),
+          String.replace(valid, "tenant=expected", "tenant=changed"),
+          String.replace(valid, "tenant=expected&", ""),
+          valid <> "&tenant=expected",
+          valid <> "&unregistered=value",
+          valid <> "&code=duplicate",
+          valid <> "&state=duplicate",
+          valid <> "&error=denied&error=duplicate",
+          valid <> "#fragment",
+          String.replace(valid, "http://localhost", "http://user:secret@localhost"),
+          callback <> "&state=" <> URI.encode_www_form(started.state),
+          callback <> "&code=never-log-code",
+          callback <> "&code=&state=" <> started.state,
+          callback <> "&code=never-log-code&state=",
+          callback <> "&" <> query <> "&scope=%ZZ",
+          "/relative/callback?" <> query,
+          "not a URL"
+        ] do
+      assert {:error, error} =
+               OAuth.consume_callback_url("gmail", response, started.state, mailbox.id)
+
+      refute inspect(error) =~ "never-log-code"
+      refute inspect(error) =~ started.state
+      refute Repo.one!(OAuthTransaction).consumed_at
+    end
+
+    assert {:ok, "never-log-code", _} =
+             OAuth.consume_callback_url("gmail", valid, started.state, mailbox.id)
+  end
+
+  test "pasted callbacks bind the active attempt account and trusted purpose", %{mailbox: mailbox} do
+    callback = "http://localhost:4290/callback"
+    assert {:ok, first} = OAuth.start("gmail", mailbox.id, callback, purpose: :send)
+    assert {:ok, second} = OAuth.start("gmail", mailbox.id, callback, purpose: :receive)
+    response = callback <> "?" <> URI.encode_query(%{"code" => "code", "state" => first.state})
+
+    for {expected_state, account_id, opts} <- [
+          {second.state, mailbox.id, [purpose: :send]},
+          {first.state, Ecto.UUID.generate(), [purpose: :send]},
+          {first.state, mailbox.id, [purpose: :receive]},
+          {first.state, mailbox.id, [purpose: "unknown"]}
+        ] do
+      assert {:error, _} =
+               OAuth.consume_callback_url("gmail", response, expected_state, account_id, opts)
+
+      assert Enum.all?(Repo.all(OAuthTransaction), &is_nil(&1.consumed_at))
+    end
+
+    assert {:ok, "code", %{purpose: :send}} =
+             OAuth.consume_callback_url("gmail", response, first.state, mailbox.id,
+               purpose: "send"
+             )
+  end
+
+  test "denied pasted callbacks produce generic errors without consuming state", %{
+    mailbox: mailbox
+  } do
+    callback = "http://localhost:4290/callback"
+    assert {:ok, started} = OAuth.start("gmail", mailbox.id, callback)
+
+    response =
+      callback <>
+        "?" <>
+        URI.encode_query(%{
+          "state" => started.state,
+          "error" => "access_denied",
+          "error_description" => "private-description"
+        })
+
+    assert {:error, %{reason: :oauth_authorization_denied} = error} =
+             OAuth.consume_callback_url("gmail", response, started.state, mailbox.id)
+
+    refute inspect(error) =~ "private-description"
+    refute inspect(error) =~ started.state
+    refute inspect(error) =~ callback
+    refute Repo.one!(OAuthTransaction).consumed_at
+
+    for response <- [
+          callback <> "?error=access_denied",
+          callback <> "?error=access_denied&state=wrong"
+        ] do
+      assert {:error, %{reason: :invalid_oauth_callback}} =
+               OAuth.consume_callback_url("gmail", response, started.state, mailbox.id)
+
+      refute Repo.one!(OAuthTransaction).consumed_at
+    end
+  end
+
+  test "registered response parameter names cannot hide ambiguous callback grants", %{
+    mailbox: mailbox
+  } do
+    for key <- ~w(code state error) do
+      callback = "http://localhost:4290/callback?#{key}=registered-value"
+      assert {:ok, _} = Connectors.put_oauth_provider_setting("gmail", %{callback_url: callback})
+      assert {:ok, started} = OAuth.start("gmail", mailbox.id, callback)
+
+      response =
+        callback <> "&" <> URI.encode_query(%{"code" => "code", "state" => started.state})
+
+      assert {:error, _} =
+               OAuth.consume_callback_url("gmail", response, started.state, mailbox.id)
+
+      assert Enum.all?(Repo.all(OAuthTransaction), &is_nil(&1.consumed_at))
+    end
+  end
+
+  test "pasted completion retains expiry and credential generation checks", %{mailbox: mailbox} do
+    callback = "http://localhost:4290/callback"
+    now = ~U[2026-10-07 00:00:00.000000Z]
+    assert {:ok, expired} = OAuth.start("gmail", mailbox.id, callback, now: now, ttl_seconds: 10)
+
+    expired_url =
+      callback <> "?" <> URI.encode_query(%{"code" => "code", "state" => expired.state})
+
+    assert {:error, %{reason: :oauth_state_expired}} =
+             OAuth.consume_callback_url("gmail", expired_url, expired.state, mailbox.id,
+               now: DateTime.add(now, 11, :second)
+             )
+
+    assert {:ok, invalidated} = OAuth.start("gmail", mailbox.id, callback, now: now)
+
+    invalidated_url =
+      callback <>
+        "?" <>
+        URI.encode_query(%{"code" => "code", "state" => invalidated.state})
+
+    assert {:ok, _} =
+             Connectors.put_oauth_provider_setting("gmail", %{client_secret: "rotated-secret"})
+
+    assert {:error, %{reason: :provider_configuration_changed}} =
+             OAuth.consume_callback_url("gmail", invalidated_url, invalidated.state, mailbox.id,
+               now: now
+             )
+
+    assert {:error, %{reason: :oauth_state_replayed}} =
+             OAuth.consume_callback_url("gmail", invalidated_url, invalidated.state, mailbox.id,
+               now: now
+             )
+  end
+
   test "legacy consumed struct construction has receive-safe defaults", %{mailbox: mailbox} do
     consumed = %OAuth.Consumed{
       provider: "gmail",

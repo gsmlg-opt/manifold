@@ -41,26 +41,54 @@ That set excludes `gmail.readonly` and `gmail.send`, so it cannot receive or sen
 Gmail messages for Manifold.
 
 Create a **Web application** OAuth client, enable the Gmail API, configure the
-consent screen, and register the exact callback shown in Settings. Save its
-client ID and secret. Add test users for a testing-mode application, and complete
+consent screen, and fill in **Callback URL** in Settings OAuth. Register that
+exact URL in the Google Cloud client, then save the callback, client ID, and
+secret. Add test users for a testing-mode application, and complete
 Google verification before public use when required.
 
-For browser redirect login, the callback comes from the configured Phoenix
-Endpoint URL, not the browser's current hostname. The development callback is:
+New Google configurations default to this editable localhost callback:
 
 ```text
 http://localhost:4290/connectors/gmail/callback
 ```
 
-This needs no public domain when the browser and Manifold run on the same
-machine. A browser on another device interprets `localhost` as that device, so
-this callback will not reach Manifold. Remote browser login needs a reachable,
-exactly registered callback. Google Desktop-client loopback authorization is a
-different flow and is not implemented by Manifold's current web-client login.
+Manifold uses the saved URL unchanged in the authorization request, callback
+comparison, and token exchange. You can set a different localhost port or path,
+or an HTTPS URL.
+
+For a local server that cannot receive the browser's localhost redirect:
+
+1. Add, reconnect, or upgrade a Gmail method. Manifold opens its Google login page.
+2. Select **Start Google login**, then **Open Google login**. Keep Manifold's page
+   open while approving access in the new tab.
+3. Google redirects to the registered localhost URL. Even if that page cannot be
+   reached, copy its complete address from the browser's address bar.
+4. Paste that address into **Final Google redirect URL** on Manifold's login page
+   and select **Complete Google login**.
+
+The pasted address must include the `code` and `state` from this login attempt.
+Manifold parses it locally and completes the existing PKCE authorization; it does
+not fetch the pasted URL. The URL is cleared after submission and filtered from
+application request logs. Do not share it. A stale, denied, or expired attempt
+requires starting again. Refreshing the login page also requires a fresh start.
+
+No reachable localhost listener or callback forwarding is needed for this manual
+completion. The existing automatic callback route remains available when the
+browser can reach it. This remains Google's Web application authorization-code
+flow, with an exactly registered redirect URL.
+
+Existing Google configurations without a saved callback continue to use the
+configured Phoenix Endpoint URL until a different callback is saved. Saving the
+unchanged legacy form preserves its configuration and active connections. Changing
+the callback requires reconnect, just like rotating credentials. API updates
+that omit the callback preserve its current value.
+
+The callback migration preserves existing credentials and generations. Clear
+saved callback URLs before rolling back that migration.
 
 ## Storage and configuration changes
 
-Client IDs and login modes are public configuration. Browser-mode client secrets,
+Client IDs, callback URLs, and login modes are public configuration. Browser-mode client secrets,
 device codes, and user tokens are encrypted with the stable
 `MANIFOLD_CONNECTOR_ENCRYPTION_KEY`. Do not rotate that key without a credential
 migration. Device codes and tokens are never displayed in errors or activity

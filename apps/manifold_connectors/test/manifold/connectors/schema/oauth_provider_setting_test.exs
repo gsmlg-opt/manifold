@@ -66,6 +66,7 @@ defmodule Manifold.Connectors.Schema.OAuthProviderSettingTest do
     assert "oauth_provider_settings_client_id_present" in constraints
     assert "oauth_provider_settings_key_version_positive" in constraints
     assert "oauth_provider_settings_lock_version_positive" in constraints
+    assert "oauth_provider_settings_callback_provider_valid" in constraints
   end
 
   test "Microsoft device setting needs no secret while code settings still do" do
@@ -80,6 +81,68 @@ defmodule Manifold.Connectors.Schema.OAuthProviderSettingTest do
         ] do
       refute OAuthProviderSetting.changeset(%OAuthProviderSetting{}, rejected).valid?
     end
+  end
+
+  test "Gmail callback accepts custom HTTPS paths and HTTP loopback URLs" do
+    for url <- [
+          "https://mail.example.test/operator/callback?mode=google",
+          "http://localhost:4290/custom/callback",
+          "http://127.0.0.1:8080/callback",
+          "http://127.2.3.4:8080/callback",
+          "http://[::1]:8080/callback"
+        ] do
+      assert callback_changeset(url).valid?
+    end
+
+    assert callback_changeset(nil).valid?
+    assert callback_changeset("").valid?
+  end
+
+  test "Gmail callback rejects malformed or unsafe URLs" do
+    for url <- [
+          "callback",
+          "//localhost/callback",
+          "https:///callback",
+          "ftp://localhost/callback",
+          "http://0.0.0.0/callback",
+          "http://192.168.1.1/callback",
+          "https://example.test:0/callback",
+          "https://example.test:65536/callback",
+          "https://example.test/callback#",
+          "https://user@example.test/callback",
+          "https://exa mple.test/callback",
+          "http://localhost.example.test/callback"
+        ] do
+      changeset = callback_changeset(url)
+      refute changeset.valid?, url
+      assert changeset.errors[:callback_url], url
+    end
+
+    refute callback_changeset("http://localhost/callback", "microsoft").valid?
+  end
+
+  test "a saved callback URL can be cleared with nil or a blank value" do
+    setting = %OAuthProviderSetting{
+      provider: "gmail",
+      client_id: "client",
+      client_secret_ciphertext: <<1>>,
+      callback_url: "http://localhost:4290/callback"
+    }
+
+    for value <- [nil, "", "  "] do
+      changeset = OAuthProviderSetting.changeset(setting, %{callback_url: value})
+      assert changeset.valid?
+      assert is_nil(Ecto.Changeset.get_field(changeset, :callback_url))
+    end
+  end
+
+  defp callback_changeset(url, provider \\ "gmail") do
+    OAuthProviderSetting.changeset(%OAuthProviderSetting{}, %{
+      provider: provider,
+      client_id: "client",
+      client_secret_ciphertext: <<1>>,
+      callback_url: url
+    })
   end
 
   test "OAuth transaction accepts a paired provider-setting generation" do

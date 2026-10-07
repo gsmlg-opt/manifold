@@ -16,10 +16,7 @@ defmodule ManifoldWeb.SettingsLive.OAuthHelp do
            definition: definition,
            help: if(flow == "device_code", do: definition.device_help, else: definition.help),
            auth_flow: flow,
-           callback_uri:
-             ManifoldWeb.Endpoint.url()
-             |> URI.merge(definition.callback_path)
-             |> URI.to_string()
+           callback_uri: callback_uri(definition)
          )}
 
       {:error, _error} ->
@@ -93,8 +90,10 @@ defmodule ManifoldWeb.SettingsLive.OAuthHelp do
         <section :if={@definition.key == "gmail"}>
           <h2>Without a fixed public hostname</h2>
           <p>Google's device-code flow does not support Gmail read or send permissions.</p>
-          <p>Use the registered localhost callback when your browser and Manifold run on the same
-            machine. A browser on another device needs a reachable, exactly registered callback.
+          <p>Set Callback URL in Settings OAuth and register that exact URL in Google Cloud.
+            Use a localhost callback. Keep Manifold's Google login page open, sign in in the new
+            tab, and paste the final redirect URL back into Manifold. Copy the complete address,
+            including code and state, even if the callback page cannot be reached.
             Google Desktop-client loopback login is a different flow and is not implemented here.</p>
         </section>
         <p :if={@definition.key == "microsoft" && @auth_flow != "device_code"}>
@@ -152,4 +151,22 @@ defmodule ManifoldWeb.SettingsLive.OAuthHelp do
   end
 
   defp help_flow(_definition), do: "authorization_code"
+
+  defp callback_uri(definition) do
+    fallback =
+      ManifoldWeb.Endpoint.url()
+      |> URI.merge(definition.callback_path)
+      |> URI.to_string()
+
+    case {definition.key, Connectors.get_oauth_provider_setting(definition.key)} do
+      {"gmail", {:ok, %{status: :not_configured}}} ->
+        "http://localhost:4290/connectors/gmail/callback"
+
+      {"gmail", {:ok, %{callback_url: callback_url}}} when is_binary(callback_url) ->
+        callback_url
+
+      _ ->
+        fallback
+    end
+  end
 end
