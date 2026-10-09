@@ -81,6 +81,17 @@ For deployments with several Graph-calling VMs,
 replace local admission with shared enforcement before claiming a deployment-wide
 mailbox concurrency limit.
 
+## Publication status
+
+2026-10-09: Microsoft login and sync changes were committed and pushed to `main`
+(`88fb35d`, `1c0804a`). Fresh prepublication checks passed 329 scoped tests,
+repository formatting, and strict development compilation. The v0.4.0 release
+has not been dispatched: clean CI builds cannot check out the pinned `ex_ssl`
+revision `75ad1da8832a24f0d7f730e54ec80717b7346664`, a pre-existing dependency
+fetch failure tracked in https://github.com/gsmlg-dev/ex_ssl/issues/5 (blocker).
+Resume publication only after upstream resolution, a validated dependency
+update, and successful clean-build checks.
+
 ## Official references
 
 - https://learn.microsoft.com/en-us/graph/throttling-limits#outlook-service-limits
