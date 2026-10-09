@@ -41,6 +41,84 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     :ok
   end
 
+  test "a receive cooldown prevents sending before any POST is dispatched" do
+    limiter =
+      start_supervised!(
+        {Manifold.Connectors.MicrosoftSyncLimiter,
+         name: nil, interval_ms: 0, clock: fn -> 0 end, jitter: fn -> 0 end}
+      )
+
+    context =
+      Manifold.Connectors.MicrosoftSyncLimiter.context({:microsoft, "mailbox"}, server: limiter)
+
+    error = %Manifold.Connectors.Provider.Error{
+      class: :temporary,
+      code: :http_429,
+      message: "Microsoft Graph is temporarily unavailable",
+      retry_after_seconds: 75
+    }
+
+    assert {:error, _} =
+             Manifold.Connectors.MicrosoftSyncLimiter.run(context, fn -> {:error, error} end)
+
+    test_pid = self()
+
+    Req.Test.stub(MicrosoftGraph, fn conn ->
+      send(test_pid, :post_dispatched)
+      Plug.Conn.send_resp(conn, 202, "")
+    end)
+
+    assert {:error,
+            %Provider.Error{class: :transient, code: "provider_cooldown", retry_after: 75}} =
+             MicrosoftGraph.submit(Keyword.put(@config, :microsoft_sync, context), @request)
+
+    refute_received :post_dispatched
+  end
+
+  test "a send 429 shares its cooldown with receive requests without replaying the POST" do
+    limiter =
+      start_supervised!(
+        {Manifold.Connectors.MicrosoftSyncLimiter,
+         name: nil, interval_ms: 0, clock: fn -> 0 end, jitter: fn -> 0 end}
+      )
+
+    context =
+      Manifold.Connectors.MicrosoftSyncLimiter.context({:microsoft, "mailbox"}, server: limiter)
+
+    Req.Test.expect(MicrosoftGraph, fn conn ->
+      conn
+      |> Plug.Conn.put_resp_header("retry-after", "75")
+      |> Plug.Conn.send_resp(429, "")
+    end)
+
+    assert {:error, %Provider.Error{class: :transient, code: "rate_limited", retry_after: 75}} =
+             MicrosoftGraph.submit(Keyword.put(@config, :microsoft_sync, context), @request)
+
+    assert {:error, %Manifold.Connectors.Provider.Error{code: :http_429, retry_after_seconds: 75}} =
+             Manifold.Connectors.MicrosoftSyncLimiter.run(context, fn ->
+               flunk("receive bypassed cooldown")
+             end)
+  end
+
+  test "paced sends retain uncertain server and transport outcomes without replay" do
+    limiter =
+      start_supervised!({Manifold.Connectors.MicrosoftSyncLimiter, name: nil, interval_ms: 0})
+
+    context =
+      Manifold.Connectors.MicrosoftSyncLimiter.context({:microsoft, "mailbox"}, server: limiter)
+
+    config = Keyword.put(@config, :microsoft_sync, context)
+    Req.Test.expect(MicrosoftGraph, fn conn -> Plug.Conn.send_resp(conn, 503, "") end)
+
+    assert {:error, %Provider.Error{class: :uncertain, code: "acceptance_unknown"}} =
+             MicrosoftGraph.submit(config, @request)
+
+    Req.Test.expect(MicrosoftGraph, fn conn -> tagged_transport_error(conn, :timeout) end)
+
+    assert {:error, %Provider.Error{class: :uncertain, code: "acceptance_unknown"}} =
+             MicrosoftGraph.submit(config, @request)
+  end
+
   test "posts the exact base64 MIME message and accepts only a 202 response" do
     Req.Test.expect(MicrosoftGraph, fn conn ->
       assert conn.method == "POST"

@@ -885,6 +885,121 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
             }} = MicrosoftGraph.resolve_folder_mapping("access-token", config, [])
   end
 
+  test "Graph calls share cooldown without replaying a throttled request" do
+    clock = start_supervised!({Agent, fn -> 0 end})
+
+    server =
+      start_supervised!(
+        {Manifold.Connectors.MicrosoftSyncLimiter,
+         name: nil, clock: fn -> Agent.get(clock, & &1) end, jitter: fn -> 0 end}
+      )
+
+    context = Manifold.Connectors.MicrosoftSyncLimiter.context("mailbox", server: server)
+
+    Req.Test.expect(MicrosoftGraph, fn conn ->
+      conn
+      |> Plug.Conn.put_resp_header("retry-after", "45")
+      |> Plug.Conn.put_status(429)
+      |> Req.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
+    end)
+
+    assert {:error, %Provider.Error{code: :http_429, retry_after_seconds: 45}} =
+             MicrosoftGraph.identity("access-token", @config, microsoft_sync: context)
+
+    assert {:error, %Provider.Error{code: :http_429, retry_after_seconds: 45}} =
+             MicrosoftGraph.fetch_raw("access-token", "message-id", @config,
+               microsoft_sync: context
+             )
+  end
+
+  test "folder mapping allows paced admission behind two slow in-flight requests" do
+    parent = self()
+
+    server =
+      start_supervised!({Manifold.Connectors.MicrosoftSyncLimiter, name: nil, interval_ms: 0})
+
+    context = Manifold.Connectors.MicrosoftSyncLimiter.context("mailbox", server: server)
+
+    Req.Test.expect(MicrosoftGraph, 4, fn conn ->
+      send(parent, {:slow_folder_lookup, self()})
+
+      receive do
+        :release_lookup -> :ok
+      after
+        10_000 -> flunk("folder lookup barrier was not released")
+      end
+
+      Req.Test.json(conn, %{"id" => Path.basename(conn.request_path)})
+    end)
+
+    task =
+      Task.async(fn ->
+        MicrosoftGraph.resolve_folder_mapping("access-token", @config, microsoft_sync: context)
+      end)
+
+    assert_receive {:slow_folder_lookup, first}, 1_000
+    assert_receive {:slow_folder_lookup, second}, 1_000
+    # Keep real requests in flight past the old task deadline; limiter pacing
+    # and concurrency behavior are covered separately with an injected clock.
+    receive do
+      {:slow_folder_lookup, _unexpected} -> flunk("exceeded two in-flight requests")
+    after
+      5_100 -> :ok
+    end
+
+    send(first, :release_lookup)
+    send(second, :release_lookup)
+
+    for _ <- 1..2 do
+      assert_receive {:slow_folder_lookup, pid}, 1_000
+      send(pid, :release_lookup)
+    end
+
+    assert {:ok, %Provider.FolderMapping{kinds_by_id: mapping}} = Task.await(task, 10_000)
+    assert map_size(mapping) == 4
+  end
+
+  test "initial folder lookups honor an existing shared mailbox cooldown" do
+    server =
+      start_supervised!(
+        {Manifold.Connectors.MicrosoftSyncLimiter, name: nil, jitter: fn -> 0 end}
+      )
+
+    context = Manifold.Connectors.MicrosoftSyncLimiter.context("mailbox", server: server)
+
+    assert {:error, %Provider.Error{code: :http_429}} =
+             Manifold.Connectors.MicrosoftSyncLimiter.run(context, fn ->
+               {:error,
+                %Provider.Error{
+                  class: :temporary,
+                  code: :http_429,
+                  message: "Rate limited",
+                  retry_after_seconds: 45
+                }}
+             end)
+
+    assert {:error, %Provider.Error{code: :http_429, retry_after_seconds: 45}} =
+             MicrosoftGraph.initial_cursors("access-token", @config, microsoft_sync: context)
+  end
+
+  test "HTTP-date Retry-After is accepted and trusted options cannot enable automatic replay" do
+    until = DateTime.utc_now() |> DateTime.add(120, :second) |> Req.Utils.format_http_date()
+
+    Req.Test.expect(MicrosoftGraph, fn conn ->
+      conn
+      |> Plug.Conn.put_resp_header("retry-after", until)
+      |> Plug.Conn.put_status(429)
+      |> Req.Test.json(%{"error" => "TooManyRequests"})
+    end)
+
+    config = Keyword.update!(@config, :req_options, &Keyword.put(&1, :retry, :safe_transient))
+
+    assert {:error, %Provider.Error{code: :http_429, retry_after_seconds: seconds}} =
+             MicrosoftGraph.identity("access-token", config, [])
+
+    assert seconds in 119..120
+  end
+
   defp assert_folder_mapping_failure(failure_response, class, code, retry_after_seconds) do
     ids_by_path = %{
       "/v1.0/me/mailFolders/archive" => "graph-archive-id",

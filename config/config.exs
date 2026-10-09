@@ -41,6 +41,7 @@ config :manifold_connectors,
   activity_log_dir: "log/connectors",
   activity_log_retention_days: 14,
   gmail_sync: [interval_ms: 500, page_size: 50],
+  microsoft_sync: [interval_ms: 500, max_concurrency: 2],
   providers: [
     gmail: [
       authorization_url: "https://accounts.google.com/o/oauth2/v2/auth",

@@ -4,6 +4,7 @@ defmodule Manifold.Outbound.Submission do
   import Ecto.Query
 
   alias Manifold.Connectors
+  alias Manifold.Connectors.MicrosoftSyncLimiter
   alias Manifold.Connectors.Provider.Error, as: ConnectorProviderError
   alias Manifold.Connectors.SubmissionMethod
   alias Manifold.Core.Error
@@ -57,6 +58,7 @@ defmodule Manifold.Outbound.Submission do
     not_found
     outbound_not_found
     provider_configuration_error
+    provider_cooldown
     provider_not_configured
     provider_unavailable
     rate_limited
@@ -866,6 +868,7 @@ defmodule Manifold.Outbound.Submission do
     config
     |> Keyword.merge(Keyword.get(opts, :provider_config, []))
     |> Keyword.put(:access_token, access_token)
+    |> microsoft_request_context(method, provider, opts)
   end
 
   defp provider_config(%SubmissionMethod{} = method, "smtp", opts) do
@@ -873,6 +876,18 @@ defmodule Manifold.Outbound.Submission do
     |> Keyword.get(:provider_config, [])
     |> Keyword.put(:submission_method, method)
   end
+
+  defp microsoft_request_context(config, method, "microsoft", opts) do
+    context =
+      MicrosoftSyncLimiter.context(
+        {:microsoft, method.account_id},
+        Keyword.get(opts, :microsoft_sync_limiter, [])
+      )
+
+    Keyword.put(config, :microsoft_sync, context)
+  end
+
+  defp microsoft_request_context(config, _method, _provider, _opts), do: config
 
   defp legacy_resend_config(opts) do
     Keyword.get(
@@ -1126,6 +1141,11 @@ defmodule Manifold.Outbound.Submission do
             submission
             |> Ecto.Changeset.change(
               state: submission_state,
+              attempt_count:
+                if(deferred_admission?(preparation, error),
+                  do: submission.attempt_count - 1,
+                  else: submission.attempt_count
+                ),
               last_http_status: error.http_status,
               last_error_code: error.code,
               last_error_message: error.message
@@ -1169,7 +1189,7 @@ defmodule Manifold.Outbound.Submission do
         _missing_or_invalid_limit -> false
       end
 
-    if exhausted? do
+    if exhausted? and not deferred_admission?(preparation, error) do
       %{retry_exhausted_error() | http_status: error.http_status}
     else
       error
@@ -1177,6 +1197,14 @@ defmodule Manifold.Outbound.Submission do
   end
 
   defp maybe_retry_exhausted(%Provider.Error{} = error, _preparation, _opts), do: error
+
+  defp deferred_admission?(
+         %{submission: %{provider: "microsoft"}},
+         %Provider.Error{class: :transient, code: "provider_cooldown"}
+       ),
+       do: true
+
+  defp deferred_admission?(_preparation, _error), do: false
 
   defp maybe_reconcile_pending(provider, provider_message_id, message_id, now)
        when is_binary(provider_message_id) and provider_message_id != "" do

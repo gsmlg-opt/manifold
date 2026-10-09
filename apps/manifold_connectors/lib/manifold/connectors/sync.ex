@@ -6,7 +6,7 @@ defmodule Manifold.Connectors.Sync do
   alias Manifold.Accounts
   alias Manifold.Connectors
   alias Manifold.Connectors.{Crypto, OAuthScopes, ProviderConfig}
-  alias Manifold.Connectors.GmailSyncLimiter
+  alias Manifold.Connectors.{GmailSyncLimiter, MicrosoftSyncLimiter}
   alias Manifold.Connectors.{MicrosoftFolderMapping, RemoteStateJobs}
   alias Manifold.Connectors.Provider
   alias Manifold.Connectors.Provider.Error, as: ProviderError
@@ -40,6 +40,9 @@ defmodule Manifold.Connectors.Sync do
     daily_quota_exceeded
     database_unavailable
     folder_cursor_missing
+    http_429
+    http_503
+    http_504
     insufficient_provider_scope
     invalid_encryption_key
     invalid_grant
@@ -52,6 +55,7 @@ defmodule Manifold.Connectors.Sync do
     reauthorization_required
     sync_disabled
     sync_failed
+    transport_error
   ))
 
   @spec run(Ecto.UUID.t(), Keyword.t()) ::
@@ -278,10 +282,29 @@ defmodule Manifold.Connectors.Sync do
     )
   end
 
+  defp prepare_provider_session(%ReceiveMethod{kind: "microsoft"} = account, _adapter, opts) do
+    context =
+      MicrosoftSyncLimiter.context(
+        {:microsoft, account.account_id},
+        Keyword.get(opts, :microsoft_sync_limiter, [])
+      )
+
+    Keyword.update(
+      opts,
+      :provider_opts,
+      [microsoft_sync: context],
+      &Keyword.put(&1, :microsoft_sync, context)
+    )
+  end
+
   defp prepare_provider_session(_account, _adapter, opts), do: opts
 
   defp complete_provider_session(%ReceiveMethod{kind: "gmail"}, opts) do
     GmailSyncLimiter.success(Keyword.fetch!(provider_opts(opts), :gmail_sync))
+  end
+
+  defp complete_provider_session(%ReceiveMethod{kind: "microsoft"}, opts) do
+    MicrosoftSyncLimiter.success(Keyword.fetch!(provider_opts(opts), :microsoft_sync))
   end
 
   defp complete_provider_session(_account, _opts), do: :ok
@@ -415,6 +438,7 @@ defmodule Manifold.Connectors.Sync do
           Repo.rollback(Error.new(:permanent, :sync_disabled, "connector sync is disabled"))
 
         %ReceiveMethod{} = account ->
+          begin_microsoft_poll_cycle(account)
           cursor = next_cursor(account.id)
 
           if cursor do
@@ -442,6 +466,27 @@ defmodule Manifold.Connectors.Sync do
       {:error, %Error{} = error} -> {:error, error}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp begin_microsoft_poll_cycle(
+         %ReceiveMethod{kind: "microsoft", status: "connected"} = account
+       ) do
+    # Completion markers belong to a poll cycle; opaque delta positions survive it.
+    # Pending bootstrap/page work already has a cycle and must resume unchanged.
+    unless pending_cursors?(account.id) do
+      SyncCursor
+      |> where([cursor], cursor.external_account_id == ^account.id)
+      |> Repo.update_all(set: [last_completed_at: nil], inc: [lock_version: 1])
+    end
+  end
+
+  defp begin_microsoft_poll_cycle(_account), do: :ok
+
+  defp pending_cursors?(account_id) do
+    SyncCursor
+    |> where([stored], stored.external_account_id == ^account_id)
+    |> where([stored], not is_nil(stored.page_cursor) or is_nil(stored.last_completed_at))
+    |> Repo.exists?()
   end
 
   defp next_cursor(account_id) do
@@ -1007,11 +1052,7 @@ defmodule Manifold.Connectors.Sync do
 
       insert_discovered_cursors(account.id, page.discovered_cursors, now)
 
-      more? =
-        SyncCursor
-        |> where([stored], stored.external_account_id == ^account.id)
-        |> where([stored], not is_nil(stored.page_cursor) or is_nil(stored.last_completed_at))
-        |> Repo.exists?()
+      more? = pending_cursors?(account.id)
 
       account
       |> ReceiveMethod.changeset(%{
@@ -1353,7 +1394,7 @@ defmodule Manifold.Connectors.Sync do
   end
 
   defp handle_cursor_provider_error(
-         %ReceiveMethod{id: account_id},
+         %ReceiveMethod{id: account_id, kind: kind},
          %SyncCursor{scope: "folder:" <> _folder_id} = cursor,
          %ProviderError{code: :not_found},
          now,
@@ -1363,9 +1404,13 @@ defmodule Manifold.Connectors.Sync do
       Repo.delete_all(from(stored in SyncCursor, where: stored.id == ^cursor.id))
 
       more? =
-        SyncCursor
-        |> where([stored], stored.external_account_id == ^account_id)
-        |> Repo.exists?()
+        if kind == "microsoft" do
+          pending_cursors?(account_id)
+        else
+          SyncCursor
+          |> where([stored], stored.external_account_id == ^account_id)
+          |> Repo.exists?()
+        end
 
       case Repo.get(ReceiveMethod, account_id) do
         %ReceiveMethod{} = account ->

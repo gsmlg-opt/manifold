@@ -344,6 +344,16 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
 
   test "Microsoft 429 schedules a byte-identical worker retry on the snapshotted method" do
     configure_microsoft_req_test!()
+    # Queue draining invokes the worker with its default server; control real admission time too.
+    server = Manifold.Connectors.MicrosoftSyncLimiter
+    original_state = :sys.get_state(server)
+    clock = :atomics.new(1, [])
+
+    :sys.replace_state(server, fn state ->
+      %{state | clock: fn -> :atomics.get(clock, 1) end, interval_ms: 0}
+    end)
+
+    on_exit(fn -> :sys.replace_state(server, fn _ -> original_state end) end)
     message = microsoft_message_fixture()
     submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
     payload = explicit_request_payload(submission.id)
@@ -399,6 +409,19 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
 
     assert retryable.id == scheduled.id
     assert retryable.state == "available"
+
+    # Making the job available early must not bypass mailbox cooldown or spend a send attempt.
+    early_drain = Oban.drain_queue(queue: :outbound)
+    assert early_drain.snoozed == 1
+    assert early_drain.success == 0
+    assert Repo.get!(ProviderSubmission, submission.id).attempt_count == 1
+    assert Repo.get!(OutboundMessage, message.id).state == "queued"
+
+    Repo.get!(Oban.Job, scheduled.id)
+    |> Ecto.Changeset.change(state: "available", scheduled_at: DateTime.utc_now())
+    |> Repo.update!()
+
+    :atomics.put(clock, 1, 75_000)
 
     Req.Test.expect(__MODULE__, fn conn ->
       {:ok, encoded, conn} = Plug.Conn.read_body(conn)

@@ -5,6 +5,8 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
 
   @behaviour Manifold.Connectors.Provider
 
+  alias Manifold.Connectors.MicrosoftSyncLimiter
+
   alias Manifold.Connectors.Provider.{
     Error,
     FolderMapping,
@@ -17,7 +19,8 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   }
 
   @default_scopes "openid profile offline_access User.Read Mail.Read"
-  @folder_mapping_timeout 5_000
+  # Four lookups share two admitted slots and the default 15-second HTTP timeout.
+  @folder_mapping_timeout 35_000
   @folder_mapping_version 1
   @graph_preference ~s(IdType="ImmutableId", odata.maxpagesize=100)
   @well_known_folders [
@@ -57,7 +60,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   @impl true
   @spec identity(String.t(), Keyword.t(), Keyword.t()) ::
           {:ok, Identity.t()} | {:error, Error.t()}
-  def identity(access_token, config, _opts) do
+  def identity(access_token, config, opts) do
     with {:ok, base_url} <- fetch_config(config, :base_url),
          {:ok, response} <-
            graph_request(
@@ -65,7 +68,8 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
              base_url <> "/me",
              access_token,
              config,
-             params: %{"$select" => "id,mail,userPrincipalName"}
+             [params: %{"$select" => "id,mail,userPrincipalName"}],
+             opts
            ) do
       normalize_identity_response(response)
     end
@@ -74,7 +78,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   @impl true
   @spec resolve_folder_mapping(String.t(), Keyword.t(), Keyword.t()) ::
           {:ok, FolderMapping.t()} | {:error, Error.t()}
-  def resolve_folder_mapping(access_token, config, _opts) do
+  def resolve_folder_mapping(access_token, config, opts) do
     with {:ok, base_url} <- fetch_config(config, :base_url),
          :ok <- validate_graph_url(base_url, base_url) do
       @well_known_folders
@@ -85,7 +89,8 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
             base_url,
             well_known_name,
             folder_kind,
-            config
+            config,
+            opts
           )
         end,
         max_concurrency: 4,
@@ -122,14 +127,16 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
          base_url,
          well_known_name,
          folder_kind,
-         config
+         config,
+         opts
        ) do
     case graph_request(
            :get,
            base_url <> "/me/mailFolders/" <> well_known_name,
            access_token,
            config,
-           params: %{"$select" => "id"}
+           [params: %{"$select" => "id"}],
+           opts
          ) do
       {:ok, %Req.Response{status: status, body: %{"id" => id}}}
       when status in 200..299 and is_binary(id) ->
@@ -207,11 +214,11 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   @impl true
   @spec sync_page(String.t(), SyncCursor.t(), Keyword.t(), Keyword.t()) ::
           {:ok, Page.t()} | {:error, Error.t()}
-  def sync_page(access_token, %SyncCursor{} = cursor, config, _opts) do
+  def sync_page(access_token, %SyncCursor{} = cursor, config, opts) do
     with {:ok, base_url} <- fetch_config(config, :base_url),
          {:ok, url} <- cursor_url(cursor),
          :ok <- validate_graph_url(url, base_url),
-         {:ok, response} <- graph_request(:get, url, access_token, config, []) do
+         {:ok, response} <- graph_request(:get, url, access_token, config, [], opts) do
       case normalize_sync_response(response, cursor, base_url) do
         {:error, %Error{code: :cursor_reset}} ->
           {:ok, %Page{cursor: reset_cursor(cursor, base_url)}}
@@ -225,7 +232,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   @impl true
   @spec fetch_raw(String.t(), String.t(), Keyword.t(), Keyword.t()) ::
           {:ok, RawMessage.t()} | {:error, Error.t()}
-  def fetch_raw(access_token, message_id, config, _opts)
+  def fetch_raw(access_token, message_id, config, opts)
       when is_binary(message_id) and message_id != "" do
     with {:ok, base_url} <- fetch_config(config, :base_url),
          encoded_id = URI.encode(message_id, &URI.char_unreserved?/1),
@@ -235,7 +242,8 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
              base_url <> "/me/messages/" <> encoded_id <> "/$value",
              access_token,
              config,
-             []
+             [],
+             opts
            ) do
       normalize_raw_response(response)
     end
@@ -627,7 +635,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
     end
   end
 
-  defp graph_request(method, url, access_token, config, options) do
+  defp graph_request(method, url, access_token, config, options, opts) do
     request_options =
       Keyword.merge(
         [
@@ -637,9 +645,23 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
         options
       )
 
-    case request(method, url, config, request_options) do
-      {:ok, %Req.Response{} = response} -> {:ok, response}
-      {:error, reason} -> {:error, transport_error(reason)}
+    callback = fn ->
+      case request(method, url, config, request_options) do
+        {:ok, %Req.Response{status: status} = response}
+        when status in [429, 500, 502, 503, 504] ->
+          {:error, classify_response(response)}
+
+        {:ok, %Req.Response{} = response} ->
+          {:ok, response}
+
+        {:error, reason} ->
+          {:error, transport_error(reason)}
+      end
+    end
+
+    case Keyword.get(opts, :microsoft_sync) do
+      nil -> callback.()
+      context -> MicrosoftSyncLimiter.run(context, callback)
     end
   end
 
@@ -648,6 +670,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
       [method: method, url: url, retry: false]
       |> Keyword.merge(options)
       |> Keyword.merge(Keyword.get(config, :req_options, []))
+      |> Keyword.put(:retry, false)
 
     Req.request(options)
   end
@@ -768,11 +791,20 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
       [value] ->
         case Integer.parse(value) do
           {seconds, ""} when seconds > 0 -> seconds
-          _invalid -> nil
+          _invalid -> retry_after_date(value)
         end
 
       _missing_or_ambiguous ->
         nil
+    end
+  end
+
+  defp retry_after_date(value) do
+    with {:ok, datetime} <- Req.Utils.parse_http_date(value),
+         seconds when seconds > 0 <- DateTime.diff(datetime, DateTime.utc_now(), :second) do
+      seconds
+    else
+      _invalid -> nil
     end
   end
 

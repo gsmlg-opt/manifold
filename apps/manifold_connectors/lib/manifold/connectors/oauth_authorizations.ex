@@ -9,6 +9,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
   alias Manifold.Connectors.{Crypto, MicrosoftFolderMapping, ProviderConfig, ProviderSettings}
   alias Manifold.Connectors.Jobs.SyncAccount
   alias Manifold.Connectors.MicrosoftScopes
+  alias Manifold.Connectors.MicrosoftSyncLimiter
   alias Manifold.Connectors.OAuth.Consumed
   alias Manifold.Connectors.OAuthScopes
   alias Manifold.Connectors.Provider.{Identity, SyncCursor, Token}
@@ -106,6 +107,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
       opts
       |> Keyword.get(:provider_opts, [])
       |> Keyword.put(:required_scopes, consumed.required_scopes)
+      |> microsoft_provider_opts(provider, consumed.mailbox_id, opts)
 
     expected_provider_generation = expected_provider_generation(consumed, opts)
 
@@ -273,7 +275,11 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
   def add_authorized_method(provider, account_id, purpose, adapter, config, opts)
       when provider in @providers and purpose in [:receive, :send] do
     now = Keyword.get(opts, :now, DateTime.utc_now())
-    provider_opts = Keyword.get(opts, :provider_opts, [])
+
+    provider_opts =
+      opts
+      |> Keyword.get(:provider_opts, [])
+      |> microsoft_provider_opts(provider, account_id, opts)
 
     after_authorized_method_snapshot =
       Keyword.get(opts, :after_authorized_method_snapshot)
@@ -2001,6 +2007,18 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
 
   defp initial_cursors(:receive, adapter, token, config, provider_opts),
     do: adapter.initial_cursors(token.access_token, config, provider_opts)
+
+  defp microsoft_provider_opts(provider_opts, "microsoft", mailbox_id, opts) do
+    context =
+      MicrosoftSyncLimiter.context(
+        {:microsoft, mailbox_id},
+        Keyword.get(opts, :microsoft_sync_limiter, [])
+      )
+
+    Keyword.put(provider_opts, :microsoft_sync, context)
+  end
+
+  defp microsoft_provider_opts(provider_opts, _provider, _mailbox_id, _opts), do: provider_opts
 
   defp reconnect_receive_snapshot(account_id) do
     ReceiveMethod

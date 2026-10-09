@@ -713,6 +713,66 @@ defmodule Manifold.Outbound.SubmissionTest do
     assert persisted.provider_metadata == %{"thread_id" => "thread-1"}
   end
 
+  test "Microsoft local cooldown does not exhaust the send attempt budget" do
+    configure_microsoft_oauth_provider!()
+    %{message: message} = queued_operational_fixture("microsoft")
+    submission = Repo.get_by!(ProviderSubmission, outbound_message_id: message.id)
+    submission |> Ecto.Changeset.change(attempt_count: 7) |> Repo.update!()
+    clock = start_supervised!({Agent, fn -> 0 end})
+
+    limiter =
+      start_supervised!(
+        {Manifold.Connectors.MicrosoftSyncLimiter,
+         name: nil, interval_ms: 0, clock: fn -> Agent.get(clock, & &1) end, jitter: fn -> 0 end}
+      )
+
+    context =
+      Manifold.Connectors.MicrosoftSyncLimiter.context({:microsoft, message.mailbox_id},
+        server: limiter
+      )
+
+    error = %Manifold.Connectors.Provider.Error{
+      class: :temporary,
+      code: :http_429,
+      message: "Microsoft Graph is temporarily unavailable",
+      retry_after_seconds: 75
+    }
+
+    assert {:error, _} =
+             Manifold.Connectors.MicrosoftSyncLimiter.run(context, fn -> {:error, error} end)
+
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      send(test_pid, :post_dispatched)
+      Plug.Conn.send_resp(conn, 202, "")
+    end)
+
+    opts = [
+      provider_attempt_limit: 8,
+      microsoft_sync_limiter: [server: limiter],
+      provider_config: [
+        base_url: "https://graph.microsoft.test/v1.0",
+        req_options: [plug: {Req.Test, __MODULE__}]
+      ]
+    ]
+
+    for _ <- 1..2 do
+      assert {:error,
+              %Provider.Error{class: :transient, code: "provider_cooldown", retry_after: 75}} =
+               Outbound.submit_message(message.id, opts)
+
+      assert Repo.get!(OutboundMessage, message.id).state == "queued"
+      assert Repo.get!(ProviderSubmission, submission.id).attempt_count == 7
+      refute_received :post_dispatched
+    end
+
+    Agent.update(clock, fn _ -> 75_000 end)
+    assert :ok = Outbound.submit_message(message.id, opts)
+    assert_receive :post_dispatched
+    assert Repo.get!(ProviderSubmission, submission.id).attempt_count == 8
+  end
+
   test "Microsoft retries the persisted snapshot and accepts a bodyless 202" do
     configure_microsoft_oauth_provider!()
     %{message: message, method: method} = queued_operational_fixture("microsoft")
@@ -751,6 +811,8 @@ defmodule Manifold.Outbound.SubmissionTest do
     assert first_request.raw_message == persisted_payload
     assert first_request.request_sha256 == submission.request_sha256
     assert Keyword.fetch!(first_config, :access_token) == "microsoft-access-token"
+    assert %{key: {:microsoft, mailbox_id}} = first_config[:microsoft_sync]
+    assert mailbox_id == message.mailbox_id
 
     assert Repo.get!(OutboundMessage, message.id).state == "queued"
 

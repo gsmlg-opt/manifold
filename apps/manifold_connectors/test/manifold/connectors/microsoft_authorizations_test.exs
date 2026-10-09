@@ -57,12 +57,14 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     @impl true
     def identity(_access_token, config, opts) do
       notify_config(opts, :identity_config, config)
+      notify_config(opts, :identity_limiter, Keyword.get(opts, :microsoft_sync))
       Keyword.fetch!(opts, :identity)
     end
 
     @impl true
     def initial_cursors(access_token, config, opts) do
       notify_config(opts, :initial_cursors_config, config)
+      notify_config(opts, :initial_cursors_limiter, Keyword.get(opts, :microsoft_sync))
 
       if test_pid = Keyword.get(opts, :test_pid) do
         send(test_pid, :initial_cursors)
@@ -225,6 +227,10 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
     assert_receive {:initial_cursors_config, initial_cursors_config}
     assert_microsoft_operation_config(initial_cursors_config)
+
+    expected_key = {:microsoft, account.id}
+    assert_receive {:identity_limiter, %{key: ^expected_key}}
+    assert_receive {:initial_cursors_limiter, %{key: ^expected_key}}
   end
 
   test "rotating the Microsoft setting during exchange rejects completion without persistence", %{
@@ -1532,6 +1538,9 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert_receive {:refresh_config, ^full_config}
     assert_receive {:initial_cursors_config, initial_cursors_config}
     assert_microsoft_operation_config(initial_cursors_config)
+
+    expected_key = {:microsoft, account.id}
+    assert_receive {:initial_cursors_limiter, %{key: ^expected_key}}
 
     advanced = Repo.get!(OAuthAuthorization, authorization.id)
     assert advanced.lock_version > authorization.lock_version

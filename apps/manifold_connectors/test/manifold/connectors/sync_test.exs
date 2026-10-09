@@ -9,6 +9,7 @@ defmodule Manifold.Connectors.SyncTest do
     Crypto,
     GmailSyncLimiter,
     MicrosoftFolderMapping,
+    MicrosoftSyncLimiter,
     MicrosoftScopes,
     RemoteStateJobs
   }
@@ -150,6 +151,7 @@ defmodule Manifold.Connectors.SyncTest do
 
       if test_pid = Keyword.get(opts, :test_pid) do
         send(test_pid, {:gmail_sync_context, Keyword.get(opts, :gmail_sync)})
+        send(test_pid, {:microsoft_sync_context, Keyword.get(opts, :microsoft_sync)})
 
         send(
           test_pid,
@@ -279,6 +281,7 @@ defmodule Manifold.Connectors.SyncTest do
       Process.delete(:folder_mapping_count)
       Process.delete(:folder_mapping_result)
       Process.delete(:raw_fetch_count)
+      Process.delete(:microsoft_cycle_page_seen)
     end)
 
     suffix = System.unique_integer([:positive])
@@ -868,6 +871,192 @@ defmodule Manifold.Connectors.SyncTest do
 
     assert Repo.get_by!(MailboxEntry, inbound_delivery_id: mapping.inbound_delivery_id).mailbox_id ==
              mailbox.id
+  end
+
+  test "Microsoft sync supplies the persisted mailbox limiter scope instead of caller overrides",
+       %{
+         account: account
+       } do
+    microsoft = convert_to_microsoft!(account)
+    limiter = start_supervised!({MicrosoftSyncLimiter, name: nil})
+
+    assert :ok =
+             Connectors.sync_account(microsoft.id,
+               microsoft_sync_limiter: [server: limiter],
+               provider_opts: [
+                 test_pid: self(),
+                 microsoft_sync: %{key: "untrusted-scope-sentinel"}
+               ]
+             )
+
+    assert_receive {:microsoft_sync_context, context}
+    assert context.key == {:microsoft, microsoft.account_id}
+    assert context.server == limiter
+    refute inspect(context) =~ "untrusted-scope-sentinel"
+  end
+
+  test "Microsoft polling completes paginated work before the remaining folders", %{
+    account: account
+  } do
+    microsoft = steady_microsoft_fixture!(account, 3)
+
+    Process.put(:sync_page_result, fn cursor ->
+      send(self(), {:polled_page, cursor.scope, cursor.page_cursor})
+
+      next =
+        if Process.get(:microsoft_cycle_page_seen) do
+          %{cursor | page_cursor: nil}
+        else
+          Process.put(:microsoft_cycle_page_seen, true)
+          %{cursor | page_cursor: "https://graph.microsoft.test/opaque-next-page"}
+        end
+
+      {:ok, %Page{cursor: next}}
+    end)
+
+    for _ <- 1..3, do: assert({:snooze, 1} = Connectors.sync_account(microsoft.id))
+    assert :ok = Connectors.sync_account(microsoft.id)
+    assert_receive {:polled_page, first_scope, nil}
+    assert_receive {:polled_page, ^first_scope, "https://graph.microsoft.test/opaque-next-page"}
+    assert_receive {:polled_page, second_scope, nil}
+    assert_receive {:polled_page, third_scope, nil}
+    assert length(Enum.uniq([first_scope, second_scope, third_scope])) == 3
+  end
+
+  test "Microsoft missing final folder ends the poll without rechecking completed folders", %{
+    account: account
+  } do
+    microsoft = steady_microsoft_fixture!(account, 2)
+    Process.put(:sync_page_result, fn cursor -> {:ok, %Page{cursor: cursor}} end)
+    assert {:snooze, 1} = Connectors.sync_account(microsoft.id)
+
+    # Remove the pending message folder; the folders discovery cursor has finished.
+    completed =
+      Repo.one!(
+        from(c in SyncCursor,
+          where: c.external_account_id == ^microsoft.id and not is_nil(c.last_completed_at)
+        )
+      )
+
+    pending =
+      Repo.one!(
+        from(c in SyncCursor,
+          where: c.external_account_id == ^microsoft.id and is_nil(c.last_completed_at)
+        )
+      )
+
+    pending |> SyncCursor.changeset(%{scope: "folder:removed"}) |> Repo.update!()
+    completed |> SyncCursor.changeset(%{scope: "folders"}) |> Repo.update!()
+
+    Process.put(
+      :sync_page_result,
+      {:error, %Error{class: :permanent, code: :not_found, message: "provider folder removed"}}
+    )
+
+    assert :ok = Connectors.sync_account(microsoft.id)
+    assert Repo.get!(ReceiveMethod, microsoft.id).status == "connected"
+
+    assert Repo.aggregate(
+             from(c in SyncCursor, where: c.external_account_id == ^microsoft.id),
+             :count
+           ) == 1
+  end
+
+  test "Microsoft steady polling checks every folder once and finishes the cycle", %{
+    account: account
+  } do
+    microsoft = steady_microsoft_fixture!(account, 9)
+    previous_synced_at = microsoft.last_synced_at
+    now = DateTime.add(previous_synced_at, 300, :second)
+
+    Process.put(:sync_page_result, fn cursor ->
+      send(self(), {:polled_scope, cursor.scope})
+      {:ok, %Page{cursor: cursor}}
+    end)
+
+    for _ <- 1..8 do
+      assert {:snooze, 1} = Connectors.sync_account(microsoft.id, now: now)
+      assert Repo.get!(ReceiveMethod, microsoft.id).last_synced_at == previous_synced_at
+    end
+
+    assert :ok = Connectors.sync_account(microsoft.id, now: now)
+
+    scopes =
+      for _ <- 1..9,
+          do:
+            (
+              assert_receive {:polled_scope, scope}
+              scope
+            )
+
+    assert length(Enum.uniq(scopes)) == 9
+    refute_receive {:polled_scope, _}
+    assert Repo.get!(ReceiveMethod, microsoft.id).last_synced_at == now
+    assert Repo.get!(ReceiveMethod, microsoft.id).status == "connected"
+
+    assert {:snooze, 1} = Connectors.sync_account(microsoft.id, now: DateTime.add(now, 300))
+    assert_receive {:polled_scope, _}
+  end
+
+  test "Microsoft throttled polling resumes unfinished folders without rechecking completed ones",
+       %{
+         account: account
+       } do
+    microsoft = steady_microsoft_fixture!(account, 3)
+
+    Process.put(:sync_page_result, fn cursor ->
+      send(self(), {:polled_scope, cursor.scope})
+      {:ok, %Page{cursor: cursor}}
+    end)
+
+    assert {:snooze, 1} = Connectors.sync_account(microsoft.id)
+    assert_receive {:polled_scope, first_scope}
+
+    Process.put(:sync_page_result, fn cursor ->
+      send(self(), {:throttled_scope, cursor.scope})
+
+      {:error,
+       %Error{
+         class: :temporary,
+         code: :http_429,
+         message: "provider rate limited",
+         retry_after_seconds: 47
+       }}
+    end)
+
+    assert {:snooze, 47} = Connectors.sync_account(microsoft.id)
+    assert_receive {:throttled_scope, retry_scope}
+    refute first_scope == retry_scope
+    assert Repo.get!(ReceiveMethod, microsoft.id).last_synced_at == microsoft.last_synced_at
+
+    Process.put(:sync_page_result, fn cursor ->
+      send(self(), {:polled_scope, cursor.scope})
+      {:ok, %Page{cursor: cursor}}
+    end)
+
+    assert {:snooze, 1} = Connectors.sync_account(microsoft.id)
+    assert_receive {:polled_scope, ^retry_scope}
+    assert :ok = Connectors.sync_account(microsoft.id)
+    assert_receive {:polled_scope, last_scope}
+    refute last_scope in [first_scope, retry_scope]
+    refute_receive {:polled_scope, _}
+  end
+
+  test "Microsoft telemetry distinguishes safe throttling and transport error codes", %{
+    account: account
+  } do
+    microsoft = convert_to_microsoft!(account)
+    attach_sync_telemetry()
+
+    for code <- [:http_429, :http_503, :http_504, :transport_error] do
+      Process.put(
+        :sync_page_result,
+        {:error, %Error{class: :temporary, code: code, message: "provider request failed"}}
+      )
+
+      assert {:snooze, 30} = Connectors.sync_account(microsoft.id)
+      assert_provider_failure_telemetry(code)
+    end
   end
 
   test "Microsoft sync telemetry omits provider identities and free-form errors", %{
@@ -2485,6 +2674,30 @@ defmodule Manifold.Connectors.SyncTest do
     assert entry.read_at == nil
     assert %DateTime{} = entry.starred_at
     assert entry.folder_id == Manifold.Mail.Folders.get_system(mailbox.id, "inbox").id
+  end
+
+  defp steady_microsoft_fixture!(account, cursor_count) do
+    microsoft = convert_to_microsoft!(account)
+    completed_at = ~U[2026-08-12 02:00:00.000000Z]
+    Repo.delete_all(from(cursor in SyncCursor, where: cursor.external_account_id == ^account.id))
+
+    for index <- 1..cursor_count do
+      insert_sync_cursor!(microsoft.id, %{
+        scope: if(index == 1, do: "folders", else: "folder:folder-#{index}"),
+        phase: "steady",
+        committed_cursor: "https://graph.microsoft.test/delta/#{index}",
+        last_completed_at: completed_at,
+        metadata: %{
+          "folder_mapping_version" => 1,
+          "folder_kind" => "archive",
+          "folder_kinds_by_id" => %{"folder-inbox" => "inbox", "folder-sent" => "sent"}
+        }
+      })
+    end
+
+    microsoft
+    |> ReceiveMethod.changeset(%{last_synced_at: completed_at})
+    |> Repo.update!()
   end
 
   defp upgraded_microsoft_fixture!(account, cursor, mailbox) do

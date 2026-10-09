@@ -9,6 +9,8 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
 
   @behaviour Manifold.Outbound.Provider
 
+  alias Manifold.Connectors.MicrosoftSyncLimiter
+  alias Manifold.Connectors.Provider.Error, as: ConnectorError
   alias Manifold.Outbound.Provider.{Error, Request, Submission}
 
   @default_base_url "https://graph.microsoft.com/v1.0"
@@ -68,7 +70,65 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
 
     with {:ok, transport} <- transport_config(Keyword.get(config, :req_options, [])),
          {:ok, uri} <- submission_uri(base_url, transport) do
-      perform_request(uri, access_token, raw_message, transport)
+      case Keyword.get(config, :microsoft_sync) do
+        nil -> perform_request(uri, access_token, raw_message, transport)
+        context -> paced_request(context, uri, access_token, raw_message, transport)
+      end
+    end
+  end
+
+  defp paced_request(context, uri, access_token, raw_message, transport) do
+    # Only a definite rejection can become a retryable shared cooldown.
+    # Uncertain POST outcomes must retain their original classification.
+    result =
+      MicrosoftSyncLimiter.run(
+        context,
+        fn ->
+          case perform_request(uri, access_token, raw_message, transport) do
+            {:error, %Error{class: :transient, code: "rate_limited"} = error} ->
+              {:error,
+               %ConnectorError{
+                 class: :temporary,
+                 code: :http_429,
+                 message: error.message,
+                 retry_after_seconds: error.retry_after
+               }}
+
+            result ->
+              result
+          end
+        end,
+        on_cooldown: fn error ->
+          {:error,
+           %Error{
+             class: :transient,
+             code: "provider_cooldown",
+             message: "Microsoft Graph request is waiting for shared cooldown",
+             retry_after: error.retry_after_seconds
+           }}
+        end
+      )
+
+    case result do
+      {:error, %ConnectorError{} = error} ->
+        code = if error.code == :http_429, do: "rate_limited", else: "provider_unavailable"
+        http_status = if error.code == :http_429, do: 429, else: nil
+
+        {:error,
+         %Error{
+           class: :transient,
+           code: code,
+           message: error.message,
+           http_status: http_status,
+           retry_after: error.retry_after_seconds
+         }}
+
+      {:ok, _} ->
+        MicrosoftSyncLimiter.success(context)
+        result
+
+      result ->
+        result
     end
   end
 

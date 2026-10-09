@@ -86,6 +86,10 @@
 
 ## Implementation notes
 
+- **2026-10-09 sync throttling update**: Shared mailbox request admission,
+  cooldown/backoff, distinct throttling diagnostics, and complete per-folder
+  polling cycles are documented in [microsoft-sync-throttling.md](microsoft-sync-throttling.md).
+
 - **What changed**: Microsoft receive/send share OAuth lifecycle, scope upgrades,
   token refresh and reconnect state. Graph resolves well-known folder IDs and
   repairs localized historical placement without cursor replacement or raw
