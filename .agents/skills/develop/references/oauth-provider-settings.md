@@ -202,9 +202,9 @@ devenv shell -- mix test \
 ```
 
 Gmail and Microsoft are both catalog-backed. Microsoft credentials have no
-environment source, import, or fallback; its tenant is fixed to `organizations`
-for work/school accounts only. Only the Microsoft authorization URL, token URL,
-and Graph base URL environment overrides remain.
+environment source, import, or fallback; its default authority is `common`
+for work/school and personal Microsoft accounts. Only the Microsoft authorization
+URL, token URL, and Graph base URL environment overrides remain.
 
 ## Persistence and public APIs
 

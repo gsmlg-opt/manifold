@@ -77,7 +77,7 @@
   planned.
 - **Config / env impact**: Save the Microsoft client ID and encrypted secret at
   `/settings/oauth`. Legacy credential and tenant environment values are ignored,
-  with no import or fallback. The tenant is fixed to `organizations`; only the
+  with no import or fallback. The default authority is `common` for work/school and personal accounts; only the
   authorization URL, token URL, and Graph base URL environment overrides remain.
   Keep the exact callback and the stable connector encryption key.
 - **Security / auth / trust-boundary impact**: Use delegated `Mail.Read` and

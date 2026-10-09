@@ -1,18 +1,20 @@
 # OAuth setup without a fixed public callback
 
-Manifold supports Microsoft 365 device-code login and retains browser redirect
-login for Gmail and existing Microsoft configurations. Configure applications at
+Manifold supports Microsoft 365 and personal Outlook.com device-code login and
+retains browser redirect login for Gmail and existing Microsoft configurations. Configure applications at
 **Settings → OAuth** (`/settings/oauth`). These settings are intended for a
 trusted local instance; they do not add administrator authentication.
 
-## Microsoft 365: device code
+## Microsoft: device code
 
 Use this mode when the installation has no fixed public hostname, or the browser
 runs on a different machine from Manifold. New Microsoft configurations select
 **Device code** by default.
 
-1. Register an application in Microsoft Entra for accounts in any organizational
-   directory. Manifold continues to support work/school accounts only.
+1. Register an application in Microsoft Entra with **Accounts in any organizational
+   directory and personal Microsoft accounts** as the supported account type.
+   Manifold uses the `common` authority for work/school and personal Outlook.com
+   accounts. The application registration must allow the account type you use.
 2. Under **Authentication → Advanced settings**, enable **Allow public client
    flows**. Device-code authorization needs no redirect URI or client secret.
 3. Add delegated **User.Read**, **Mail.Read**, and **Mail.Send** permissions. Obtain

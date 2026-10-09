@@ -1386,8 +1386,8 @@ credentials are stored through Settings → OAuth; legacy client-credential
 environment values are ignored and never imported or used as fallback. Provider
 endpoint overrides remain static operator configuration and must be absolute
 HTTPS URLs without credentials or fragments. For Microsoft, only authorization,
-token, and Graph base URL overrides remain; the tenant is fixed to
-`organizations` for work/school accounts only.
+token, and Graph base URL overrides remain; the default authority is `common`
+for work/school and personal Microsoft accounts.
 
 ### 20.3 Nix development environment
 
@@ -1570,8 +1570,9 @@ cutover. Staging must verify immediate Microsoft picker enablement after save, t
 exact Microsoft help callback, receive and send, rotation/removal reconnect
 behavior, and absence of automatic method resumption.
 
-Microsoft uses the fixed `organizations` tenant, so the registration is limited
-to work/school accounts and does not include Outlook.com personal accounts.
+Microsoft uses the `common` authority for work/school and Outlook.com personal
+accounts. The application registration must allow both organizational and
+personal Microsoft accounts.
 Operators must register the exact production HTTPS callback, configure delegated
 `User.Read`, `Mail.Read`, and `Mail.Send`, save the client ID and secret at
 `/settings/oauth`, restrict staging to a non-production app registration and

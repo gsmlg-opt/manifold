@@ -27,7 +27,7 @@ config :manifold_connectors,
       authorization_url: "https://login.microsoft.invalid/authorize",
       token_url: "https://login.microsoft.invalid/token",
       base_url: "https://graph.microsoft.invalid/v1.0",
-      tenant: "organizations"
+      tenant: "common"
     ]
   ]
 

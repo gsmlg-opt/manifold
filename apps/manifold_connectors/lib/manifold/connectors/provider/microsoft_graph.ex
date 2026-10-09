@@ -323,6 +323,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
       parsed.scheme == "https" and parsed.port == 443 and is_nil(parsed.userinfo) and
         is_nil(parsed.query) and is_nil(parsed.fragment) and
         ((parsed.host in ["microsoft.com", "www.microsoft.com"] and parsed.path == "/devicelogin") or
+           (parsed.host == "login.microsoft.com" and parsed.path == "/device") or
            (parsed.host == "login.microsoftonline.com" and
               parsed.path in ["/common/oauth2/deviceauth", "/organizations/oauth2/deviceauth"]))
 

@@ -313,7 +313,7 @@ if not edge_release? do
     if config_env() == :test do
       [gmail: gmail_config]
     else
-      microsoft_tenant = "organizations"
+      microsoft_tenant = "common"
       microsoft_tenant_base = "https://login.microsoftonline.com/#{microsoft_tenant}/oauth2/v2.0"
 
       microsoft_config = [

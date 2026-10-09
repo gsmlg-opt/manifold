@@ -1,7 +1,7 @@
 # Microsoft device-code OAuth
 
 - **Date:** 2026-10-06
-- **Scope:** Microsoft work/school device login, public-client settings and refresh,
+- **Scope:** Microsoft work/school and personal Outlook.com device login, public-client settings and refresh,
   compatible browser login, Settings/help, and Gmail setup guidance.
 - **Operator instructions:** `docs/OAUTH_SETUP.md`.
 - **Design:** `docs/superpowers/specs/2026-10-06-oauth-device-login-design.md`.
@@ -72,3 +72,39 @@ mix test apps/manifold_connectors/test
 mix test apps/manifold_web/test/manifold_web/oauth_settings_live_test.exs apps/manifold_web/test/manifold_web/microsoft_device_live_test.exs apps/manifold_web/test/manifold_web/account_live_test.exs apps/manifold_web/test/manifold_web/external_accounts_web_test.exs
 mix test apps/manifold_data/test/manifold/migrations/add_oauth_device_flow_test.exs
 ```
+
+## Personal account and verification URL repair (2026-10-09)
+
+User-approved scope: support personal Outlook.com alongside work/school accounts,
+without changing delegated scopes, address binding, encrypted persistence or
+Graph operation credential boundaries.
+
+- The default authority is now `common` in catalog, compile-time/runtime defaults
+  and test tenant metadata; explicit trusted endpoint overrides remain available.
+  Entra registration must allow organizational and personal Microsoft accounts.
+- Device normalization accepts exactly `https://login.microsoft.com/device`, which
+  was returned by the live provider with HTTP 200 but previously rejected locally.
+  Legacy legitimate verification routes remain supported. HTTPS/443, no userinfo,
+  query or fragment, and exact host/path checks continue to apply.
+- Regression coverage traverses the real LiveView/device/Graph adapter with a
+  mocked Outlook.com identity and the current verification URL; malicious variants
+  of the new URL remain rejected. Help and operator setup describe both account types.
+- No migration, new settings, environment variables or credentials are needed.
+- Verified: 219 scoped tests, zero failures (Connectors 167, Web 38, runtime
+  configuration 14). Changed-file formatting and strict development compilation
+  passed. Expected RED reproduced the URL and default-authority failures before
+  fixes; runtime regression expectations were also updated and verified.
+- Independent adapter/integration and configuration/documentation reviews passed.
+- Live public-client request used `/common/oauth2/v2.0/devicecode`; the real adapter
+  successfully normalized `https://login.microsoft.com/device` with interval 5
+  and expiry 900 seconds. Device-code encryption succeeded; codes were discarded
+  without token polling or a new persisted login transaction.
+- Service reload initially stalled with the old VM still listening. A targeted
+  TERM to that old manifold VM plus managed restart started a new VM. Settings
+  and Microsoft help returned HTTP 200 with common/personal-account guidance.
+  Guarded pre-reload SyncAccount job recovery preserved existing work; Postgres
+  was left running. The manager still reported starting at the final probe, while
+  actual HTTP readiness was verified.
+- Subsequent maintainer interactive login succeeded for a personal Outlook
+  account. Live receive sync imported 258 messages. Work/school authorization and
+  credentialed outbound sending were not exercised by this validation.

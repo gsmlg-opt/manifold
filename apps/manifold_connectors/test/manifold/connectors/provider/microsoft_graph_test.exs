@@ -70,6 +70,36 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
     assert {:ok, %Provider.Token{}} = MicrosoftGraph.refresh_token("refresh", config, [])
   end
 
+  test "device authorization accepts current and legacy Microsoft verification URLs" do
+    config =
+      Keyword.put(
+        @config,
+        :device_authorization_url,
+        "https://login.microsoftonline.test/devicecode"
+      )
+
+    for uri <- [
+          "https://login.microsoft.com/device",
+          "https://microsoft.com/devicelogin",
+          "https://www.microsoft.com/devicelogin",
+          "https://login.microsoftonline.com/common/oauth2/deviceauth",
+          "https://login.microsoftonline.com/organizations/oauth2/deviceauth"
+        ] do
+      Req.Test.expect(MicrosoftGraph, fn conn ->
+        Req.Test.json(conn, %{
+          "device_code" => "private-device-code",
+          "user_code" => "ABCD-EFGH",
+          "verification_uri" => uri,
+          "expires_in" => 900,
+          "interval" => 5
+        })
+      end)
+
+      assert {:ok, %{verification_uri: ^uri, interval: 5}} =
+               MicrosoftGraph.request_device_code(config, [])
+    end
+  end
+
   test "device authorization rejects untrusted verification URLs" do
     config =
       Keyword.put(
@@ -82,7 +112,17 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
           "https://evil.test/devicelogin",
           "http://microsoft.com/devicelogin",
           "https://microsoft.com@evil.test/devicelogin",
-          "https://microsoft.com/devicelogin?token=private"
+          "https://microsoft.com/devicelogin?token=private",
+          "http://login.microsoft.com/device",
+          "https://login.microsoft.com:444/device",
+          "https://user:private@login.microsoft.com/device",
+          "https://login.microsoft.com/device?token=private",
+          "https://login.microsoft.com/device#fragment",
+          "https://login.microsoft.com/devicelogin",
+          "https://login.microsoft.com/device/",
+          "https://login.microsoft.com.evil.test/device",
+          "https://login.microsoft.com@evil.test/device",
+          "https://evil.test/device"
         ] do
       Req.Test.expect(MicrosoftGraph, fn conn ->
         Req.Test.json(conn, %{

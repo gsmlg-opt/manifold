@@ -9,10 +9,10 @@ defmodule Manifold.Connectors.OAuthProvider.Microsoft do
     capabilities: [:receive, :send],
     scopes: ["openid", "profile", "User.Read", "Mail.Read", "Mail.Send", "offline_access"],
     runtime_config: [
-      authorization_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
-      token_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+      authorization_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+      token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
       base_url: "https://graph.microsoft.com/v1.0",
-      tenant: "organizations"
+      tenant: "common"
     ],
     help: %{
       title: "Set up Microsoft OAuth",
@@ -20,7 +20,7 @@ defmodule Manifold.Connectors.OAuthProvider.Microsoft do
       documentation_name: "Microsoft",
       steps: [
         "Create or select a Microsoft Entra application registration.",
-        "Select accounts in any organizational directory for work/school access.",
+        "Select accounts in any organizational directory and personal Microsoft accounts for work/school and Outlook.com access.",
         "Add a Web platform and register the exact callback URI shown below.",
         "Add delegated User.Read, Mail.Read, and Mail.Send permissions.",
         "Do not add Mail.ReadWrite; Manifold does not create or modify Graph drafts.",
@@ -38,9 +38,9 @@ defmodule Manifold.Connectors.OAuthProvider.Microsoft do
         %{value: "offline_access", purpose: "Refresh the delegated grant when access expires."}
       ],
       testing_note:
-        "Use non-production Microsoft 365 work/school accounts; personal Outlook.com accounts are not supported.",
+        "Use non-production Microsoft 365 work/school or personal Outlook.com accounts.",
       production_note:
-        "The organizations tenant accepts work/school identities, and tenant policy may require administrator consent.",
+        "The common authority accepts work/school and personal Microsoft accounts when the application registration supports both; work/school tenant policy may require administrator consent.",
       links: [
         {"Register an Entra application",
          "https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app"},
@@ -48,7 +48,7 @@ defmodule Manifold.Connectors.OAuthProvider.Microsoft do
          "https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-redirect-uri"},
         {"Microsoft Graph permissions",
          "https://learn.microsoft.com/en-us/graph/permissions-reference"},
-        {"Supported organizational account types",
+        {"Supported account types",
          "https://learn.microsoft.com/en-us/entra/identity-platform/howto-modify-supported-accounts"}
       ]
     }
@@ -60,7 +60,7 @@ defmodule Manifold.Connectors.OAuthProvider.Microsoft do
       Map.merge(@definition.help, %{
         steps: [
           "Create or select a Microsoft Entra application registration.",
-          "Select accounts in any organizational directory for work/school access.",
+          "Select accounts in any organizational directory and personal Microsoft accounts for work/school and Outlook.com access.",
           "Under Authentication, enable Allow public client flows.",
           "Add delegated User.Read, Mail.Read, and Mail.Send permissions.",
           "Do not add Mail.ReadWrite; Manifold does not create or modify Graph drafts.",

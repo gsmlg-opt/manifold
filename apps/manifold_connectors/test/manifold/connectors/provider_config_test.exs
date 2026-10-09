@@ -177,11 +177,10 @@ defmodule Manifold.Connectors.ProviderConfigTest do
     assert resolved.setting_lock_version == setting.lock_version
 
     assert Map.new(resolved.config) == %{
-             authorization_url:
-               "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
-             token_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+             authorization_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+             token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
              base_url: "https://graph.microsoft.com/v1.0",
-             tenant: "organizations",
+             tenant: "common",
              client_id: "microsoft-db-client",
              client_secret: secret
            }
@@ -216,7 +215,7 @@ defmodule Manifold.Connectors.ProviderConfigTest do
              authorization_url: "https://login.example/authorize",
              token_url: "https://login.example/token",
              base_url: "https://graph.example/v1.0",
-             tenant: "organizations",
+             tenant: "common",
              client_id: "microsoft-db-client",
              client_secret: secret,
              req_options: [plug: {Req.Test, __MODULE__}]
@@ -297,11 +296,10 @@ defmodule Manifold.Connectors.ProviderConfigTest do
     assert {:ok, %ProviderConfig.Resolved{} = resolved} = ProviderConfig.fetch("microsoft")
 
     assert Map.new(resolved.config) == %{
-             authorization_url:
-               "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
-             token_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+             authorization_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+             token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
              base_url: "https://graph.microsoft.com/v1.0",
-             tenant: "organizations",
+             tenant: "common",
              client_id: "microsoft-db-client",
              client_secret: secret
            }
@@ -478,7 +476,7 @@ defmodule Manifold.Connectors.ProviderConfigTest do
     assert resolved.config[:auth_flow] == "device_code"
 
     assert resolved.config[:device_authorization_url] ==
-             "https://login.microsoftonline.com/organizations/oauth2/v2.0/devicecode"
+             "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
 
     refute Keyword.has_key?(resolved.config, :client_secret)
 

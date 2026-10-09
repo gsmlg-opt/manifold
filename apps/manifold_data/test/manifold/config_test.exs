@@ -126,7 +126,7 @@ defmodule Manifold.ConfigTest do
              authorization_url: "https://login.microsoft.invalid/authorize",
              token_url: "https://login.microsoft.invalid/token",
              base_url: "https://graph.microsoft.invalid/v1.0",
-             tenant: "organizations"
+             tenant: "common"
            ]
 
     refute Keyword.has_key?(connectors[:providers][:gmail], :client_id)
@@ -171,7 +171,7 @@ defmodule Manifold.ConfigTest do
              authorization_url: "https://login.example/authorize",
              token_url: "https://login.example/token",
              base_url: "https://graph.example/v1.0",
-             tenant: "organizations"
+             tenant: "common"
            ]
   end
 
@@ -190,7 +190,13 @@ defmodule Manifold.ConfigTest do
 
       refute Keyword.has_key?(microsoft, :client_id)
       refute Keyword.has_key?(microsoft, :client_secret)
-      assert microsoft[:tenant] == "organizations"
+      assert microsoft[:tenant] == "common"
+
+      assert microsoft[:authorization_url] ==
+               "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+
+      assert microsoft[:token_url] ==
+               "https://login.microsoftonline.com/common/oauth2/v2.0/token"
     end
   end
 

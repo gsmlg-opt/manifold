@@ -862,8 +862,9 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     end
 
     assert html =~ "work/school"
-    assert html =~ "organizations"
-    assert html =~ "personal Outlook.com accounts are not supported"
+    assert html =~ "common"
+    assert html =~ "personal Outlook.com"
+    refute html =~ "personal Outlook.com accounts are not supported"
     assert html =~ "Do not add Mail.ReadWrite"
   end
 

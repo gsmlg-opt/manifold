@@ -1260,7 +1260,7 @@ defmodule Manifold.Connectors.SyncTest do
     assert refresh_config[:client_secret] == "microsoft-db-secret"
     assert refresh_config[:authorization_url]
     assert refresh_config[:token_url]
-    assert refresh_config[:tenant] == "organizations"
+    assert refresh_config[:tenant] == "common"
 
     assert_receive {:folder_mapping_config, folder_mapping_config}
     assert_microsoft_operation_config(folder_mapping_config)

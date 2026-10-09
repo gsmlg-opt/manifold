@@ -24,7 +24,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
     on_exit(fn -> Application.put_env(:manifold_connectors, :providers, previous) end)
 
     {:ok, account} =
-      Accounts.create_account(%{name: "Device login", address: "device@example.test"})
+      Accounts.create_account(%{name: "Device login", address: "device@outlook.com"})
 
     {:ok, _} =
       Connectors.put_oauth_provider_setting("microsoft", %{
@@ -50,7 +50,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
 
     assert has_element?(
              view,
-             "#microsoft-device-verification[href='https://microsoft.com/devicelogin']"
+             "#microsoft-device-verification[href='https://login.microsoft.com/device']"
            )
 
     for private <- [
@@ -83,7 +83,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
       Req.Test.json(request, %{
         device_code: "private-cancel-code",
         user_code: "CANCEL-CODE",
-        verification_uri: "https://microsoft.com/devicelogin",
+        verification_uri: "https://login.microsoft.com/device",
         expires_in: 900,
         interval: 60
       })
@@ -140,7 +140,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
       live(conn, "/settings/accounts/#{account.id}/microsoft/device?purpose=send")
 
     assert html =~ "Microsoft device-code login"
-    assert html =~ "device@example.test"
+    assert html =~ "device@outlook.com"
     assert has_element?(view, "#start-microsoft-device")
     assert Repo.aggregate(OAuthDeviceTransaction, :count) == 0
 
@@ -164,7 +164,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
           Req.Test.json(request, %{
             device_code: "private-device-sentinel",
             user_code: "ABCD-EFGH",
-            verification_uri: "https://microsoft.com/devicelogin",
+            verification_uri: "https://login.microsoft.com/device",
             expires_in: 900,
             interval: 60
           })
@@ -181,7 +181,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
           })
 
         "/v1.0/me" ->
-          Req.Test.json(request, %{id: "device-subject", mail: "device@example.test"})
+          Req.Test.json(request, %{id: "device-subject", mail: "device@outlook.com"})
       end
     end)
 

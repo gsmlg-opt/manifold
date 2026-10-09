@@ -49,10 +49,10 @@ config :manifold_connectors,
       base_url: "https://gmail.googleapis.com"
     ],
     microsoft: [
-      authorization_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize",
-      token_url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
+      authorization_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+      token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
       base_url: "https://graph.microsoft.com/v1.0",
-      tenant: "organizations"
+      tenant: "common"
     ]
   ]
 
