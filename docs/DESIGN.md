@@ -1924,3 +1924,25 @@ The repository should record at least these ADRs:
 8. **Storage behaviour with local and ESS/S3 adapters.**
 9. **No IMAP, POP3, or direct outbound MTA in Release 0.1.**
 10. **Future cloud edge uses local-initiated, idempotent synchronization.**
+
+
+## iCloud contacts and calendars (v0.4.0)
+
+The historical Release 0.1 contact/calendar non-goal is superseded for read-only
+iCloud import and local contact management. Independent instance-owned iCloud
+connections use encrypted app-specific passwords, CardDAV/CalDAV discovery,
+ETag or sync-token synchronization, and five-minute Oban polling. Connections
+are not mailbox receive/send methods.
+
+Shared schemas and central migrations are owned by `manifold_data`;
+`manifold_contacts` owns local contact CRUD/query contracts and
+`manifold_calendars` owns calendar/event reading. `manifold_connectors` owns DAV
+transport, parsing, credentials and generation/lease-fenced jobs. Web exposes
+`/contacts`, `/calendars` and `/settings/icloud` with existing trusted-local
+authorization and DuskMoon themes. The edge release remains ingress-only.
+
+Only complete validated collection results commit deletions/checkpoints. Each
+service commits independently. Unknown or malformed projections retain previous
+data. Credential replacement, disable/disconnect and expired/replaced sync
+leases reject stale commits. Full setup and rollback guidance is in
+[ICLOUD.md](ICLOUD.md); approved scope is the 2026-10-09 iCloud design.

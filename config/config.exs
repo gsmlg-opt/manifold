@@ -27,7 +27,8 @@ config :manifold_data, Oban,
      crontab: [
        {"*/5 * * * *", Manifold.Cloud.Jobs.PublishRoutes},
        {"* * * * *", Manifold.Cloud.Jobs.PullDeliveries},
-       {"*/5 * * * *", Manifold.Connectors.Jobs.PollAccounts}
+       {"*/5 * * * *", Manifold.Connectors.Jobs.PollAccounts},
+       {"*/5 * * * *", Manifold.Connectors.Jobs.PollICloud}
      ]}
   ]
 
@@ -143,7 +144,14 @@ config :manifold_api, ManifoldAPI.Endpoint,
   pubsub_server: ManifoldAPI.PubSub
 
 config :phoenix, :json_library, Jason
-config :phoenix, :filter_parameters, ["password", "token", "secret", "callback_response_url"]
+
+config :phoenix, :filter_parameters, [
+  "password",
+  "app_password",
+  "token",
+  "secret",
+  "callback_response_url"
+]
 
 config :codepagex,
   encodings: [

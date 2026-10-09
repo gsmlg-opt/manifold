@@ -26,6 +26,8 @@ defmodule ManifoldWeb.MixProject do
       {:manifold_account_lifecycle, in_umbrella: true},
       {:manifold_accounts, in_umbrella: true},
       {:manifold_connectors, in_umbrella: true},
+      {:manifold_contacts, in_umbrella: true},
+      {:manifold_calendars, in_umbrella: true},
       {:manifold_ingest, in_umbrella: true},
       {:manifold_mail, in_umbrella: true},
       {:manifold_outbound, in_umbrella: true},

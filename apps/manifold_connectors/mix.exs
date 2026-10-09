@@ -27,8 +27,9 @@ defmodule Manifold.Connectors.MixProject do
       {:manifold_mail, in_umbrella: true},
       {:oban, "~> 2.23"},
       {:req, "~> 0.7"},
-      # TODO(upstream): gsmlg-dev/ex_ssl#5
-      {:ex_ssl, github: "gsmlg-dev/ex_ssl", ref: "75ad1da8832a24f0d7f730e54ec80717b7346664"},
+      {:mint, "~> 1.9"},
+      {:saxy, "~> 1.6"},
+      {:ex_ssl, "== 0.17.1"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.3"}
     ]

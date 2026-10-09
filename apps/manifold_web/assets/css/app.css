@@ -81,6 +81,12 @@ a {
   flex-shrink: 0;
 }
 
+/* Keep the expanded application navigation inside narrow viewports. */
+#app-appbar .appbar-trailing {
+  min-width: 0;
+  overflow-x: auto;
+}
+
 #app-appbar .appbar-actions {
   gap: 0.125rem;
   flex-wrap: nowrap;
@@ -2203,6 +2209,10 @@ button.folder-header-icon-button.is-active {
 }
 
 @media (max-width: 780px) {
+  #app-appbar .appbar-trailing {
+    justify-content: flex-start;
+  }
+
   #app-theme-switcher .theme-controller-trigger {
     padding-inline: 0.5rem;
     font-size: 0.75rem;

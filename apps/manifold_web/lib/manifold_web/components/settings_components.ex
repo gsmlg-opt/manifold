@@ -3,7 +3,10 @@ defmodule ManifoldWeb.SettingsComponents do
 
   use ManifoldWeb, :html
 
-  attr(:current, :atom, required: true, values: [:general, :accounts, :oauth, :appearance])
+  attr(:current, :atom,
+    required: true,
+    values: [:general, :accounts, :oauth, :icloud, :appearance]
+  )
 
   def settings_nav(assigns) do
     ~H"""
@@ -30,6 +33,13 @@ defmodule ManifoldWeb.SettingsComponents do
         >
           <.dm_mdi name="key-outline" class="settings-nav-icon" />
           <span>OAuth</span>
+        </.link>
+        <.link
+          navigate={~p"/settings/icloud"}
+          class={["settings-nav-link", @current == :icloud && "is-current"]}
+        >
+          <.dm_mdi name="apple-icloud" class="settings-nav-icon" />
+          <span>iCloud</span>
         </.link>
         <.link
           navigate={~p"/settings/appearance"}

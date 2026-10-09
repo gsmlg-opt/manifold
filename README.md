@@ -58,6 +58,17 @@ Microsoft Graph, or SMTP submission:
   database-backed Google and Microsoft client secrets and catalog-defined setup
   help.
 
+## Contacts and iCloud calendars
+
+Manage local contacts at `/contacts` and connect Apple accounts at
+`/settings/icloud` using encrypted app-specific passwords. Manifold automatically
+queues iCloud contacts and calendar event synchronization every five minutes via
+read-only CardDAV/CalDAV, with manual refresh and per-service status.
+Imported contacts and calendars are read-only; local contacts support CRUD and
+search. Calendar reading retains timezone/recurrence information and original
+ICS without expanding a full recurring-occurrence calendar.
+See [setup, synchronization and migration guidance](docs/ICLOUD.md).
+
 ## Out Of Scope
 
 The current milestones intentionally do not implement rich-text composition,

@@ -44,6 +44,13 @@ defmodule ManifoldWeb.Router do
         :conversation
       )
 
+      live("/contacts", ContactLive.Index, :index)
+      live("/contacts/new", ContactLive.Index, :new)
+      live("/contacts/:id/edit", ContactLive.Index, :edit)
+      live("/contacts/:id", ContactLive.Index, :show)
+      live("/calendars", CalendarLive.Index, :index)
+      live("/calendars/:calendar_id/events/:id", CalendarLive.Index, :show)
+      live("/calendars/:calendar_id", CalendarLive.Index, :index)
       live("/deliveries", DeliveryLive.Index, :index)
       live("/deliveries/:id", DeliveryLive.Show, :show)
       live("/jobs", JobLive.Index, :index)
@@ -56,6 +63,7 @@ defmodule ManifoldWeb.Router do
       live("/settings/general", SettingsLive.General, :index)
       live("/settings/appearance", SettingsLive.Appearance, :index)
       live("/settings/oauth", SettingsLive.OAuth, :index)
+      live("/settings/icloud", SettingsLive.ICloud, :index)
       live("/settings/oauth/:provider/help", SettingsLive.OAuthHelp, :show)
 
       live("/settings/accounts", AccountLive.Index, :index)
