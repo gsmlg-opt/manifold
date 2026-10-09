@@ -1926,7 +1926,7 @@ The repository should record at least these ADRs:
 10. **Future cloud edge uses local-initiated, idempotent synchronization.**
 
 
-## iCloud contacts and calendars (v0.4.0)
+## iCloud contacts and calendars (v0.5.0)
 
 The historical Release 0.1 contact/calendar non-goal is superseded for read-only
 iCloud import and local contact management. Independent instance-owned iCloud

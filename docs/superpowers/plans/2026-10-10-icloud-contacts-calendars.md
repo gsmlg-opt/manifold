@@ -94,4 +94,5 @@ v0.4.0 workflow/publication completed; actual relocated main archive web startup
 failed due to build-path asset configuration. Public release is marked
 prerelease; tag/artifacts retained. Supported runtime override correction is
 implemented and passes relocated local startup. Final publication verification
-remains incomplete pending decision on correction release vs replacing v0.4.0.
+continues under the user-authorized v0.5.0 correction release. Preserve public
+v0.4.0 history and stop after verified v0.5.0 publication.

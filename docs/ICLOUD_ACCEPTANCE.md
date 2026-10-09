@@ -95,6 +95,14 @@ image until a correction is published; pin v0.3.0 rather than mutable latest.
 `Application.app_dir(:manifold_web, "priv/static/assets")`. A rebuilt main
 release copied to an independent directory passed fresh isolated migration,
 context CRUD and HTTP 200 for `/contacts`, `/calendars`, `/settings/icloud`.
-Strict compile and formatting pass. This correction has not been published.
-A correction publication decision is required because the request allowed only
-one version and replacing public tags/artifacts changes their identity.
+Strict compile and formatting pass. The user authorized publishing the corrected implementation as **v0.5.0** on
+2026-10-10. The public v0.4.0 tag and artifacts remain unchanged; corrected
+published artifact/startup verification is required before completion.
+
+## v0.5.0 release candidate
+
+Source correction CI: `37965535415` (format/strict compile/JS), `37965535528`
+(full ExUnit suite), and `37965535443` (TLS workflows), all successful.
+A relocated local main package passed fresh isolated migration/context CRUD and
+HTTP 200 for all three new pages. Publication verification is recorded in the
+v0.5.0 release notes and final acceptance checkpoint after actual download.

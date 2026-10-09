@@ -2,7 +2,7 @@
 
 - Date: 2026-10-10.
 - Status: implemented; v0.4.0 published as prerelease after portability failure.
-  Local runtime asset correction verified; correction publication pending decision.
+  Runtime asset correction and its CI verified; v0.5.0 publication authorized.
 - Approved scope: local contacts, automatic read-only iCloud contact import/sync,
   calendar reading, then one release and stop.
 - Design: `docs/superpowers/specs/2026-10-09-icloud-contacts-calendars-design.md`.
@@ -54,5 +54,5 @@ exposed a build-machine absolute asset outdir and HTTP 500. Runtime uses the
 supported :duskmoon_bundler_runtime :manifold_web outdir override computed by
 Application.app_dir; this is application configuration, not an upstream bug.
 Corrected local relocated startup/migration passes. Keep public v0.4.0 marked
-prerelease until a correction publication is chosen; no tag/artifact rewrite
-has been performed. Record actual published verification independently.
+prerelease; its tag/artifacts remain unchanged. The user authorized corrected
+v0.5.0 publication. Verify downloaded packages and relocated startup independently.
