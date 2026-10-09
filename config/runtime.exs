@@ -349,6 +349,10 @@ if not edge_release? do
   config :manifold_connectors, connector_config
 
   if config_env() == :prod do
+    # Resolve assets from the installed application after release relocation.
+    config :duskmoon_bundler_runtime, :manifold_web,
+      outdir: Application.app_dir(:manifold_web, "priv/static/assets")
+
     secret_key_base =
       System.get_env("SECRET_KEY_BASE") ||
         raise "SECRET_KEY_BASE is missing. Generate one with mix phx.gen.secret."

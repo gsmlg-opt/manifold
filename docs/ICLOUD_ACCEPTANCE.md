@@ -66,3 +66,35 @@ not guarantee a completed synchronization within five minutes. Keep the
 connector encryption key stable. See `ICLOUD.md` for setup, migration and
 rollback. Rolling back the new migration deletes all new tables, including
 local contacts; retain additive tables when rolling back only binaries.
+
+## Published v0.4.0 and relocation correction
+
+Release workflow `37963642826` completed successfully, publishing main/edge
+archives and both images. Release tag/source: `4571f976988cb1471776ed158b79b990144d9acc`.
+Pre-release source CI passed 1,322 tests (`122453`), format/strict compile/JS;
+TLS workflow passed 46 tests (`662377`).
+
+Downloaded archives match GitHub sizes and SHA-256:
+
+- Main: 37,945,882 bytes,
+  `bf08fc529f905bdcfe1765c0a893ab3dcf5eff9a992270e1cc79b8d63b4d4711`.
+- Edge: 28,031,544 bytes,
+  `c46d5a81f487ffab45dc3d6a57a015cdd1492f9ed844d088755eb0edc3e0289f`.
+
+All packaged project applications have version 0.4.0. Main includes the new
+contexts and migration; edge excludes them. **FAIL:** actual downloaded main
+archive relocation/startup HTTP verification returned 500: the build-time
+absolute asset manifest path survived relocation. Earlier local startup at the
+build path passed and did not prove portability. Migration/context CRUD passed.
+The public v0.4.0 release is marked prerelease with this failure disclosed;
+its tag and archives have not been rewritten. Do not use its main archive or
+image until a correction is published; pin v0.3.0 rather than mutable latest.
+
+**PASS, local correction only:** production runtime now uses the supported
+`duskmoon_bundler_runtime` profile override with
+`Application.app_dir(:manifold_web, "priv/static/assets")`. A rebuilt main
+release copied to an independent directory passed fresh isolated migration,
+context CRUD and HTTP 200 for `/contacts`, `/calendars`, `/settings/icloud`.
+Strict compile and formatting pass. This correction has not been published.
+A correction publication decision is required because the request allowed only
+one version and replacing public tags/artifacts changes their identity.

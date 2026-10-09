@@ -1,7 +1,8 @@
 # iCloud contacts and calendars
 
 - Date: 2026-10-10.
-- Status: implemented; final release verification in progress.
+- Status: implemented; v0.4.0 published as prerelease after portability failure.
+  Local runtime asset correction verified; correction publication pending decision.
 - Approved scope: local contacts, automatic read-only iCloud contact import/sync,
   calendar reading, then one release and stop.
 - Design: `docs/superpowers/specs/2026-10-09-icloud-contacts-calendars-design.md`.
@@ -45,3 +46,13 @@ Dependencies changed narrowly: unavailable historical ex_ssl Git pin replaced
 by validated exact Hex 0.17.1, Saxy 1.6.1 added, existing Mint declared directly.
 Keep encryption key stable and apply additive migration before main startup.
 Migration rollback deletes local contacts too; binary rollback can retain tables.
+
+## Release correction boundary
+
+Actual downloaded archive checksums/version/module wiring passed, but relocation
+exposed a build-machine absolute asset outdir and HTTP 500. Runtime uses the
+supported :duskmoon_bundler_runtime :manifold_web outdir override computed by
+Application.app_dir; this is application configuration, not an upstream bug.
+Corrected local relocated startup/migration passes. Keep public v0.4.0 marked
+prerelease until a correction publication is chosen; no tag/artifact rewrite
+has been performed. Record actual published verification independently.

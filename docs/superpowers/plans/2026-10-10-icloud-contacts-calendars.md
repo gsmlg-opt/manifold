@@ -85,5 +85,13 @@ Files: README, product design, feature reference, scoped evidence/report; releas
 - [x] Run focused contact/calendar/DAV/connection/LiveView/TLS gates, changed-file formatting, strict compilation, asset build and controlled actual-wire gates.
 - [x] Record actual iCloud credentialed verification separately; never substitute fixtures for actual Apple traffic or put passwords in chat/docs.
 - [x] Record migrations/startup/rollback guidance, precise test results and limitations; update feature reference to implementation state.
-- [ ] Commit scoped feature, push, integrate the reviewed branch without absorbing original dirty work, and dispatch existing release workflow once for the next available minor version (initial target v0.4.0).
+- [x] Commit scoped feature, push, integrate the reviewed branch without absorbing original dirty work, and dispatch existing release workflow once for the next available minor version (initial target v0.4.0).
 - [ ] Verify workflow success, tag/source identity, both release archives/checksums, migration/startup behavior and Docker images. Fetch/synchronize safely; stop after reporting the one release.
+
+### Release checkpoint
+
+v0.4.0 workflow/publication completed; actual relocated main archive web startup
+failed due to build-path asset configuration. Public release is marked
+prerelease; tag/artifacts retained. Supported runtime override correction is
+implemented and passes relocated local startup. Final publication verification
+remains incomplete pending decision on correction release vs replacing v0.4.0.
