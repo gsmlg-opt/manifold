@@ -1,6 +1,8 @@
 defmodule ManifoldWeb.SettingsLive.GoogleLogin do
   use ManifoldWeb, :live_view
 
+  require Logger
+
   alias Manifold.Accounts
   alias Manifold.Connectors
   alias Manifold.Connectors.{OAuth, ProviderConfig}
@@ -117,13 +119,21 @@ defmodule ManifoldWeb.SettingsLive.GoogleLogin do
      |> push_navigate(to: ~p"/settings/accounts/#{socket.assigns.account.id}")}
   end
 
-  def handle_async(:complete_google, _result, socket) do
+  def handle_async(:complete_google, result, socket) do
+    reason =
+      case result do
+        {:ok, {:error, %Manifold.Core.Error{reason: reason}}} when is_atom(reason) -> reason
+        {:exit, _} -> :async_task_exit
+        _ -> :unexpected_result
+      end
+
+    Logger.warning("Google OAuth completion failed: #{reason}")
+
     {:noreply,
      assign(socket,
        status: :idle,
        callback_form: callback_form(),
-       error:
-         "Google login could not be completed. Sign in with the Google account matching this account's email address and start again."
+       error: "Google login could not be completed. Start again and try once more."
      )}
   end
 

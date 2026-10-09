@@ -11,6 +11,9 @@ defmodule Manifold.Connectors.Application do
     Handler.attach()
     ReadPushHandler.attach()
 
-    Supervisor.start_link([], strategy: :one_for_one, name: Manifold.Connectors.Supervisor)
+    Supervisor.start_link([Manifold.Connectors.GmailSyncLimiter],
+      strategy: :one_for_one,
+      name: Manifold.Connectors.Supervisor
+    )
   end
 end

@@ -9,6 +9,8 @@ defmodule Manifold.Connectors.Provider.Gmail do
 
   @behaviour Manifold.Connectors.Provider
 
+  alias Manifold.Connectors.GmailSyncLimiter
+
   alias Manifold.Connectors.Provider.{
     Error,
     Identity,
@@ -24,11 +26,9 @@ defmodule Manifold.Connectors.Provider.Gmail do
   @default_userinfo_url "https://openidconnect.googleapis.com/v1/userinfo"
   @readonly_scope "https://www.googleapis.com/auth/gmail.readonly"
   @mailbox_scope "mailbox"
-  @page_size 500
+  @page_size 50
 
   @rate_limit_reasons ~w(
-    dailyLimitExceeded
-    quotaExceeded
     rateLimitExceeded
     userRateLimitExceeded
   )
@@ -60,13 +60,14 @@ defmodule Manifold.Connectors.Provider.Gmail do
   end
 
   @impl true
-  def identity(access_token, config, _opts) do
+  def identity(access_token, config, opts) do
     with {:ok, response} <-
            request(
              :get,
              Keyword.get(config, :userinfo_url, @default_userinfo_url),
              config,
-             auth: {:bearer, access_token}
+             [auth: {:bearer, access_token}],
+             opts
            ),
          {:ok, subject} <- required_string(response.body, "sub"),
          {:ok, email_address} <- required_string(response.body, "email") do
@@ -79,8 +80,8 @@ defmodule Manifold.Connectors.Provider.Gmail do
   end
 
   @impl true
-  def initial_cursors(access_token, config, _opts) do
-    with {:ok, profile} <- profile(access_token, config),
+  def initial_cursors(access_token, config, opts) do
+    with {:ok, profile} <- profile(access_token, config, opts),
          {:ok, history_id} <- required_string(profile, "historyId") do
       {:ok,
        [
@@ -98,17 +99,19 @@ defmodule Manifold.Connectors.Provider.Gmail do
         access_token,
         %SyncCursor{scope: @mailbox_scope, phase: "initial"} = cursor,
         config,
-        _opts
+        opts
       ) do
     params =
       [
         includeSpamTrash: true,
-        maxResults: @page_size
+        maxResults: page_size()
       ]
       |> maybe_put(:pageToken, cursor.page_cursor)
 
     with {:ok, response} <-
-           api_request(access_token, :get, "/gmail/v1/users/me/messages", config, params: params),
+           api_request(access_token, :get, "/gmail/v1/users/me/messages", config, opts,
+             params: params
+           ),
          {:ok, messages} <- initial_messages(response.body) do
       {:ok,
        %Page{
@@ -122,16 +125,18 @@ defmodule Manifold.Connectors.Provider.Gmail do
         access_token,
         %SyncCursor{scope: @mailbox_scope, phase: "incremental"} = cursor,
         config,
-        _opts
+        opts
       ) do
     params =
       [
         startHistoryId: cursor.committed_cursor,
-        maxResults: @page_size
+        maxResults: page_size()
       ]
       |> maybe_put(:pageToken, cursor.page_cursor)
 
-    case api_request(access_token, :get, "/gmail/v1/users/me/history", config, params: params) do
+    case api_request(access_token, :get, "/gmail/v1/users/me/history", config, opts,
+           params: params
+         ) do
       {:ok, response} ->
         with {:ok, messages} <- history_messages(response.body),
              {:ok, next_cursor} <- next_history_cursor(cursor, response.body) do
@@ -139,7 +144,7 @@ defmodule Manifold.Connectors.Provider.Gmail do
         end
 
       {:error, %Error{code: :not_found}} ->
-        reset_expired_history(access_token, config)
+        reset_expired_history(access_token, config, opts)
 
       {:error, %Error{} = error} ->
         {:error, error}
@@ -151,11 +156,11 @@ defmodule Manifold.Connectors.Provider.Gmail do
   end
 
   @impl true
-  def fetch_raw(access_token, message_id, config, _opts) do
+  def fetch_raw(access_token, message_id, config, opts) do
     path = "/gmail/v1/users/me/messages/" <> URI.encode(message_id, &URI.char_unreserved?/1)
 
     with {:ok, response} <-
-           api_request(access_token, :get, path, config, params: [format: "RAW"]),
+           api_request(access_token, :get, path, config, opts, params: [format: "RAW"]),
          {:ok, encoded_raw} <- required_string(response.body, "raw"),
          {:ok, raw} <- decode_raw(encoded_raw),
          {:ok, labels} <- labels(response.body["labelIds"]),
@@ -179,7 +184,8 @@ defmodule Manifold.Connectors.Provider.Gmail do
              :post,
              Keyword.get(config, :token_url, @default_token_url),
              config,
-             form: form
+             [form: form],
+             opts
            ),
          {:ok, access_token} <- required_string(response.body, "access_token"),
          {:ok, expires_in} <- positive_integer(response.body["expires_in"]) do
@@ -196,15 +202,15 @@ defmodule Manifold.Connectors.Provider.Gmail do
     end
   end
 
-  defp profile(access_token, config) do
+  defp profile(access_token, config, opts) do
     with {:ok, response} <-
-           api_request(access_token, :get, "/gmail/v1/users/me/profile", config) do
+           api_request(access_token, :get, "/gmail/v1/users/me/profile", config, opts) do
       {:ok, response.body}
     end
   end
 
-  defp reset_expired_history(access_token, config) do
-    with {:ok, profile} <- profile(access_token, config),
+  defp reset_expired_history(access_token, config, opts) do
+    with {:ok, profile} <- profile(access_token, config, opts),
          {:ok, history_id} <- required_string(profile, "historyId") do
       {:ok,
        %Page{
@@ -360,15 +366,20 @@ defmodule Manifold.Connectors.Provider.Gmail do
     end
   end
 
-  defp api_request(access_token, method, path, config, options \\ []) do
+  defp api_request(access_token, method, path, config, opts, options \\ []) do
     request_options =
       options
       |> Keyword.put(:auth, {:bearer, access_token})
 
-    request(method, base_url(config) <> path, config, request_options)
+    callback = fn -> request(method, base_url(config) <> path, config, request_options, opts) end
+
+    case Keyword.get(opts, :gmail_sync) do
+      nil -> callback.()
+      context -> GmailSyncLimiter.run(context, callback)
+    end
   end
 
-  defp request(method, url, config, options) do
+  defp request(method, url, config, options, opts) do
     request_options =
       [
         method: method,
@@ -390,14 +401,14 @@ defmodule Manifold.Connectors.Provider.Gmail do
         end
 
       {:ok, %Req.Response{} = response} ->
-        {:error, classify_response(response)}
+        {:error, classify_response(response, Keyword.get(opts, :now, DateTime.utc_now()))}
 
       {:error, _reason} ->
         {:error, error(:temporary, :transport_error, "Gmail request failed")}
     end
   end
 
-  defp classify_response(%Req.Response{status: status, body: body, headers: headers}) do
+  defp classify_response(%Req.Response{status: status, body: body, headers: headers}, now) do
     cond do
       invalid_grant?(body) ->
         error(:reconnect, :invalid_grant, "Gmail authorization must be reconnected")
@@ -410,7 +421,14 @@ defmodule Manifold.Connectors.Provider.Gmail do
           :temporary,
           :rate_limited,
           "Gmail rate limit reached",
-          retry_after_seconds(headers)
+          retry_after_seconds(headers, body, now)
+        )
+
+      status == 403 and provider_reason(body) == "dailyLimitExceeded" ->
+        error(
+          :permanent,
+          :daily_quota_exceeded,
+          "Gmail daily project quota reached; review the configured quota in Google Cloud"
         )
 
       status == 403 and provider_reason(body) == "domainPolicy" ->
@@ -424,7 +442,7 @@ defmodule Manifold.Connectors.Provider.Gmail do
           :temporary,
           :rate_limited,
           "Gmail rate limit reached",
-          retry_after_seconds(headers)
+          retry_after_seconds(headers, body, now)
         )
 
       status in [500, 502, 503, 504] ->
@@ -447,10 +465,10 @@ defmodule Manifold.Connectors.Provider.Gmail do
 
   defp provider_reason(_body), do: nil
 
-  defp retry_after_seconds(headers) do
-    headers
-    |> header_value("retry-after")
-    |> parse_retry_after()
+  defp retry_after_seconds(headers, body, now) do
+    [parse_retry_after(header_value(headers, "retry-after"), now), google_retry_after(body, now)]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.max(fn -> nil end)
   end
 
   defp header_value(headers, name) when is_map(headers) do
@@ -471,14 +489,43 @@ defmodule Manifold.Connectors.Provider.Gmail do
     end)
   end
 
-  defp parse_retry_after(value) when is_binary(value) do
+  defp parse_retry_after(value, now) when is_binary(value) do
+    value = String.trim(value)
+
     case Integer.parse(value) do
-      {seconds, ""} when seconds > 0 -> seconds
+      {seconds, ""} when seconds > 0 ->
+        seconds
+
+      _invalid ->
+        case Req.Utils.parse_http_date(value) do
+          {:ok, datetime} -> seconds_until(datetime, now)
+          _invalid -> nil
+        end
+    end
+  end
+
+  defp parse_retry_after(_value, _now), do: nil
+
+  defp google_retry_after(%{"error" => %{"message" => message}}, now) when is_binary(message) do
+    retry_timestamp =
+      ~r/Retry after\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))/i
+
+    with [_match, timestamp] <- Regex.run(retry_timestamp, message),
+         {:ok, datetime, _offset} <- DateTime.from_iso8601(timestamp) do
+      seconds_until(datetime, now)
+    else
       _invalid -> nil
     end
   end
 
-  defp parse_retry_after(_value), do: nil
+  defp google_retry_after(_body, _now), do: nil
+
+  defp seconds_until(datetime, now) do
+    case DateTime.diff(datetime, now, :microsecond) do
+      difference when difference > 0 -> div(difference + 999_999, 1_000_000)
+      _past -> nil
+    end
+  end
 
   defp decode_raw(encoded) do
     case Base.url_decode64(encoded, padding: false) do
@@ -537,6 +584,12 @@ defmodule Manifold.Connectors.Provider.Gmail do
     config
     |> Keyword.get(:base_url, @default_base_url)
     |> String.trim_trailing("/")
+  end
+
+  defp page_size do
+    :manifold_connectors
+    |> Application.get_env(:gmail_sync, [])
+    |> Keyword.get(:page_size, @page_size)
   end
 
   defp maybe_put(keyword, _key, nil), do: keyword

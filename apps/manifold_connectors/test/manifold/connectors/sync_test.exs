@@ -7,6 +7,7 @@ defmodule Manifold.Connectors.SyncTest do
   alias Manifold.Connectors.{
     ActivityLog,
     Crypto,
+    GmailSyncLimiter,
     MicrosoftFolderMapping,
     MicrosoftScopes,
     RemoteStateJobs
@@ -148,6 +149,8 @@ defmodule Manifold.Connectors.SyncTest do
       send(self(), {:sync_access_token, access_token})
 
       if test_pid = Keyword.get(opts, :test_pid) do
+        send(test_pid, {:gmail_sync_context, Keyword.get(opts, :gmail_sync)})
+
         send(
           test_pid,
           {:sync_page_called, Keyword.get(opts, :folder_mapping_gate), access_token, cursor}
@@ -314,6 +317,216 @@ defmodule Manifold.Connectors.SyncTest do
       |> Repo.update!()
 
     {:ok, account: account, cursor: cursor, domain: domain, mailbox: mailbox}
+  end
+
+  test "Gmail sync supplies a trusted authorization context instead of caller overrides", %{
+    account: account
+  } do
+    clock = start_supervised!({Agent, fn -> 0 end})
+
+    limiter =
+      start_supervised!({GmailSyncLimiter, name: nil, clock: fn -> Agent.get(clock, & &1) end})
+
+    wait = fn ms -> Agent.update(clock, &(&1 + ms)) end
+
+    assert :ok =
+             Connectors.sync_account(account.id,
+               gmail_sync_limiter: [server: limiter, wait: wait],
+               provider_opts: [test_pid: self(), gmail_sync: %{key: "untrusted-token-sentinel"}]
+             )
+
+    assert_receive {:gmail_sync_context, context}
+    assert context.key == account.oauth_authorization_id
+    assert context.server == limiter
+    assert context.wait == wait
+    refute inspect(context) =~ "untrusted-token-sentinel"
+  end
+
+  test "paced Gmail sync retains partial imports and resumes without another raw download", %{
+    account: account,
+    cursor: cursor
+  } do
+    clock = start_supervised!({Agent, fn -> 0 end})
+
+    limiter =
+      start_supervised!(
+        {GmailSyncLimiter,
+         name: nil, clock: fn -> Agent.get(clock, & &1) end, jitter: fn -> 0 end}
+      )
+
+    wait = fn ms -> Agent.update(clock, &(&1 + ms)) end
+    opts = [gmail_sync_limiter: [server: limiter, wait: wait]]
+    adapters = Application.fetch_env!(:manifold_connectors, :adapters)
+    providers = Application.fetch_env!(:manifold_connectors, :providers)
+
+    Application.put_env(
+      :manifold_connectors,
+      :adapters,
+      Keyword.put(adapters, :gmail, Manifold.Connectors.Provider.Gmail)
+    )
+
+    Application.put_env(
+      :manifold_connectors,
+      :providers,
+      Keyword.put(providers, :gmail, req_options: [plug: {Req.Test, __MODULE__}])
+    )
+
+    owner = self()
+
+    cursor
+    |> SyncCursor.changeset(%{phase: "initial", bootstrap_cursor: "100", committed_cursor: nil})
+    |> Repo.update!()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      send(owner, {:gmail_request, conn.request_path, Agent.get(clock, & &1)})
+
+      case conn.request_path do
+        "/gmail/v1/users/me/messages" ->
+          assert URI.decode_query(conn.query_string)["maxResults"] == "50"
+          Req.Test.json(conn, %{messages: [%{id: "paced-1"}, %{id: "paced-2"}]})
+
+        "/gmail/v1/users/me/messages/paced-2" ->
+          count = Process.get(:paced_second_attempts, 0)
+          Process.put(:paced_second_attempts, count + 1)
+
+          if count == 0 do
+            conn
+            |> Plug.Conn.put_status(429)
+            |> Plug.Conn.put_resp_header("retry-after", "90")
+            |> Req.Test.json(%{error: %{message: "private-quota-response"}})
+          else
+            gmail_raw_response(conn, "paced-2")
+          end
+
+        "/gmail/v1/users/me/messages/paced-1" ->
+          gmail_raw_response(conn, "paced-1")
+
+        "/gmail/v1/users/me/history" ->
+          Req.Test.json(conn, %{historyId: "101"})
+      end
+    end)
+
+    assert {:snooze, 90} = Connectors.sync_account(account.id, opts)
+    assert_receive {:gmail_request, "/gmail/v1/users/me/messages", 0}
+    assert_receive {:gmail_request, "/gmail/v1/users/me/messages/paced-1", 500}
+    assert_receive {:gmail_request, "/gmail/v1/users/me/messages/paced-2", 1_000}
+
+    assert %{phase: "initial", page_cursor: nil, committed_cursor: nil} =
+             Repo.get!(SyncCursor, cursor.id)
+
+    assert Repo.get_by!(RemoteMessage,
+             external_account_id: account.id,
+             provider_message_id: "paced-1"
+           ).inbound_delivery_id
+
+    assert Repo.get_by(RemoteMessage,
+             external_account_id: account.id,
+             provider_message_id: "paced-2"
+           ) == nil
+
+    # A caller cannot bypass the shared Google cooldown by enqueueing another sync.
+    assert {:snooze, 90} = Connectors.sync_account(account.id, opts)
+    refute_receive {:gmail_request, _, _}
+    Agent.update(clock, &(&1 + 90_000))
+
+    assert {:snooze, 1} = Connectors.sync_account(account.id, opts)
+    assert_receive {:gmail_request, "/gmail/v1/users/me/messages", 91_000}
+    assert_receive {:gmail_request, "/gmail/v1/users/me/messages/paced-2", 91_500}
+    refute_receive {:gmail_request, "/gmail/v1/users/me/messages/paced-1", _}
+    assert %{phase: "incremental", committed_cursor: "100"} = Repo.get!(SyncCursor, cursor.id)
+
+    assert Repo.get_by!(RemoteMessage,
+             external_account_id: account.id,
+             provider_message_id: "paced-2"
+           ).inbound_delivery_id
+
+    assert Repo.get!(ReceiveMethod, account.id).status == "syncing"
+    assert :ok = Connectors.sync_account(account.id, opts)
+    assert_receive {:gmail_request, "/gmail/v1/users/me/history", 92_000}
+    assert Repo.get!(ReceiveMethod, account.id).status == "connected"
+
+    current =
+      GmailSyncLimiter.context(account.oauth_authorization_id, server: limiter, wait: wait)
+
+    assert {:error, %{retry_after_seconds: 30}} =
+             GmailSyncLimiter.run(current, fn ->
+               {:error, %Error{class: :temporary, code: :rate_limited, message: "safe limit"}}
+             end)
+  end
+
+  test "a successful overlapping page does not clear a newer Gmail cooldown", %{account: account} do
+    clock = start_supervised!({Agent, fn -> 0 end})
+
+    limiter =
+      start_supervised!(
+        {GmailSyncLimiter,
+         name: nil, clock: fn -> Agent.get(clock, & &1) end, jitter: fn -> 0 end}
+      )
+
+    wait = fn ms -> Agent.update(clock, &(&1 + ms)) end
+
+    context =
+      GmailSyncLimiter.context(account.oauth_authorization_id, server: limiter, wait: wait)
+
+    Process.put(:sync_page_result, fn cursor ->
+      assert {:error, %{retry_after_seconds: 30}} =
+               GmailSyncLimiter.run(context, fn ->
+                 {:error, %Error{class: :temporary, code: :rate_limited, message: "safe limit"}}
+               end)
+
+      {:ok, %Page{cursor: %{cursor | committed_cursor: "101"}}}
+    end)
+
+    assert :ok =
+             Connectors.sync_account(account.id,
+               gmail_sync_limiter: [server: limiter, wait: wait]
+             )
+
+    Agent.update(clock, &(&1 + 30_000))
+
+    assert {:error, %{retry_after_seconds: 60}} =
+             GmailSyncLimiter.run(context, fn ->
+               {:error, %Error{class: :temporary, code: :rate_limited, message: "safe limit"}}
+             end)
+  end
+
+  test "daily Gmail quota cancels the attempt and retains its diagnostic code", %{
+    account: account
+  } do
+    attach_sync_telemetry()
+
+    Process.put(
+      :sync_page_result,
+      {:error,
+       %Error{
+         class: :permanent,
+         code: :daily_quota_exceeded,
+         message: "Gmail daily project quota reached; review the configured quota in Google Cloud"
+       }}
+    )
+
+    assert {:cancel, :daily_quota_exceeded} = Connectors.sync_account(account.id)
+    assert Repo.get!(ReceiveMethod, account.id).last_error_code == "daily_quota_exceeded"
+
+    assert_receive {:sync_telemetry, [:manifold, :connectors, :sync, :stop], _,
+                    %{error_code: :daily_quota_exceeded}}
+
+    assert Repo.get_by!(ConnectorEvent,
+             external_account_id: account.id,
+             event_type: "sync_failed"
+           ).metadata["code"] == "daily_quota_exceeded"
+  end
+
+  defp gmail_raw_response(conn, id) do
+    Req.Test.json(conn, %{
+      raw:
+        Base.url_encode64("From: sender@example.net\r\nSubject: #{id}\r\n\r\nBody\r\n",
+          padding: false
+        ),
+      threadId: "thread-#{id}",
+      labelIds: ["INBOX"],
+      internalDate: "1700000000000"
+    })
   end
 
   test "initial discovery and ongoing Gmail sync receive stored provider credentials", %{

@@ -17,7 +17,7 @@ defmodule Manifold.Connectors.OAuth do
   @mailbox_foreign_key "connector_oauth_transactions_mailbox_id_fkey"
   @telemetry_forbidden_fragments ~w(token password authorization_code raw_message)
   @telemetry_code_pattern ~r/\A[a-z0-9_.:-]{1,128}\z/
-  @callback_response_keys ~w(code state error scope authuser prompt hd error_description error_uri)
+  @callback_response_keys ~w(code state error iss scope authuser prompt hd error_description error_uri)
 
   @type purpose :: :receive | :send
   @type purpose_input :: purpose() | String.t()
@@ -289,10 +289,13 @@ defmodule Manifold.Connectors.OAuth do
     grouped = Enum.group_by(params, &elem(&1, 0), &elem(&1, 1))
 
     cond do
-      Enum.any?(~w(code state error), &(length(Map.get(grouped, &1, [])) > 1)) ->
+      Enum.any?(~w(code state error iss), &(length(Map.get(grouped, &1, [])) > 1)) ->
         invalid_callback_url()
 
       Map.get(grouped, "state") != [expected_state] ->
+        invalid_callback_url()
+
+      Map.has_key?(grouped, "iss") and Map.get(grouped, "iss") != ["https://accounts.google.com"] ->
         invalid_callback_url()
 
       Map.has_key?(grouped, "error") ->

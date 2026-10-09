@@ -160,6 +160,7 @@ defmodule Manifold.Connectors.OAuthTest do
         URI.encode_query(%{
           "code" => "paste-only-+code",
           "state" => started.state,
+          "iss" => "https://accounts.google.com",
           "scope" => "openid email",
           "authuser" => "0",
           "prompt" => "consent"
@@ -207,6 +208,9 @@ defmodule Manifold.Connectors.OAuthTest do
           String.replace(valid, "tenant=expected&", ""),
           valid <> "&tenant=expected",
           valid <> "&unregistered=value",
+          valid <> "&iss=https%3A%2F%2Fwrong.example",
+          valid <> "&iss=",
+          valid <> "&iss=https%3A%2F%2Faccounts.google.com&iss=https%3A%2F%2Faccounts.google.com",
           valid <> "&code=duplicate",
           valid <> "&state=duplicate",
           valid <> "&error=denied&error=duplicate",

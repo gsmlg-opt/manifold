@@ -149,6 +149,42 @@ defmodule ManifoldWeb.GoogleLoginLiveTest do
     assert Connectors.list_receive_methods_for_account(account.id) == []
   end
 
+  test "failed token exchange logs a safe reason without callback or provider secrets", %{
+    conn: conn,
+    account: account
+  } do
+    Req.Test.stub(__MODULE__, fn request ->
+      request
+      |> Plug.Conn.put_status(400)
+      |> Req.Test.json(%{
+        error: "invalid_grant",
+        error_description: "private-provider-description-sentinel"
+      })
+    end)
+
+    {:ok, view, _html} = live(conn, "/settings/accounts/#{account.id}/google/login")
+    Req.Test.allow(__MODULE__, self(), view.pid)
+    view |> element("#start-google-login") |> render_click()
+    query = login_query(view)
+    url = response_url(query)
+
+    log =
+      capture_log(fn ->
+        submit_callback(view, url)
+        html = render_async(view)
+        assert html =~ "Google login could not be completed."
+        refute html =~ "private-provider-description-sentinel"
+      end)
+
+    assert log =~ "invalid_grant"
+    refute log =~ url
+    refute log =~ "private-code-sentinel"
+    refute log =~ query["state"]
+    refute log =~ "private-provider-description-sentinel"
+    assert Repo.one!(OAuthTransaction).consumed_at
+    assert Connectors.list_receive_methods_for_account(account.id) == []
+  end
+
   test "another attempt cannot be submitted on this login page", %{conn: conn, account: account} do
     {:ok, view, _html} = live(conn, "/settings/accounts/#{account.id}/google/login")
     view |> element("#start-google-login") |> render_click()
@@ -198,6 +234,7 @@ defmodule ManifoldWeb.GoogleLoginLiveTest do
       @redirect_uri <>
         "?" <>
         URI.encode_query(%{
+          iss: "https://accounts.google.com",
           code: "private-code-sentinel",
           state: query["state"],
           scope: query["scope"],

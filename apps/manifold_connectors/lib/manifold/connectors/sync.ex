@@ -6,6 +6,7 @@ defmodule Manifold.Connectors.Sync do
   alias Manifold.Accounts
   alias Manifold.Connectors
   alias Manifold.Connectors.{Crypto, OAuthScopes, ProviderConfig}
+  alias Manifold.Connectors.GmailSyncLimiter
   alias Manifold.Connectors.{MicrosoftFolderMapping, RemoteStateJobs}
   alias Manifold.Connectors.Provider
   alias Manifold.Connectors.Provider.Error, as: ProviderError
@@ -36,6 +37,7 @@ defmodule Manifold.Connectors.Sync do
     account_disconnected
     authentication_expired
     connector_lifecycle_changed
+    daily_quota_exceeded
     database_unavailable
     folder_cursor_missing
     insufficient_provider_scope
@@ -192,6 +194,7 @@ defmodule Manifold.Connectors.Sync do
                ),
              :ok <- maybe_fault(opts, :after_page_before_cursor),
              {:ok, more?} <- checkpoint(account, cursor, page, now) do
+          complete_provider_session(account, opts)
           outcome = if more?, do: {:snooze, 1}, else: :ok
           {:ok, account.kind, length(messages), outcome}
         else
@@ -260,7 +263,28 @@ defmodule Manifold.Connectors.Sync do
     end
   end
 
+  defp prepare_provider_session(%ReceiveMethod{kind: "gmail"} = account, _adapter, opts) do
+    context =
+      GmailSyncLimiter.context(
+        account.oauth_authorization_id,
+        Keyword.get(opts, :gmail_sync_limiter, [])
+      )
+
+    Keyword.update(
+      opts,
+      :provider_opts,
+      [gmail_sync: context],
+      &Keyword.put(&1, :gmail_sync, context)
+    )
+  end
+
   defp prepare_provider_session(_account, _adapter, opts), do: opts
+
+  defp complete_provider_session(%ReceiveMethod{kind: "gmail"}, opts) do
+    GmailSyncLimiter.success(Keyword.fetch!(provider_opts(opts), :gmail_sync))
+  end
+
+  defp complete_provider_session(_account, _opts), do: :ok
 
   defp release_provider_session(adapter) do
     if function_exported?(adapter, :release_session, 0) do
