@@ -65,5 +65,8 @@ archive closures are0.5.0 (older cached directories are inactive). Actual
 relocated main archive and published main image pass fresh migrations/context
 CRUD and three pages/CSS/JS. Edge image metadata and versions pass; edge boot
 NOT_RUN. Real credentialed Apple synchronization remains NOT_RUN. See acceptance
-and release notes for exact digests. Original dirty checkout is preserved;
-feature worktree holds the release and final documentation. Stop after this release.
+and release notes for exact digests. Release and final documentation are merged
+into main; original local maintenance changes remain uncommitted. Verification
+evidence is retained in the root checkout under `tmp/icloud*`, and pre-merge
+local files are backed up under `tmp/worktree-merge-preserved-*`.
+Stop after this release.
