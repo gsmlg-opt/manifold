@@ -106,3 +106,45 @@ Source correction CI: `37965535415` (format/strict compile/JS), `37965535528`
 A relocated local main package passed fresh isolated migration/context CRUD and
 HTTP 200 for all three new pages. Publication verification is recorded in the
 v0.5.0 release notes and final acceptance checkpoint after actual download.
+
+## v0.5.0 publication acceptance — PASS
+
+- Stable GitHub release: https://github.com/gsmlg-opt/manifold/releases/tag/v0.5.0.
+- Release workflow `37966360700`: main/edge archive build, both GHCR images and
+  release notes all **PASS**. Latest stable release is v0.5.0.
+- Release source/tag: `d841d1e642c6390d12dae1ceab24128c39f78a75`;
+  source CI `37966328364`, full tests `37966328367` and TLS `37966328444` pass.
+  Workflow source differs only by project version metadata from tested source.
+- Main archive: 40,139,560 bytes; SHA-256
+  `aa57a1758836e04ea8c50323e9a1f39da03c90730f999451c6da6451393cbb07`.
+- Edge archive: 28,227,694 bytes; SHA-256
+  `b08d36b3d4a3df17d69cb71cd9d8c29ba12442ed34130cc6914627d45955b71d`.
+  Both sizes/digests match GitHub asset metadata. Active start_erl/.rel/.boot/.app
+  closures select 0.5.0; main contains the new contexts/sync/migration, edge
+  excludes them. Cached archives retain historical 0.4.0 directories; these
+  are outside the active 0.5.0 closure and were preserved during verification.
+- **PASS:** actual downloaded main archive executed in a compatible Ubuntu
+  container at an independent installation path. Fresh isolated PostgreSQL
+  migrations, active app versions, local contact CRUD, calendar reads, three
+  page HTTP responses and served CSS/JS/password-clear listener all pass.
+- **PASS:** actual published main GHCR image executed independently: fresh
+  migration/context operations, all 15 project app versions 0.5.0, three pages,
+  CSS/JS and password-clear listener. Its runtime configuration matches the tag.
+- **PASS:** edge GHCR manifest/config digests, four packaged project app versions
+  0.5.0 and runtime configuration matching the tag. Edge runtime startup:
+  **NOT RUN**.
+- Main OCI index digest:
+  `sha256:35b92b472e1ef432b39de67b6e64ecc84e707840c8a7f3701ca934c33093701a`.
+- Edge OCI index digest:
+  `sha256:26c64e1d9cf236739736fd0a8b22c0eb431c2e2bc36fbbd3cab8cd5698dfd5ca`.
+  OCI revision labels identify tested workflow caller `c0e3985`; packaged
+  runtime configuration matches the version-bump tag `d841d1e` byte-for-byte.
+- **NOT RUN:** real credentialed Apple synchronization; the established
+  implementation/browser/fixture boundaries remain unchanged.
+
+Local evidence: `tmp/icloud-release-0.5.0/{digest,archive}-verification.json`,
+`tmp/icloud-oci-0.5.0/{main-startup,edge-packaged}-evidence.json`, and the
+published archive startup log. Owned preview and verification containers are
+stopped; the original working tree and existing development server are retained.
+The v0.4.0 prerelease tag and archives remain unchanged and are superseded by
+this verified v0.5.0 release. No further release is authorized by this task.

@@ -1,8 +1,8 @@
 # iCloud contacts and calendars
 
 - Date: 2026-10-10.
-- Status: implemented; v0.4.0 published as prerelease after portability failure.
-  Runtime asset correction and its CI verified; v0.5.0 publication authorized.
+- Status: released and verified as v0.5.0.
+  v0.4.0 remains prerelease after its portability failure.
 - Approved scope: local contacts, automatic read-only iCloud contact import/sync,
   calendar reading, then one release and stop.
 - Design: `docs/superpowers/specs/2026-10-09-icloud-contacts-calendars-design.md`.
@@ -56,3 +56,14 @@ Application.app_dir; this is application configuration, not an upstream bug.
 Corrected local relocated startup/migration passes. Keep public v0.4.0 marked
 prerelease; its tag/artifacts remain unchanged. The user authorized corrected
 v0.5.0 publication. Verify downloaded packages and relocated startup independently.
+
+## Verified v0.5.0 release
+
+Workflow37966360700 succeeded; stable tag/source d841d1e, tested workflow
+caller c0e3985. Downloaded main/edge sizes and SHA-256 match GitHub. Active
+archive closures are0.5.0 (older cached directories are inactive). Actual
+relocated main archive and published main image pass fresh migrations/context
+CRUD and three pages/CSS/JS. Edge image metadata and versions pass; edge boot
+NOT_RUN. Real credentialed Apple synchronization remains NOT_RUN. See acceptance
+and release notes for exact digests. Original dirty checkout is preserved;
+feature worktree holds the release and final documentation. Stop after this release.

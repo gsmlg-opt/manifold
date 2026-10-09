@@ -86,7 +86,7 @@ Files: README, product design, feature reference, scoped evidence/report; releas
 - [x] Record actual iCloud credentialed verification separately; never substitute fixtures for actual Apple traffic or put passwords in chat/docs.
 - [x] Record migrations/startup/rollback guidance, precise test results and limitations; update feature reference to implementation state.
 - [x] Commit scoped feature, push, integrate the reviewed branch without absorbing original dirty work, and dispatch existing release workflow once for the next available minor version (initial target v0.4.0).
-- [ ] Verify workflow success, tag/source identity, both release archives/checksums, migration/startup behavior and Docker images. Fetch/synchronize safely; stop after reporting the one release.
+- [x] Verify workflow success, tag/source identity, both release archives/checksums, migration/startup behavior and Docker images. Fetch/synchronize safely; stop after reporting the one release.
 
 ### Release checkpoint
 
@@ -96,3 +96,12 @@ prerelease; tag/artifacts retained. Supported runtime override correction is
 implemented and passes relocated local startup. Final publication verification
 continues under the user-authorized v0.5.0 correction release. Preserve public
 v0.4.0 history and stop after verified v0.5.0 publication.
+
+### Final checkpoint
+
+User-authorized v0.5.0 published and verified: workflow37966360700 PASS;
+actual downloaded archive + main image relocated migration/startup/pages/assets
+PASS; both archives and image metadata/versions PASS. Real Apple credentialed
+verification and edge binary boot are NOT_RUN and recorded separately. Public
+v0.4.0 history is preserved. Final documentation only follows the release tag;
+application source/version metadata remain identical to v0.5.0. Task complete.
