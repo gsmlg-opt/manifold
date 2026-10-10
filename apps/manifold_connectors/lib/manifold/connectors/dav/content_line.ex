@@ -31,7 +31,9 @@ defmodule Manifold.Connectors.DAV.ContentLine do
             end)
 
           property = name |> String.split(".") |> List.last() |> String.upcase()
-          {:cont, {:ok, [%{name: property, params: params, value: value} | acc]}}
+
+          {:cont,
+           {:ok, [%{name: property, original_name: name, params: params, value: value} | acc]}}
 
         _ ->
           {:halt, {:error, :invalid_content_line}}

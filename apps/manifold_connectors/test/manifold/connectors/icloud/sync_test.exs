@@ -8,7 +8,18 @@ defmodule Manifold.Connectors.ICloud.SyncTest do
       if Keyword.get(opts, :discovery_failure) == kind,
         do: {:error, :unauthorized},
         else:
-          {:ok, [%{href: "https://contacts.icloud.com/#{kind}/", name: kind, sync_token: nil}]}
+          {:ok,
+           [
+             %{
+               href: "https://contacts.icloud.com/#{kind}/",
+               name: kind,
+               sync_token: nil,
+               writable: true,
+               can_create: true,
+               can_update: true,
+               can_delete: true
+             }
+           ]}
     end
 
     def sync_collection(collection, _, opts) do
@@ -38,7 +49,7 @@ defmodule Manifold.Connectors.ICloud.SyncTest do
 
   defp connection do
     {:ok, connection} =
-      ICloud.connect(%{
+      connect(%{
         apple_id: "apple@example.test",
         app_password: "aaaa-bbbb-cccc-dddd",
         contacts_enabled: true,
@@ -65,7 +76,7 @@ defmodule Manifold.Connectors.ICloud.SyncTest do
 
     assert Repo.get!(Contact, first.id).full_name == "Ada Updated"
     assert :ok = Sync.run(c.id, c.generation, client: FakeClient)
-    assert Repo.all(Contact) == []
+    assert Manifold.Contacts.list_contacts() == []
   end
 
   test "failed or invalid snapshot retains prior records and checkpoint" do
@@ -96,7 +107,7 @@ defmodule Manifold.Connectors.ICloud.SyncTest do
                before_read: fn -> ICloud.set_enabled(c.id, false) end
              )
 
-    assert Repo.all(Contact) == []
+    assert Manifold.Contacts.list_contacts() == []
     refute Repo.get!(ICloudConnection, c.id).enabled
     {:ok, enabled} = ICloud.set_enabled(c.id, true)
     assert {:error, :stale} = Sync.run(c.id, c.generation, client: FakeClient)
@@ -109,7 +120,7 @@ defmodule Manifold.Connectors.ICloud.SyncTest do
              )
 
     assert Repo.get(ICloudConnection, c.id) == nil
-    assert Repo.all(Contact) == []
+    assert Manifold.Contacts.list_contacts() == []
   end
 
   test "unchanged resources require existing matching records and leases serialize work" do
@@ -144,12 +155,12 @@ defmodule Manifold.Connectors.ICloud.SyncTest do
     }
 
     assert :ok = Sync.run(c.id, c.generation, client: FakeClient, contacts: delta)
-    assert Repo.all(Contact) == []
+    assert Manifold.Contacts.list_contacts() == []
   end
 
   test "a later service throttle controls retries and no request bypasses Retry-After" do
     {:ok, c} =
-      ICloud.connect(%{
+      connect(%{
         apple_id: "+8613912345678",
         app_password: "pass",
         contacts_enabled: true,
@@ -175,7 +186,7 @@ defmodule Manifold.Connectors.ICloud.SyncTest do
 
   test "calendar success remains visible despite contact authentication failure" do
     {:ok, c} =
-      ICloud.connect(%{
+      connect(%{
         apple_id: "apple@example.test",
         app_password: "pass",
         contacts_enabled: true,
@@ -206,5 +217,15 @@ defmodule Manifold.Connectors.ICloud.SyncTest do
     stored = Repo.get!(ICloudConnection, c.id)
     assert stored.contacts_status == "reconnect_required"
     assert stored.calendars_status == "connected"
+  end
+
+  defp connect(attrs) do
+    {:ok, account} =
+      Manifold.Accounts.create_account(%{
+        address: "icloud-#{Ecto.UUID.generate()}@example.test",
+        name: "iCloud test"
+      })
+
+    ICloud.connect(Map.put(attrs, :account_id, account.id))
   end
 end

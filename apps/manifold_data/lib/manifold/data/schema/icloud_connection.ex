@@ -9,6 +9,8 @@ defmodule Manifold.Data.Schema.ICloudConnection do
   @statuses ~w(pending syncing connected failed reconnect_required disabled)
 
   schema "icloud_connections" do
+    field(:account_id, :binary_id)
+    belongs_to(:default_contacts_collection, Manifold.Data.Schema.DAVCollection)
     field(:apple_id, :string)
     field(:password_ciphertext, :binary, redact: true)
     field(:enabled, :boolean, default: true)
@@ -32,6 +34,8 @@ defmodule Manifold.Data.Schema.ICloudConnection do
   def changeset(connection, attrs) do
     connection
     |> cast(attrs, [
+      :account_id,
+      :default_contacts_collection_id,
       :apple_id,
       :password_ciphertext,
       :enabled,
@@ -63,6 +67,9 @@ defmodule Manifold.Data.Schema.ICloudConnection do
     |> validate_number(:generation, greater_than: 0)
     |> validate_inclusion(:contacts_status, @statuses)
     |> validate_inclusion(:calendars_status, @statuses)
+    |> foreign_key_constraint(:account_id)
+    |> foreign_key_constraint(:default_contacts_collection_id)
+    |> unique_constraint(:account_id)
     |> check_constraint(:apple_id, name: :icloud_connections_apple_id_present)
     |> check_constraint(:generation, name: :icloud_connections_generation_positive)
     |> check_constraint(:contacts_status, name: :icloud_connections_contacts_status_valid)

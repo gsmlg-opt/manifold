@@ -1,98 +1,143 @@
-# iCloud contacts and calendars
+# iCloud Contacts and Calendar
 
-Manifold supports local contact management and read-only iCloud synchronization.
-Connections are independent of mailboxes and belong to the trusted local
-installation. Access to the web endpoint remains full-instance access.
+Contacts and Calendar are configured inside a local Account. Local changes save
+immediately; background jobs synchronize them with iCloud in both directions.
+This feature supports iCloud only. Access to the web endpoint remains trusted
+full-instance access.
 
-## Connect
+## Configure an Account
 
-1. Enable two-factor authentication on your Apple Account.
-2. At https://account.apple.com/, choose **Sign-In and Security → App-Specific
-   Passwords** and generate a password for Manifold. Use this app-specific
-   password rather than your primary Apple password. Apple documents the flow
-   at https://support.apple.com/en-us/102654.
-3. Open **Settings → iCloud**, enter the Apple Account identifier (email or phone)
-   and the generated password, select Contacts and/or Calendars, and connect.
-4. The initial background job verifies access, discovers address books/calendars,
-   and imports records. Watch the independent service status and successful-sync
-   timestamps. Incorrect/revoked credentials require replacement in Settings.
+1. Enable Apple two-factor authentication and generate an app-specific password
+   at https://account.apple.com/ (https://support.apple.com/en-us/102654).
+2. Open **Settings → Accounts**, create or select a local Account, and configure
+   **iCloud Contacts and Calendar** on its details page. The local Account address
+   and Apple login can differ. Existing Account mailbox/routing semantics apply.
+3. Enter the Apple login and app-specific password, and select Contacts and/or
+   Calendar. Each Account has at most one connection.
+4. Wait for discovery, then select the default writable address book. Contacts
+   wait locally until this destination is configured. Map local calendars to
+   discovered iCloud calendars on the Calendars page.
 
-Passwords are encrypted with the existing `MANIFOLD_CONNECTOR_ENCRYPTION_KEY`.
-Keep that key stable when upgrading or restoring a backup. No Apple credential
-belongs in environment files, job arguments, logs or source control. The form
-clears its password field after saving, including invalid submissions.
+Passwords use connection-specific encryption with
+`MANIFOLD_CONNECTOR_ENCRYPTION_KEY`. Keep the key stable. Credentials never belong
+in jobs, logs or source control; the password form clears after submission.
+Replace a revoked app-specific password in the Account. Changing Apple identity
+requires disconnection and a new connection; retained bindings are not silently
+uploaded into that identity.
 
-## Contacts and calendar reading
+The old **Settings → iCloud** page lists connections and links to their Accounts.
+Legacy connections require explicit assignment to an Account before syncing.
+Assignment preserves record/connection IDs, encryption AAD, raw documents and
+ETags. It does not upload migrated records or infer ownership from email.
 
-`/contacts` lists, searches, and displays both local and imported contacts.
-Create/edit/delete local contacts, including multiple emails, phones, postal
-addresses, names, organization and notes. Imported contacts are read-only and
-labelled with their account and address-book source. Matching email addresses
-or UIDs from different books/connections are not automatically merged.
+## Contacts
 
-`/calendars` lists discovered calendars and stored event records. Event details
-include start/end, all-day state, original timezone, location, description,
-recurrence rules, exclusions and recurrence exceptions. Original vCard and
-iCalendar text is retained in the database. This version lists stored event
-records without expanding recurring occurrences into a month/week calendar.
-Floating times remain floating; timezone values are not fabricated or converted.
-Supported projections are vCard 3.0/4.0 and iCalendar 2.0 VEVENT. Unsupported or
-malformed resource results retain prior collection data and checkpoint and
-report a failure; they never silently erase existing records.
+`/contacts` supports local create/edit/delete, search, multiple email/phone/address
+values and explicit local copies. Choose an Account and **Sync to iCloud**
+(default enabled). Unassigned contacts remain local; enabling the flag alone
+never chooses an upload destination. Newly configured destinations enroll only
+explicitly Account-owned drafts.
 
-## Synchronization and lifecycle
+Turning the flag off pauses both inbound application and outbound writes while
+retaining both copies and their binding. Deleting an opted-out contact hides the
+local record and retains suppression metadata so polling does not recreate it.
+Re-enabling compares the retained baseline; divergent changes require a choice.
+Changing a bound contact's Account requires an explicit local copy.
 
-Enabled connections synchronize on setup and every five minutes using Oban's
-connectors queue. **Sync now** queues a refresh; concurrent queued/running work
-is not duplicated. CardDAV and CalDAV only perform discovery/read operations.
-Remote additions, edits and deletions appear after a complete successful sync.
-Local contacts are never uploaded or removed by an iCloud synchronization.
+## Calendars and events
 
-DAV sync tokens are used when supported. Invalid tokens or unsupported sync
-reports fall back to complete ETag enumeration and changed-resource reads.
-Incomplete/error/truncated results retain prior data/checkpoints. Each service
-commits independently, so calendar errors do not erase successful contacts and
-vice versa. Rate limits retain data and defer both manual and automatic retries
-until the stored retry deadline.
+`/calendars` supports local calendar and event create/edit/delete. An unmapped
+calendar remains local. Map to an existing discovered iCloud collection for
+asynchronous event synchronization. Remote calendar/address-book container
+creation, renaming and deletion are outside this feature. Deleting a local
+calendar requires its visible events and deletion conflicts to be resolved.
 
-**Disable** retains imported data and stops synchronization. Enabling queues
-fresh work. Changing credentials/services invalidates old jobs. **Disconnect**
-requires confirmation and removes that connection's credentials, books,
-contacts and calendar records; it retains local contacts and other connections.
-Neither action modifies Apple's data.
+Discovery creates a local calendar for each imported destination. To map an
+existing local calendar to that destination, explicitly confirm **Merge the
+existing local calendar for this iCloud destination**. Imported events move into
+the selected calendar and the replaced local calendar is removed. Event/resource
+identities, raw documents and acknowledged baselines remain intact; only the
+selected calendar's unbound local events are enrolled for upload. Both calendars
+must belong to the same Account. A calendar with existing resource bindings
+cannot be remapped; use explicit local copies instead.
 
-All destinations must be verified HTTPS Apple DAV hosts/shards on port 443.
-Discovery redirects are manually bounded and validated before credentials are
-sent. The DAV Req adapter uses fresh Mint HTTP/1 connections with OTP peer and
-hostname verification, avoiding credential-bearing Finch request telemetry.
-Network deadlines, header/body/resource limits, generation fencing and leased
-synchronization bound work and prevent stale jobs from committing after
-credential changes or disconnection.
+Event forms support summary, description, location, start/end, all-day and
+original timezone. DATE, UTC, floating and TZID representations are preserved.
+Imported recurrence masters and exceptions remain stored components; occurrences
+are not expanded. Edit a selected component or explicitly delete a whole series.
+Removing an exception updates its full ICS resource without deleting its master.
+Unedited sibling events, alarms, timezones and unknown properties are retained.
+Recurrence-rule editing, future splits, invitations and RSVP are not supported.
+Read-only collections offer a local copy and refuse unsupported writes.
+Resources containing ORGANIZER or ATTENDEE remain readable, but cloud edits and
+deletes are refused to avoid implicit scheduling. Local edits/intents remain
+stored with an explanatory sync error. Make a local copy to edit independently.
+Deleting the last event also refuses whole-resource deletion when unrelated
+VTODO, VJOURNAL or unknown components remain, preserving their cloud data.
 
-## Upgrade and rollback
+## Async synchronization and conflicts
 
-Back up PostgreSQL and the connector encryption key before upgrading. Apply
-migration `20261010000100` using the existing main-release migration procedure
-(or `devenv shell -- mix ecto.migrate` in development). It adds
-`icloud_connections`, `dav_collections`, `contacts`, and `calendar_events`.
-The main release includes contacts/calendars contexts and the DAV poll job;
-the ingress-only edge release does not run these services.
+Local save transactions persist durable revision/intention state. Oban jobs wake
+sync workers; the five-minute poll also recovers work after restarts. A queued
+operation does not guarantee completion within five minutes. Account pages show
+service status; contact/event details show pending, paused, uncertain, failed or
+conflicted resource status. Deletion conflicts remain accessible in their lists.
 
-For a release installation, run before starting the new main release:
+Creates use stable UID/href and `If-None-Match: *`; updates/deletes use strong
+`If-Match` ETags. A lost response is reconciled by reading the same href before
+retrying. Acknowledging an older write never clears a newer local edit.
+Repeated contact properties retain their original parameters and groups. If a
+server response changes property positions, newer local edits rebase their
+property identities against the acknowledged document without replacing values.
+Normalization permits folding, property order and provider-maintained revision
+metadata while retaining unknown content in comparison; other changes produce
+an explicit conflict. **Use local** retries conditionally against the observed
+remote version; **Use iCloud** accepts the remote version or deletion. Another
+remote edit can conflict again.
+
+Complete validated collection results are required before applying remote
+deletions or checkpoints. Partial/malformed responses preserve previous data.
+Services commit independently; authentication failures stop affected writes and
+throttling pauses connection admission until the stored deadline. Missing
+collections retain local drafts and bindings with writes unavailable.
+
+## Lifecycle and security
+
+Disabling an Account/connection/service stops new dispatch and retains local
+records/intents. Disconnect removes credentials/active targets and keeps local
+contacts, calendars and events. Explicit Account purge deletes only its local
+data through the durable purge workflow, never issuing cloud deletes. Other
+Accounts and unassigned local contacts remain intact.
+
+Generation/lease checks fence stale jobs and acknowledgements. An already
+admitted HTTP request may finish after disable/disconnect; these actions cannot
+retract a remote request.
+
+DAV destinations are verified HTTPS Apple hosts/shards on port443. Direct bounded
+Mint HTTP/1 transport verifies TLS peer/hostname and avoids credential-bearing
+Finch telemetry. Writes never automatically redirect or replay. Unsupported
+editing and missing strong ETags retain local work instead of overwriting.
+
+## Upgrade
+
+Back up PostgreSQL and the connector encryption key. Apply additive migrations
+`20261010000100` and `20261010000200` before starting the main application:
+
+```sh
+devenv shell -- mix ecto.migrate
+```
+
+For packaged main installations:
 
 ```sh
 bin/manifold eval 'Application.put_env(:manifold_data, :oban_enabled, false); Application.ensure_all_started(:manifold_data); Ecto.Migrator.with_repo(Manifold.Repo, fn repo -> Ecto.Migrator.run(repo, :up, all: true) end)'
 ```
 
-Retain the additive tables when rolling back application binaries. Rolling back
-this migration drops **all new tables and local contacts**, not just imported
-records. Stop synchronization and export/back up required data before an
-explicit migration rollback; a binary rollback does not require this deletion.
+The new migration creates local calendars/resource state and backfills imported
+baselines with zero outbound revisions/jobs. Legacy local contacts remain
+unassigned. Main includes these services; the ingress-only edge does not.
+Retain additive tables for binary rollback; schema rollback can destroy local
+records/state. Export/back up data before explicit migration rollback.
 
-## Verification boundary
-
-Automated fixtures, controlled real HTTP peers, migration/startup checks and
-browser checks are documented in `docs/ICLOUD_ACCEPTANCE.md`. Actual Apple
-accounts require a separate secure settings entry; no real Apple password was
-provided during implementation. Unauthenticated HTTPS DAV discovery proves
-connectivity/certificate verification only, not credentialed synchronization.
+Verification evidence and the separate credentialed Apple gate are in
+`docs/ICLOUD_ACCEPTANCE.md`.

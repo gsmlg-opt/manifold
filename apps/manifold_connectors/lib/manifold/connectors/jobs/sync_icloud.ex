@@ -11,7 +11,15 @@ defmodule Manifold.Connectors.Jobs.SyncICloud do
       :ok ->
         :ok
 
-      {:error, reason} when reason in [:stale, :disabled, :not_found, :reconnect_required] ->
+      {:error, reason}
+      when reason in [
+             :stale,
+             :disabled,
+             :not_found,
+             :reconnect_required,
+             :account_disabled,
+             :account_assignment_required
+           ] ->
         {:cancel, reason}
 
       {:error, :busy} ->

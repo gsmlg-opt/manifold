@@ -2,6 +2,8 @@ defmodule ManifoldWeb.ContactLive.Index do
   use ManifoldWeb, :live_view
 
   alias Manifold.Contacts
+  alias Manifold.Accounts
+  alias Manifold.Connectors.ICloud.Outbound
   alias Manifold.Data.Schema.Contact
 
   @value_fields ~w(emails phones addresses)
@@ -18,13 +20,15 @@ defmodule ManifoldWeb.ContactLive.Index do
        contact: nil,
        form: nil,
        form_values: %{},
-       error: nil
+       error: nil,
+       accounts: Accounts.list_accounts()
      )}
   end
 
   @impl true
   def handle_params(params, _url, socket) do
-    contact = if params["id"], do: Contacts.get_contact(params["id"])
+    contact =
+      if params["id"], do: Contacts.get_contact(params["id"], include_deleted_conflicts: true)
 
     socket =
       socket
@@ -39,10 +43,10 @@ defmodule ManifoldWeb.ContactLive.Index do
         {:noreply,
          socket |> put_flash(:error, "Contact not found.") |> push_patch(to: ~p"/contacts")}
 
-      socket.assigns.live_action == :edit && not is_nil(contact.collection_id) ->
+      socket.assigns.live_action == :edit && not editable?(contact) ->
         {:noreply,
          socket
-         |> put_flash(:error, "iCloud contacts are read-only.")
+         |> put_flash(:error, "This iCloud source is read-only. Make a local copy to edit it.")
          |> push_patch(to: ~p"/contacts/#{contact.id}")}
 
       socket.assigns.live_action == :edit ->
@@ -65,10 +69,12 @@ defmodule ManifoldWeb.ContactLive.Index do
   end
 
   def handle_event("validate", %{"contact" => params}, socket) do
+    attrs = normalize_values(params, socket.assigns.form_values)
+
     {:noreply,
      assign(socket,
-       form_values: normalize_values(params, socket.assigns.form_values),
-       form: to_form(params, as: :contact),
+       form_values: attrs,
+       form: to_form(attrs, as: :contact),
        error: nil
      )}
   end
@@ -127,6 +133,62 @@ defmodule ManifoldWeb.ContactLive.Index do
     end
   end
 
+  def handle_event("sync-preference", %{"preference" => %{"sync_to_icloud" => value}}, socket) do
+    case socket.assigns.contact &&
+           Contacts.update_contact(socket.assigns.contact.id, %{sync_to_icloud: value}) do
+      {:ok, contact} ->
+        {:noreply,
+         socket
+         |> assign(:contact, Contacts.get_contact(contact.id))
+         |> reload_contacts()
+         |> put_flash(:info, "Synchronization preference saved.")}
+
+      _ ->
+        {:noreply, put_flash(socket, :error, "Unable to update synchronization preference.")}
+    end
+  end
+
+  def handle_event("copy", %{"copy" => params}, socket) do
+    case socket.assigns.contact && Contacts.copy_contact(socket.assigns.contact.id, params) do
+      {:ok, contact} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Local copy saved.")
+         |> push_patch(to: ~p"/contacts/#{contact.id}")}
+
+      _ ->
+        {:noreply, put_flash(socket, :error, "Unable to copy this contact.")}
+    end
+  end
+
+  def handle_event("resolve", %{"choice" => choice}, socket) when choice in ["local", "remote"] do
+    result =
+      if socket.assigns.contact && socket.assigns.contact.resource_id,
+        do:
+          Outbound.resolve(
+            socket.assigns.contact.resource_id,
+            if(choice == "local", do: :local, else: :remote)
+          )
+
+    case result do
+      {:ok, _} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Conflict choice saved.")
+         |> push_patch(
+           to:
+             if(socket.assigns.contact.deleted_at && choice == "local",
+               do: ~p"/contacts",
+               else: ~p"/contacts/#{socket.assigns.contact.id}"
+             )
+         )}
+
+      _ ->
+        {:noreply,
+         put_flash(socket, :error, "Unable to resolve this conflict. Synchronize and try again.")}
+    end
+  end
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -134,7 +196,7 @@ defmodule ManifoldWeb.ContactLive.Index do
       <div class="settings-heading">
         <div>
           <h1>Contacts</h1><p class="settings-intro">
-            Your local contacts and read-only iCloud address books.
+            Save contacts locally and synchronize selected Accounts with iCloud.
           </p>
         </div>
         <div class="settings-heading-actions">
@@ -164,12 +226,13 @@ defmodule ManifoldWeb.ContactLive.Index do
           class="bg-surface-container text-on-surface border border-outline-variant rounded-lg p-4"
         >
           <p :if={@contacts == []} id="contacts-empty">
-            No contacts found. Add a local contact or connect iCloud in Settings.
+            No contacts found. Add a contact or configure iCloud inside an Account.
           </p>
           <ul id="contacts-list" class="space-y-4">
             <li :for={contact <- @contacts} id={"contact-#{contact.id}"}>
               <.link patch={~p"/contacts/#{contact.id}"} class="text-primary font-semibold">{contact.full_name}</.link>
               <p class="text-sm text-on-surface-variant">{source(contact)}</p>
+              <p :if={contact.deleted_at}>Deletion conflict</p>
               <p :for={email <- contact.emails}>{email["value"]}</p>
             </li>
           </ul>
@@ -214,6 +277,19 @@ defmodule ManifoldWeb.ContactLive.Index do
             <.dm_input field={@form[:given_name]} label="Given name" />
             <.dm_input field={@form[:family_name]} label="Family name" />
             <.dm_input field={@form[:organization]} label="Organization" />
+            <.dm_select
+              field={@form[:account_id]}
+              label="Account"
+              options={account_options(@accounts)}
+              disabled={@contact && not is_nil(@contact.resource_id)}
+            />
+            <p :if={@contact && @contact.resource_id} class="text-on-surface-variant">
+              To use another Account, make an explicit local copy.
+            </p>
+            <.dm_input field={@form[:sync_to_icloud]} type="checkbox" label="Sync to iCloud" />
+            <p class="text-on-surface-variant">
+              Saves commit locally first. Synchronization waits for a configured destination.
+            </p>
             <fieldset :for={field <- ["emails", "phones"]} class="space-y-4">
               <legend>{String.capitalize(field)}</legend>
               <div :for={{value, index} <- Enum.with_index(@form_values[field])} class="space-y-2">
@@ -313,9 +389,46 @@ defmodule ManifoldWeb.ContactLive.Index do
           class="bg-surface-container text-on-surface border border-outline-variant rounded-lg p-4 space-y-4"
         >
           <h2>{@contact.full_name}</h2><p>{source(@contact)}</p>
-          <p :if={@contact.collection_id} id="contact-read-only">
-            Imported from iCloud. Edit this contact in iCloud; changes appear after synchronization.
+          <p id="contact-sync-status" aria-live="polite">{sync_status(@contact)}</p>
+          <.form
+            :if={is_nil(@contact.deleted_at)}
+            for={%{"sync_to_icloud" => @contact.sync_to_icloud}}
+            as={:preference}
+            id="contact-sync-preference"
+            phx-submit="sync-preference"
+          >
+            <.dm_input
+              name="preference[sync_to_icloud]"
+              id="contact-sync-enabled"
+              type="checkbox"
+              value={@contact.sync_to_icloud}
+              label="Sync to iCloud"
+            />
+            <.dm_btn type="submit" variant="outline">Save sync preference</.dm_btn>
+          </.form>
+          <p :if={@contact.deleted_at}>Local deletion is waiting for conflict resolution.</p>
+          <p :if={!editable?(@contact)} id="contact-read-only">
+            This iCloud source is read-only. Make a local copy to edit it.
           </p>
+          <div :if={conflicted?(@contact)} id="contact-conflict" class="space-y-4">
+            <p>Both your local draft and iCloud changed. Choose which version to keep.</p>
+            <.dm_btn
+              id="contact-use-local"
+              phx-click="resolve"
+              phx-value-choice="local"
+              variant="outline"
+            >
+              Use local
+            </.dm_btn>
+            <.dm_btn
+              id="contact-use-icloud"
+              phx-click="resolve"
+              phx-value-choice="remote"
+              variant="outline"
+            >
+              Use iCloud
+            </.dm_btn>
+          </div>
           <dl class="space-y-4">
             <div
               :for={
@@ -344,20 +457,41 @@ defmodule ManifoldWeb.ContactLive.Index do
               <dt>Notes</dt><dd class="whitespace-pre-wrap">{@contact.notes}</dd>
             </div>
           </dl>
-          <div :if={is_nil(@contact.collection_id)} class="flex gap-4">
+          <div :if={editable?(@contact) && is_nil(@contact.deleted_at)} class="flex gap-4">
             <.dm_btn id="edit-contact" patch={~p"/contacts/#{@contact.id}/edit"} variant="outline">
               Edit contact
             </.dm_btn>
             <.dm_btn
               id="delete-contact"
               variant="error"
-              confirm="Delete this local contact?"
+              confirm={
+                if @contact.sync_to_icloud && @contact.resource_id,
+                  do: "Delete this contact locally and queue its iCloud deletion?",
+                  else: "Delete this local contact?"
+              }
               confirm_title="Delete contact"
               phx-click="delete"
             >
               Delete contact
             </.dm_btn>
           </div>
+          <.form
+            :if={is_nil(@contact.deleted_at)}
+            for={%{"account_id" => ""}}
+            as={:copy}
+            id="contact-copy-form"
+            phx-submit="copy"
+            class="space-y-4"
+          >
+            <.dm_select
+              name="copy[account_id]"
+              id="contact-copy-account"
+              label="Copy to Account"
+              options={account_options(@accounts)}
+              value=""
+            />
+            <.dm_btn id="copy-contact" type="submit" variant="outline">Make local copy</.dm_btn>
+          </.form>
         </section>
       </div>
     </section>
@@ -372,12 +506,18 @@ defmodule ManifoldWeb.ContactLive.Index do
         Contacts.list_contacts(
           search: socket.assigns.search,
           limit: 50,
-          offset: socket.assigns.offset
+          offset: socket.assigns.offset,
+          include_deleted_conflicts: true
         )
       )
 
   defp edit_form(socket, contact) do
     values = Map.new(@name_fields, &{&1, Map.get(contact, String.to_existing_atom(&1)) || ""})
+
+    values =
+      values
+      |> Map.put("account_id", contact.account_id || "")
+      |> Map.put("sync_to_icloud", contact.sync_to_icloud)
 
     values =
       Enum.reduce(
@@ -390,7 +530,13 @@ defmodule ManifoldWeb.ContactLive.Index do
   end
 
   defp normalize_values(params, previous) do
-    Enum.reduce(@value_fields, Map.take(params, @name_fields), fn field, attrs ->
+    attrs =
+      Map.merge(
+        Map.take(previous, ~w(account_id sync_to_icloud)),
+        Map.take(params, @name_fields ++ ~w(account_id sync_to_icloud))
+      )
+
+    Enum.reduce(@value_fields, attrs, fn field, attrs ->
       values =
         case Map.get(params, field, %{}) do
           values when is_map(values) ->
@@ -422,6 +568,27 @@ defmodule ManifoldWeb.ContactLive.Index do
 
   defp source(%{collection: collection}),
     do: "iCloud · #{collection.connection.apple_id} · #{collection.name}"
+
+  defp account_options(accounts),
+    do: [
+      {"", "Local only — no Account"} | Enum.map(accounts, &{&1.id, Accounts.account_address(&1)})
+    ]
+
+  defp editable?(%{sync_to_icloud: false}), do: true
+  defp editable?(%{collection_id: nil}), do: true
+
+  defp editable?(%{collection: collection}),
+    do: collection.can_update == true or (is_nil(collection.can_update) and collection.writable)
+
+  defp conflicted?(%{resource: %{status: "conflict"}}), do: true
+  defp conflicted?(_), do: false
+  defp sync_status(%{sync_to_icloud: false}), do: "Sync to iCloud is off"
+  defp sync_status(%{resource: %{status: status}}), do: status_label(status)
+  defp sync_status(%{account_id: nil}), do: "Local only"
+  defp sync_status(_), do: "Waiting for configuration"
+  defp status_label("synced"), do: "Synchronized"
+  defp status_label("uncertain"), do: "Syncing — confirming remote outcome"
+  defp status_label(status), do: String.capitalize(status)
 
   defp address_text(address),
     do: Enum.map_join(~w(street locality region postal_code country), "\n", &(address[&1] || ""))

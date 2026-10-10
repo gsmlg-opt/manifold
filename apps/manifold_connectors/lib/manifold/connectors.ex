@@ -751,6 +751,7 @@ defmodule Manifold.Connectors do
   @spec quiesce_account(module(), Ecto.UUID.t()) ::
           {:ok, %{receive_methods: non_neg_integer(), send_methods: non_neg_integer()}}
   def quiesce_account(repo, mailbox_id) do
+    :ok = Manifold.Connectors.ICloud.quiesce_account(repo, mailbox_id)
     now = DateTime.utc_now()
 
     {receive_count, _} =
@@ -886,7 +887,7 @@ defmodule Manifold.Connectors do
         purge_result(repo, mailbox_id, deleted, [])
 
       :empty ->
-        %{deleted: 0, done?: true, activity_log_ids: []}
+        Manifold.Connectors.ICloud.purge_account_batch(repo, mailbox_id, limit)
     end
   end
 
@@ -2547,25 +2548,31 @@ defmodule Manifold.Connectors do
     |> where([job], job.state in ~w(available scheduled executing retryable suspended cancelled))
     |> where(
       [job],
-      (job.worker == ^inspect(SyncAccount) and
+      (job.worker == "Manifold.Connectors.Jobs.SyncICloud" and
          fragment(
-           """
-           EXISTS (
-             SELECT 1
-             FROM connector_accounts AS receive_method
-             WHERE receive_method.mailbox_id = ?
-               AND receive_method.id = CASE
-                 WHEN (?->>'external_account_id') ~*
-                   '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-                 THEN (?->>'external_account_id')::uuid
-                 ELSE NULL
-               END
-           )
-           """,
+           "EXISTS (SELECT 1 FROM icloud_connections c WHERE c.account_id = ? AND c.id::text = (?->>'connection_id'))",
            type(^mailbox_id, :binary_id),
-           job.args,
            job.args
          )) or
+        (job.worker == ^inspect(SyncAccount) and
+           fragment(
+             """
+             EXISTS (
+               SELECT 1
+               FROM connector_accounts AS receive_method
+               WHERE receive_method.mailbox_id = ?
+                 AND receive_method.id = CASE
+                   WHEN (?->>'external_account_id') ~*
+                     '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                   THEN (?->>'external_account_id')::uuid
+                   ELSE NULL
+                 END
+             )
+             """,
+             type(^mailbox_id, :binary_id),
+             job.args,
+             job.args
+           )) or
         (job.worker in ^[inspect(ApplyRemoteState), inspect(PushRemoteRead)] and
            fragment(
              """
@@ -2766,7 +2773,8 @@ defmodule Manifold.Connectors do
   end
 
   defp account_data_remaining?(repo, mailbox_id) do
-    repo.exists?(where(ReceiveMethod, [method], method.account_id == ^mailbox_id)) or
+    Manifold.Connectors.ICloud.account_data_remaining?(repo, mailbox_id) or
+      repo.exists?(where(ReceiveMethod, [method], method.account_id == ^mailbox_id)) or
       repo.exists?(where(SendMethod, [method], method.account_id == ^mailbox_id)) or
       repo.exists?(where(OAuthTransaction, [transaction], transaction.mailbox_id == ^mailbox_id))
   end

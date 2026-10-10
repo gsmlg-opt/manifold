@@ -1,7 +1,7 @@
 # Account-owned iCloud contacts and calendars
 
 Date: 2026-10-10
-Status: design draft for user review; implementation has not started.
+Status: user-approved design; implemented; scoped acceptance complete (203 tests, zero failures).
 
 ## Confirmed scope
 
@@ -15,7 +15,7 @@ local Contacts and Calendar, consistently with the surrounding request.
 
 This supersedes the independent-connection, read-only behavior in the previous
 iCloud design. The completed v0.5.0/v0.5.1 releases remain historical evidence;
-this draft does not schedule another publication.
+this approved scope does not schedule another publication.
 
 ## Recommended ownership and configuration
 

@@ -1,91 +1,36 @@
 defmodule ManifoldWeb.ICloudSettingsLiveTest do
-  use ManifoldWeb.ConnCase, async: true
+  use ManifoldWeb.ConnCase, async: false
 
+  alias Manifold.Accounts
   alias Manifold.Connectors.ICloud
-  alias Manifold.Contacts
-  alias Manifold.Data.Schema.{Contact, DAVCollection, ICloudConnection}
+  alias Manifold.Data.Schema.{Contact, DAVCollection, DAVResource, ICloudConnection}
   alias Manifold.Repo
 
-  test "iCloud settings help and navigation", %{conn: conn} do
+  setup do
+    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    :ok
+  end
+
+  test "legacy URL guides Account setup without independent credential creation", %{conn: conn} do
     {:ok, view, _} = live(conn, ~p"/settings/icloud")
     assert has_element?(view, "#settings-nav[data-current='icloud']")
     assert has_element?(view, "#icloud-empty")
-    assert has_element?(view, "input[type='password'][name='icloud[app_password]'][value='']")
-    assert has_element?(view, "a[href='https://support.apple.com/en-us/121539']")
-    assert has_element?(view, "#icloud-settings", "read-only")
+    assert has_element?(view, "a[href='/settings/accounts']")
+    assert has_element?(view, "#icloud-create-account[href='/settings/accounts/new']")
+    refute has_element?(view, "#icloud-form")
+    refute has_element?(view, "input[type='password']")
   end
 
-  test "connect, replace credentials and disable without displaying secrets", %{conn: conn} do
-    {:ok, view, _} = live(conn, ~p"/settings/icloud")
-    password = "test-app-password-never-render"
+  test "legacy imported identities pause until explicitly assigned to a chosen Account", %{
+    conn: conn
+  } do
+    {:ok, account} =
+      Accounts.create_account(%{name: "Local Account", address: "local@example.test"})
 
-    view
-    |> form("#icloud-form",
-      icloud: %{
-        apple_id: "ui@example.test",
-        app_password: password,
-        contacts_enabled: "true",
-        calendars_enabled: "false"
-      }
-    )
-    |> render_submit()
-
-    assert_push_event(view, "clear-icloud-password", %{})
-    [connection] = ICloud.list_connections()
-    assert has_element?(view, "#icloud-#{connection.id}", "ui@example.test")
-    assert connection.contacts_enabled
-    refute connection.calendars_enabled
-    assert has_element?(view, "input[name='icloud[app_password]'][value='']")
-    refute render(view) =~ password
-    refute Map.has_key?(connection, :password_ciphertext)
-
-    view |> element("#edit-icloud-#{connection.id}") |> render_click()
-    assert has_element?(view, "input[name='icloud[apple_id]'][readonly]")
-
-    view
-    |> form("#icloud-form",
-      icloud: %{app_password: "replacement-test-secret", calendars_enabled: "true"}
-    )
-    |> render_submit()
-
-    refute render(view) =~ "replacement-test-secret"
-    assert has_element?(view, "input[name='icloud[app_password]'][value='']")
-    view |> element("#toggle-icloud-#{connection.id}") |> render_click()
-    refute hd(ICloud.list_connections()).enabled
-    assert has_element?(view, "#sync-icloud-#{connection.id}[disabled]")
-    view |> element("#toggle-icloud-#{connection.id}") |> render_click()
-    assert hd(ICloud.list_connections()).enabled
-    view |> element("#sync-icloud-#{connection.id}") |> render_click()
-    assert render(view) =~ "Synchronization queued"
-  end
-
-  test "invalid settings clear password and report sanitized failure", %{conn: conn} do
-    {:ok, view, _} = live(conn, ~p"/settings/icloud")
-
-    render_submit(view, "connect", %{
-      "icloud" => %{
-        "apple_id" => "",
-        "app_password" => "do-not-show-invalid-secret",
-        "contacts_enabled" => "true",
-        "calendars_enabled" => "true"
-      }
-    })
-
-    assert_push_event(view, "clear-icloud-password", %{})
-    assert has_element?(view, "#icloud-form-error")
-    assert has_element?(view, "input[name='icloud[app_password]'][value='']")
-    refute render(view) =~ "do-not-show-invalid-secret"
-  end
-
-  test "disconnect confirmation removes imports but retains local contacts", %{conn: conn} do
-    {:ok, local} = Contacts.create_contact(%{full_name: "Local survives"})
-
-    {:ok, connection} =
-      ICloud.connect(%{
-        apple_id: "disconnect@example.test",
-        app_password: "test-secret",
-        contacts_enabled: true,
-        calendars_enabled: false
+    connection =
+      Repo.insert!(%ICloudConnection{
+        apple_id: "different-apple@example.test",
+        password_ciphertext: <<1, 2, 3>>
       })
 
     collection =
@@ -96,24 +41,63 @@ defmodule ManifoldWeb.ICloudSettingsLiveTest do
         name: "Book"
       })
 
+    resource =
+      Repo.insert!(%DAVResource{
+        kind: "contacts",
+        connection_id: connection.id,
+        collection_id: collection.id,
+        href: "https://contacts.icloud.com/book/ada.vcf",
+        uid: "ada",
+        base_raw: "original",
+        status: "paused"
+      })
+
     imported =
       Repo.insert!(%Contact{
         collection_id: collection.id,
-        resource_href: "https://contacts.icloud.com/book/one.vcf",
-        full_name: "Imported",
-        raw: "BEGIN:VCARD\nEND:VCARD"
+        resource_id: resource.id,
+        resource_href: resource.href,
+        uid: "ada",
+        full_name: "Imported Ada"
       })
 
     {:ok, view, _} = live(conn, ~p"/settings/icloud")
-    view |> element("#disconnect-icloud-#{connection.id}") |> render_click()
-    assert has_element?(view, "#icloud-disconnect-dialog", "Your iCloud data is unchanged")
-    assert Repo.get(ICloudConnection, connection.id)
-    view |> element("#cancel-icloud-disconnect") |> render_click()
-    refute has_element?(view, "#icloud-disconnect-dialog")
-    view |> element("#disconnect-icloud-#{connection.id}") |> render_click()
-    view |> element("#confirm-icloud-disconnect") |> render_click()
-    assert is_nil(Repo.get(ICloudConnection, connection.id))
-    assert is_nil(Contacts.get_contact(imported.id))
-    assert Contacts.get_contact(local.id)
+    assert has_element?(view, "#icloud-#{connection.id}", "Account assignment required")
+
+    view
+    |> form("#icloud-assign-#{connection.id}", assignment: %{account_id: account.id})
+    |> render_submit()
+
+    assert_redirect(view, ~p"/settings/accounts/#{account.id}")
+    assert ICloud.for_account(account.id).id == connection.id
+    assert Repo.get!(Contact, imported.id).account_id == account.id
+    assert Repo.get!(DAVResource, resource.id).desired_revision == 0
+    assert Repo.get!(DAVResource, resource.id).acknowledged_revision == 0
+  end
+
+  test "blank assignment reports a sanitized error and bound connections link to their Account",
+       %{conn: conn} do
+    {:ok, account} = Accounts.create_account(%{name: "Bound", address: "bound@example.test"})
+
+    {:ok, bound} =
+      ICloud.connect(%{
+        account_id: account.id,
+        apple_id: "apple@example.test",
+        app_password: "test-secret"
+      })
+
+    legacy =
+      Repo.insert!(%ICloudConnection{apple_id: "legacy@example.test", password_ciphertext: <<1>>})
+
+    {:ok, view, _} = live(conn, ~p"/settings/icloud")
+
+    assert has_element?(
+             view,
+             "#manage-icloud-#{bound.id}[href='/settings/accounts/#{account.id}']"
+           )
+
+    view |> form("#icloud-assign-#{legacy.id}", assignment: %{account_id: ""}) |> render_submit()
+    assert render(view) =~ "Unable to assign this connection"
+    assert Repo.get!(ICloudConnection, legacy.id).account_id == nil
   end
 end

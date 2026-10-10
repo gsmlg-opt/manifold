@@ -95,7 +95,14 @@ defmodule Manifold.Connectors.DAV.XML do
             [p, l] -> {p, l}
           end
 
-        node = %{name: {Map.get(ns, prefix, ""), local}, text: "", children: [], ns: ns}
+        node = %{
+          name: {Map.get(ns, prefix, ""), local},
+          text: "",
+          children: [],
+          ns: ns,
+          attrs: Map.new(attrs)
+        }
+
         {:ok, %{state | stack: [node | state.stack], count: state.count + 1}}
       end
     end

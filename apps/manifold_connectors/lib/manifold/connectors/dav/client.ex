@@ -29,7 +29,13 @@ defmodule Manifold.Connectors.DAV.Client do
            propfind(
              home,
              credentials,
-             [{@dav, "resourcetype"}, {@dav, "displayname"}, {@dav, "sync-token"}],
+             [
+               {@dav, "resourcetype"},
+               {@dav, "displayname"},
+               {@dav, "sync-token"},
+               {@dav, "current-user-privilege-set"},
+               {@cal, "supported-calendar-component-set"}
+             ],
              "1",
              opts
            ),
@@ -56,6 +62,170 @@ defmodule Manifold.Connectors.DAV.Client do
       end
     else
       full(collection, credentials, opts)
+    end
+  end
+
+  def put_resource(href, credentials, kind, body, condition, opts \\ []) do
+    with true <- (is_binary(body) and byte_size(body) <= @max_body) || {:error, :content_limit},
+         {:ok, conditional} <- condition_header(condition),
+         content_type when not is_nil(content_type) <- content_type(kind) do
+      write_request(
+        :put,
+        href,
+        credentials,
+        body,
+        [conditional, {"content-type", content_type}],
+        opts
+      )
+    else
+      nil -> {:error, :invalid_kind}
+      {:error, _} = error -> error
+    end
+  end
+
+  def delete_resource(href, credentials, etag, opts \\ []) do
+    with true <- strong_etag?(etag) || {:error, :missing_etag} do
+      write_request(:delete, href, credentials, nil, [{"if-match", etag}], opts)
+    end
+  end
+
+  def get_resource(href, credentials, opts \\ []) do
+    with {:ok, response, final} <-
+           request(
+             :get,
+             href,
+             credentials,
+             nil,
+             nil,
+             deadline(Keyword.put(opts, :resource_read, true))
+           ),
+         true <- final == href || {:error, :resource_moved} do
+      case response do
+        %{status: 404} ->
+          {:ok, :missing}
+
+        %{status: 200, body: body, headers: headers} ->
+          etag = header(headers, "etag")
+
+          if strong_etag?(etag),
+            do: {:ok, %{content: body, etag: etag}},
+            else: {:error, :missing_etag}
+
+        %{status: 403} ->
+          {:error, :forbidden}
+
+        _ ->
+          {:error, :dav_failure}
+      end
+    end
+  end
+
+  def strong_etag?(etag) when is_binary(etag),
+    do: Regex.match?(~r/\A"[^"\x00-\x20\x7f]*"\z/, etag)
+
+  def strong_etag?(_), do: false
+
+  defp content_type(kind) when kind in ["contacts", :contacts], do: "text/vcard; charset=utf-8"
+
+  defp content_type(kind) when kind in ["calendars", :calendars],
+    do: "text/calendar; charset=utf-8"
+
+  defp content_type(_), do: nil
+  defp condition_header(:create), do: {:ok, {"if-none-match", "*"}}
+
+  defp condition_header(etag),
+    do: if(strong_etag?(etag), do: {:ok, {"if-match", etag}}, else: {:error, :missing_etag})
+
+  defp write_request(method, href, credentials, body, extra_headers, opts) do
+    with {:ok, href} <- URL.validate(href) do
+      headers =
+        extra_headers ++
+          [
+            {"authorization",
+             "Basic " <> Base.encode64(credentials.apple_id <> ":" <> credentials.app_password)},
+            {"accept-encoding", "identity"}
+          ]
+
+      transport = Keyword.get(opts, :transport, &Transport.request/4)
+
+      case transport.(method, href, headers, body) do
+        {:ok, %{status: status, headers: response_headers, body: response_body}}
+        when is_binary(response_body) ->
+          cond do
+            byte_size(response_body) > @max_body ->
+              {:error, :outcome_unknown}
+
+            status in [200, 201, 204] and method == :delete ->
+              {:ok, :deleted}
+
+            status in [200, 201, 204] ->
+              etag = header(response_headers, "etag")
+              if strong_etag?(etag), do: {:ok, %{etag: etag}}, else: {:error, :outcome_unknown}
+
+            status == 404 and method == :delete ->
+              {:ok, :deleted}
+
+            status == 412 ->
+              {:error, :conflict}
+
+            status == 401 ->
+              {:error, :unauthorized}
+
+            status == 403 ->
+              {:error, :forbidden}
+
+            status == 429 ->
+              {:error, {:rate_limited, retry_after(response_headers)}}
+
+            status in [301, 302, 303, 307, 308] ->
+              {:error, :resource_moved}
+
+            status in [400, 404, 405, 409, 415, 422, 507] ->
+              {:error, :write_rejected}
+
+            true ->
+              {:error, :outcome_unknown}
+          end
+
+        _ ->
+          {:error, :outcome_unknown}
+      end
+    end
+  rescue
+    _ -> {:error, :outcome_unknown}
+  end
+
+  defp privileges(response) do
+    case Map.get(response.props, {@dav, "current-user-privilege-set"}) do
+      nil ->
+        []
+
+      node ->
+        XML.children(node, {@dav, "privilege"})
+        |> Enum.flat_map(fn privilege ->
+          for name <- ["all", "write", "write-content", "bind", "unbind"],
+              XML.child(privilege, {@dav, name}) != nil,
+              do: name
+        end)
+    end
+  end
+
+  defp privilege(response, name) do
+    case Map.get(response.props, {@dav, "current-user-privilege-set"}) do
+      nil -> nil
+      _ -> Enum.any?(privileges(response), &(&1 in [name, "write", "all"]))
+    end
+  end
+
+  defp components(response) do
+    case Map.get(response.props, {@cal, "supported-calendar-component-set"}) do
+      nil ->
+        []
+
+      node ->
+        XML.children(node, {@cal, "comp"})
+        |> Enum.map(fn comp -> Map.get(comp.attrs, "name") end)
+        |> Enum.reject(&is_nil/1)
     end
   end
 
@@ -158,7 +328,13 @@ defmodule Manifold.Connectors.DAV.Client do
                       href: href,
                       name:
                         property_text(response, {@dav, "displayname"}) || "Unnamed collection",
-                      sync_token: property_text(response, {@dav, "sync-token"})
+                      sync_token: property_text(response, {@dav, "sync-token"}),
+                      can_create: privilege(response, "bind"),
+                      can_update: privilege(response, "write-content"),
+                      can_delete: privilege(response, "unbind"),
+                      privileges: privileges(response),
+                      supported_components: components(response),
+                      writable: privilege(response, "write-content") == true
                     }
                     | acc
                   ]}}
@@ -301,6 +477,9 @@ defmodule Manifold.Connectors.DAV.Client do
               with {:ok, destination} <- URL.resolve(url, header(response_headers, "location")) do
                 request(method, destination, credentials, body, depth, opts, redirects + 1)
               end
+
+            status == 403 && Keyword.get(opts, :resource_read, false) ->
+              {:error, :forbidden}
 
             status in [401, 403] && method != :report ->
               {:error, :unauthorized}

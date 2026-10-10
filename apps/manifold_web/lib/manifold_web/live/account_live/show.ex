@@ -18,6 +18,8 @@ defmodule ManifoldWeb.AccountLive.Show do
          |> push_navigate(to: ~p"/settings/accounts")}
 
       account ->
+        if connected?(socket), do: Process.send_after(self(), :refresh_icloud, 5_000)
+
         {:ok,
          assign(socket,
            page_title: Accounts.account_address(account),
@@ -28,6 +30,22 @@ defmodule ManifoldWeb.AccountLive.Show do
            oauth_providers: @oauth_providers
          )}
     end
+  end
+
+  @impl Phoenix.LiveView
+  def handle_info({:icloud_flash, kind, message}, socket) do
+    {:noreply, put_flash(socket, kind, message)}
+  end
+
+  def handle_info(:refresh_icloud, socket) do
+    Process.send_after(self(), :refresh_icloud, 5_000)
+
+    send_update(ManifoldWeb.AccountLive.ICloudComponent,
+      id: "account-icloud",
+      account: socket.assigns.account
+    )
+
+    {:noreply, socket}
   end
 
   @impl Phoenix.LiveView
@@ -306,6 +324,11 @@ defmodule ManifoldWeb.AccountLive.Show do
           </tbody>
         </table>
       </div>
+      <.live_component
+        module={ManifoldWeb.AccountLive.ICloudComponent}
+        id="account-icloud"
+        account={@account}
+      />
     </section>
     """
   end

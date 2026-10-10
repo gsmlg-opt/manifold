@@ -3,7 +3,8 @@ defmodule Manifold.Connectors.ICloud.Sync do
   import Ecto.Query
   alias Manifold.Connectors.{Crypto, ICloud}
   alias Manifold.Connectors.DAV.{Client, URL, VCard, ICalendar}
-  alias Manifold.Data.Schema.{ICloudConnection, DAVCollection, Contact, CalendarEvent}
+  alias Manifold.Data.Schema.{ICloudConnection, DAVCollection, DAVResource}
+  alias Manifold.Connectors.ICloud.{Inbound, Outbound}
   alias Manifold.Repo
 
   def run(id, generation, opts \\ []) do
@@ -31,7 +32,13 @@ defmodule Manifold.Connectors.ICloud.Sync do
                 end
               end)
 
-            aggregate(results)
+            outcome = aggregate(results)
+
+            case outcome do
+              {:error, :stale} -> outcome
+              {:error, {:rate_limited, _}} -> outcome
+              _ -> aggregate([outcome, Outbound.run(connection, credentials, opts)])
+            end
 
           _ ->
             Enum.each(
@@ -69,6 +76,12 @@ defmodule Manifold.Connectors.ICloud.Sync do
       cond do
         c.generation != generation ->
           Repo.rollback(:stale)
+
+        is_nil(c.account_id) ->
+          Repo.rollback(:account_assignment_required)
+
+        not ICloud.account_active?(c) ->
+          Repo.rollback(:account_disabled)
 
         not c.enabled ->
           Repo.rollback(:disabled)
@@ -130,7 +143,12 @@ defmodule Manifold.Connectors.ICloud.Sync do
                  Keyword.put(opts, :existing_etags, etags)
                ),
              {:ok, prepared} <- prepare(collection, snapshot) do
-          {:cont, {:ok, [%{collection: collection, name: remote.name, snapshot: prepared} | acc]}}
+          {:cont,
+           {:ok,
+            [
+              %{collection: collection, remote: remote, name: remote.name, snapshot: prepared}
+              | acc
+            ]}}
         else
           {:error, reason} -> {:halt, {:error, reason}}
           _ -> {:halt, {:error, :incomplete_response}}
@@ -145,9 +163,7 @@ defmodule Manifold.Connectors.ICloud.Sync do
   defp existing_etags(%{id: nil}), do: %{}
 
   defp existing_etags(c) do
-    schema = schema(c.kind)
-
-    Repo.all(from r in schema, where: r.collection_id == ^c.id, select: {r.resource_href, r.etag})
+    Repo.all(from(r in DAVResource, where: r.collection_id == ^c.id, select: {r.href, r.etag}))
     |> Map.new()
   end
 
@@ -213,21 +229,35 @@ defmodule Manifold.Connectors.ICloud.Sync do
         Enum.each(snapshots, fn data ->
           collection =
             data.collection
-            |> DAVCollection.changeset(%{name: data.name, sync_token: data.snapshot.sync_token})
+            |> DAVCollection.changeset(
+              Map.merge(
+                Map.take(data.remote, [
+                  :can_create,
+                  :can_update,
+                  :can_delete,
+                  :privileges,
+                  :supported_components,
+                  :writable
+                ]),
+                %{name: data.name, sync_token: data.snapshot.sync_token}
+              )
+            )
             |> persist!()
 
-          apply_snapshot(collection, data.snapshot)
+          Inbound.apply(collection, data.snapshot, locked.account_id)
         end)
 
         hrefs = Enum.map(snapshots, & &1.collection.href)
 
-        Repo.delete_all(
+        Repo.all(
           from collection in DAVCollection,
             where:
               collection.connection_id == ^c.id and collection.kind == ^kind and
                 collection.href not in ^hrefs
         )
+        |> Enum.each(&Inbound.missing_collection/1)
 
+        if locked.account_id, do: Manifold.Data.SyncState.enroll_account(locked.account_id)
         f = fields(kind)
 
         ICloud.update!(locked, %{
@@ -240,64 +270,6 @@ defmodule Manifold.Connectors.ICloud.Sync do
     case result do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp apply_snapshot(c, snapshot) do
-    schema = schema(c.kind)
-
-    Enum.each(snapshot.entries, fn entry ->
-      if is_nil(entry.records) do
-        rows =
-          Repo.all(
-            from r in schema, where: r.collection_id == ^c.id and r.resource_href == ^entry.href
-          )
-
-        if rows == [] or Enum.any?(rows, &(&1.etag != entry.etag)),
-          do: Repo.rollback(:incomplete_response)
-      else
-        Enum.each(entry.records, fn attrs ->
-          attrs =
-            Map.merge(attrs, %{collection_id: c.id, resource_href: entry.href, etag: entry.etag})
-
-          existing =
-            if c.kind == "contacts" do
-              Repo.get_by(Contact, collection_id: c.id, resource_href: entry.href)
-            else
-              Repo.get_by(CalendarEvent,
-                collection_id: c.id,
-                resource_href: entry.href,
-                uid: attrs.uid,
-                recurrence_id: attrs.recurrence_id
-              )
-            end
-
-          (existing || struct(schema)) |> schema.changeset(attrs) |> persist!()
-        end)
-
-        if c.kind == "calendars" do
-          identities = MapSet.new(Enum.map(entry.records, &{&1.uid, &1.recurrence_id}))
-
-          Repo.all(
-            from r in CalendarEvent,
-              where: r.collection_id == ^c.id and r.resource_href == ^entry.href
-          )
-          |> Enum.reject(&MapSet.member?(identities, {&1.uid, &1.recurrence_id}))
-          |> Enum.each(&Repo.delete!/1)
-        end
-      end
-    end)
-
-    if snapshot.mode == :full do
-      seen = Enum.map(snapshot.entries, & &1.href)
-
-      Repo.delete_all(
-        from r in schema, where: r.collection_id == ^c.id and r.resource_href not in ^seen
-      )
-    else
-      Repo.delete_all(
-        from r in schema, where: r.collection_id == ^c.id and r.resource_href in ^snapshot.deleted
-      )
     end
   end
 
@@ -324,14 +296,16 @@ defmodule Manifold.Connectors.ICloud.Sync do
     end
   end
 
-  defp current!(expected) do
+  @doc false
+  def current!(expected) do
     c =
       case Repo.get(ICloudConnection, expected.id) do
         nil -> Repo.rollback(:stale)
         _ -> ICloud.locked!(expected.id)
       end
 
-    if (c.enabled and c.generation == expected.generation and c.sync_owner == expected.sync_owner and
+    if (ICloud.account_active?(c) and c.enabled and c.generation == expected.generation and
+          c.sync_owner == expected.sync_owner and
           c.sync_expires_at) && DateTime.compare(c.sync_expires_at, DateTime.utc_now()) == :gt,
        do: c,
        else: Repo.rollback(:stale)
@@ -371,9 +345,6 @@ defmodule Manifold.Connectors.ICloud.Sync do
       _ -> Repo.rollback(:invalid_resource)
     end
   end
-
-  defp schema("contacts"), do: Contact
-  defp schema("calendars"), do: CalendarEvent
 
   defp fields("contacts"),
     do: %{

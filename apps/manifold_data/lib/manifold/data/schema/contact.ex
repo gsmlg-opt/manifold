@@ -19,6 +19,11 @@ defmodule Manifold.Data.Schema.Contact do
   @postal_fields [:street, :locality, :region, :postal_code, :country, :po_box, :extended_address]
 
   schema "contacts" do
+    field(:account_id, :binary_id)
+    field(:sync_to_icloud, :boolean, default: true)
+    field(:local_revision, :integer, default: 0)
+    field(:deleted_at, :utc_datetime_usec)
+    belongs_to(:resource, Manifold.Data.Schema.DAVResource)
     field(:resource_href, :string)
     field(:uid, :string)
     field(:etag, :string)
@@ -37,9 +42,26 @@ defmodule Manifold.Data.Schema.Contact do
 
   def changeset(contact, attrs) do
     contact
-    |> cast(attrs, @local_fields ++ [:collection_id, :resource_href, :uid, :etag, :raw])
+    |> cast(
+      attrs,
+      @local_fields ++
+        [
+          :account_id,
+          :sync_to_icloud,
+          :local_revision,
+          :deleted_at,
+          :resource_id,
+          :collection_id,
+          :resource_href,
+          :uid,
+          :etag,
+          :raw
+        ]
+    )
     |> validate_required([:full_name, :emails, :phones, :addresses])
     |> foreign_key_constraint(:collection_id)
+    |> foreign_key_constraint(:account_id)
+    |> foreign_key_constraint(:resource_id)
     |> unique_constraint([:collection_id, :resource_href], error_key: :resource_href)
     |> check_constraint(:collection_id, name: :contacts_source_identity_valid)
     |> check_constraint(:full_name, name: :contacts_full_name_present)
@@ -47,9 +69,9 @@ defmodule Manifold.Data.Schema.Contact do
 
   def local_changeset(contact, attrs) do
     contact
-    |> cast(attrs, @local_fields)
+    |> cast(attrs, @local_fields ++ [:account_id, :sync_to_icloud])
     |> update_change(:full_name, &String.trim/1)
-    |> validate_required([:full_name, :emails, :phones, :addresses])
+    |> validate_required([:full_name, :emails, :phones, :addresses, :sync_to_icloud])
     |> validate_length(:full_name, max: 512)
     |> validate_length(:given_name, max: 512)
     |> validate_length(:family_name, max: 512)
@@ -59,6 +81,7 @@ defmodule Manifold.Data.Schema.Contact do
     |> validate_values(:phones, &present_string?/1)
     |> validate_values(:addresses, &valid_address?/1)
     |> check_constraint(:full_name, name: :contacts_full_name_present)
+    |> foreign_key_constraint(:account_id)
   end
 
   defp validate_values(changeset, field, valid?) do

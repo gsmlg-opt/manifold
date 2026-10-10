@@ -12,6 +12,12 @@ defmodule Manifold.Data.Schema.DAVCollection do
     field(:href, :string)
     field(:name, :string)
     field(:sync_token, :string)
+    field(:writable, :boolean, default: false)
+    field(:can_create, :boolean)
+    field(:can_update, :boolean)
+    field(:can_delete, :boolean)
+    field(:supported_components, {:array, :string}, default: [])
+    field(:privileges, {:array, :string}, default: [])
     belongs_to(:connection, Manifold.Data.Schema.ICloudConnection)
     has_many(:contacts, Manifold.Data.Schema.Contact, foreign_key: :collection_id)
     has_many(:events, Manifold.Data.Schema.CalendarEvent, foreign_key: :collection_id)
@@ -20,7 +26,19 @@ defmodule Manifold.Data.Schema.DAVCollection do
 
   def changeset(collection, attrs) do
     collection
-    |> cast(attrs, [:connection_id, :kind, :href, :name, :sync_token])
+    |> cast(attrs, [
+      :connection_id,
+      :kind,
+      :href,
+      :name,
+      :sync_token,
+      :writable,
+      :can_create,
+      :can_update,
+      :can_delete,
+      :supported_components,
+      :privileges
+    ])
     |> validate_required([:connection_id, :kind, :href])
     |> validate_inclusion(:kind, ["contacts", "calendars"])
     |> foreign_key_constraint(:connection_id)

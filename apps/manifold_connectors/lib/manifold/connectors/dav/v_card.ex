@@ -28,7 +28,12 @@ defmodule Manifold.Connectors.DAV.VCard do
              notes: text(props, "NOTE"),
              emails: values(props, "EMAIL"),
              phones: values(props, "TEL"),
-             addresses: Enum.map(Line.all(props, "ADR"), &address/1)
+             addresses:
+               Line.all(props, "ADR")
+               |> Enum.with_index()
+               |> Enum.map(fn {prop, index} ->
+                 address(prop) |> Map.put("property_id", property_id(prop, index))
+               end)
            }}
     else
       _ -> {:error, :invalid_vcard}
@@ -37,12 +42,25 @@ defmodule Manifold.Connectors.DAV.VCard do
 
   defp text(props, name), do: Line.first(props, name, "") |> Line.unescape()
 
-  defp values(props, name),
-    do:
-      Enum.map(
-        Line.all(props, name),
-        &%{"value" => Line.unescape(&1.value), "label" => Map.get(&1.params, "TYPE", "")}
-      )
+  defp values(props, name) do
+    Line.all(props, name)
+    |> Enum.with_index()
+    |> Enum.map(fn {prop, index} ->
+      %{
+        "value" => Line.unescape(prop.value),
+        "label" => Map.get(prop.params, "TYPE", ""),
+        "property_id" => property_id(prop, index)
+      }
+    end)
+  end
+
+  defp property_id(prop, index) do
+    if String.contains?(prop.original_name, "."),
+      do:
+        (prop.original_name |> String.split(".") |> Enum.drop(-1) |> Enum.join(".")) <>
+          "." <> prop.name,
+      else: prop.name <> ":" <> Integer.to_string(index)
+  end
 
   defp address(prop) do
     parts = Line.split(prop.value, ";") |> Enum.map(&Line.unescape/1)

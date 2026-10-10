@@ -1,5 +1,81 @@
 # iCloud contacts and calendars acceptance
 
+## Account-owned bidirectional implementation — 2026-10-10
+
+Current scope: iCloud configuration in Accounts, local-first Contacts/Calendar
+CRUD, asynchronous bidirectional resource synchronization, default-enabled
+contact preference, explicit destinations, conflict choices and retained local
+data on disconnect. Branch: `codex/account-icloud-sync`, based on v0.5.1.
+This acceptance does not publish a new release.
+
+- **PASS:** final scoped ExUnit suite, **203 tests, zero failures**, seed `468787`:
+  Calendars18, Contacts20, DAV/iCloud/connectors80, AccountLifecycle40, selected
+  Account/Contact/Calendar/settings LiveViews45. Covers local offline saves,
+  transactional intent rollback, explicit destination merge, independent
+  ownership/remap races, older acknowledgement versus newer edits, repeated
+  property identity rebase, lost responses, conditional conflicts, opt-out,
+  capabilities, lifecycle fencing and Account purge isolation.
+- **PASS:** invitation resource edit/delete and final-event deletion from mixed
+  VEVENT/VTODO resources retain local intentions and issue zero cloud writes.
+  Document checks also cover VJOURNAL and unknown component deletion refusal.
+- **PASS:** actual TCP peers verify conditional PUT/DELETE headers, UTF8 request
+  body/media type and classification of a lost write response. These exercise
+  the DAV client/transport contract using controlled peers.
+- **PASS:** populated migration acceptance preserves two contacts, two event
+  projections/shared resource identities, raw documents and ETags with **zero
+  queued uploads**. Evidence database:
+  `manifold_icloud_upgrade_1791618216470758`. Legacy local contacts remain
+  unassigned; deleting the connection retains local records.
+- **PASS:** strict development compilation, formatting of all45 changed Elixir/
+  HEEx files and `git diff --check`.
+- **PASS:** asset build and JS check: zero errors, two existing unused catch
+  variable warnings. CSS493KB and JS195.8KB.
+- **PASS:** isolated browser fixture on port4395 verifies immediate Contact/event
+  saves while iCloud is disabled, native date/time inputs, account selection,
+  default Contact sync preference, both sunshine/moonlight themes and connected
+  LiveView without console errors/warnings. Contacts/Calendar pages have no
+  horizontal overflow at390px. Account details retain an existing4px overflow
+  caused by the receive-method table; it is outside this change.
+- **PASS:** browser destination mapping refuses save without explicit merge
+  consent; confirmed merge saves immediately with existing local event IDs and
+  records retained while the fake connection is disabled. Imported baseline
+  retention is covered by domain/LiveView tests. No console errors/warnings.
+- **NOT RUN:** real credentialed Apple account discovery and CRUD. No disposable
+  Apple account/app-specific password was supplied. Controlled peers, fixtures
+  and local builds do not prove account-specific Apple interoperability.
+- **NOT RUN:** new release publication, packaged release acceptance or development
+  process restart. No new publication is scheduled; only the owned temporary
+  preview was started for this feature.
+
+Verification runs through root `devenv shell`, with isolated database
+`manifold_icloud_acceptance_test`; only affected apps/test paths are selected:
+
+```sh
+mix test apps/manifold_contacts/test apps/manifold_calendars/test \
+  apps/manifold_connectors/test/manifold/connectors/dav \
+  apps/manifold_connectors/test/manifold/connectors/icloud \
+  apps/manifold_connectors/test/manifold/connectors/icloud_test.exs \
+  apps/manifold_account_lifecycle/test \
+  apps/manifold_web/test/manifold_web/contact_live_test.exs \
+  apps/manifold_web/test/manifold_web/calendar_live_test.exs \
+  apps/manifold_web/test/manifold_web/icloud_settings_live_test.exs \
+  apps/manifold_web/test/manifold_web/account_icloud_live_test.exs \
+  apps/manifold_web/test/manifold_web/account_live_test.exs
+MIX_ENV=test mix run --no-start apps/manifold_data/test/acceptance/icloud_upgrade.exs
+mix compile --warnings-as-errors
+mix assets.build
+mix duskmoon_bundler.js.check
+```
+
+Only generated fixtures are used. Development/production databases are not
+migrated for this feature. An additive migration is required before deploying
+the branch; setup/rollback limits are in `ICLOUD.md`.
+
+## Historical read-only implementation and releases
+
+The sections below record earlier read-only functionality and publication
+evidence. They do not describe the current branch's editable synchronization.
+
 Approved scope: local contact CRUD, independent read-only iCloud contacts and
 calendar synchronization, settings/navigation, and one minor release.
 Implementation starts from `dfe2412a74596aed2238ee30ee0ba18d5530f298` in an

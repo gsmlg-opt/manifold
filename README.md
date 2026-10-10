@@ -60,13 +60,16 @@ Microsoft Graph, or SMTP submission:
 
 ## Contacts and iCloud calendars
 
-Manage local contacts at `/contacts` and connect Apple accounts at
-`/settings/icloud` using encrypted app-specific passwords. Manifold automatically
-queues iCloud contacts and calendar event synchronization every five minutes via
-read-only CardDAV/CalDAV, with manual refresh and per-service status.
-Imported contacts and calendars are read-only; local contacts support CRUD and
-search. Calendar reading retains timezone/recurrence information and original
-ICS without expanding a full recurring-occurrence calendar.
+Configure iCloud Contacts and Calendar inside **Settings → Accounts** using
+an encrypted Apple app-specific password. Contacts (`/contacts`) and local
+calendars/events (`/calendars`) save immediately and synchronize asynchronously
+in both directions. Contacts default to **Sync to iCloud**; an explicit Account
+and writable destination are required before uploading. The old `/settings/icloud`
+page assigns legacy connections to Accounts.
+
+Conditional CardDAV/CalDAV writes retain local changes during outages and expose
+conflict choices. Calendar edits preserve complete ICS resources, recurrence
+exceptions, timezones and alarms; recurring occurrences are not expanded.
 See [setup, synchronization and migration guidance](docs/ICLOUD.md).
 
 ## Out Of Scope

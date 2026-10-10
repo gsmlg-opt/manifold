@@ -4,10 +4,14 @@ defmodule Manifold.Connectors.ICloud.ProtocolSyncTest do
   alias Manifold.Data.Schema.{Contact, DAVCollection}
 
   test "queued connection traverses DAV discovery, vCard projection, ETag changes and remote deletion" do
+    {:ok, account} =
+      Manifold.Accounts.create_account(%{address: "test-#{Ecto.UUID.generate()}@example.test"})
+
     password = "aaaa-bbbb-cccc-dddd"
 
     {:ok, c} =
       ICloud.connect(%{
+        account_id: account.id,
         apple_id: "apple@example.test",
         app_password: password,
         contacts_enabled: true,
@@ -71,7 +75,7 @@ defmodule Manifold.Connectors.ICloud.ProtocolSyncTest do
                Sync.run(job.args["connection_id"], job.args["generation"], transport: transport)
 
       if phase == :deleted do
-        assert Repo.all(Contact) == []
+        assert Manifold.Contacts.list_contacts() == []
       else
         assert [contact] = Repo.all(Contact)
         assert contact.full_name == "Ada #{phase}"
