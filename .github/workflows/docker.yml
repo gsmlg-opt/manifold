@@ -92,6 +92,12 @@ jobs:
         with:
           ref: ${{ steps.meta.outputs.ref }}
 
+      - name: Capture build metadata
+        id: build_info
+        run: |
+          echo "git_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "built_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -122,6 +128,10 @@ jobs:
           labels: ${{ steps.docker_meta.outputs.labels }}
           build-args: |
             RELEASE=${{ matrix.release }}
+            MANIFOLD_GIT_REF=${{ steps.meta.outputs.ref }}
+            MANIFOLD_GIT_SHA=${{ steps.build_info.outputs.git_sha }}
+            MANIFOLD_BUILD_TIME=${{ steps.build_info.outputs.built_at }}
+            MANIFOLD_RELEASE_TIME=${{ github.event.release.published_at }}
           cache-from: type=gha,scope=${{ matrix.release }}
           cache-to: type=gha,mode=max,scope=${{ matrix.release }}
 

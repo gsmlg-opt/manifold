@@ -70,6 +70,32 @@ a {
   flex: none;
 }
 
+#app-appbar .appbar-version {
+  flex-shrink: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  white-space: nowrap;
+  cursor: help;
+}
+
+#app-appbar .appbar-version:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+.appbar-version-tooltip[popover] {
+  --tooltip-bg: var(--color-primary-container);
+  --tooltip-fg: var(--color-on-primary-container);
+  max-width: calc(100vw - 2rem);
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  text-align: start;
+}
+
 /* Text nav labels need auto width; core .appbar-action is icon-sized (2.5rem). */
 #app-appbar .appbar-action {
   width: auto;
