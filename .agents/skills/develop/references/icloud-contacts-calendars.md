@@ -8,6 +8,23 @@
 - Design: `docs/superpowers/specs/2026-10-09-icloud-contacts-calendars-design.md`.
 - Acceptance: `docs/ICLOUD_ACCEPTANCE.md`; operator guide: `docs/ICLOUD.md`.
 
+## Account-owned bidirectional follow-up
+
+The user narrowed the next feature to iCloud only, configured inside Accounts,
+and confirmed bidirectional Contacts/Calendar synchronization. Local CRUD must
+commit first and synchronize asynchronously. Contacts have `sync_to_icloud`,
+default true. The revised review draft is
+`docs/superpowers/specs/2026-10-10-account-icloud-bidirectional-design.md`.
+Implementation has not started; the sections below describe the released
+read-only implementation, not the proposed write behavior.
+
+The proposed scope includes Account binding, local calendar/event CRUD, durable
+resource intents, lossless DAV document editing, conditional writes/conflicts,
+and AccountLifecycle quiescing/purge integration. Preserve local drafts and
+opted-out contacts when remote collections disappear; current snapshot upserts
+and cascading imported-record deletion are not safe for this new scope. Tests
+must distinguish local/fault-fixture evidence from credentialed Apple validation.
+
 ## Module ownership
 
 - `manifold_data`: ICloudConnection, DAVCollection, Contact, CalendarEvent;

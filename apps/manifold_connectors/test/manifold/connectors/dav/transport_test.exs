@@ -148,7 +148,8 @@ defmodule Manifold.Connectors.DAV.TransportTest do
         end
       end)
 
-    :erlang.trace_pattern({Mint.HTTP, :recv, 3}, [{:_, [], [{:return_trace}]}], [:local])
+    Code.ensure_loaded!(Mint.HTTP)
+    assert :erlang.trace_pattern({Mint.HTTP, :recv, 3}, [{:_, [], [{:return_trace}]}], [:local]) == 1
     :erlang.trace(requester.pid, true, [:call, :set_on_spawn, {:tracer, self()}])
 
     try do
