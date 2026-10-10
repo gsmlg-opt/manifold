@@ -101,6 +101,9 @@ defmodule Manifold.Connectors.DAV.MintAdapter do
         {:error, _, %Mint.HTTPError{reason: {:max_header_list_size_exceeded, _, _}}, _} ->
           {:error, :header_limit}
 
+        {:error, _, %Mint.TransportError{reason: :timeout}, _} ->
+          {:error, :timeout}
+
         {:error, _, _, _} ->
           {:error, :transport_failure}
       end

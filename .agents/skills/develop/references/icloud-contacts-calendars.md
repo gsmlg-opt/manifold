@@ -66,7 +66,27 @@ relocated main archive and published main image pass fresh migrations/context
 CRUD and three pages/CSS/JS. Edge image metadata and versions pass; edge boot
 NOT_RUN. Real credentialed Apple synchronization remains NOT_RUN. See acceptance
 and release notes for exact digests. Release and final documentation are merged
-into main; original local maintenance changes remain uncommitted. Verification
+into main; the original local maintenance changes were subsequently committed
+for the separately authorized v0.5.1 maintenance release. Verification
 evidence is retained in the root checkout under `tmp/icloud*`, and pre-merge
 local files are backed up under `tmp/worktree-merge-preserved-*`.
-Stop after this release.
+The original feature/release scope concluded with v0.5.0.
+
+## DAV timeout classification correction
+
+The subsequent maintenance CI run `37970230361`, seed `12335`, exposed a
+stalled-peer race: passive Mint receive can return
+`%Mint.TransportError{reason: :timeout}` before the outer adapter Task deadline.
+The adapter preserves that receive timeout as `:timeout`; other transport
+failures retain their generic classification. This is application error mapping,
+not an upstream Mint defect.
+
+`transport_test.exs` deterministically exercises the internal timeout using real
+loopback traffic and call/return tracing. It suspends the outer requester after
+Mint receive begins, observes the socket timeout and worker termination, then
+resumes the requester. No sleeps or mocked transport errors determine the
+ordering. The test cleans up tracing, suspended tasks and socket ownership;
+a peer closing without an HTTP response still returns `:transport_failure`.
+Before the adapter correction the new test failed with the CI error; afterward
+the transport file passes 8 tests and the scoped DAV directory passes 30 tests,
+both with seed `12335`. Changed Elixir files are formatted.

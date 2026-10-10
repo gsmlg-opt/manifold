@@ -57,6 +57,13 @@ defmodule Manifold.Connectors.DAV.TransportTest do
     Task.await(peer)
   end
 
+  test "peer closing without an HTTP response remains a transport failure" do
+    {url, peer} = server("")
+
+    assert {:error, :transport_failure} = Transport.request(:get, url, [], nil)
+    assert Task.await(peer) =~ "GET / HTTP/1.1"
+  end
+
   test "DAV request credentials never enter Finch telemetry" do
     handler = "dav-no-credential-telemetry-#{System.unique_integer([:positive])}"
 
@@ -113,6 +120,71 @@ defmodule Manifold.Connectors.DAV.TransportTest do
 
     assert_received :peer_received
     assert {:error, :closed} = Task.await(peer)
+  end
+
+  test "Mint receive timeout stays a timeout when the adapter task finishes first" do
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+
+    {:ok, {_, port}} = :inet.sockname(listener)
+    parent = self()
+
+    peer =
+      Task.async(fn ->
+        {:ok, socket} = :gen_tcp.accept(listener, 5_000)
+        request = read_headers(socket, "")
+        send(parent, {:stalled_request, request})
+        result = :gen_tcp.recv(socket, 0, 5_000)
+        :gen_tcp.close(socket)
+        :gen_tcp.close(listener)
+        result
+      end)
+
+    requester =
+      Task.async(fn ->
+        receive do
+          :request ->
+            Transport.request(:get, "http://127.0.0.1:#{port}/", [], nil, timeout: 1_000)
+        end
+      end)
+
+    :erlang.trace_pattern({Mint.HTTP, :recv, 3}, [{:_, [], [{:return_trace}]}], [:local])
+    :erlang.trace(requester.pid, true, [:call, :set_on_spawn, {:tracer, self()}])
+
+    try do
+      send(requester.pid, :request)
+      assert_receive {:trace, worker, :call, {Mint.HTTP, :recv, [_, 0, remaining]}}, 2_000
+      assert remaining > 0
+
+      # Let the real socket timeout finish before the outer Task.yield can win.
+      :erlang.suspend_process(requester.pid)
+      monitor = Process.monitor(worker)
+      assert_receive {:stalled_request, request}, 2_000
+      assert request =~ "GET / HTTP/1.1"
+
+      assert_receive {:trace, ^worker, :return_from, {Mint.HTTP, :recv, 3},
+                      {:error, _, %Mint.TransportError{reason: :timeout}, _}},
+                     2_000
+
+      assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}, 2_000
+      :erlang.resume_process(requester.pid)
+      assert {:error, :timeout} = Task.await(requester)
+      assert {:error, :closed} = Task.await(peer)
+    after
+      :erlang.trace_pattern({Mint.HTTP, :recv, 3}, false, [:local])
+
+      if Process.alive?(requester.pid) do
+        try do
+          :erlang.resume_process(requester.pid)
+        rescue
+          ArgumentError -> :ok
+        end
+      end
+
+      Task.shutdown(requester, :brutal_kill)
+      Task.shutdown(peer, :brutal_kill)
+      :gen_tcp.close(listener)
+    end
   end
 
   defp server(response) do
