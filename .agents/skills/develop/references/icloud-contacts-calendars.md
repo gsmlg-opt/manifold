@@ -92,3 +92,7 @@ Final repair acceptance: 136 scoped tests, strict compilation and formatting
 passed. Main integration and service restart retained the user worktree files.
 Native DAV completed and native IMAP resumed actual imports; historical mail
 backfill continues asynchronously. See the configured-account acceptance section.
+
+TLS release checks also exercise BODY.PEEK[] and BODY[] literal responses over
+both OTP/ex_ssl direct TLS and STARTTLS peers; keep these wire fixtures aligned
+with the read-only IMAP body command.

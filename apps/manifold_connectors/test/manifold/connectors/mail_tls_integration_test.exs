@@ -245,12 +245,12 @@ defmodule Manifold.Connectors.MailTLSIntegrationTest do
     :ok = :ssl.send(socket, "A1 OK authenticated\r\n")
     assert_line(socket, "A2 SELECT INBOX")
     :ok = :ssl.send(socket, "* OK [UIDVALIDITY 42] selected\r\nA2 OK selected\r\n")
-    assert_line(socket, "A3 UID FETCH 1 (RFC822)")
+    assert_line(socket, "A3 UID FETCH 1 (BODY.PEEK[])")
 
     :ok =
       :ssl.send(
         socket,
-        "* 1 FETCH (RFC822 {#{byte_size(@imap_message)}}\r\n" <>
+        "* 1 FETCH (BODY[] {#{byte_size(@imap_message)}}\r\n" <>
           @imap_message <> ")\r\nA3 OK fetched\r\n"
       )
 
@@ -263,12 +263,12 @@ defmodule Manifold.Connectors.MailTLSIntegrationTest do
     :ok = :ssl.send(socket, "A2 OK authenticated\r\n")
     assert_line(socket, "A3 SELECT INBOX")
     :ok = :ssl.send(socket, "* OK [UIDVALIDITY 42] selected\r\nA3 OK selected\r\n")
-    assert_line(socket, "A4 UID FETCH 1 (RFC822)")
+    assert_line(socket, "A4 UID FETCH 1 (BODY.PEEK[])")
 
     :ok =
       :ssl.send(
         socket,
-        "* 1 FETCH (RFC822 {#{byte_size(@imap_message)}}\r\n" <>
+        "* 1 FETCH (BODY[] {#{byte_size(@imap_message)}}\r\n" <>
           @imap_message <> ")\r\nA4 OK fetched\r\n"
       )
 
