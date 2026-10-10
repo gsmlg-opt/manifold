@@ -24,6 +24,12 @@ Webmail list UX in `ManifoldWeb.MailLive.Index`:
 3. **Total count** — `@folder.total_count` beside the folder title.
 4. **Unread filter** — toggle patches `unread=1`; `list_conversations` keeps threads with any unread entry (`BOOL_OR(read_at IS NULL)`).
 
+After the 2026-10-09 DuskMoon 9.16.7 update, the unread-filter tooltip and
+shared `ManifoldWeb.MailComponents.mail_action/1` pass the tooltip's slot attrs
+to their button. Tests verify the native tooltip description/trigger/anchor
+relationship before and after unread-filter and automatic read-state updates,
+while preserving the original labels, events and entry IDs.
+
 ## Tests
 
 - `apps/manifold_mail/test/manifold/mail/mailbox_test.exs` — `unread_only` filtering

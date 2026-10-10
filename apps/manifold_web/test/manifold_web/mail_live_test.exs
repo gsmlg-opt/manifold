@@ -123,7 +123,13 @@ defmodule ManifoldWeb.MailLiveTest do
     assert has_element?(view, "#mark-all-read")
     assert has_element?(view, "#unread-filter.folder-header-icon-button")
     assert has_element?(view, "#folder-more-actions .folder-header-icon-button")
-    assert has_element?(view, "#unread-filter[aria-label='Show unread only']")
+
+    assert_mail_tooltip(
+      view,
+      "#unread-filter[phx-click='toggle-unread-filter'][aria-pressed='false']",
+      "Show unread only"
+    )
+
     assert has_element?(view, "#folder-more-actions", "More actions")
     assert has_element?(view, "#mark-all-read", "Mark all read")
 
@@ -135,6 +141,12 @@ defmodule ManifoldWeb.MailLiveTest do
     assert html =~ "Unread note"
     refute html =~ "Read note"
     assert_patch(view, ~p"/mail/#{mailbox.id}/folders/#{inbox.id}?unread=1")
+
+    assert_mail_tooltip(
+      view,
+      "#unread-filter[phx-click='toggle-unread-filter'][aria-pressed='true']",
+      "Show all messages"
+    )
 
     assert {:ok, _view, filtered} =
              live(conn, ~p"/mail/#{mailbox.id}/folders/#{inbox.id}?unread=1")
@@ -229,6 +241,14 @@ defmodule ManifoldWeb.MailLiveTest do
 
     assert has_element?(view, "#conversation-row-#{thread.thread.id}.is-checked")
     assert has_element?(view, "#conversation-row-#{thread.thread.id}.is-selected")
+
+    for {event, label} <- [{"reply", "Reply"}, {"reply-all", "Reply all"}, {"forward", "Forward"}] do
+      assert_mail_tooltip(
+        view,
+        ".message-actions button[phx-click='#{event}'][phx-value-entry-id='#{thread.message.id}']",
+        label
+      )
+    end
   end
 
   test "modifier select toggles without opening", %{conn: conn} do
@@ -346,11 +366,23 @@ defmodule ManifoldWeb.MailLiveTest do
 
     assert has_element?(view, "#conversation-row-#{thread.thread.id}.is-unread")
 
+    assert_mail_tooltip(
+      view,
+      ".message-actions button[phx-click='mark-read'][phx-value-entry-id='#{thread.entry.id}']",
+      "Mark read"
+    )
+
     send(view.pid, {:auto_mark_read, thread.thread.id})
     _ = render(view)
 
     refute has_element?(view, "#conversation-row-#{thread.thread.id}.is-unread")
     assert Repo.get!(MailboxEntry, thread.entry.id).read_at
+
+    assert_mail_tooltip(
+      view,
+      ".message-actions button[phx-click='mark-unread'][phx-value-entry-id='#{thread.entry.id}']",
+      "Mark unread"
+    )
   end
 
   test "leaving a conversation before auto-mark keeps it unread", %{conn: conn} do
@@ -373,6 +405,26 @@ defmodule ManifoldWeb.MailLiveTest do
     _ = render(view)
 
     assert is_nil(Repo.get!(MailboxEntry, thread.entry.id).read_at)
+  end
+
+  defp assert_mail_tooltip(view, selector, label) do
+    html = view |> render() |> LazyHTML.from_document()
+    trigger = LazyHTML.query(html, selector)
+    assert [tooltip_id] = LazyHTML.attribute(trigger, "aria-describedby")
+    assert LazyHTML.attribute(trigger, "aria-label") == [label]
+    assert LazyHTML.attribute(trigger, "interestfor") == [tooltip_id]
+    assert LazyHTML.attribute(trigger, "title") == [label]
+    assert LazyHTML.attribute(trigger, "style") == ["anchor-name: --anchor-#{tooltip_id}"]
+    assert Enum.count(LazyHTML.query(trigger, "svg[aria-hidden='true']")) == 1
+
+    tooltip =
+      LazyHTML.query(
+        html,
+        "span##{tooltip_id}.tooltip.tooltip-bottom[role='tooltip'][popover='hint']"
+      )
+
+    assert String.trim(LazyHTML.text(tooltip)) == label
+    assert LazyHTML.attribute(tooltip, "style") == ["position-anchor: --anchor-#{tooltip_id}"]
   end
 
   defp mailbox_fixture do

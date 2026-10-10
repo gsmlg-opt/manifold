@@ -71,16 +71,14 @@ The Settings routes inherit Manifold's trusted-local-instance boundary. They are
 not administrator-authenticated and must not be exposed as a secure remote admin
 surface without a separate access-control feature.
 
-### OAuth card element registration
+### OAuth card rendering
 
-The OAuth settings and help pages render `dm_card` and `dm_badge`, which emit the
-`el-dm-card` and `el-dm-badge` custom elements. Their registrations must remain
-imported in `apps/manifold_web/assets/js/app.js`; an unregistered card defaults to
-`display: inline` and fragments its border/background across the form. The shared
-`oauth-provider-card` class provides the block-level width/margin contract, and
-its `:not(:defined)` rule preserves a usable token-styled card while JavaScript is
-unavailable. The focused OAuth LiveView test checks the imports, card class, and
-fallback rule; browser verification must also confirm both elements are defined.
+After the 2026-10-09 DuskMoon 9.16.7 update, `dm_card` emits native
+`article.card` and `dm_badge` emits `span.badge`. The OAuth settings/help tests
+retain their provider IDs and `oauth-provider-card` class while matching the new
+semantic card markup. Existing custom-element imports and fallback rules remain
+in the assets as historical compatibility; these native cards do not depend on
+custom-element registration. Browser interaction was not checked in this update.
 
 ## Catalog contract and extension
 

@@ -12,6 +12,11 @@
 - The ex_ssl dependency is pinned independently; update it only after its own
   protocol/public-API/OTP/OpenSSL gate passes. Do not change inbound SMTP, web,
   database or unrelated Req TLS while working on these backends.
+- On 2026-10-09 dependency maintenance replaced the unavailable Git revision
+  with exact Hex `ex_ssl == 0.17.1`, matching DuskMoon's new Fetch dependency
+  graph. The published-source protocol/public-API/OTP/OpenSSL gate passed 430
+  executed tests/properties with no exclusions or skips; Manifold's mandatory
+  TLS workflow scope passed 46 tests. OTP remains the default backend.
 - Regression tests live under connector tests; local TLS fixtures are generated
   by `test/support/tls_peer.exs`. Production accounts/endpoints are not fixtures.
 - Validation status and deliberate exclusions belong in the compatibility

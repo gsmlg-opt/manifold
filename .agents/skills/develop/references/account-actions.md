@@ -13,6 +13,12 @@ The account table is served at `/settings/accounts` by
 `ManifoldWeb.AccountLive.Index`. Each normal row uses icon-only controls whose
 DuskMoon tooltip content exactly matches its accessible label:
 
+After the 2026-10-09 DuskMoon 9.16.7 update, each tooltip accepts
+`:let={trigger_attrs}` and spreads those attrs onto its native link/button.
+The trigger owns `aria-describedby`, `interestfor`, title fallback and anchor
+positioning; the native tooltip retains its role and left placement. Regression
+assertions verify both sides of the relationship, rather than the old wrapper.
+
 | Action | Icon | Tooltip and `aria-label` |
 | --- | --- | --- |
 | Edit | `pencil-outline` | Edit account |

@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "marked": "18.0.10",
+    "marked": "18.1.0",
     "tailwindcss": "4.3.3"
   },
   "name": "manifold",

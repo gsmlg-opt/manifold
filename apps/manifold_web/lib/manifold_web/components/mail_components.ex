@@ -11,13 +11,14 @@ defmodule ManifoldWeb.MailComponents do
 
   def mail_action(assigns) do
     ~H"""
-    <.dm_tooltip content={@label} position="bottom">
+    <.dm_tooltip :let={trigger_attrs} content={@label} position="bottom">
       <button
         type="button"
         class={["mail-icon-button", @active && "is-active"]}
         aria-label={@label}
         phx-click={@event}
         phx-value-entry-id={@entry_id}
+        {trigger_attrs}
       >
         <.dm_mdi name={@icon} class="mail-icon" />
       </button>

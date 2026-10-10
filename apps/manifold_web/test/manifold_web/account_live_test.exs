@@ -1005,17 +1005,19 @@ defmodule ManifoldWeb.AccountLiveTest do
   defp restore_smtp_env(key, value), do: Application.put_env(:manifold_connectors, key, value)
 
   defp assert_icon_action(view, account_id, action, label, icon) do
-    tooltip_id = "#{action}-tooltip-#{account_id}"
+    tooltip_id = "#{action}-tooltip-#{account_id}-tooltip"
     action_id = "#{action}-#{account_id}"
+
+    assert has_element?(view, "a##{action_id}, button##{action_id}[type='button']")
 
     assert has_element?(
              view,
-             "##{tooltip_id}.tooltip-left[aria-describedby='#{tooltip_id}-tooltip'] ##{action_id}[aria-label='#{label}'] svg[data-icon='#{icon}']"
+             "##{action_id}[aria-label='#{label}'][aria-describedby='#{tooltip_id}'][interestfor='#{tooltip_id}'][title='#{label}'][style='anchor-name: --anchor-#{tooltip_id}'] svg[data-icon='#{icon}'][aria-hidden='true']"
            )
 
     assert has_element?(
              view,
-             "##{tooltip_id} .tooltip-content[role='tooltip']",
+             "span##{tooltip_id}.tooltip.tooltip-left[role='tooltip'][popover='hint'][phx-hook='DuskmoonPopover'][style='position-anchor: --anchor-#{tooltip_id}']",
              label
            )
   end

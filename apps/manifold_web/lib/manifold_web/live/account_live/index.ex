@@ -205,6 +205,7 @@ defmodule ManifoldWeb.AccountLive.Index do
                 <div :if={delete_failed?(row)} class="account-delete-failed">
                   <span>Delete failed</span>
                   <.dm_tooltip
+                    :let={trigger_attrs}
                     id={"retry-delete-account-tooltip-#{row.account.id}"}
                     content="Retry account deletion"
                     position="left"
@@ -216,6 +217,7 @@ defmodule ManifoldWeb.AccountLive.Index do
                       phx-click="retry-delete-account"
                       phx-value-id={row.account.id}
                       aria-label="Retry account deletion"
+                      {trigger_attrs}
                     >
                       <.dm_mdi name="restart" data-icon="restart" />
                     </button>
@@ -224,6 +226,7 @@ defmodule ManifoldWeb.AccountLive.Index do
 
                 <div :if={account_actions?(row)} class="account-actions">
                   <.dm_tooltip
+                    :let={trigger_attrs}
                     id={"edit-account-tooltip-#{row.account.id}"}
                     content="Edit account"
                     position="left"
@@ -233,12 +236,14 @@ defmodule ManifoldWeb.AccountLive.Index do
                       navigate={~p"/settings/accounts/#{row.account.id}/edit"}
                       class="settings-icon-button"
                       aria-label="Edit account"
+                      {trigger_attrs}
                     >
                       <.dm_mdi name="pencil-outline" data-icon="pencil-outline" />
                     </.link>
                   </.dm_tooltip>
 
                   <.dm_tooltip
+                    :let={trigger_attrs}
                     id={"manage-account-tooltip-#{row.account.id}"}
                     content="Manage account"
                     position="left"
@@ -248,12 +253,14 @@ defmodule ManifoldWeb.AccountLive.Index do
                       navigate={~p"/settings/accounts/#{row.account.id}"}
                       class="settings-icon-button"
                       aria-label="Manage account"
+                      {trigger_attrs}
                     >
                       <.dm_mdi name="cog-outline" data-icon="cog-outline" />
                     </.link>
                   </.dm_tooltip>
 
                   <.dm_tooltip
+                    :let={trigger_attrs}
                     :if={row.account.active}
                     id={"disable-account-tooltip-#{row.account.id}"}
                     content="Disable account"
@@ -266,12 +273,14 @@ defmodule ManifoldWeb.AccountLive.Index do
                       phx-click="disable-account"
                       phx-value-id={row.account.id}
                       aria-label="Disable account"
+                      {trigger_attrs}
                     >
                       <.dm_mdi name="account-off-outline" data-icon="account-off-outline" />
                     </button>
                   </.dm_tooltip>
 
                   <.dm_tooltip
+                    :let={trigger_attrs}
                     id={"delete-account-tooltip-#{row.account.id}"}
                     content="Delete account"
                     position="left"
@@ -283,6 +292,7 @@ defmodule ManifoldWeb.AccountLive.Index do
                       class="settings-icon-button settings-icon-button-danger"
                       phx-click={open_delete_dialog(row.account.id)}
                       aria-label="Delete account"
+                      {trigger_attrs}
                     >
                       <.dm_mdi name="delete-outline" data-icon="delete-outline" />
                     </button>

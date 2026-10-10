@@ -116,8 +116,8 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     assert html =~ "/settings/accounts"
     assert html =~ callback_uri
 
-    assert has_element?(view, "el-dm-card#oauth-provider-gmail.oauth-provider-card")
-    assert has_element?(view, "el-dm-card#oauth-provider-microsoft.oauth-provider-card")
+    assert has_element?(view, "article#oauth-provider-gmail.card.oauth-provider-card")
+    assert has_element?(view, "article#oauth-provider-microsoft.card.oauth-provider-card")
     assert has_element?(view, "#oauth-provider-gmail-form[phx-submit='save-provider']")
     refute has_element?(view, "#oauth-provider-gmail-form[phx-change]")
 
@@ -771,7 +771,7 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     callback_uri = "http://localhost:4290/connectors/gmail/callback"
 
     assert html =~ ~s(data-current="oauth")
-    assert has_element?(view, "el-dm-card#oauth-provider-gmail-help.oauth-provider-card")
+    assert has_element?(view, "article#oauth-provider-gmail-help.card.oauth-provider-card")
     assert has_element?(view, "h1", "Set up Google OAuth")
     assert has_element?(view, "h2", "Setup checklist")
     assert has_element?(view, "ol > li", "Create or select a Google Cloud project.")

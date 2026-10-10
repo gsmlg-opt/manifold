@@ -381,13 +381,15 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
 
     assert Repo.get!(OutboundMessage, message.id).state == "queued"
     assert Repo.get!(ProviderSubmission, submission.id).state == "pending"
+    assert Repo.get!(ProviderSubmission, submission.id).attempt_count == 1
     assert explicit_request_payload(submission.id) == payload
 
     assert [%Oban.Job{} = scheduled] = Repo.all(submit_jobs(message.id))
     assert scheduled.id == original_job.id
     assert scheduled.state == "scheduled"
-    assert scheduled.attempt == 1
-    assert scheduled.max_attempts == original_job.max_attempts + 1
+    assert scheduled.attempt == original_job.attempt
+    assert scheduled.max_attempts == original_job.max_attempts
+    assert scheduled.meta["snoozed"] == 1
 
     assert DateTime.compare(
              scheduled.scheduled_at,

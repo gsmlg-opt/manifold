@@ -1004,6 +1004,7 @@ defmodule ManifoldWeb.MailLive.Index do
               </span>
               <div class="folder-header-actions">
                 <.dm_tooltip
+                  :let={trigger_attrs}
                   content={if @unread_only, do: "Show all messages", else: "Show unread only"}
                   position="bottom"
                 >
@@ -1014,6 +1015,7 @@ defmodule ManifoldWeb.MailLive.Index do
                     phx-click="toggle-unread-filter"
                     aria-pressed={to_string(@unread_only)}
                     aria-label={if @unread_only, do: "Show all messages", else: "Show unread only"}
+                    {trigger_attrs}
                   >
                     <.dm_mdi name="filter-variant" class="mail-icon" />
                   </button>

@@ -7,8 +7,11 @@ client API for an implemented subset, not a universal SSL replacement.
 ## Revisions and acceptance contract
 
 The consumer baseline is `c21ea5d4e41b367bf2fa0b94dea54552cfa60af6`. The ex_ssl
-baseline was `04180a504c55c65d4f339d459e011e2e2307bc49`; the dependency pins the
-authenticated client implementation at `75ad1da8832a24f0d7f730e54ec80717b7346664`.
+baseline was `04180a504c55c65d4f339d459e011e2e2307bc49`; the authenticated client
+implementation was pinned at `75ad1da8832a24f0d7f730e54ec80717b7346664`.
+Dependency maintenance on 2026-10-09 replaced that unavailable Git revision
+with exact Hex `ex_ssl == 0.17.1`, matching the Fetch dependency graph introduced
+by DuskMoon 9.16.7. The default backend remains OTP.
 Library and consumer changes are reviewed separately. No release or production
 configuration change is required by this development change.
 
@@ -16,7 +19,7 @@ configuration change is required by this development change.
 | --- | --- | --- |
 | IMAP | Host and existing-socket connect; send, raw recv length 0 (30 seconds), close. Binary/passive/raw, verify_peer, system cacerts, DNS SNI and HTTPS hostname match function. | `IMAP.Client` resolves TLS configuration before connecting; direct TLS and STARTTLS retain a backend-tagged handle. |
 | SMTP submission | Same TLS calls/options; connect 15 seconds, remaining monotonic reply deadline; EHLO/STARTTLS/220/re-EHLO, AUTH, envelope, DATA and QUIT. | `SMTP.Client` uses the same handle boundary. Checked-out submission account identity selects the backend. Definite versus uncertain DATA outcomes remain unchanged. |
-| EAS | Req OPTIONS/POST, URL/query, Basic auth headers, cookies, binary WBXML and response headers/body; connect 15 seconds, receive 60 seconds; HTTP/1 only, compression disabled. | Locked Req 0.7.3 supports a request adapter. Finch 0.23.0 and Mint 1.9.3 still use OTP; ex_ssl selects `EAS.HTTPAdapter` explicitly. |
+| EAS | Req OPTIONS/POST, URL/query, Basic auth headers, cookies, binary WBXML and response headers/body; connect 15 seconds, receive 60 seconds; HTTP/1 only, compression disabled. | Locked Req 0.7.5 supports a request adapter. Finch 0.24.0 and Mint 1.11.0 still use OTP; ex_ssl selects `EAS.HTTPAdapter` explicitly. |
 | Unchanged consumers | Inbound SMTP, Phoenix/server TLS, database TLS, cloud HTTP, Gmail/Microsoft Graph HTTP, Resend and other Req calls. | Existing implementation and configuration. |
 
 ## Enable a controlled account
@@ -121,6 +124,19 @@ Chunk sizes and extensions are validated against the bounded
 unrecognized valid extensions are ignored and trailers remain separate headers.
 
 ## Compatibility evidence
+
+The 2026-10-09 upgrade gate used the actual Hex 0.17.1 library and `mix.exs`,
+with unmodified tests/fixtures from release tag `v0.17.1`
+(`a78c0a35d84921678de40e8623eeeae71389c4ce`). All 58 library files matched the
+tag byte for byte; the downloaded tarball checksum matched the live Hex API.
+Strict compilation passed. With integration tests included and seed 42,
+protocol/crypto/ClientHello/PKIX passed 268 tests plus 18 properties, public
+API/lifecycle/real OTP and OpenSSL traffic passed 136 tests, and OTP reference
+passed 8 tests: 430 executions, no failures, exclusions or skips. Manifold's
+mandatory TLS workflow files passed 39 connector tests and 7 outbound SMTP
+tests. This is local Elixir 1.18.5 / OTP 28 evidence; standalone QUIC, mTLS,
+resumption and TLS 1.2 feature suites and credentialed provider staging were
+not part of this upgrade gate. The earlier baseline evidence below is historical.
 
 | Layer | Evidence / readiness |
 | --- | --- |
