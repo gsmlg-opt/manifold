@@ -163,7 +163,7 @@ defmodule Manifold.Connectors.IMAP.Client do
   def uid_fetch_rfc822(conn, uid) when is_integer(uid) do
     conn = get_conn(conn)
 
-    case command(conn, "UID FETCH #{uid} (RFC822)") do
+    case command(conn, "UID FETCH #{uid} (BODY.PEEK[])") do
       {:ok, conn, lines} ->
         put_conn(conn)
         extract_rfc822(lines)
@@ -293,6 +293,14 @@ defmodule Manifold.Connectors.IMAP.Client do
 
   @doc false
   def extract_rfc822(lines) when is_list(lines) do
+    if Enum.any?(lines, &Regex.match?(~r/^\* \d+ FETCH\b/i, &1)) do
+      extract_rfc822_literal(lines)
+    else
+      {:error, %Error{class: :permanent, code: :not_found, message: "IMAP message not found"}}
+    end
+  end
+
+  defp extract_rfc822_literal(lines) do
     blob = Enum.join(lines, "\r\n")
 
     case Regex.run(~r/\{(\d+)\}\r?\n([\s\S]*)/m, blob) do

@@ -5,6 +5,7 @@ defmodule Manifold.Connectors.SyncImapTest do
   alias Manifold.Connectors.IMAP.Fake
   alias Manifold.Connectors.Jobs.ApplyRemoteState
   alias Manifold.Connectors.Schema.RemoteMessage
+  alias Manifold.Connectors.Schema.SyncCursor
   alias Manifold.Ingest
   alias Manifold.Ingest.Schema.InboundDelivery
   alias Manifold.Mail.Schema.MailboxEntry
@@ -13,6 +14,19 @@ defmodule Manifold.Connectors.SyncImapTest do
   import Ecto.Query
 
   @moduletag :tmp_dir
+
+  defmodule MissingSearchResult do
+    alias Manifold.Connectors.IMAP.{Client, Fake}
+
+    defdelegate connect(settings), to: Fake
+    defdelegate select(conn, mailbox), to: Fake
+    defdelegate uid_search(conn, query), to: Fake
+    defdelegate uid_fetch_flags(conn, uids), to: Fake
+    defdelegate logout(conn), to: Fake
+
+    def uid_fetch_rfc822(_conn, 1), do: Client.extract_rfc822([])
+    def uid_fetch_rfc822(conn, uid), do: Fake.uid_fetch_rfc822(conn, uid)
+  end
 
   setup %{tmp_dir: tmp_dir} do
     old_key = Application.get_env(:manifold_connectors, :encryption_key)
@@ -89,6 +103,38 @@ defmodule Manifold.Connectors.SyncImapTest do
     entry = Repo.get!(MailboxEntry, entry.id)
     assert entry.read_at
 
+    assert :ok = Connectors.sync_account(account.id)
+  end
+
+  test "sync skips stale SEARCH UIDs and checkpoints after importing a present message", %{
+    account: account,
+    raw: raw
+  } do
+    Application.put_env(:manifold_connectors, :imap_transport, MissingSearchResult)
+
+    Application.put_env(:manifold_connectors, :imap_fake, %{
+      password_expected: "secret",
+      uidvalidity: 7,
+      messages: [{1, raw}, {2, raw}]
+    })
+
+    assert {:snooze, 1} = Connectors.sync_account(account.id)
+
+    assert %{state: "deleted", remote_deleted: true, inbound_delivery_id: nil} =
+             Repo.get_by!(RemoteMessage,
+               external_account_id: account.id,
+               provider_message_id: "imap:7:1"
+             )
+
+    assert %{state: "imported"} =
+             Repo.get_by!(RemoteMessage,
+               external_account_id: account.id,
+               provider_message_id: "imap:7:2"
+             )
+
+    cursor = Repo.get_by!(SyncCursor, external_account_id: account.id)
+    assert cursor.metadata["last_uid"] == 2
+    assert cursor.page_cursor == nil
     assert :ok = Connectors.sync_account(account.id)
   end
 

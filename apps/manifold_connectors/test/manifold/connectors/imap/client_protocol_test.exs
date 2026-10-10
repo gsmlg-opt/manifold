@@ -2,6 +2,7 @@ defmodule Manifold.Connectors.IMAP.ClientProtocolTest do
   use ExUnit.Case, async: true
 
   alias Manifold.Connectors.IMAP.Client
+  alias Manifold.Connectors.Provider.Error
 
   test "parse_search_response extracts uids" do
     assert {:ok, [1, 2, 9]} =
@@ -33,6 +34,36 @@ defmodule Manifold.Connectors.IMAP.ClientProtocolTest do
     ]
 
     assert {:ok, ^raw} = Client.extract_rfc822(lines)
+  end
+
+  test "extract_rfc822 treats absent FETCH as a missing message" do
+    assert {:error, %Error{code: :not_found}} = Client.extract_rfc822([])
+    assert {:error, %Error{code: :not_found}} = Client.extract_rfc822(["* 2 EXISTS"])
+  end
+
+  test "extract_rfc822 retains parse errors for malformed FETCH" do
+    for response <- [
+          "* 1 FETCH (UID 447 BODY[] NIL)",
+          "* 1 FETCH UID 447 BODY[] NIL",
+          "* 1 FETCH"
+        ] do
+      assert {:error, %Error{code: :fetch_parse_failed}} = Client.extract_rfc822([response])
+    end
+  end
+
+  test "uid_fetch_rfc822 reads a literal without marking the message seen" do
+    raw = "Subject: hi\r\n\r\nbody\r\n"
+
+    {result, command} =
+      fetch_over_tcp("* 1 FETCH (UID 232 BODY[] {#{byte_size(raw)}}\r\n#{raw})\r\n")
+
+    assert {:ok, ^raw} = result
+    assert command == "A1 UID FETCH 232 (BODY.PEEK[])\r\n"
+  end
+
+  test "uid_fetch_rfc822 classifies tagged OK without FETCH as not_found" do
+    {result, _command} = fetch_over_tcp("")
+    assert {:error, %Error{code: :not_found}} = result
   end
 
   test "parse_flags_response maps uid to flags and INTERNALDATE" do
@@ -73,5 +104,35 @@ defmodule Manifold.Connectors.IMAP.ClientProtocolTest do
 
     assert Client.store_flags_command(10, :remove, ["\\Seen"]) ==
              "UID STORE 10 -FLAGS (\\Seen)"
+  end
+
+  defp fetch_over_tcp(response) do
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, packet: :line])
+    {:ok, port} = :inet.port(listener)
+
+    server =
+      Task.async(fn ->
+        {:ok, socket} = :gen_tcp.accept(listener, 1_000)
+
+        try do
+          {:ok, command} = :gen_tcp.recv(socket, 0, 1_000)
+          :ok = :gen_tcp.send(socket, response <> "A1 OK FETCH completed\r\n")
+          command
+        after
+          :gen_tcp.close(socket)
+        end
+      end)
+
+    {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 1_000)
+
+    try do
+      conn = %Client{socket: {:tcp, socket}, tag_seq: 0, buffer: ""}
+      result = Client.uid_fetch_rfc822(conn, 232)
+      {result, Task.await(server, 2_000)}
+    after
+      :gen_tcp.close(socket)
+      :gen_tcp.close(listener)
+      Process.delete({Client, :conn})
+    end
   end
 end

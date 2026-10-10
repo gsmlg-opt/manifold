@@ -1,5 +1,35 @@
 # iCloud contacts and calendars acceptance
 
+## Configured-account error repairs — 2026-10-11
+
+- Confirmed China-region discovery failures: the global Contacts endpoint
+  advertised a nonexistent global shard; the global Calendar endpoint
+  advertised a China-region home that the previous URL policy rejected.
+  Exact Apple China DAV hosts are now accepted, with one DNS-only regional
+  discovery retry using the same deadline.
+- Confirmed Calendar discovery also returned two Reminders collections
+  supporting VTODO only. Event synchronization now excludes collections
+  explicitly lacking VEVENT support; unknown capabilities remain subject to
+  normal validation. No parser or complete-snapshot safeguards were relaxed.
+- **PASS:** saved-account authenticated discovery and local import through
+  repaired modules: **132 contacts**, **79 events**, one address book and five
+  event calendars, both service statuses `connected` with saved timestamps.
+  An initial transient Apple HTTP502 preserved prior data; the next complete
+  read succeeded. Verification permitted only PROPFIND/REPORT/GET and issued
+  zero cloud writes.
+- Confirmed the independent IMAP SEARCH response included nonexistent UIDs.
+  Successful FETCH with no FETCH data now follows the existing not-found
+  path, while malformed FETCH remains an error. Body reads use BODY.PEEK[].
+- **PASS:** actual Apple IMAP probe reads an existing message and skips stale
+  UIDs without exposing contents; provider FLAGS/INTERNALDATE before and after
+  the body read are identical.
+
+- **PASS:** final scoped DAV/iCloud/IMAP/provider/synchronization regression
+  suite: **136 tests**, zero failures. Includes stale SEARCH UIDs, body PEEK,
+  malformed FETCH, strict China DAV URLs, bounded DNS fallback, unsafe
+  redirect rejection and calendar component eligibility. Strict compilation,
+  changed-file formatting and diff checks passed.
+
 ## Account-owned bidirectional implementation — 2026-10-10
 
 Current scope: iCloud configuration in Accounts, local-first Contacts/Calendar

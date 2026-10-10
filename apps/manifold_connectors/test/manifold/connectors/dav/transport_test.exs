@@ -2,6 +2,13 @@ defmodule Manifold.Connectors.DAV.TransportTest do
   use ExUnit.Case, async: true
   alias Manifold.Connectors.DAV.Transport
 
+  test "DNS nonexistence remains distinguishable for regional discovery" do
+    assert {:error, :nxdomain} =
+             Transport.request(:get, "https://manifold-dav-no-such-host.invalid/", [], nil,
+               timeout: 5_000
+             )
+  end
+
   test "real HTTP dispatch preserves DAV method and authorization with bounded body" do
     {url, peer} =
       server("HTTP/1.1 207 Multi-Status\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")

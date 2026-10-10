@@ -10,13 +10,23 @@ defmodule Manifold.Connectors.DAV.Client do
 
   def discover(credentials, kind, opts \\ [])
       when kind in ["contacts", "calendars", :contacts, :calendars] do
-    {root, namespace, home_property, collection_type} =
+    {service, properties} =
       if kind in ["contacts", :contacts],
-        do: {"https://contacts.icloud.com/", @card, "addressbook-home-set", "addressbook"},
-        else: {"https://caldav.icloud.com/", @cal, "calendar-home-set", "calendar"}
+        do: {"contacts", {@card, "addressbook-home-set", "addressbook"}},
+        else: {"caldav", {@cal, "calendar-home-set", "calendar"}}
 
     opts = deadline(opts)
 
+    case discover_at("https://#{service}.icloud.com/", credentials, properties, opts) do
+      {:error, :nxdomain} ->
+        discover_at("https://#{service}.icloud.com.cn/", credentials, properties, opts)
+
+      result ->
+        result
+    end
+  end
+
+  defp discover_at(root, credentials, {namespace, home_property, collection_type}, opts) do
     with {:ok, principal_data, root} <-
            propfind(root, credentials, [{@dav, "current-user-principal"}], "0", opts),
          {:ok, principal_href} <- href_property(principal_data, {@dav, "current-user-principal"}),
@@ -229,6 +239,13 @@ defmodule Manifold.Connectors.DAV.Client do
     end
   end
 
+  defp supported_collection?(response, {@cal, "calendar"}) do
+    is_nil(Map.get(response.props, {@cal, "supported-calendar-component-set"})) or
+      "VEVENT" in components(response)
+  end
+
+  defp supported_collection?(_response, _type), do: true
+
   defp full(collection, credentials, opts) do
     with {:ok, data, url} <-
            propfind(
@@ -315,7 +332,7 @@ defmodule Manifold.Connectors.DAV.Client do
           failed?(response) ->
             {:halt, {:error, :incomplete_snapshot}}
 
-          not has_type?(response, type) ->
+          not has_type?(response, type) or not supported_collection?(response, type) ->
             {:cont, {:ok, acc}}
 
           true ->
@@ -494,7 +511,7 @@ defmodule Manifold.Connectors.DAV.Client do
               {:ok, response, url}
           end
 
-        {:error, reason} when reason in [:response_limit, :timeout] ->
+        {:error, reason} when reason in [:response_limit, :timeout, :nxdomain] ->
           {:error, reason}
 
         _ ->

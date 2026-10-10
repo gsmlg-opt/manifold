@@ -113,7 +113,13 @@ Generation/lease checks fence stale jobs and acknowledgements. An already
 admitted HTTP request may finish after disable/disconnect; these actions cannot
 retract a remote request.
 
-DAV destinations are verified HTTPS Apple hosts/shards on port443. Direct bounded
+DAV destinations are verified HTTPS Apple hosts/shards on port443, including
+`icloud.com.cn` for China-region accounts. Discovery starts at the global service;
+when its host or advertised shard does not exist in DNS, it retries discovery
+once at the China-region service using the same deadline. Authentication,
+throttling and other transport errors do not switch regions. Calendar discovery
+excludes collections that explicitly advertise no `VEVENT` support, such as
+iCloud Reminders (`VTODO`). Unknown capability sets retain normal validation. Direct bounded
 Mint HTTP/1 transport verifies TLS peer/hostname and avoids credential-bearing
 Finch telemetry. Writes never automatically redirect or replay. Unsupported
 editing and missing strong ETags retain local work instead of overwriting.

@@ -1,6 +1,6 @@
 defmodule Manifold.Connectors.DAV.URL do
   @moduledoc false
-  @hosts ~r/\A(?:contacts|caldav|p[0-9]+-contacts|p[0-9]+-caldav)\.icloud\.com\z/
+  @hosts ~r/\A(?:contacts|caldav|p[0-9]+-contacts|p[0-9]+-caldav)\.icloud\.com(?:\.cn)?\z/
 
   def validate(url) when is_binary(url) and byte_size(url) <= 4096 do
     uri = URI.parse(url)

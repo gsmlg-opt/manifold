@@ -65,3 +65,25 @@ unless secure disposable test-account credentials are available. Existing releas
 history and archive verification remain in the historical acceptance sections;
 v0.5.0/v0.5.1 publication remains historical evidence. Current publication
 authorization is the user's explicit merge/release/restart request.
+
+## Configured-account repairs — 2026-10-11
+
+- DAV URL policy allows exact `contacts`, `caldav`, and numbered service shards
+  under `icloud.com` and `icloud.com.cn`, retaining verified HTTPS on port443.
+  Global Contacts discovery can advertise a nonexistent global shard for a
+  China-region account. Preserve the safe `:nxdomain` classification through
+  Mint/Transport/Client and restart read-only discovery once at the China root,
+  with the original deadline. Other errors do not trigger a regional retry.
+- Calendar discovery may advertise a China-region home directly from the global
+  root. Resolve it under the same strict URL policy. Skip collections explicitly
+  advertising no VEVENT support (including VTODO-only Reminders), retaining
+  unknown capability collections for normal fail-closed validation. Writes retain their existing
+  conditional request and redirect/replay restrictions.
+- The independent IMAP receiver can encounter stale UIDs in iCloud SEARCH
+  results: a tagged successful FETCH with no FETCH response means `:not_found`.
+  Existing sync handling records a local deleted remote-message marker and
+  continues/checkpoints the page. Malformed FETCH data still fails parsing.
+  Fetch bodies with `BODY.PEEK[]` so synchronization preserves provider flags.
+- Regression tests live in DAV regional discovery/transport, IMAP protocol, and
+  IMAP synchronization tests. Account-specific read/import verification is
+  recorded in `docs/ICLOUD_ACCEPTANCE.md`; no schema changes are required.

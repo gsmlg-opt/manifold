@@ -27,7 +27,7 @@ defmodule Manifold.Connectors.DAV.Transport do
         {:ok, %{status: response.status, headers: response.headers, body: response.body}}
 
       {:error, %Req.TransportError{reason: reason}}
-      when reason in [:response_limit, :header_limit, :timeout] ->
+      when reason in [:response_limit, :header_limit, :timeout, :nxdomain] ->
         {:error, reason}
 
       {:error, _} ->

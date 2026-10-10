@@ -67,6 +67,9 @@ defmodule Manifold.Connectors.DAV.MintAdapter do
           Mint.HTTP.close(connection)
         end
 
+      {:error, %Mint.TransportError{reason: :nxdomain}} ->
+        {:error, :nxdomain}
+
       {:error, _} ->
         {:error, :transport_failure}
     end
