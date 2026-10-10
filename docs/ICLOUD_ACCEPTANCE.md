@@ -30,6 +30,19 @@
   redirect rejection and calendar component eligibility. Strict compilation,
   changed-file formatting and diff checks passed.
 
+- **PASS:** repair integrated into main as `ca48f94`; Manifold restarted
+  while PostgreSQL remained running. Both managed processes are ready.
+  Hash verification preserved all 16 pre-existing user-owned files.
+- **PASS:** restarted native Oban DAV job completed on 2026-10-10 at
+  16:13:38 UTC, refreshing both service timestamps and retaining `connected`
+  statuses. The configured Account page no longer displays either original
+  sync error.
+- **PASS:** native IMAP synchronization checkpointed stale UID pages and
+  continued importing real messages (at least eight imported at verification).
+  No current receive-method error remains. Historical mailbox bootstrap is
+  still running asynchronously; this records restored import progress, not
+  completion of the entire mailbox backfill. No schema migration was needed.
+
 ## Account-owned bidirectional implementation — 2026-10-10
 
 Current scope: iCloud configuration in Accounts, local-first Contacts/Calendar

@@ -87,3 +87,8 @@ authorization is the user's explicit merge/release/restart request.
 - Regression tests live in DAV regional discovery/transport, IMAP protocol, and
   IMAP synchronization tests. Account-specific read/import verification is
   recorded in `docs/ICLOUD_ACCEPTANCE.md`; no schema changes are required.
+
+Final repair acceptance: 136 scoped tests, strict compilation and formatting
+passed. Main integration and service restart retained the user worktree files.
+Native DAV completed and native IMAP resumed actual imports; historical mail
+backfill continues asynchronously. See the configured-account acceptance section.
