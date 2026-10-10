@@ -392,6 +392,7 @@ defmodule Manifold.Connectors.Provider.Gmail do
       |> Keyword.put(:retry, false)
       |> Keyword.put(:redirect, false)
 
+    # TODO(upstream): gsmlg-dev/http_fetch#31 - verify a compatible secret-safe release before approved default-client migration.
     case Req.request(request_options) do
       {:ok, %Req.Response{status: status} = response} when status in 200..299 ->
         if is_map(response.body) do
