@@ -6,9 +6,9 @@ Current scope: iCloud configuration in Accounts, local-first Contacts/Calendar
 CRUD, asynchronous bidirectional resource synchronization, default-enabled
 contact preference, explicit destinations, conflict choices and retained local
 data on disconnect. Branch: `codex/account-icloud-sync`, based on v0.5.1.
-This acceptance does not publish a new release.
-The user subsequently authorized merge to main, v0.6.0 publication and devenv
-restart. Publication evidence will be recorded separately below after completion.
+This section records implementation acceptance before publication. The user
+subsequently authorized merge to main, v0.6.0 publication and devenv restart;
+publication evidence is recorded separately below.
 
 - **PASS:** final scoped ExUnit suite, **203 tests, zero failures**, seed `468787`:
   Calendars18, Contacts20, DAV/iCloud/connectors80, AccountLifecycle40, selected
@@ -28,15 +28,15 @@ restart. Publication evidence will be recorded separately below after completion
   queued uploads**. Evidence database:
   `manifold_icloud_upgrade_1791618216470758`. Legacy local contacts remain
   unassigned; deleting the connection retains local records.
-- **PASS:** strict development compilation, formatting of all45 changed Elixir/
+- **PASS:** strict development compilation, formatting of all 45 changed Elixir/
   HEEx files and `git diff --check`.
 - **PASS:** asset build and JS check: zero errors, two existing unused catch
-  variable warnings. CSS493KB and JS195.8KB.
+  variable warnings. CSS 493 KB and JS 195.8 KB.
 - **PASS:** isolated browser fixture on port4395 verifies immediate Contact/event
   saves while iCloud is disabled, native date/time inputs, account selection,
   default Contact sync preference, both sunshine/moonlight themes and connected
   LiveView without console errors/warnings. Contacts/Calendar pages have no
-  horizontal overflow at390px. Account details retain an existing4px overflow
+  horizontal overflow at 390px. Account details retain an existing 4px overflow
   caused by the receive-method table; it is outside this change.
 - **PASS:** browser destination mapping refuses save without explicit merge
   consent; confirmed merge saves immediately with existing local event IDs and
@@ -45,9 +45,9 @@ restart. Publication evidence will be recorded separately below after completion
 - **NOT RUN:** real credentialed Apple account discovery and CRUD. No disposable
   Apple account/app-specific password was supplied. Controlled peers, fixtures
   and local builds do not prove account-specific Apple interoperability.
-- **NOT RUN:** new release publication, packaged release acceptance or development
-  process restart. No new publication is scheduled; only the owned temporary
-  preview was started for this feature.
+- **Implementation-stage NOT RUN:** release publication, packaged release
+  acceptance and development process restart. These were subsequently authorized
+  and completed as recorded in the v0.6.0 section below.
 
 Verification runs through root `devenv shell`, with isolated database
 `manifold_icloud_acceptance_test`; only affected apps/test paths are selected:
@@ -69,9 +69,73 @@ mix assets.build
 mix duskmoon_bundler.js.check
 ```
 
-Only generated fixtures are used. Development/production databases are not
-migrated for this feature. An additive migration is required before deploying
-the branch; setup/rollback limits are in `ICLOUD.md`.
+Only generated fixtures are used for acceptance. The development database was
+later backed up and migrated during the authorized process restart; no production
+database was migrated. Setup/rollback limits are in `ICLOUD.md`.
+
+## Published v0.6.0 and main integration — 2026-10-10
+
+- **PASS:** feature commits fast-forwarded into main; the completed worktree and
+  branch were removed. Original root design drafts are retained in a named git
+  stash and hash-verified snapshot at
+  `tmp/worktree-merge-20261010-account-icloud/`. The implemented documents supersede
+  their draft status; no unrelated source edits were absorbed.
+- **PASS:** merged-main local acceptance: 203 scoped tests, zero failures, seed
+  `438645`; repository format, strict compile, asset build and JS check. The two
+  existing JS unused catch-variable warnings remain.
+- **PASS:** source CI `38037553296`, full ExUnit `38037553333` (**1,401 tests**, zero
+  failures, seed `472723`) and TLS `38037553267` (**46 tests**, zero failures, seed
+  `216062`) on source commit `16085c45673278dabe8725845a38e258e843bed9`.
+- **PASS:** release workflow
+  [38037710921](https://github.com/gsmlg-opt/manifold/actions/runs/38037710921)
+  completed Build Release, both Docker image jobs and release-note update.
+  Published [v0.6.0](https://github.com/gsmlg-opt/manifold/releases/tag/v0.6.0)
+  tag/version commit:`6d15e4f953f8c4932d5d2e8b1ce94342a6e8f84c`.
+- **PASS:** downloaded archives match GitHub size and SHA-256:
+  main 48,864,407 bytes,
+  `a450da1763fc2dc2acac37c99566a13bedd653f05d089a506c354cddfc97aa83`;
+  edge 28,465,510 bytes,
+  `8a9f1b177ad16cbcc372d57a218bb238faf319de644cf3dd45c82eb2befffffd`.
+  Exact active release files and `runtime.exs` match the tag; all 15 main and 4 edge
+  application versions are 0.6.0. Main includes iCloud modules/migration002;
+  the ingress-only edge excludes them.
+- **PASS:** actual downloaded main archive, relocated into an independent
+  runtime container, migrates a fresh isolated database, performs Contact/
+  Calendar/event CRUD and serves `/contacts`, `/calendars`, legacy settings and
+  Account iCloud configuration with HTTP 200. Served CSS/JS return 200 and contain
+  the password-clear listener. Owned proof container/database cleanup passes.
+- **PASS:** downloaded edge archive migrates its isolated database, uses
+  `Manifold.Edge.SMTP` resolver/ingest wiring, serves authenticated status 200 and
+  completes SMTP 220/QUIT 221. Owned proof container/database cleanup passes.
+- **PASS:** digest-pinned GHCR main/edge images were pulled and their actual
+  active release/application versions, required BEAM modules and migration bytes
+  verified. Runtime configuration matches the tag. Main digest:
+  `sha256:d0bfddd70780e8f02dca3251761f39252c8ec8b302715b91dc555a79e3d92864`;
+  edge digest:
+  `sha256:2ad220051c0212897ede3e3998d8a539288646e96a9f6a11c80f73e9bbf92b45`.
+  OCI revision labels carry the workflow dispatch source `16085c4`, before the
+  automated version bump; actual image apps are 0.6.0 and migration/runtime bytes
+  independently match tag `6d15e4f`. Identity containers were never started and
+  removed after inspection. Runtime/DB checks apply to downloaded archives above;
+  they were not repeated for the GHCR images.
+- **PASS:** root devenv PostgreSQL and Manifold ready after orderly stop/start;
+  migrations001/002 present in `manifold_dev`. Contacts, Calendars, Accounts,
+  Account iCloud details and CSS/JS respond 200. The pre-upgrade development dump is
+  retained with restrictive permissions at
+  `tmp/release-0.6.0/devenv-pre-upgrade.dump`.
+  Initial PostgreSQL restart overlapped old smart shutdown and was recovered
+  after the old postmaster exited; the final readiness check passes.
+- **NOT RUN:** real credentialed Apple discovery/CRUD. This limitation is also
+  disclosed in the public release notes. Fixture/archive startup acceptance does
+  not establish successful Apple account-specific synchronization.
+
+Detailed local evidence/scripts are under `tmp/release-0.6.0/`, including
+`digest-verification.json`, `archive-verification.json`,
+`packaged-acceptance-report.json` and `devenv-http-proof.json`. A verifier's initial
+incorrect boot filename assumption is retained in `download-failure.json`; the
+correct active `start.boot` gate and both runtime gates subsequently pass.
+GHCR actual-content identity evidence is in
+`ghcr-main-identity-evidence.json` and `ghcr-edge-identity-evidence.json`.
 
 ## Historical read-only implementation and releases
 

@@ -1,6 +1,9 @@
 # Account-owned iCloud Contacts and Calendar
 
 - Date: 2026-10-10; implemented on `codex/account-icloud-sync` from v0.5.1.
+- Integrated into main and published as v0.6.0; feature worktree removed.
+  Release workflow 38037710921, source CI (1,401 tests + 46 TLS tests), relocated
+  main/edge archive startup, GHCR identity and devenv restart proof are in acceptance.
 - Approved design: `docs/superpowers/specs/2026-10-10-account-icloud-bidirectional-design.md`.
 - Plan: `docs/superpowers/plans/2026-10-10-account-icloud-bidirectional.md`.
 - Operator/acceptance: `docs/ICLOUD.md`, `docs/ICLOUD_ACCEPTANCE.md`.
