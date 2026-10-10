@@ -15,7 +15,8 @@ local Contacts and Calendar, consistently with the surrounding request.
 
 This supersedes the independent-connection, read-only behavior in the previous
 iCloud design. The completed v0.5.0/v0.5.1 releases remain historical evidence;
-this approved scope does not schedule another publication.
+the user subsequently authorized merge to main, v0.6.0 publication and a devenv
+process restart on 2026-10-10.
 
 ## Recommended ownership and configuration
 

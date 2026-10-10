@@ -7,6 +7,8 @@ CRUD, asynchronous bidirectional resource synchronization, default-enabled
 contact preference, explicit destinations, conflict choices and retained local
 data on disconnect. Branch: `codex/account-icloud-sync`, based on v0.5.1.
 This acceptance does not publish a new release.
+The user subsequently authorized merge to main, v0.6.0 publication and devenv
+restart. Publication evidence will be recorded separately below after completion.
 
 - **PASS:** final scoped ExUnit suite, **203 tests, zero failures**, seed `468787`:
   Calendars18, Contacts20, DAV/iCloud/connectors80, AccountLifecycle40, selected

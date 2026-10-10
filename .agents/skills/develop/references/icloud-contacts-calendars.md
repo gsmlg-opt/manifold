@@ -5,7 +5,8 @@
 - Plan: `docs/superpowers/plans/2026-10-10-account-icloud-bidirectional.md`.
 - Operator/acceptance: `docs/ICLOUD.md`, `docs/ICLOUD_ACCEPTANCE.md`.
 - Scope: iCloud only; Account settings, local-first bidirectional Contacts/Calendar.
-  Contact `sync_to_icloud` defaults true. No new publication is scheduled.
+  Contact `sync_to_icloud` defaults true. The user subsequently authorized merging
+  to main, publishing v0.6.0 and restarting devenv on 2026-10-10.
 
 ## Module ownership
 
@@ -59,4 +60,5 @@ Run scoped tests centrally through root devenv with a disposable isolated databa
 See acceptance for exact evidence. Real credentialed Apple writes remain NOT RUN
 unless secure disposable test-account credentials are available. Existing release
 history and archive verification remain in the historical acceptance sections;
-v0.5.0/v0.5.1 publication does not authorize another release.
+v0.5.0/v0.5.1 publication remains historical evidence. Current publication
+authorization is the user's explicit merge/release/restart request.
