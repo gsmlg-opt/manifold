@@ -1,4 +1,5 @@
 /_build/
+/apps/*/_build/
 /cover/
 /deps/
 /doc/
