@@ -81,6 +81,67 @@ defmodule Manifold.CalendarsTest do
     assert id == later.id
   end
 
+  test "date range returns later records beyond the first page and retained exceptions" do
+    collection = collection_fixture("calendars", "Personal")
+
+    for index <- 1..55 do
+      event_fixture(collection, "old-#{index}", %{
+        starts_at: "20200101T100000",
+        ends_at: "20200101T110000"
+      })
+    end
+
+    master = event_fixture(collection, "", %{starts_at: "20261010T100000"})
+    exception = event_fixture(collection, "20261017T100000", %{starts_at: "20261017T100000"})
+    other = collection_fixture("calendars", "Other")
+    event_fixture(other, "", %{starts_at: "20261010T100000"})
+
+    events = Calendars.list_events_in_range(collection.id, ~D[2026-10-01], ~D[2026-11-01])
+    assert Enum.map(events, & &1.id) == [master.id, exception.id]
+    assert hd(events).recurrence_rules == ["FREQ=WEEKLY;BYDAY=SA"]
+    assert List.last(events).recurrence_id == "20261017T100000"
+    assert Calendars.list_events_in_range(collection.id, ~D[2026-11-01], ~D[2026-10-01]) == []
+    assert Calendars.list_events_in_range("bad-id", ~D[2026-10-01], ~D[2026-11-01]) == []
+  end
+
+  test "date range includes spanning events and treats all-day and midnight ends as exclusive" do
+    collection = collection_fixture("calendars", "Personal")
+
+    spanning =
+      event_fixture(collection, "span", %{
+        starts_at: "20260929",
+        ends_at: "20261003",
+        all_day: true
+      })
+
+    timed =
+      event_fixture(collection, "timed", %{
+        starts_at: "20260930T230000Z",
+        ends_at: "20261001T010000Z"
+      })
+
+    event_fixture(collection, "all-day-ended", %{
+      starts_at: "20260930",
+      ends_at: "20261001",
+      all_day: true
+    })
+
+    event_fixture(collection, "midnight-ended", %{
+      starts_at: "20260930T230000Z",
+      ends_at: "20261001T000000Z"
+    })
+
+    event_fixture(collection, "next-month", %{starts_at: "20261101", all_day: true})
+
+    event_fixture(collection, "deleted", %{
+      starts_at: "20261005T100000",
+      deleted_at: DateTime.utc_now()
+    })
+
+    events = Calendars.list_events_in_range(collection.id, ~D[2026-10-01], ~D[2026-11-01])
+    assert Enum.map(events, & &1.id) == [spanning.id, timed.id]
+  end
+
   test "malformed and missing IDs yield empty results" do
     for id <- ["bad-uuid", "", nil, Ecto.UUID.generate()] do
       assert Calendars.get_event(id) == nil

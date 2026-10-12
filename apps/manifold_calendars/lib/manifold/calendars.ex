@@ -147,6 +147,30 @@ defmodule Manifold.Calendars do
     end
   end
 
+  @doc "Lists every stored event overlapping a wall-date range; the end date is exclusive."
+  def list_events_in_range(calendar_id, %Date{} = first, %Date{} = until, opts \\ []) do
+    with {:ok, uuid} <- Ecto.UUID.cast(calendar_id),
+         :lt <- Date.compare(first, until) do
+      first_date = Elixir.Calendar.strftime(first, "%Y%m%d")
+      until_date = Elixir.Calendar.strftime(until, "%Y%m%d")
+      first_time = first_date <> "T000000"
+
+      CalendarEvent
+      |> where([e], e.calendar_id == ^uuid or e.collection_id == ^uuid)
+      |> visible_events(Keyword.get(opts, :include_deleted_conflicts, false))
+      |> where(
+        [e],
+        e.starts_at < ^until_date and
+          (e.starts_at >= ^first_date or fragment("rtrim(?, 'Z')", e.ends_at) > ^first_time)
+      )
+      |> order_by([e], asc: e.starts_at, asc: e.uid, asc: e.recurrence_id, asc: e.id)
+      |> Repo.all()
+      |> preload_sources()
+    else
+      _ -> []
+    end
+  end
+
   def get_event(id, opts \\ []) do
     with {:ok, uuid} <- Ecto.UUID.cast(id),
          %CalendarEvent{} = event <- Repo.get(CalendarEvent, uuid) do
