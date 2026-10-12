@@ -4,7 +4,7 @@ defmodule Manifold.Outbound.MixProject do
   def project do
     [
       app: :manifold_outbound,
-      version: "0.6.1",
+      version: "0.6.2",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps()
