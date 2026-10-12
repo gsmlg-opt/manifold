@@ -4,6 +4,8 @@
 @import "@duskmoon-dev/core/themes/moonlight";
 @import "@duskmoon-dev/core/components";
 @import "../../../../deps/phoenix_duskmoon/assets/css/element-theme-bridge.css";
+@import "./contacts.css";
+@import "./calendar.css";
 
 :root {
   --font-body: "DM Sans", ui-sans-serif, system-ui, sans-serif;
@@ -150,7 +152,13 @@ a {
   color: var(--color-on-surface);
 }
 
-.content > section:not(.webmail):not(.ops-layout):not(.settings-layout) {
+/* Keep action links paired with their primary fill despite the global link reset. */
+.contacts-workspace .btn-primary,
+.calendar-workspace .btn-primary {
+  color: var(--color-primary-content);
+}
+
+.content > section:not(.webmail):not(.ops-layout):not(.settings-layout):not(.contacts-workspace):not(.calendar-workspace) {
   max-width: 1180px;
   margin: 0 auto;
   padding: 28px;
@@ -2244,7 +2252,7 @@ button.folder-header-icon-button.is-active {
     font-size: 0.75rem;
   }
 
-  .content > section:not(.webmail) {
+  .content > section:not(.webmail):not(.contacts-workspace):not(.calendar-workspace) {
     padding: 18px 14px;
   }
 

@@ -21,6 +21,10 @@ defmodule ManifoldWeb.CalendarLiveTest do
     assert has_element?(view, "#calendar-recurrence-help", "does not expand")
     assert has_element?(view, "a[href='/settings/accounts']")
     assert has_element?(view, "#new-calendar")
+    assert has_element?(view, "#calendar-navigation-toggle", "Open calendar navigation")
+    view |> element("#calendar-navigation-toggle") |> render_click()
+    assert has_element?(view, "#calendar-navigation-toggle", "Close calendar navigation")
+    refute has_element?(view, ".calendar-sidebar-footer", "Connected to iCloud")
   end
 
   test "local calendar and all-day event CRUD commits offline through native date controls", %{
@@ -30,7 +34,7 @@ defmodule ManifoldWeb.CalendarLiveTest do
     assert has_element?(view, "input[name='calendar[sync_to_icloud]'][type='checkbox'][checked]")
     view |> form("#calendar-form", calendar: %{name: "Local calendar"}) |> render_submit()
     [calendar] = Calendars.list_calendars()
-    assert_patch(view, ~p"/calendars/#{calendar.id}")
+    assert URI.parse(assert_patch(view)).path == ~p"/calendars/#{calendar.id}"
     view |> element("#new-event") |> render_click()
     view |> form("#event-form", event: %{summary: "Birthday", all_day: "true"}) |> render_change()
     assert has_element?(view, "input[name='event[starts_at]'][type='date']")
@@ -205,6 +209,137 @@ defmodule ManifoldWeb.CalendarLiveTest do
              live(conn, ~p"/calendars/#{calendar.id}/events/#{event.id}")
   end
 
+  test "month canvas navigates dates and view while preserving multi-day boundaries", %{
+    conn: conn
+  } do
+    {:ok, calendar} = Calendars.create_calendar(%{name: "Personal"})
+
+    {:ok, spanning} =
+      Calendars.create_event(%{
+        calendar_id: calendar.id,
+        summary: "Away",
+        starts_at: "20261030",
+        ends_at: "20261102",
+        all_day: true
+      })
+
+    {:ok, meeting} =
+      Calendars.create_event(%{
+        calendar_id: calendar.id,
+        summary: "November planning",
+        starts_at: "20261105T103000Z",
+        timezone: "UTC"
+      })
+
+    {:ok, view, _} = live(conn, ~p"/calendars/#{calendar.id}?date=2026-11-01")
+
+    assert has_element?(view, "#calendar-month-title", "November")
+    assert has_element?(view, "#calendar-day-2026-11-01 a", "Away")
+    refute has_element?(view, "#calendar-day-2026-11-02 a", "Away")
+    assert has_element?(view, "#calendar-day-2026-11-05 a", "November planning")
+    assert has_element?(view, "#calendar-timezone-help", "UTC")
+    view |> element("#calendar-agenda-view") |> render_click()
+    assert has_element?(view, "#calendar-agenda-view[aria-current='page']")
+    assert has_element?(view, "#event-#{spanning.id}", "Continues from")
+    assert has_element?(view, "#event-#{meeting.id}", "10:30")
+    refute has_element?(view, "#calendar-month-grid")
+    view |> element("#calendar-next-month") |> render_click()
+    assert has_element?(view, "#calendar-month-title", "December")
+    assert has_element?(view, "#calendar-events-empty")
+    view |> element("#calendar-previous-month") |> render_click()
+    view |> element("#calendar-month-view") |> render_click()
+    view |> element("#calendar-day-2026-11-12 .calendar-day-number") |> render_click()
+    assert has_element?(view, "input[name='event[starts_at]'][value='2026-11-12T09:00:00']")
+    view |> form("#event-form", event: %{all_day: "true"}) |> render_change()
+    assert has_element?(view, "input[name='event[starts_at]'][type='date'][value='2026-11-12']")
+    assert has_element?(view, "#event-form", "End date is exclusive")
+    view |> form("#event-form", event: %{all_day: "false"}) |> render_change()
+
+    assert has_element?(
+             view,
+             "input[name='event[starts_at]'][type='datetime-local'][value='2026-11-12T09:00:00']"
+           )
+
+    view |> element("#calendar-drawer-close") |> render_click()
+    refute has_element?(view, "#event-editor")
+    assert has_element?(view, "#calendar-month-title", "November")
+  end
+
+  test "editing a spanning event preserves agenda month and UTC across all-day toggles", %{
+    conn: conn
+  } do
+    {:ok, calendar} = Calendars.create_calendar(%{name: "Spanning plans"})
+
+    {:ok, event} =
+      Calendars.create_event(%{
+        calendar_id: calendar.id,
+        summary: "Away",
+        starts_at: "20261030T090000Z",
+        ends_at: "20261102T090000Z",
+        timezone: "UTC"
+      })
+
+    {:ok, view, _} =
+      live(conn, ~p"/calendars/#{calendar.id}/events/#{event.id}?date=2026-11-01&view=agenda")
+
+    view |> element("#edit-event") |> render_click()
+
+    assert URI.parse(assert_patch(view)).path ==
+             ~p"/calendars/#{calendar.id}/events/#{event.id}/edit"
+
+    view |> form("#event-form", event: %{all_day: "true"}) |> render_change()
+    assert has_element?(view, "input[name='event[timezone]'][disabled][value='UTC']")
+    # Disabled browser inputs are absent from the event sent when toggling back.
+    render_change(view, "validate-event", %{
+      "event" => %{
+        "all_day" => "false",
+        "starts_at" => "2026-10-30",
+        "ends_at" => "2026-11-02",
+        "summary" => "Away"
+      }
+    })
+
+    assert has_element?(view, "input[name='event[timezone]'][value='UTC']")
+    view |> form("#event-form", event: %{summary: "Updated away"}) |> render_submit()
+    uri = URI.parse(assert_patch(view))
+    assert uri.path == ~p"/calendars/#{calendar.id}/events/#{event.id}"
+    assert URI.decode_query(uri.query) == %{"date" => "2026-11-01", "view" => "agenda"}
+    assert has_element?(view, "#calendar-month-title", "November")
+    assert has_element?(view, "#calendar-agenda-view[aria-current='page']")
+    assert Calendars.get_event(event.id).starts_at == "20261030T090000Z"
+    assert Calendars.get_event(event.id).ends_at == "20261102T090000Z"
+    assert Calendars.get_event(event.id).timezone == "UTC"
+    assert Calendars.get_event(event.id).summary == "Updated away"
+    render_click(view, "delete-event", %{"scope" => "component"})
+    uri = URI.parse(assert_patch(view))
+    assert uri.path == ~p"/calendars/#{calendar.id}"
+    assert URI.decode_query(uri.query) == %{"date" => "2026-11-01", "view" => "agenda"}
+    assert Calendars.get_event(event.id) == nil
+  end
+
+  test "month canvas fetches current records after more than fifty older records", %{conn: conn} do
+    {:ok, calendar} = Calendars.create_calendar(%{name: "Archive"})
+
+    for _ <- 1..55 do
+      Calendars.create_event(%{
+        calendar_id: calendar.id,
+        summary: "Old record",
+        starts_at: "20200101"
+      })
+    end
+
+    {:ok, current} =
+      Calendars.create_event(%{
+        calendar_id: calendar.id,
+        summary: "Current planning",
+        starts_at: "20261105T103000"
+      })
+
+    {:ok, view, _} = live(conn, ~p"/calendars/#{calendar.id}?date=2026-11-01")
+    assert has_element?(view, "#event-#{current.id}", "Current planning")
+    refute has_element?(view, "#calendar-events", "Old record")
+  end
+
   defp imported_calendar_fixture(writable) do
     name = "cal#{System.unique_integer([:positive])}.example.test"
     domain = Repo.insert!(%Manifold.Accounts.Schema.Domain{name: name, normalized_domain: name})
@@ -288,7 +423,7 @@ defmodule ManifoldWeb.CalendarLiveTest do
     |> form("#calendar-form", calendar: %{merge_destination: "true"})
     |> render_submit()
 
-    assert_patch(view, ~p"/calendars/#{source.id}")
+    assert URI.parse(assert_patch(view)).path == ~p"/calendars/#{source.id}"
     assert Calendars.get_calendar(destination.id) == nil
     assert Calendars.get_event(imported.id).calendar_id == source.id
     assert Repo.get!(DAVResource, resource.id) == resource
@@ -330,10 +465,11 @@ defmodule ManifoldWeb.CalendarLiveTest do
     render_click(view, "delete-calendar")
     assert render(view) =~ "Pending synchronization and conflicts must finish"
     view |> element("#event-#{event.id} a") |> render_click()
+    assert URI.parse(assert_patch(view)).path == ~p"/calendars/#{calendar.id}/events/#{event.id}"
     assert has_element?(view, "#event-conflict")
     refute has_element?(view, "#edit-event")
     view |> element("#event-use-local") |> render_click()
-    assert_patch(view, ~p"/calendars/#{calendar.id}")
+    assert URI.parse(assert_patch(view)).path == ~p"/calendars/#{calendar.id}"
     assert Repo.get!(DAVResource, resource.id).status == "pending"
     assert Repo.get!(CalendarEvent, event.id).deleted_at
   end

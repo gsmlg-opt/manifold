@@ -5,6 +5,7 @@ defmodule ManifoldWeb.CalendarLive.Index do
   alias Manifold.Connectors.ICloud
   alias Manifold.Connectors.ICloud.Outbound
   alias Manifold.Data.Schema.{Calendar, CalendarEvent}
+  alias ManifoldWeb.CalendarLive.Display
 
   @calendar_fields ~w(name account_id collection_id sync_to_icloud merge_destination)
   @event_fields ~w(summary description location starts_at ends_at timezone all_day)
@@ -14,7 +15,12 @@ defmodule ManifoldWeb.CalendarLive.Index do
     {:ok,
      assign(socket,
        page_title: "Calendars",
-       offset: 0,
+       selected_date: Date.utc_today(),
+       today: Date.utc_today(),
+       display_view: "month",
+       navigation_open: false,
+       days: [],
+       agenda: [],
        calendars: [],
        calendar: nil,
        events: [],
@@ -41,27 +47,32 @@ defmodule ManifoldWeb.CalendarLive.Index do
 
     event = if event && calendar && event.calendar_id == calendar.id, do: event
 
-    offset =
-      if socket.assigns.calendar && calendar && socket.assigns.calendar.id == calendar.id,
-        do: socket.assigns.offset,
-        else: 0
+    selected_date = selected_date(params["date"], event, socket.assigns.selected_date)
+    days = Display.month_days(selected_date)
+
+    display_view =
+      if params["view"] in ["month", "agenda"],
+        do: params["view"],
+        else: socket.assigns.display_view
+
+    events =
+      if calendar,
+        do:
+          Calendars.list_events_in_range(calendar.id, hd(days), Date.add(List.last(days), 1),
+            include_deleted_conflicts: true
+          ),
+        else: []
 
     socket =
       assign(socket,
         calendars: calendars,
         calendar: calendar,
         event: event,
-        offset: offset,
-        events:
-          if(calendar,
-            do:
-              Calendars.list_events(calendar.id,
-                limit: 50,
-                offset: offset,
-                include_deleted_conflicts: true
-              ),
-            else: []
-          ),
+        selected_date: selected_date,
+        days: days,
+        display_view: display_view,
+        events: events,
+        agenda: Display.agenda(events, selected_date),
         calendar_form: nil,
         event_form: nil,
         error: nil
@@ -81,7 +92,10 @@ defmodule ManifoldWeb.CalendarLive.Index do
         {:noreply, calendar_form(socket, calendar)}
 
       socket.assigns.live_action == :new_event ->
-        {:noreply, event_form(socket, %CalendarEvent{})}
+        {:noreply,
+         event_form(socket, %CalendarEvent{
+           starts_at: Elixir.Calendar.strftime(selected_date, "%Y%m%d") <> "T090000"
+         })}
 
       socket.assigns.live_action == :edit_event && editable?(calendar, :update) ->
         {:noreply, event_form(socket, event)}
@@ -90,7 +104,7 @@ defmodule ManifoldWeb.CalendarLive.Index do
         {:noreply,
          socket
          |> put_flash(:error, "This iCloud source is read-only. Make a local copy to edit it.")
-         |> push_patch(to: ~p"/calendars/#{calendar.id}/events/#{event.id}")}
+         |> push_patch(to: event_path(calendar, event, socket.assigns))}
 
       true ->
         {:noreply, socket}
@@ -98,21 +112,8 @@ defmodule ManifoldWeb.CalendarLive.Index do
   end
 
   @impl true
-  def handle_event("page", %{"direction" => direction}, socket)
-      when direction in ["previous", "next"] do
-    offset = max(0, socket.assigns.offset + if(direction == "next", do: 50, else: -50))
-
-    {:noreply,
-     assign(socket,
-       offset: offset,
-       events:
-         Calendars.list_events(socket.assigns.calendar.id,
-           limit: 50,
-           offset: offset,
-           include_deleted_conflicts: true
-         )
-     )}
-  end
+  def handle_event("toggle-navigation", _params, socket),
+    do: {:noreply, assign(socket, :navigation_open, !socket.assigns.navigation_open)}
 
   def handle_event("validate-calendar", %{"calendar" => params}, socket) do
     params = Map.take(params, @calendar_fields)
@@ -151,7 +152,7 @@ defmodule ManifoldWeb.CalendarLive.Index do
         {:noreply,
          socket
          |> put_flash(:info, "Calendar saved locally.")
-         |> push_patch(to: ~p"/calendars/#{calendar.id}")}
+         |> push_patch(to: calendar_path(calendar, socket.assigns))}
 
       {:error, :local_copy_required} ->
         {:noreply,
@@ -182,7 +183,9 @@ defmodule ManifoldWeb.CalendarLive.Index do
     case socket.assigns.calendar && Calendars.delete_calendar(socket.assigns.calendar.id) do
       {:ok, _} ->
         {:noreply,
-         socket |> put_flash(:info, "Local calendar deleted.") |> push_patch(to: ~p"/calendars")}
+         socket
+         |> put_flash(:info, "Local calendar deleted.")
+         |> push_patch(to: calendar_path(nil, socket.assigns))}
 
       {:error, :not_empty} ->
         {:noreply,
@@ -222,7 +225,7 @@ defmodule ManifoldWeb.CalendarLive.Index do
         {:noreply,
          socket
          |> put_flash(:info, "Event saved locally. Eligible changes synchronize asynchronously.")
-         |> push_patch(to: ~p"/calendars/#{socket.assigns.calendar.id}/events/#{event.id}")}
+         |> push_patch(to: event_path(socket.assigns.calendar, event, socket.assigns))}
 
       _ ->
         {:noreply,
@@ -233,13 +236,17 @@ defmodule ManifoldWeb.CalendarLive.Index do
     end
   end
 
-  def handle_event("validate-event", %{"event" => params}, socket),
-    do:
-      {:noreply,
-       assign(socket,
-         event_form: to_form(Map.take(params, @event_fields), as: :event),
-         error: nil
-       )}
+  def handle_event("validate-event", %{"event" => params}, socket) do
+    params = Map.take(params, @event_fields)
+    params = Map.put_new(params, "timezone", socket.assigns.event_form.params["timezone"])
+
+    params =
+      Enum.reduce(["starts_at", "ends_at"], params, fn field, attrs ->
+        Map.update(attrs, field, nil, &input_date_mode(&1, all_day?(params["all_day"])))
+      end)
+
+    {:noreply, assign(socket, event_form: to_form(params, as: :event), error: nil)}
+  end
 
   def handle_event("delete-event", %{"scope" => scope}, socket)
       when scope in ["component", "series"] do
@@ -249,7 +256,7 @@ defmodule ManifoldWeb.CalendarLive.Index do
         {:noreply,
          socket
          |> put_flash(:info, "Event deletion saved locally.")
-         |> push_patch(to: ~p"/calendars/#{socket.assigns.calendar.id}")}
+         |> push_patch(to: calendar_path(socket.assigns.calendar, socket.assigns))}
 
       _ ->
         {:noreply,
@@ -264,7 +271,9 @@ defmodule ManifoldWeb.CalendarLive.Index do
         {:noreply,
          socket
          |> put_flash(:info, "Event copy saved locally.")
-         |> push_patch(to: ~p"/calendars/#{event.calendar_id}/events/#{event.id}")}
+         |> push_patch(
+           to: event_path(Calendars.get_calendar(event.calendar_id), event, socket.assigns)
+         )}
 
       _ ->
         {:noreply,
@@ -289,9 +298,8 @@ defmodule ManifoldWeb.CalendarLive.Index do
          |> push_patch(
            to:
              if(socket.assigns.event.deleted_at && choice == "local",
-               do: ~p"/calendars/#{socket.assigns.calendar.id}",
-               else:
-                 ~p"/calendars/#{socket.assigns.calendar.id}/events/#{socket.assigns.event.id}"
+               do: calendar_path(socket.assigns.calendar, socket.assigns),
+               else: event_path(socket.assigns.calendar, socket.assigns.event, socket.assigns)
              )
          )}
 
@@ -304,42 +312,326 @@ defmodule ManifoldWeb.CalendarLive.Index do
   @impl true
   def render(assigns) do
     ~H"""
-    <section id="calendars-page" class="space-y-6">
-      <div class="settings-heading">
-        <div>
-          <h1>Calendars</h1><p class="settings-intro">
-            Local calendars with asynchronous iCloud synchronization.
-          </p>
+    <section
+      id="calendars-page"
+      class={[
+        "calendar-workspace",
+        (@event || @event_form || @calendar_form) && "has-calendar-drawer"
+      ]}
+    >
+      <aside
+        class={["calendar-sidebar", @navigation_open && "is-open"]}
+        aria-label="Calendar navigation"
+      >
+        <div class="calendar-sidebar-heading">
+          <.dm_mdi name="calendar-outline" class="w-6 h-6" />
+          <h1>Calendar</h1>
         </div>
-        <div class="flex gap-4">
-          <.dm_btn id="new-calendar" patch={~p"/calendars/new"} variant="primary">
-            Add calendar
-          </.dm_btn><.dm_btn navigate={~p"/settings/accounts"} variant="outline">
-            Manage Accounts
+        <.dm_btn
+          :if={@calendar && editable?(@calendar, :create) && !@event_form && !@calendar_form}
+          id="new-event"
+          patch={new_event_path(@calendar, assigns, @selected_date)}
+          variant="primary"
+          class="calendar-create"
+        >
+          <.dm_mdi name="plus" class="w-5 h-5" /> Create event
+        </.dm_btn>
+        <.dm_btn
+          :if={!@calendar && !@calendar_form}
+          id="new-calendar"
+          patch={new_calendar_path(assigns)}
+          variant="primary"
+          class="calendar-create"
+        >
+          <.dm_mdi name="plus" class="w-5 h-5" /> Add calendar
+        </.dm_btn>
+        <div class="calendar-mini" aria-label="Mini month">
+          <div class="calendar-mini-heading">
+            <span>{Elixir.Calendar.strftime(@selected_date, "%B %Y")}</span>
+            <.link
+              patch={month_path(assigns, -1)}
+              aria-label="Previous month"
+              class="calendar-icon-link"
+            ><.dm_mdi name="chevron-left" class="w-4 h-4" /></.link>
+            <.link patch={month_path(assigns, 1)} aria-label="Next month" class="calendar-icon-link"><.dm_mdi
+              name="chevron-right"
+              class="w-4 h-4"
+            /></.link>
+          </div>
+          <div class="calendar-mini-grid">
+            <span :for={weekday <- ~w(M T W T F S S)} class="calendar-mini-weekday" aria-hidden="true">{weekday}</span>
+            <.link
+              :for={day <- @days}
+              patch={calendar_path(@calendar, assigns, day)}
+              aria-label={Elixir.Calendar.strftime(day, "%A, %B %-d, %Y")}
+              aria-current={day == @selected_date && "date"}
+              class={[
+                "calendar-mini-day",
+                day.month != @selected_date.month && "outside-month",
+                day == @selected_date && "is-selected",
+                day == @today && "is-today"
+              ]}
+            >{day.day}</.link>
+          </div>
+        </div>
+        <div class="calendar-source-heading">
+          <h2>My calendars</h2><.link
+            :if={@calendar}
+            id="new-calendar"
+            patch={new_calendar_path(assigns)}
+            aria-label="Add calendar"
+            class="calendar-icon-link"
+          ><.dm_mdi name="plus" class="w-5 h-5" /></.link>
+        </div>
+        <nav aria-label="Calendar selection" class="calendar-sources">
+          <.link
+            :for={calendar <- @calendars}
+            id={"calendar-#{calendar.id}"}
+            patch={calendar_path(calendar, assigns)}
+            aria-current={@calendar && @calendar.id == calendar.id && "page"}
+            class={["calendar-source", @calendar && @calendar.id == calendar.id && "is-selected"]}
+          >
+            <span class={"calendar-source-dot tone-#{calendar_tone(calendar)}"}></span>
+            <span><strong>{calendar.name}</strong><small>{if calendar.collection_id,
+              do: "iCloud",
+              else: "On this device"}</small></span>
+            <.dm_mdi :if={@calendar && @calendar.id == calendar.id} name="check" class="w-4 h-4" />
+          </.link>
+        </nav>
+        <div class="calendar-sidebar-footer">
+          <.link navigate={~p"/settings/accounts"}><.dm_mdi name="cloud-outline" class="w-4 h-4" />
+          Manage Accounts</.link>
+          <p>Local calendars. Optional iCloud sync.</p>
+        </div>
+      </aside>
+      <div class="calendar-main">
+        <header class="calendar-toolbar">
+          <%!-- # TODO(upstream): duskmoon-dev/duskmoon-elements#86 --%>
+          <%!-- # WORKAROUND(upstream): duskmoon-dev/duskmoon-elements#86 — slotted text names the internal button. --%>
+          <.dm_btn
+            id="calendar-navigation-toggle"
+            variant="ghost"
+            phx-click="toggle-navigation"
+            aria-label="Toggle calendar navigation"
+            aria-expanded={@navigation_open}
+            class="calendar-mobile-toggle"
+          >
+            <.dm_mdi name="menu" class="w-5 h-5" />
+            <span class="sr-only">{if @navigation_open,
+              do: "Close calendar navigation",
+              else: "Open calendar navigation"}</span>
+          </.dm_btn>
+          <.dm_btn
+            id="calendar-today"
+            patch={calendar_path(@calendar, assigns, @today)}
+            variant="outline"
+            size="sm"
+          >
+            Today
+          </.dm_btn>
+          <div class="calendar-month-controls">
+            <.link
+              id="calendar-previous-month"
+              patch={month_path(assigns, -1)}
+              aria-label="Previous month"
+              class="calendar-icon-link"
+            ><.dm_mdi name="chevron-left" class="w-5 h-5" /></.link>
+            <.link
+              id="calendar-next-month"
+              patch={month_path(assigns, 1)}
+              aria-label="Next month"
+              class="calendar-icon-link"
+            ><.dm_mdi name="chevron-right" class="w-5 h-5" /></.link>
+          </div>
+          <h2 id="calendar-month-title">
+            {Elixir.Calendar.strftime(@selected_date, "%B")}
+            <span>{Elixir.Calendar.strftime(@selected_date, "%Y")}</span>
+          </h2>
+          <.dm_btn
+            :if={
+              @calendar && editable?(@calendar, :create) && !@navigation_open && !@event_form &&
+                !@calendar_form
+            }
+            id="new-event-mobile"
+            patch={new_event_path(@calendar, assigns, @selected_date)}
+            variant="primary"
+            size="sm"
+            aria-label="Create event"
+            class="calendar-mobile-create"
+          >
+            <.dm_mdi name="plus" class="w-5 h-5" />
+          </.dm_btn>
+          <.dm_btn
+            :if={!@calendar && !@navigation_open && !@calendar_form}
+            id="new-calendar-mobile"
+            patch={new_calendar_path(assigns)}
+            variant="primary"
+            size="sm"
+            aria-label="Add calendar"
+            class="calendar-mobile-create"
+          >
+            <.dm_mdi name="plus" class="w-5 h-5" />
+          </.dm_btn>
+          <span class="calendar-mobile-view-label">Monthly agenda</span>
+          <div class="calendar-view-switch" aria-label="Calendar view">
+            <.link
+              id="calendar-month-view"
+              patch={calendar_path(@calendar, assigns, @selected_date, "month")}
+              aria-current={@display_view == "month" && "page"}
+            >Month</.link>
+            <.link
+              id="calendar-agenda-view"
+              patch={calendar_path(@calendar, assigns, @selected_date, "agenda")}
+              aria-current={@display_view == "agenda" && "page"}
+            >Agenda</.link>
+          </div>
+        </header>
+        <div :if={@calendar} class="calendar-contextbar">
+          <span class={"calendar-source-dot tone-#{calendar_tone(@calendar)}"}></span><strong>{@calendar.name}</strong>
+          <span class="calendar-context-source">{source(@calendar)}</span>
+          <.dm_btn
+            id="edit-calendar"
+            patch={edit_calendar_path(@calendar, assigns)}
+            variant="ghost"
+            size="sm"
+            aria-label="Edit calendar"
+          >
+            <.dm_mdi name="cog-outline" class="w-4 h-4" />
           </.dm_btn>
         </div>
+        <div :if={!@calendar} id="calendars-empty" class="calendar-empty-state">
+          <.dm_mdi name="calendar-blank-outline" class="w-12 h-12" />
+          <h2>A little room for your plans.</h2>
+          <p>No calendars yet. Add a local calendar or configure iCloud inside an Account.</p>
+        </div>
+        <div
+          :if={@calendar}
+          id="calendar-events"
+          class={["calendar-canvas", @display_view == "month" && "is-month"]}
+        >
+          <div
+            :if={@display_view == "month"}
+            id="calendar-month-grid"
+            class="calendar-month-grid"
+            aria-label="Month calendar"
+          >
+            <div
+              :for={weekday <- ~w(Monday Tuesday Wednesday Thursday Friday Saturday Sunday)}
+              class="calendar-weekday"
+            >
+              {String.slice(weekday, 0, 3)}
+            </div>
+            <div
+              :for={day <- @days}
+              id={"calendar-day-#{Date.to_iso8601(day)}"}
+              class={[
+                "calendar-day",
+                day.month != @selected_date.month && "outside-month",
+                day == @today && "is-today",
+                day == @selected_date && "is-selected"
+              ]}
+            >
+              <.link
+                patch={
+                  if editable?(@calendar, :create),
+                    do: new_event_path(@calendar, assigns, day),
+                    else: calendar_path(@calendar, assigns, day)
+                }
+                class="calendar-day-number"
+                aria-label={Elixir.Calendar.strftime(day, "%A, %B %-d, %Y") <> if(editable?(@calendar, :create), do: ", create event", else: "")}
+              >{day.day}</.link>
+              <ul class="calendar-day-events">
+                <li
+                  :for={event <- events_on_day(@events, day)}
+                  id={month_event_id(event, day, hd(@days))}
+                >
+                  <.link
+                    patch={event_path(@calendar, event, assigns)}
+                    class={[
+                      "calendar-event",
+                      "tone-#{calendar_tone(@calendar)}",
+                      event.all_day && "is-all-day",
+                      @event && @event.id == event.id && "is-selected"
+                    ]}
+                    title={(event.summary || "Untitled event") <> if(event.all_day, do: " · All day", else: " · " <> (event.timezone || "Floating time"))}
+                  >
+                    <span :if={!event.all_day} class="calendar-event-dot"></span><time>{Display.clock(
+                      event
+                    )}</time><strong>{event.summary || "Untitled event"}</strong>
+                    <.dm_mdi :if={Display.recurring?(event)} name="repeat" class="w-3 h-3" />
+                    <span :if={event.deleted_at} class="calendar-event-conflict">Deletion conflict</span>
+                  </.link>
+                </li>
+              </ul>
+            </div>
+          </div>
+          <div
+            id="calendar-agenda"
+            class={["calendar-agenda", @display_view == "month" && "mobile-agenda"]}
+          >
+            <p :if={@agenda == []} id="calendar-events-empty" class="calendar-agenda-empty">
+              No event records this month. Make room for something good.
+            </p>
+            <section
+              :for={{day, events} <- @agenda}
+              class="calendar-agenda-day"
+              aria-label={Elixir.Calendar.strftime(day, "%A, %B %-d")}
+            >
+              <div class={[
+                "calendar-agenda-date",
+                day == @today && "is-today",
+                day == @selected_date && "is-selected"
+              ]}>
+                <span>{Elixir.Calendar.strftime(day, "%a")}</span><strong>{day.day}</strong>
+              </div>
+              <ul>
+                <li
+                  :for={event <- events}
+                  id={
+                    if @display_view == "agenda",
+                      do: "event-#{event.id}",
+                      else: "agenda-event-#{event.id}"
+                  }
+                >
+                  <.link patch={event_path(@calendar, event, assigns)} class="calendar-agenda-event">
+                    <span class="calendar-agenda-time">{Display.clock(event)}</span>
+                    <span class={"calendar-source-dot tone-#{calendar_tone(@calendar)}"}></span>
+                    <span class="calendar-agenda-summary"><strong>{event.summary || "Untitled event"}</strong><small :if={
+                      event.location
+                    }>{event.location}</small><small :if={!event.all_day} class="calendar-agenda-zone">{event.timezone ||
+                      "Floating time"}</small><small :if={
+                      Date.compare(Display.date(event.starts_at), day) == :lt
+                    }>Continues from {event_time(event.starts_at)}</small><small :if={
+                      event.deleted_at
+                    }>Deletion conflict</small></span>
+                    <.dm_mdi :if={Display.recurring?(event)} name="repeat" class="w-4 h-4" />
+                  </.link>
+                </li>
+              </ul>
+            </section>
+          </div>
+        </div>
+        <footer class="calendar-canvas-footer">
+          <p id="calendar-recurrence-help">
+            <.dm_mdi name="repeat" class="w-4 h-4" />
+            Stored records only · this view does not expand recurring occurrences. Original rules and exceptions are retained.
+          </p>
+          <span :if={@calendar} id="calendar-timezone-help">Times shown as stored · {calendar_timezones(
+            @events
+          )}</span>
+        </footer>
       </div>
-      <p id="calendar-recurrence-help" class="text-on-surface-variant">
-        Recurring events retain their original rules and exceptions. This view lists stored records; it does not expand recurring occurrences.
-      </p>
-      <p :if={@calendars == []} id="calendars-empty">
-        No calendars yet. Add a local calendar or configure iCloud inside an Account.
-      </p>
-      <nav :if={@calendars != []} aria-label="Calendar selection" class="flex flex-wrap gap-4">
-        <.link
-          :for={calendar <- @calendars}
-          id={"calendar-#{calendar.id}"}
-          patch={~p"/calendars/#{calendar.id}"}
-          aria-current={@calendar && @calendar.id == calendar.id && "page"}
-          class="text-primary"
-        >{calendar.name} · {source(calendar)}</.link>
-      </nav>
       <section
         :if={@calendar_form}
         id="calendar-editor"
-        class="bg-surface-container text-on-surface border border-outline-variant rounded-lg p-4 space-y-4"
+        class="calendar-drawer calendar-editor"
       >
+        <.drawer_close context={assigns} />
+        <p class="calendar-eyebrow">Calendar settings</p>
         <h2>{if @live_action == :edit_calendar, do: "Edit calendar", else: "New calendar"}</h2>
+        <p class="calendar-drawer-intro">
+          Choose where this calendar lives and what syncs to iCloud.
+        </p>
         <.form
           for={@calendar_form}
           id="calendar-form"
@@ -376,7 +668,71 @@ defmodule ManifoldWeb.CalendarLive.Index do
           <p :if={@error} role="alert" class="settings-error">{@error}</p>
           <div class="flex gap-4">
             <.dm_btn id="save-calendar" type="submit" variant="primary">Save calendar</.dm_btn><.dm_btn
-              patch={~p"/calendars"}
+              patch={calendar_path(@calendar, assigns)}
+              variant="ghost"
+            >
+              Cancel
+            </.dm_btn>
+          </div>
+        </.form>
+        <.dm_btn
+          :if={@live_action == :edit_calendar}
+          id="delete-calendar"
+          variant="error"
+          confirm="Delete this empty local calendar? Its iCloud calendar is retained."
+          phx-click="delete-calendar"
+        >
+          Delete local calendar
+        </.dm_btn>
+      </section>
+      <section
+        :if={@event_form}
+        id="event-editor"
+        class="calendar-drawer calendar-editor"
+      >
+        <.drawer_close context={assigns} />
+        <p class="calendar-eyebrow">Event</p>
+        <h2>{if @live_action == :edit_event, do: "Edit event", else: "New event"}</h2>
+        <.form
+          for={@event_form}
+          id="event-form"
+          phx-change="validate-event"
+          phx-submit="save-event"
+          class="space-y-4"
+        >
+          <.dm_input field={@event_form[:summary]} label="Summary" />
+          <.dm_input
+            field={@event_form[:starts_at]}
+            label="Start"
+            type={if all_day?(@event_form[:all_day].value), do: "date", else: "datetime-local"}
+            required
+          />
+          <.dm_input
+            field={@event_form[:ends_at]}
+            label="End"
+            helper={
+              if all_day?(@event_form[:all_day].value),
+                do: "End date is exclusive. For one day, use the following date.",
+                else: nil
+            }
+            type={if all_day?(@event_form[:all_day].value), do: "date", else: "datetime-local"}
+          />
+          <.dm_input field={@event_form[:all_day]} type="checkbox" label="All day" />
+          <.dm_input
+            field={@event_form[:timezone]}
+            label="Time zone"
+            disabled={all_day?(@event_form[:all_day].value)}
+            helper="Leave blank for floating local time. Use UTC or a named time zone such as Europe/London."
+          />
+          <.dm_input field={@event_form[:location]} label="Location" />
+          <.dm_input field={@event_form[:description]} type="textarea" label="Description" />
+          <p :if={@event && @event.recurrence_id != ""}>
+            This edits the stored exception only. The remaining series is preserved.
+          </p>
+          <p :if={@error} role="alert" class="settings-error">{@error}</p>
+          <div class="flex gap-4">
+            <.dm_btn id="save-event" type="submit" variant="primary">Save event</.dm_btn><.dm_btn
+              patch={calendar_path(@calendar, assigns)}
               variant="ghost"
             >
               Cancel
@@ -384,227 +740,199 @@ defmodule ManifoldWeb.CalendarLive.Index do
           </div>
         </.form>
       </section>
-      <div :if={@calendar && !@calendar_form} class="grid gap-6 lg:grid-cols-2">
-        <section
-          class="bg-surface-container text-on-surface border border-outline-variant rounded-lg p-4 space-y-4"
-          aria-label="Event records"
-        >
-          <h2>{@calendar.name}</h2><p>{source(@calendar)}</p>
-          <div class="flex flex-wrap gap-4">
-            <.dm_btn
-              :if={editable?(@calendar, :create)}
-              id="new-event"
-              patch={~p"/calendars/#{@calendar.id}/events/new"}
-              variant="outline"
-            >
-              Add event
-            </.dm_btn><.dm_btn
-              id="edit-calendar"
-              patch={~p"/calendars/#{@calendar.id}/edit"}
-              variant="outline"
-            >
-              Edit calendar
-            </.dm_btn><.dm_btn
-              id="delete-calendar"
-              variant="error"
-              confirm="Delete this empty local calendar? Its iCloud calendar is retained."
-              phx-click="delete-calendar"
-            >
-              Delete local calendar
-            </.dm_btn>
-          </div>
-          <p :if={@events == []} id="calendar-events-empty">No event records in this calendar.</p>
-          <ul id="calendar-events" class="space-y-4">
-            <li :for={event <- @events} id={"event-#{event.id}"}>
-              <.link
-                patch={~p"/calendars/#{@calendar.id}/events/#{event.id}"}
-                class="text-primary font-semibold"
-              >{event.summary || "Untitled event"}</.link>
-              <p>{event_time(event.starts_at)} <span :if={event.all_day}>· All day</span></p>
-              <p :if={event.deleted_at}>Deletion conflict</p>
-              <p :if={event.timezone} class="text-sm text-on-surface-variant">{event.timezone}</p>
-              <p :if={event.recurrence_rules != []}>Recurring record</p><p :if={
-                event.recurrence_id != ""
-              }>
-                Recurrence exception
-              </p>
-            </li>
-          </ul>
-          <div class="flex gap-4">
-            <.dm_btn
-              id="events-previous"
-              type="button"
-              variant="ghost"
-              phx-click="page"
-              phx-value-direction="previous"
-              disabled={@offset == 0}
-            >
-              Previous
-            </.dm_btn><.dm_btn
-              id="events-next"
-              type="button"
-              variant="ghost"
-              phx-click="page"
-              phx-value-direction="next"
-              disabled={length(@events) < 50}
-            >
-              Next
-            </.dm_btn>
-          </div>
-        </section>
-        <section
-          :if={@event_form}
-          id="event-editor"
-          class="bg-surface-container text-on-surface border border-outline-variant rounded-lg p-4 space-y-4"
-        >
-          <h2>{if @live_action == :edit_event, do: "Edit stored component", else: "New event"}</h2>
-          <.form
-            for={@event_form}
-            id="event-form"
-            phx-change="validate-event"
-            phx-submit="save-event"
-            class="space-y-4"
+      <section
+        :if={@event && !@event_form}
+        id="calendar-event-detail"
+        class="calendar-drawer calendar-detail"
+      >
+        <.drawer_close context={assigns} />
+        <p class="calendar-eyebrow">
+          {Elixir.Calendar.strftime(Display.date(@event.starts_at) || @selected_date, "%A, %B %-d")}
+        </p>
+        <h2>{@event.summary || "Untitled event"}</h2><p>
+          {source(@calendar)} <span :if={!editable?(@calendar, :update)}>· Read-only</span>
+        </p>
+        <p id="event-sync-status" aria-live="polite">{sync_status(@event, @calendar)}</p>
+        <p :if={@event.deleted_at}>Local deletion is waiting for conflict resolution.</p>
+        <div :if={conflicted?(@event)} id="event-conflict" class="space-y-4">
+          <p>
+            Both sides changed. This choice applies to the complete calendar resource, including its stored components.
+          </p><.dm_btn
+            id="event-use-local"
+            phx-click="resolve"
+            phx-value-choice="local"
+            variant="outline"
           >
-            <.dm_input field={@event_form[:summary]} label="Summary" />
-            <.dm_input
-              field={@event_form[:starts_at]}
-              label="Start"
-              type={if all_day?(@event_form[:all_day].value), do: "date", else: "datetime-local"}
-              required
-            />
-            <.dm_input
-              field={@event_form[:ends_at]}
-              label="End"
-              type={if all_day?(@event_form[:all_day].value), do: "date", else: "datetime-local"}
-            />
-            <.dm_input field={@event_form[:all_day]} type="checkbox" label="All day" />
-            <.dm_input
-              field={@event_form[:timezone]}
-              label="Time zone"
-              helper="Leave blank for floating local time. Use UTC or a named time zone such as Europe/London."
-            />
-            <.dm_input field={@event_form[:location]} label="Location" />
-            <.dm_input field={@event_form[:description]} type="textarea" label="Description" />
-            <p :if={@event && @event.recurrence_id != ""}>
-              This edits the stored exception only. The remaining series is preserved.
-            </p>
-            <p :if={@error} role="alert" class="settings-error">{@error}</p>
-            <div class="flex gap-4">
-              <.dm_btn id="save-event" type="submit" variant="primary">Save event</.dm_btn><.dm_btn
-                patch={~p"/calendars/#{@calendar.id}"}
-                variant="ghost"
-              >
-                Cancel
-              </.dm_btn>
-            </div>
-          </.form>
-        </section>
-        <section
-          :if={@event && !@event_form}
-          id="calendar-event-detail"
-          class="bg-surface-container text-on-surface border border-outline-variant rounded-lg p-4 space-y-4"
+            Use local
+          </.dm_btn><.dm_btn
+            id="event-use-icloud"
+            phx-click="resolve"
+            phx-value-choice="remote"
+            variant="outline"
+          >
+            Use iCloud
+          </.dm_btn>
+        </div>
+        <dl class="calendar-detail-fields">
+          <div>
+            <dt>Start</dt><dd>{event_time(@event.starts_at)}</dd>
+          </div><div>
+            <dt>{if @event.all_day, do: "End (exclusive)", else: "End"}</dt><dd>
+              {event_time(@event.ends_at)}
+            </dd>
+          </div>
+          <div>
+            <dt>Time zone</dt><dd>{@event.timezone || "Floating / unspecified"}</dd>
+          </div><div>
+            <dt>All day</dt><dd>{if @event.all_day, do: "Yes", else: "No"}</dd>
+          </div>
+          <div :if={@event.location}>
+            <dt>Location</dt><dd>{@event.location}</dd>
+          </div><div :if={@event.description}>
+            <dt>Description</dt><dd class="whitespace-pre-wrap">{@event.description}</dd>
+          </div>
+          <div :if={@event.recurrence_rules != []}>
+            <dt>Recurrence rules</dt><dd :for={rule <- @event.recurrence_rules}>{rule}</dd>
+          </div>
+          <div :if={@event.recurrence_id != ""}>
+            <dt>Recurrence exception ID</dt><dd>{@event.recurrence_id}</dd>
+          </div><div :if={@event.excluded_dates != []}>
+            <dt>Excluded dates</dt><dd :for={date <- @event.excluded_dates}>{date}</dd>
+          </div>
+        </dl>
+        <div
+          :if={editable?(@calendar, :update) && is_nil(@event.deleted_at)}
+          class="flex flex-wrap gap-4"
         >
-          <h2>{@event.summary || "Untitled event"}</h2><p>
-            {source(@calendar)} <span :if={!editable?(@calendar, :update)}>· Read-only</span>
-          </p>
-          <p id="event-sync-status" aria-live="polite">{sync_status(@event, @calendar)}</p>
-          <p :if={@event.deleted_at}>Local deletion is waiting for conflict resolution.</p>
-          <div :if={conflicted?(@event)} id="event-conflict" class="space-y-4">
-            <p>
-              Both sides changed. This choice applies to the complete calendar resource, including its stored components.
-            </p><.dm_btn
-              id="event-use-local"
-              phx-click="resolve"
-              phx-value-choice="local"
-              variant="outline"
-            >
-              Use local
-            </.dm_btn><.dm_btn
-              id="event-use-icloud"
-              phx-click="resolve"
-              phx-value-choice="remote"
-              variant="outline"
-            >
-              Use iCloud
-            </.dm_btn>
-          </div>
-          <dl class="space-y-4">
-            <div>
-              <dt>Start</dt><dd>{event_time(@event.starts_at)}</dd>
-            </div><div>
-              <dt>End</dt><dd>{event_time(@event.ends_at)}</dd>
-            </div>
-            <div>
-              <dt>Time zone</dt><dd>{@event.timezone || "Floating / unspecified"}</dd>
-            </div><div>
-              <dt>All day</dt><dd>{if @event.all_day, do: "Yes", else: "No"}</dd>
-            </div>
-            <div :if={@event.location}>
-              <dt>Location</dt><dd>{@event.location}</dd>
-            </div><div :if={@event.description}>
-              <dt>Description</dt><dd class="whitespace-pre-wrap">{@event.description}</dd>
-            </div>
-            <div :if={@event.recurrence_rules != []}>
-              <dt>Recurrence rules</dt><dd :for={rule <- @event.recurrence_rules}>{rule}</dd>
-            </div>
-            <div :if={@event.recurrence_id != ""}>
-              <dt>Recurrence exception ID</dt><dd>{@event.recurrence_id}</dd>
-            </div><div :if={@event.excluded_dates != []}>
-              <dt>Excluded dates</dt><dd :for={date <- @event.excluded_dates}>{date}</dd>
-            </div>
-          </dl>
-          <div
-            :if={editable?(@calendar, :update) && is_nil(@event.deleted_at)}
-            class="flex flex-wrap gap-4"
+          <.dm_btn
+            id="edit-event"
+            patch={edit_event_path(@calendar, @event, assigns)}
+            variant="outline"
           >
-            <.dm_btn
-              id="edit-event"
-              patch={~p"/calendars/#{@calendar.id}/events/#{@event.id}/edit"}
-              variant="outline"
-            >
-              Edit component
-            </.dm_btn>
-            <.dm_btn
-              id="delete-event-component"
-              phx-click="delete-event"
-              phx-value-scope="component"
-              confirm="Delete this stored event component? Remaining components are preserved."
-              variant="error"
-            >
-              Delete component
-            </.dm_btn>
-            <.dm_btn
-              :if={@event.recurrence_rules != [] || @event.recurrence_id != ""}
-              id="delete-event-series"
-              phx-click="delete-event"
-              phx-value-scope="series"
-              confirm="Delete the whole stored series, including its exceptions?"
-              variant="error"
-            >
-              Delete whole series
-            </.dm_btn>
-          </div>
-          <.form
-            :if={is_nil(@event.deleted_at)}
-            for={%{"calendar_id" => ""}}
-            as={:copy}
-            id="event-copy-form"
-            phx-submit="copy-event"
-            class="space-y-4"
+            Edit event
+          </.dm_btn>
+          <.dm_btn
+            id="delete-event-component"
+            phx-click="delete-event"
+            phx-value-scope="component"
+            confirm="Delete this stored event component? Remaining components are preserved."
+            variant="error"
           >
-            <.dm_select
-              name="copy[calendar_id]"
-              id="event-copy-calendar"
-              label="Copy to local calendar"
-              options={Enum.map(@calendars, &{&1.id, &1.name})}
-              value=""
-            />
-            <.dm_btn id="copy-event" type="submit" variant="outline">Make local copy</.dm_btn>
-          </.form>
-        </section>
-      </div>
+            {if Display.recurring?(@event), do: "Delete component", else: "Delete event"}
+          </.dm_btn>
+          <.dm_btn
+            :if={@event.recurrence_rules != [] || @event.recurrence_id != ""}
+            id="delete-event-series"
+            phx-click="delete-event"
+            phx-value-scope="series"
+            confirm="Delete the whole stored series, including its exceptions?"
+            variant="error"
+          >
+            Delete whole series
+          </.dm_btn>
+        </div>
+        <.form
+          :if={is_nil(@event.deleted_at)}
+          for={%{"calendar_id" => ""}}
+          as={:copy}
+          id="event-copy-form"
+          phx-submit="copy-event"
+          class="calendar-copy-form"
+        >
+          <.dm_select
+            name="copy[calendar_id]"
+            id="event-copy-calendar"
+            label="Copy to local calendar"
+            options={Enum.map(Enum.filter(@calendars, &editable?(&1, :create)), &{&1.id, &1.name})}
+            value=""
+          />
+          <.dm_btn id="copy-event" type="submit" variant="outline">Make local copy</.dm_btn>
+        </.form>
+      </section>
     </section>
     """
+  end
+
+  attr :context, :map, required: true
+
+  defp drawer_close(assigns) do
+    ~H"""
+    <.link
+      id="calendar-drawer-close"
+      patch={calendar_path(@context.calendar, @context)}
+      aria-label="Close details"
+      class="calendar-drawer-close"
+    ><.dm_mdi name="close" class="w-5 h-5" /></.link>
+    """
+  end
+
+  defp selected_date(value, event, fallback) do
+    case value && Date.from_iso8601(value) do
+      {:ok, date} -> date
+      _ -> if(event, do: Display.date(event.starts_at) || fallback, else: fallback)
+    end
+  end
+
+  defp calendar_path(calendar, assigns, date \\ nil, view \\ nil) do
+    params = %{
+      date: Date.to_iso8601(date || assigns.selected_date),
+      view: view || assigns.display_view
+    }
+
+    if calendar, do: ~p"/calendars/#{calendar.id}?#{params}", else: ~p"/calendars?#{params}"
+  end
+
+  defp month_path(assigns, direction),
+    do:
+      calendar_path(
+        assigns.calendar,
+        assigns,
+        Display.shift_month(assigns.selected_date, direction)
+      )
+
+  defp new_calendar_path(assigns),
+    do:
+      ~p"/calendars/new?#{%{date: Date.to_iso8601(assigns.selected_date), view: assigns.display_view}}"
+
+  defp new_event_path(calendar, assigns, date),
+    do:
+      ~p"/calendars/#{calendar.id}/events/new?#{%{date: Date.to_iso8601(date), view: assigns.display_view}}"
+
+  defp event_path(calendar, event, assigns),
+    do:
+      ~p"/calendars/#{calendar.id}/events/#{event.id}?#{%{date: Date.to_iso8601(assigns.selected_date), view: assigns.display_view}}"
+
+  defp edit_event_path(calendar, event, assigns),
+    do:
+      ~p"/calendars/#{calendar.id}/events/#{event.id}/edit?#{%{date: Date.to_iso8601(assigns.selected_date), view: assigns.display_view}}"
+
+  defp edit_calendar_path(calendar, assigns),
+    do:
+      ~p"/calendars/#{calendar.id}/edit?#{%{date: Date.to_iso8601(assigns.selected_date), view: assigns.display_view}}"
+
+  defp calendar_timezones(events) do
+    events
+    |> Enum.reject(& &1.all_day)
+    |> Enum.map(&(&1.timezone || "Floating time"))
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.join(" / ")
+    |> case do
+      "" -> "All-day dates"
+      zones -> zones
+    end
+  end
+
+  defp calendar_tone(calendar), do: if(calendar.collection_id, do: "primary", else: "tertiary")
+  defp events_on_day(events, date), do: Enum.filter(events, &Display.on_day?(&1, date))
+
+  defp month_event_id(event, day, first) do
+    start = Display.date(event.starts_at)
+    visible_start = if Date.compare(start, first) == :lt, do: first, else: start
+
+    if day == visible_start,
+      do: "event-#{event.id}",
+      else: "event-#{event.id}-#{Date.to_iso8601(day)}"
   end
 
   defp calendar_form(socket, calendar) do
@@ -694,6 +1022,10 @@ defmodule ManifoldWeb.CalendarLive.Index do
       Map.update(result, key, nil, &stored_time(&1, date_only, attrs["timezone"]))
     end)
   end
+
+  defp input_date_mode(value, true) when is_binary(value), do: String.slice(value, 0, 10)
+  defp input_date_mode(<<date::binary-size(10)>>, false), do: date <> "T09:00:00"
+  defp input_date_mode(value, _), do: value
 
   defp all_day?(value), do: value in [true, "true"]
   defp stored_time(nil, _, _), do: nil

@@ -259,6 +259,86 @@ defmodule ManifoldWeb.ContactLiveTest do
     end
   end
 
+  test "account sources filter search and remain selected through profile navigation", %{
+    conn: conn
+  } do
+    {account, _collection} = target_fixture()
+    {:ok, owned} = Contacts.create_contact(%{full_name: "Account Ada", account_id: account.id})
+    {:ok, local} = Contacts.create_contact(%{full_name: "Local Lin"})
+
+    {:ok, view, _} = live(conn, ~p"/contacts")
+    assert has_element?(view, "#contacts-source-all[aria-current='page']")
+    assert has_element?(view, "#contact-#{owned.id}")
+    assert has_element?(view, "#contact-#{local.id}")
+
+    view |> element("#contacts-source-#{account.id}") |> render_click()
+    assert_patch(view, ~p"/contacts?#{[account: account.id]}")
+    assert has_element?(view, "#contacts-source-#{account.id}[aria-current='page']")
+    assert has_element?(view, "#contact-#{owned.id}")
+    refute has_element?(view, "#contact-#{local.id}")
+
+    view |> form("#contact-search", search: "Local Lin") |> render_change()
+    assert has_element?(view, "#contacts-empty", "No matching contacts")
+    view |> form("#contact-search", search: "Account Ada") |> render_change()
+    view |> element("#contact-#{owned.id} a") |> render_click()
+    assert_patch(view, ~p"/contacts/#{owned.id}?#{[account: account.id]}")
+    assert has_element?(view, "#contact-#{owned.id} a[aria-current='true']")
+    assert has_element?(view, "#contact-detail", "Account Ada")
+
+    view |> element("#contact-detail .contacts-workspace__back") |> render_click()
+    assert_patch(view, ~p"/contacts?#{[account: account.id]}")
+    refute has_element?(view, "#contact-detail")
+    assert has_element?(view, "#contact-search-input[value='Account Ada']")
+  end
+
+  test "new contacts default to the active account and invalid sources return to all contacts", %{
+    conn: conn
+  } do
+    {account, _collection} = target_fixture()
+    {:ok, local} = Contacts.create_contact(%{full_name: "Visible local"})
+    {:ok, view, _} = live(conn, ~p"/contacts?#{[account: account.id]}")
+
+    view |> element("#new-contact") |> render_click()
+    assert_patch(view, ~p"/contacts/new?#{[account: account.id]}")
+
+    assert has_element?(
+             view,
+             "select[name='contact[account_id]'] option[value='#{account.id}'][selected]"
+           )
+
+    view |> form("#contact-form", contact: %{full_name: "New account contact"}) |> render_submit()
+    [created] = Contacts.list_contacts(account_id: account.id)
+    assert_patch(view, ~p"/contacts/#{created.id}?#{[account: account.id]}")
+
+    {:ok, invalid_view, _} = live(conn, ~p"/contacts?#{[account: "invalid-account"]}")
+    assert has_element?(invalid_view, "#contacts-source-all[aria-current='page']")
+    assert has_element?(invalid_view, "#contact-#{local.id}")
+  end
+
+  test "directory groups names and enables next only when another page exists", %{conn: conn} do
+    for index <- 1..50 do
+      Repo.insert!(%Contact{full_name: "Ada #{String.pad_leading(to_string(index), 2, "0")}"})
+    end
+
+    {:ok, view, _} = live(conn, ~p"/contacts")
+    assert has_element?(view, ".contacts-workspace__letter", "A")
+    assert has_element?(view, "#contacts-next[disabled]")
+    assert has_element?(view, "#contacts-previous[disabled]")
+
+    last = Repo.insert!(%Contact{full_name: "Zoe Last"})
+    view |> form("#contact-search", search: "") |> render_change()
+    refute has_element?(view, "#contacts-next[disabled]")
+    view |> element("#contacts-next") |> render_click()
+    assert has_element?(view, "#contact-#{last.id}")
+    assert has_element?(view, ".contacts-workspace__letter", "Z")
+    assert has_element?(view, "#contacts-next[disabled]")
+    refute has_element?(view, "#contacts-previous[disabled]")
+
+    view |> form("#contact-search", search: "Ada") |> render_change()
+    assert has_element?(view, "#contacts-previous[disabled]")
+    refute has_element?(view, "#contact-#{last.id}")
+  end
+
   defp target_fixture do
     name = "ui#{System.unique_integer([:positive])}.example.test"
     domain = Repo.insert!(%Manifold.Accounts.Schema.Domain{name: name, normalized_domain: name})

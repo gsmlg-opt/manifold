@@ -39,6 +39,8 @@
   generation quiescing, job drain and bounded local purge. No remote purge deletes.
 - `manifold_web`: Account ICloudComponent settings; legacy SettingsLive assignment;
   Contact and Calendar local forms/status/copy/conflict actions using DuskMoon.
+  Contact browsing and calendar month/agenda presentation are documented in
+  `contacts-calendar-workspace.md`; the redesigned UI retains these sync flows.
 
 ## Constraints and follow-ups
 
