@@ -2,6 +2,15 @@
 
 **Status:** Completed
 
+**Historical scope:** This document records the original Resend-based Milestone 3
+delivery model and its completion evidence. Later work added account-selected
+Gmail API, Microsoft Graph, and authenticated SMTP submission; the main release
+is a provider mail client, and the inbound SMTP listener belongs to the separate
+edge release. Resend remains a legacy submission path. See [PROGRESS.md](PROGRESS.md)
+for current capabilities and remaining work, and [README.md](README.md) for the
+documentation index. Historical verification below is not a fresh test result
+for the current tree.
+
 ## Scope
 
 Milestone 3 adds managed outbound delivery to the local webmail client:
@@ -112,7 +121,10 @@ Replayed or out-of-order provider events must not regress recipient state.
 
 ## Key Invariants
 
-- Manifold never resolves recipient MX records or opens outbound SMTP sessions.
+- In the original Milestone 3 implementation, Manifold never resolves recipient
+  MX records or opens outbound SMTP sessions. Current account-selected SMTP
+  submission connects to a configured authenticated relay; direct recipient-MX
+  delivery remains excluded.
 - A message is editable only in `draft`; queueing freezes sender, recipients,
   subject, body, and source references.
 - Draft-to-queue state and the first Oban job commit atomically.

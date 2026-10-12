@@ -5,6 +5,9 @@ mail platform. The main runtime acts as a mail client for provider-hosted
 accounts; the optional `manifold_edge` release provides durable inbound SMTP for
 installations that deploy it.
 
+See the [documentation index](docs/README.md) and
+[development progress and remaining work](docs/PROGRESS.md) for current guidance.
+
 ## Milestones 0-6
 
 Milestones 0-6 implement durable inbound delivery, mailbox projection, managed

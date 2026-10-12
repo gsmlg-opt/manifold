@@ -1,7 +1,17 @@
 # iCloud contacts and calendars — proposed v0.4.0 design
 
 Date: 2026-10-09
-Status: approved by user on 2026-10-10; implementation in progress.
+Status: approved by user on 2026-10-10; implemented. Historical import-only design;
+the Account-owned bidirectional design below supersedes its read-only UI and
+standalone connection model.
+
+This document preserves the original scope and release target. See the
+[completed implementation plan](../plans/2026-10-10-icloud-contacts-calendars.md),
+[Account-owned bidirectional design](2026-10-10-account-icloud-bidirectional-design.md),
+[current iCloud operator guide](../../ICLOUD.md), and
+[acceptance record](../../ICLOUD_ACCEPTANCE.md). Current remaining work and
+credentialed write-validation limits are tracked in
+[development progress](../../PROGRESS.md).
 
 ## Goal
 

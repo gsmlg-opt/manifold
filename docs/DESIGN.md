@@ -3,10 +3,15 @@
 ## Product and Architecture Design
 
 - **Status:** Milestones 0-6 implemented
-- **Product type:** Self-hosted webmail application and Elixir-native mail platform
-- **Primary deployment model:** Self-hosted, single installation, single OTP release
+- **Product type:** Self-hosted provider mail client with local mail, contacts, and calendars
+- **Primary deployment model:** Self-hosted main OTP release, with an optional separate ingress edge
 - **Primary user interface:** Phoenix LiveView in a web browser
-- **Outbound model:** Managed delivery provider; Manifold does not deliver directly to recipient MX servers
+- **Outbound model:** Account-selected Gmail API, Microsoft Graph, or authenticated SMTP submission; no direct recipient-MX delivery
+
+For the current implementation status and remaining tasks, start with
+[PROGRESS.md](PROGRESS.md). [README.md](README.md) indexes current guides and
+historical plans. Release 0.1 requirements and milestone completion evidence
+below retain their historical scope; they are not current acceptance results.
 
 ---
 
@@ -15,19 +20,27 @@
 Manifold is a self-hosted web email application for receiving, reading, organizing,
 composing, and sending email. Its browser interface is the primary mail client and
 is intended to replace desktop clients such as Microsoft Outlook and Apple Mail
-for mailboxes hosted by Manifold. Milestone 6 extends that client experience by
-importing mail read-only from Gmail and Microsoft 365 into local Manifold
-mailboxes. Account-selected delivery can also submit through Gmail API,
+for configured provider mailboxes. The main release imports mail from Gmail,
+Microsoft Graph, IMAP, and EAS into local Manifold mailboxes. Gmail and Graph
+receive synchronization does not mutate remote mailboxes; IMAP and EAS also
+support read-state writeback. Account-selected delivery submits through Gmail API,
 Microsoft Graph, or an authenticated SMTP relay without turning Manifold into a
 direct-MX MTA.
 
 The product combines the user-facing webmail experience with an Elixir-native
-mail platform. Manifold accepts SMTP deliveries for configured domains, validates
-recipients during the SMTP transaction, durably records each accepted delivery,
-preserves the original RFC 5322 message, and processes messages asynchronously
-into mailbox-oriented views.
+mail platform. Its optional `manifold_edge` release accepts SMTP deliveries for
+configured domains, validates recipients during the SMTP transaction, and
+durably spools mail before acknowledgement. The main release pulls edge mail
+through the signed import protocol; it does not include an inbound SMTP listener.
+All receive paths preserve the original RFC 5322 message and process it
+asynchronously into mailbox-oriented views. Local Account-owned contacts and
+calendars synchronize with iCloud in both directions.
 
-Outbound mail is deliberately delegated to a managed provider such as Amazon SES, Postmark, Mailgun, or another provider exposed through a Manifold adapter. Manifold owns composition, local queueing, provider submission, and delivery-event tracking, but it does not operate a public outbound MTA or perform direct MX delivery.
+Outbound mail is delegated to the Account's Gmail, Graph, or authenticated SMTP
+method. Manifold owns composition, local queueing, immutable submission
+snapshots, and provider acceptance state, but does not operate a public outbound
+MTA or perform direct MX delivery. Resend and its webhooks remain a legacy path;
+other managed-provider adapters are future extension points.
 
 Manifold is not intended to reproduce Postfix, Dovecot, and Rspamd in its first
 release. The implementation is inbound-first because durable receipt is the
@@ -37,8 +50,8 @@ Phoenix webmail application rather than an SMTP administration console.
 ### Product statement
 
 > Manifold is a self-hosted webmail application that replaces a desktop email
-> client for locally hosted mailboxes, backed by durable Elixir/OTP mail
-> infrastructure and managed outbound delivery.
+> client for configured mail providers, backed by durable local Elixir/OTP mail
+> infrastructure, account-selected sending, and optional cloud SMTP ingress.
 
 ---
 
@@ -168,6 +181,13 @@ Release 0.1 is one OTP release with explicit application boundaries. It must not
 
 ## 5. System Context
 
+Current main mail receipt uses provider connectors or local pulls from the
+separate SMTP edge. The diagram below records the original inbound pipeline;
+the SMTP listener and initial spool run at the edge in the current deployment.
+Provider imports enter the main durable spool and ingest boundary directly.
+Only the local filesystem object-store adapter is implemented; ESS/S3 remains
+a target adapter.
+
 ```text
                             INBOUND
 
@@ -231,7 +251,7 @@ Phoenix/API -> local outbound queue -> provider adapter -> paid provider
 
 ## 6. Umbrella Structure
 
-The target umbrella structure is:
+The current umbrella structure is:
 
 ```text
 manifold/
@@ -239,6 +259,9 @@ manifold/
 │   ├── manifold_core/
 │   ├── manifold_data/
 │   ├── manifold_accounts/
+│   ├── manifold_contacts/
+│   ├── manifold_calendars/
+│   ├── manifold_account_lifecycle/
 │   ├── manifold_storage/
 │   ├── manifold_ingest/
 │   ├── manifold_smtp/
@@ -257,7 +280,8 @@ manifold/
 └── devenv.yaml
 ```
 
-Not every target application must be fully implemented in the first bootstrap change. Application boundaries should be introduced when they own a coherent API or runtime responsibility.
+`manifold_smtp` starts only in the separate edge release. The main release
+contains Contacts, Calendars, and Account Lifecycle alongside the mail client.
 
 ### 6.1 `manifold_core`
 
@@ -365,9 +389,10 @@ Owns the inbound SMTP edge:
 - Connection and abuse controls.
 
 The initial implementation may use `gen_smtp`, isolated behind a Manifold adapter so the protocol engine can be replaced later if streaming `DATA` is required.
-The transport application has no production dependency on Accounts or Ingest;
-the local release configures those modules, while the edge release configures
-`Manifold.Edge.SMTP`.
+The transport application has no production dependency on Accounts or Ingest.
+The current main release excludes it; the edge release configures
+`Manifold.Edge.SMTP`. Local resolver/ingest adapters remain available for scoped
+integration tests of the original inbound contract.
 
 ### 6.7 `manifold_mail`
 
@@ -469,13 +494,16 @@ applications and stores no long-term mailbox state.
 Owns external mailbox synchronization and shared Gmail/Microsoft authorization
 lifecycle:
 
-- OAuth authorization transactions and PKCE.
+- OAuth authorization transactions, PKCE, and Microsoft device-code login.
 - Encrypted access and refresh credentials, including incremental Gmail and
   Microsoft receive/send grants.
 - Gmail and Microsoft Graph provider adapters.
 - Provider account, message identity, cursor, and operational event schemas.
 - Bounded Oban synchronization and remote-state jobs.
 - Mapping provider identities to durable local inbound deliveries.
+- IMAP and EAS receive methods, read-state writeback, and SMTP credential checkout.
+- Account-owned iCloud credentials, DAV discovery, and bidirectional contact/event
+  synchronization through generation/lease-fenced jobs.
 
 The application depends only on public APIs from Core, Data, Accounts, Ingest,
 and Mail. Provider adapters never write another application's schemas directly.
@@ -487,6 +515,10 @@ Microsoft 365. It does not mutate remote messages, register push subscriptions,
 or implement direct outbound MX delivery. It exposes checked-out Gmail and
 Microsoft send credentials to `manifold_outbound`, which owns rendering and
 submission.
+
+Contact, calendar, and DAV resource schemas are shared contracts in
+`manifold_data`. The local Contacts/Calendars contexts and the connector sync
+pipeline use these contracts without depending on each other's private schemas.
 
 ### 6.14 `manifold_api`
 
@@ -512,6 +544,21 @@ Phoenix LiveView using Phoenix Duskmoon components is the product frontend.
 Duskmoon Bundler owns JavaScript, CSS, and Tailwind asset builds. A separate SPA
 or native desktop client is not required.
 
+### 6.15 `manifold_contacts` and `manifold_calendars`
+
+Both applications depend on `manifold_data`. Contacts owns local contact CRUD,
+search, Account assignment, and opt-in sync intentions. Calendars owns local
+calendar/event CRUD, Account-owned collection mapping, and sync intentions.
+Neither context performs network I/O; `manifold_connectors` executes DAV work
+from shared durable resource state. See [ICLOUD.md](ICLOUD.md) for supported edits,
+conflicts, and lifecycle behavior.
+
+### 6.16 `manifold_account_lifecycle`
+
+Owns durable Account disable/purge orchestration through public application APIs,
+including local mail and iCloud data cleanup. Account purge does not issue cloud
+contact or event deletes.
+
 ---
 
 ## 7. Dependency Direction
@@ -530,10 +577,11 @@ Tier 1:
 Tier 2:
   manifold_accounts
   manifold_mail
+  manifold_contacts
+  manifold_calendars
 
 Tier 3:
   manifold_security
-  manifold_outbound
 
 Tier 4:
   manifold_ingest
@@ -543,6 +591,12 @@ Tier 5:
   manifold_connectors
 
 Tier 6:
+  manifold_outbound
+
+Tier 7:
+  manifold_account_lifecycle
+
+Tier 8:
   manifold_web
   manifold_api
 
@@ -558,6 +612,9 @@ Important rules:
   production dependency on Accounts, Ingest, or Edge.
 - `manifold_cloud` calls public APIs from Accounts and Ingest.
 - `manifold_connectors` calls public APIs from Accounts, Ingest, and Mail.
+- `manifold_outbound` checks out send credentials through Connectors.
+- Contacts, Calendars, and iCloud sync share Data-owned schemas; local context
+  changes persist sync intentions while connector jobs own network effects.
 - `manifold_web` and `manifold_api` call public context APIs; they do not
   implement mail policy.
 - `manifold_accounts` does not depend on SMTP or Phoenix.
@@ -1225,7 +1282,7 @@ LiveView updates use Phoenix PubSub after database commits. The UI must reload a
 
 ## 18. OTP and Supervision Model
 
-A representative release supervision structure is:
+A conceptual supervision structure for the original local inbound release was:
 
 ```text
 Manifold.Supervisor
@@ -1239,6 +1296,10 @@ Manifold.Supervisor
 │   └── SMTP listener / acceptor pool
 └── ManifoldWeb.Endpoint
 ```
+
+Current supervision is spread across the umbrella application supervisors.
+The main release does not start SMTP; the separate edge release owns its SMTP
+listener and Repo, and does not start local webmail, contacts, or calendars.
 
 Additional rules:
 
@@ -1317,7 +1378,12 @@ Expose health for:
 
 ## 20. Deployment Model
 
-### 20.1 Direct local ingress
+### 20.1 Historical direct local ingress
+
+This was the original deployment target. Current SMTP ingress uses the separate
+`manifold_edge` release in section 21; the main release is a provider mail client
+and does not start an inbound SMTP listener. ESS/S3 below remains a target store,
+not an implemented adapter.
 
 ```text
 Internet
@@ -1342,7 +1408,10 @@ Required DNS and network configuration:
 
 ### 20.2 Runtime configuration
 
-At minimum:
+The following list combines original local-ingress configuration and connector
+configuration. `MANIFOLD_SMTP_*` configures the separate edge listener in current
+deployments; it does not enable a listener in the main release. Some storage and
+provider entries describe target or legacy adapters rather than current choices.
 
 ```text
 DATABASE_URL
@@ -1378,7 +1447,7 @@ SECRET_KEY_BASE
 PHX_HOST
 ```
 
-Development should default to a non-privileged SMTP port such as 2525.
+Scoped local SMTP integration tests use a non-privileged port such as 2525.
 The production local release requires
 `MANIFOLD_CONNECTOR_ENCRYPTION_KEY` to decode to exactly 32 bytes. It remains the
 out-of-database master key for connector ciphertext. Google and Microsoft client
@@ -1472,7 +1541,8 @@ durable spool -> manifold_ingest -> raw store -> mailbox projection
 
 - Connector OAuth remains limited to trusted, code-defined providers. Gmail and
   Microsoft both resolve their client credentials from database-backed Settings.
-- Authorization uses the OAuth 2.0 authorization-code flow and PKCE `S256`.
+- Authorization-code login uses PKCE `S256`; Microsoft also supports device-code
+  login with a public client ID and no callback or client secret.
 - The random state value is persisted only as a SHA-256 digest, expires after a
   bounded interval, and is consumed once under a database lock.
 - PKCE verifiers and provider tokens use versioned AES-256-GCM envelopes.
@@ -1507,16 +1577,21 @@ durable spool -> manifold_ingest -> raw store -> mailbox projection
   telemetry. Browser HTML, LiveView assigns, logs, telemetry, activity events,
   and errors must contain neither plaintext secrets nor ciphertext.
 
-The intended callback URLs are:
+The standard callback paths for browser redirect login are:
 
 ```text
 https://<PHX_HOST>/connectors/gmail/callback
 https://<PHX_HOST>/connectors/microsoft/callback
 ```
 
-Local development uses the same paths at `http://localhost:4290`. The exact
-redirect URI is stored with the OAuth transaction and must match on callback.
-The Phoenix controller derives the callback from the configured Endpoint URL.
+Local development uses the same paths at `http://localhost:4290`. Gmail settings
+can store an exact registered callback URL; legacy settings without one retain
+the configured Endpoint-derived URL. The exact redirect URI is stored with the
+OAuth transaction and must match at completion. Gmail also supports pasting the
+final redirected browser URL to complete login when localhost is unreachable;
+the server parses that URL without fetching it. Microsoft device-code login
+needs no callback, and new Microsoft settings default to that flow. See
+[OAUTH_SETUP.md](OAUTH_SETUP.md) for current provider-specific setup.
 
 Operators configure Google and Microsoft at `/settings/oauth`; provider-specific
 setup help is at `/settings/oauth/gmail/help` and
@@ -1525,10 +1600,12 @@ only from `Manifold.Connectors.OAuthProviderCatalog`, so users cannot supply
 arbitrary OAuth endpoints or scopes. The current Settings surface is a
 trusted-local boundary, not an authenticated administrator interface.
 
-Changing either provider's client ID requires a new secret. With an unchanged
-client ID, a blank secret safely preserves the current ciphertext and a nonblank
-secret rotates it. Save, rotation, client-ID change, and removal serialize through
-a provider advisory lock. Every actual credential change or removal marks the
+For authorization-code login, changing either provider's client ID requires a
+new secret. With an unchanged client ID, a blank secret safely preserves the
+current ciphertext and a nonblank secret rotates it. Microsoft's device-code
+setting does not require a secret. Save, rotation, client-ID/flow/callback change,
+and removal serialize through a provider advisory lock. Every actual credential
+or login-configuration change or removal marks the
 affected provider's grants and receive/send methods `reconnect_required` and
 disables the methods; no method resumes automatically. Removal does not revoke
 the remote Google or Microsoft grant.
@@ -1644,9 +1721,9 @@ the immutable local raw message.
   into an idempotent remote tombstone without deleting local immutable data.
 - Microsoft folder membership removals probe the global message resource; an
   existing message is treated as a move and `404` as remote deletion.
-- Development and production read provider credentials from the same runtime
-  environment variables. Production additionally requires a stable connector
-  encryption key.
+- Development and production read OAuth client credentials from database-backed
+  Settings → OAuth; legacy client-credential environment values are ignored.
+  Production additionally requires a stable connector encryption key.
 
 These limits keep receive synchronization isolated from provider mutation and
 push lifecycle. Manifold never performs direct outbound MX delivery.
@@ -1926,23 +2003,38 @@ The repository should record at least these ADRs:
 10. **Future cloud edge uses local-initiated, idempotent synchronization.**
 
 
-## iCloud contacts and calendars (v0.5.0)
+## iCloud contacts and calendars
 
-The historical Release 0.1 contact/calendar non-goal is superseded for read-only
-iCloud import and local contact management. Independent instance-owned iCloud
-connections use encrypted app-specific passwords, CardDAV/CalDAV discovery,
-ETag or sync-token synchronization, and five-minute Oban polling. Connections
-are not mailbox receive/send methods.
+The historical Release 0.1 contact/calendar non-goal is superseded by local
+contact/calendar/event CRUD and bidirectional iCloud synchronization. Each local
+Account has at most one iCloud connection with encrypted app-specific credentials;
+the Account address and Apple login may differ. Connections are configured on
+the Account page, separate from its mail receive/send methods. Legacy unassigned
+connections require explicit Account assignment before sync resumes.
 
 Shared schemas and central migrations are owned by `manifold_data`;
 `manifold_contacts` owns local contact CRUD/query contracts and
-`manifold_calendars` owns calendar/event reading. `manifold_connectors` owns DAV
-transport, parsing, credentials and generation/lease-fenced jobs. Web exposes
-`/contacts`, `/calendars` and `/settings/icloud` with existing trusted-local
-authorization and DuskMoon themes. The edge release remains ingress-only.
+`manifold_calendars` owns local calendar/event CRUD and collection mapping.
+`manifold_connectors` owns DAV transport, parsing, credentials and
+generation/lease-fenced jobs. Web exposes
+`/contacts`, `/calendars`, and Account configuration with existing trusted-local
+authorization and DuskMoon themes. `/settings/icloud` is a compatibility list
+linking to Accounts. Main includes these services; edge remains ingress-only.
+
+Local saves commit revision/intention state before asynchronous writes. Contacts
+need explicit Account ownership, sync opt-in, and a default writable address
+book; calendar events need a mapped iCloud collection. Unassigned contacts and
+unmapped calendars remain local. Writes use stable UID/href, conditional ETags,
+and read reconciliation after uncertain responses. Conflicts require explicit
+Use local/Use iCloud choices; disabling, disconnecting, or Account purge does
+not delete cloud resources. Remote container management, invitation/RSVP flows,
+recurrence-rule editing, and occurrence expansion remain excluded.
 
 Only complete validated collection results commit deletions/checkpoints. Each
 service commits independently. Unknown or malformed projections retain previous
 data. Credential replacement, disable/disconnect and expired/replaced sync
 leases reject stale commits. Full setup and rollback guidance is in
-[ICLOUD.md](ICLOUD.md); approved scope is the 2026-10-09 iCloud design.
+[ICLOUD.md](ICLOUD.md), which is the current guide. Verification evidence and the
+separate credentialed Apple gate are tracked in
+[ICLOUD_ACCEPTANCE.md](ICLOUD_ACCEPTANCE.md); historical designs remain indexed
+from [README.md](README.md).

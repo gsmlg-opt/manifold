@@ -7,6 +7,18 @@ Milestone 6 scope. Later work implemented account-selected Gmail API and Microso
 Graph send plus IMAP and EAS receive methods. Provider receive synchronization
 remains read-only with respect to remote Gmail and Microsoft mailboxes.
 
+The implementation checklist and verification below record historical completion,
+not fresh verification of the current tree. The original `ExternalAccount`
+model is now represented by local Accounts, `ReceiveMethod`, `SendMethod`, and
+shared `OAuthAuthorization` records. Microsoft defaults to the `common`
+authority for work/school and personal accounts and supports device-code login
+as well as authorization code; the original `organizations` and client-secret
+requirements below apply to the historical flow. Device-code login uses a
+public client ID without a callback or client secret. Both providers are
+configured through database-backed Settings → OAuth. See [OAUTH_SETUP.md](OAUTH_SETUP.md)
+for current setup, [PROGRESS.md](PROGRESS.md) for current capabilities and remaining
+work, and [README.md](README.md) for the documentation index.
+
 ## Implementation Status
 
 - [x] Add the `manifold_connectors` application and dependency boundary.
@@ -94,6 +106,10 @@ spool, ingest, mail, or Oban tables directly.
 
 ## Persistent Model
 
+This section describes the original Milestone 6 model. Current account and
+authorization ownership is summarized in the current-state note above; the
+historical `ExternalAccount` name is retained here to explain the original plan.
+
 `ExternalAccount` stores:
 
 - Active local mailbox ID, provider, immutable provider account ID, and provider
@@ -158,6 +174,10 @@ keeps receive least-privilege but incrementally adds `gmail.send` for Gmail and
 - Production requires a base64-encoded 32-byte connector encryption key.
 
 ## Runtime Configuration
+
+The callback, tenant, and secret requirements in this section describe the
+original authorization-code deployment. Use [OAUTH_SETUP.md](OAUTH_SETUP.md) for
+current configured callbacks and Microsoft's optional device-code flow.
 
 The production local release maps these environment variables into
 `:manifold_connectors`:
