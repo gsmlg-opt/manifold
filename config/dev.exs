@@ -1,5 +1,8 @@
 import Config
 
+# SQL debug logs can exhaust the tmpfs used by devenv's process logs.
+config :logger, level: :info
+
 # Compile-time defaults only. Env overrides belong in config/runtime.exs.
 config :manifold_data, Manifold.Repo,
   username: "manifold_dev",
