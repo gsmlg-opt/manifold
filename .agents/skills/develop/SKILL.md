@@ -17,6 +17,7 @@ task decomposition.
 - For task planning and execution: [`task-development.md`](references/task-development.md)
 - For creating feature/task updates: [`feature-task-template.md`](references/feature-task-template.md)
 - For documentation and progress updates: [`documentation-progress.md`](references/documentation-progress.md)
+- For deployment guidance: [`deployment-documentation.md`](references/deployment-documentation.md)
 
 ## Core workflow
 

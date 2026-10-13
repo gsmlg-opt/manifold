@@ -7,6 +7,7 @@ installations that deploy it.
 
 See the [documentation index](docs/README.md) and
 [development progress and remaining work](docs/PROGRESS.md) for current guidance.
+For production installation, see the [deployment guide](docs/DEPLOYMENT.md).
 
 ## Milestones 0-6
 

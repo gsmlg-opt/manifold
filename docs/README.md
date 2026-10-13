@@ -8,6 +8,7 @@ implementation snapshot, recorded acceptance gaps, and suggested next tasks.
 | Document | Purpose |
 | --- | --- |
 | [Progress](PROGRESS.md) | Implemented capabilities, pending verification, engineering follow-ups and optional extensions |
+| [Deployment guide](DEPLOYMENT.md) | Main/Edge Compose installation, persistent data, migrations, HTTPS, upgrades and backup/restore |
 | [Product and architecture](DESIGN.md) | Application boundaries, durable mail contracts and product scope |
 | [Web UI design](../DESIGN.md) | DuskMoon tokens, themes and app chrome conventions |
 | [OAuth setup](OAUTH_SETUP.md) | Microsoft device-code login and Google redirect/pasted-URL completion |
