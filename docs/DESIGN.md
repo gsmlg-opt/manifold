@@ -1956,12 +1956,15 @@ the backend so all later operations dispatch consistently. Selection never
 triggers fallback or replay after a failure. STARTTLS requires a completely
 consumed positive response and rejects unexpected buffered plaintext.
 
-EAS uses a supported Req adapter for ex_ssl and a bounded HTTP/1.1 exchange on a
-fresh connection per request. HTTP framing and EAS behavior stay in Manifold;
-the TLS library contains neither. The adapter disables redirects and retries,
-preserves verified peer identity, and distinguishes authenticated TLS closure
-from abrupt transport loss. Unrelated HTTP consumers and inbound/server/database
-TLS keep their existing transports. See [TLS_BACKENDS.md](TLS_BACKENDS.md) for the
+Business HTTP consumers use native `http_fetch` through
+`Manifold.Core.HTTPClient` with fresh HTTP/1 connections and no redirects or
+transport replay. EAS.HTTPAdapter keeps request/TLS policy while native Fetch
+owns response framing. EAS preserves verified peer identity, WBXML and bounded
+request/response data. Published 0.21.10 fixes upstream #121 response-version
+admission; #114/#115 DAV method/framing fixes are also included. See
+[HTTP_CLIENT.md](HTTP_CLIENT.md) for the migration worktree, finite deadline
+semantics and verification evidence.
+Inbound/server/database TLS keep their existing transports. See [TLS_BACKENDS.md](TLS_BACKENDS.md) for the
 acceptance contract, supported options and independently validated scope.
 
 ---

@@ -1,6 +1,8 @@
 defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
   use Manifold.DataCase, async: false
 
+  alias Manifold.Core.HTTPClient
+
   alias Manifold.Accounts
   alias Manifold.Connectors
   alias Manifold.Connectors.{Crypto, MicrosoftScopes}
@@ -311,10 +313,10 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     configure_microsoft_req_test!()
     message = microsoft_message_fixture()
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       conn
       |> Plug.Conn.put_status(503)
-      |> Req.Test.json(%{"error" => %{"code" => "ServiceUnavailable"}})
+      |> HTTPClient.Test.json(%{"error" => %{"code" => "ServiceUnavailable"}})
     end)
 
     result = Oban.drain_queue(queue: :outbound)
@@ -360,14 +362,14 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     test_pid = self()
     original_job = Repo.one!(submit_jobs(message.id))
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       {:ok, encoded, conn} = Plug.Conn.read_body(conn)
       send(test_pid, {:microsoft_worker_request, :first, encoded})
 
       conn
       |> Plug.Conn.put_resp_header("retry-after", "75")
       |> Plug.Conn.put_status(429)
-      |> Req.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
+      |> HTTPClient.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
     end)
 
     snooze_started_at = DateTime.utc_now()
@@ -425,7 +427,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
 
     :atomics.put(clock, 1, 75_000)
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       {:ok, encoded, conn} = Plug.Conn.read_body(conn)
       send(test_pid, {:microsoft_worker_request, :second, encoded})
       Plug.Conn.send_resp(conn, 202, "")
@@ -458,14 +460,14 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     persisted_job = prepare_final_attempt!(message.id, submission.id, 7, 12)
     test_pid = self()
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       {:ok, encoded, conn} = Plug.Conn.read_body(conn)
       send(test_pid, {:final_microsoft_request, encoded})
 
       conn
       |> Plug.Conn.put_resp_header("retry-after", "75")
       |> Plug.Conn.put_status(429)
-      |> Req.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
+      |> HTTPClient.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
     end)
 
     result = Oban.drain_queue(queue: :outbound)
@@ -822,7 +824,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     configured =
       Keyword.put(previous, :microsoft,
         base_url: "https://graph.microsoft.test/v1.0",
-        req_options: [plug: {Req.Test, __MODULE__}]
+        req_options: [plug: {HTTPClient.Test, __MODULE__}]
       )
 
     Application.put_env(:manifold_connectors, :providers, configured)

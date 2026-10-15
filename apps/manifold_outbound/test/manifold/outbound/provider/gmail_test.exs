@@ -1,6 +1,8 @@
 defmodule Manifold.Outbound.Provider.GmailTest do
   use ExUnit.Case, async: true
 
+  alias Manifold.Core.HTTPClient
+
   alias Manifold.Outbound.Provider
   alias Manifold.Outbound.Provider.Gmail
 
@@ -9,7 +11,7 @@ defmodule Manifold.Outbound.Provider.GmailTest do
   @config [
     access_token: @access_token,
     base_url: "https://gmail.googleapis.test",
-    req_options: [plug: {Req.Test, Gmail}]
+    req_options: [plug: {HTTPClient.Test, Gmail}]
   ]
   @request %Provider.Request{
     provider: "gmail",
@@ -28,7 +30,7 @@ defmodule Manifold.Outbound.Provider.GmailTest do
   }
 
   test "posts the exact base64url RFC message with bearer authorization" do
-    Req.Test.expect(Gmail, fn conn ->
+    HTTPClient.Test.expect(Gmail, fn conn ->
       assert conn.method == "POST"
       assert conn.request_path == "/gmail/v1/users/me/messages/send"
       assert conn.query_string == ""
@@ -42,7 +44,7 @@ defmodule Manifold.Outbound.Provider.GmailTest do
                "raw" => Base.url_encode64(@raw_message, padding: false)
              }
 
-      Req.Test.json(conn, %{"id" => "gmail-message-1", "threadId" => "gmail-thread-1"})
+      HTTPClient.Test.json(conn, %{"id" => "gmail-message-1", "threadId" => "gmail-thread-1"})
     end)
 
     assert {:ok,
@@ -53,7 +55,9 @@ defmodule Manifold.Outbound.Provider.GmailTest do
   end
 
   test "treats a missing thread id as acceptance uncertainty" do
-    Req.Test.expect(Gmail, fn conn -> Req.Test.json(conn, %{"id" => "gmail-message-2"}) end)
+    HTTPClient.Test.expect(Gmail, fn conn ->
+      HTTPClient.Test.json(conn, %{"id" => "gmail-message-2"})
+    end)
 
     assert {:error,
             %Provider.Error{
@@ -64,17 +68,17 @@ defmodule Manifold.Outbound.Provider.GmailTest do
   end
 
   test "classifies authentication and authorization failures without retry" do
-    Req.Test.expect(Gmail, 3, fn conn ->
+    HTTPClient.Test.expect(Gmail, 3, fn conn ->
       case Process.get(:gmail_failure) do
         :unauthorized ->
           conn
           |> Plug.Conn.put_status(401)
-          |> Req.Test.json(%{"error" => %{"message" => "private-auth-response"}})
+          |> HTTPClient.Test.json(%{"error" => %{"message" => "private-auth-response"}})
 
         :invalid_grant ->
           conn
           |> Plug.Conn.put_status(400)
-          |> Req.Test.json(%{
+          |> HTTPClient.Test.json(%{
             "error" => "invalid_grant",
             "error_description" => "private-grant-response"
           })
@@ -82,7 +86,7 @@ defmodule Manifold.Outbound.Provider.GmailTest do
         :insufficient_scope ->
           conn
           |> Plug.Conn.put_status(403)
-          |> Req.Test.json(%{
+          |> HTTPClient.Test.json(%{
             "error" => %{
               "message" => "private-scope-response",
               "errors" => [%{"reason" => "insufficientPermissions"}]
@@ -122,23 +126,23 @@ defmodule Manifold.Outbound.Provider.GmailTest do
   end
 
   test "classifies rate limits, definite client failures, and server failures" do
-    Req.Test.expect(Gmail, 3, fn conn ->
+    HTTPClient.Test.expect(Gmail, 3, fn conn ->
       case Process.get(:gmail_failure) do
         :rate_limited ->
           conn
           |> Plug.Conn.put_resp_header("retry-after", "75")
           |> Plug.Conn.put_status(429)
-          |> Req.Test.json(%{"error" => %{"message" => "private-rate-response"}})
+          |> HTTPClient.Test.json(%{"error" => %{"message" => "private-rate-response"}})
 
         :client_rejected ->
           conn
           |> Plug.Conn.put_status(422)
-          |> Req.Test.json(%{"error" => %{"message" => "private-client-response"}})
+          |> HTTPClient.Test.json(%{"error" => %{"message" => "private-client-response"}})
 
         :server ->
           conn
           |> Plug.Conn.put_status(503)
-          |> Req.Test.json(%{"error" => %{"message" => "private-server-response"}})
+          |> HTTPClient.Test.json(%{"error" => %{"message" => "private-server-response"}})
       end
     end)
 
@@ -173,10 +177,10 @@ defmodule Manifold.Outbound.Provider.GmailTest do
     Process.delete(:gmail_failure)
   end
 
-  test "protects request semantics from Req options and deprecated redirect aliases" do
+  test "protects request semantics from injected options and deprecated redirect aliases" do
     test_pid = self()
 
-    Req.Test.stub(Gmail, fn conn ->
+    HTTPClient.Test.stub(Gmail, fn conn ->
       case conn.host do
         "gmail.googleapis.test" ->
           {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -190,7 +194,7 @@ defmodule Manifold.Outbound.Provider.GmailTest do
           conn
           |> Plug.Conn.put_resp_header("location", "https://redirect-attacker.test/capture")
           |> Plug.Conn.put_status(302)
-          |> Req.Test.json(%{"error" => %{"message" => "do not follow"}})
+          |> HTTPClient.Test.json(%{"error" => %{"message" => "do not follow"}})
 
         "redirect-attacker.test" ->
           send(
@@ -198,13 +202,13 @@ defmodule Manifold.Outbound.Provider.GmailTest do
             {:redirect_request, Plug.Conn.get_req_header(conn, "authorization")}
           )
 
-          Req.Test.json(conn, %{"id" => "stolen", "threadId" => "stolen"})
+          HTTPClient.Test.json(conn, %{"id" => "stolen", "threadId" => "stolen"})
       end
     end)
 
     config =
       Keyword.put(@config, :req_options,
-        plug: {Req.Test, Gmail},
+        plug: {HTTPClient.Test, Gmail},
         url: "https://redirect-attacker.test/capture",
         base_url: "https://redirect-attacker.test",
         path: "/capture",
@@ -238,7 +242,7 @@ defmodule Manifold.Outbound.Provider.GmailTest do
   end
 
   test "scans every Gmail 403 reason and gives insufficient scope precedence" do
-    Req.Test.expect(Gmail, 3, fn conn ->
+    HTTPClient.Test.expect(Gmail, 3, fn conn ->
       {reasons, retry_after} =
         case Process.get(:gmail_403_failure) do
           :rate_not_first -> {~w(domainPolicy userRateLimitExceeded), "45"}
@@ -253,7 +257,7 @@ defmodule Manifold.Outbound.Provider.GmailTest do
 
       conn
       |> Plug.Conn.put_status(403)
-      |> Req.Test.json(%{
+      |> HTTPClient.Test.json(%{
         "error" => %{"errors" => Enum.map(reasons, &%{"reason" => &1})}
       })
     end)
@@ -290,7 +294,7 @@ defmodule Manifold.Outbound.Provider.GmailTest do
   end
 
   test "treats malformed successful responses as acceptance uncertainty" do
-    Req.Test.expect(Gmail, 5, fn conn ->
+    HTTPClient.Test.expect(Gmail, 5, fn conn ->
       body =
         case Process.get(:gmail_invalid_success) do
           :missing_id -> %{"threadId" => "thread-1"}
@@ -300,7 +304,7 @@ defmodule Manifold.Outbound.Provider.GmailTest do
           :invalid_thread -> %{"id" => "message-1", "threadId" => 123}
         end
 
-      Req.Test.json(conn, body)
+      HTTPClient.Test.json(conn, body)
     end)
 
     for failure <- [:missing_id, :empty_id, :invalid_id, :empty_thread, :invalid_thread] do
@@ -318,7 +322,7 @@ defmodule Manifold.Outbound.Provider.GmailTest do
   end
 
   test "uses only transport-error phase evidence and defaults other failures to uncertain" do
-    Req.Test.expect(Gmail, 4, fn conn ->
+    HTTPClient.Test.expect(Gmail, 4, fn conn ->
       reason =
         case Process.get(:gmail_transport_failure) do
           :pre -> {:manifold_transport_phase, :pre_transmission, :econnrefused}
@@ -371,10 +375,10 @@ defmodule Manifold.Outbound.Provider.GmailTest do
     response_secret = "private-response-sentinel"
     long_secret = String.duplicate(response_secret, 100)
 
-    Req.Test.expect(Gmail, fn conn ->
+    HTTPClient.Test.expect(Gmail, fn conn ->
       conn
       |> Plug.Conn.put_status(400)
-      |> Req.Test.json(%{
+      |> HTTPClient.Test.json(%{
         "error" => %{
           "message" => long_secret,
           "details" => [@access_token, @raw_message]
@@ -389,7 +393,14 @@ defmodule Manifold.Outbound.Provider.GmailTest do
     refute inspect(error) =~ @raw_message
   end
 
+  defp tagged_transport_error(conn, {:manifold_transport_phase, phase, reason}) do
+    put_in(conn.private[:http_client_test_exception], %HTTPClient.TransportError{
+      phase: phase,
+      reason: reason
+    })
+  end
+
   defp tagged_transport_error(conn, reason) do
-    put_in(conn.private[:req_test_exception], %Req.TransportError{reason: reason})
+    put_in(conn.private[:http_client_test_exception], %HTTPClient.TransportError{reason: reason})
   end
 end

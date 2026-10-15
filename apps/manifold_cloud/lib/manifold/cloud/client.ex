@@ -1,4 +1,6 @@
 defmodule Manifold.Cloud.Client do
+  alias Manifold.Core.HTTPClient
+
   @moduledoc """
   Signed HTTP client for the local-initiated cloud ingress protocol.
   """
@@ -15,13 +17,13 @@ defmodule Manifold.Cloud.Client do
     body = Jason.encode!(snapshot)
 
     case request(source, :put, @snapshot_path, body, opts) do
-      {:ok, %Req.Response{status: status}} when status in 200..299 ->
+      {:ok, %HTTPClient.Response{status: status}} when status in 200..299 ->
         :ok
 
-      {:ok, %Req.Response{status: status}} when status >= 500 ->
+      {:ok, %HTTPClient.Response{status: status}} when status >= 500 ->
         {:error, Error.new(:temporary, :edge_http_error, "edge returned HTTP #{status}")}
 
-      {:ok, %Req.Response{status: status}} ->
+      {:ok, %HTTPClient.Response{status: status}} ->
         {:error, Error.new(:permanent, :edge_protocol_error, "edge returned HTTP #{status}")}
 
       {:error, _reason} ->
@@ -32,7 +34,7 @@ defmodule Manifold.Cloud.Client do
   @spec list_deliveries(keyword(), keyword()) :: {:ok, [map()]} | {:error, Error.t()}
   def list_deliveries(source, opts \\ []) do
     case request(source, :get, @deliveries_path, "", opts) do
-      {:ok, %Req.Response{status: 200, body: %{"deliveries" => deliveries}}}
+      {:ok, %HTTPClient.Response{status: 200, body: %{"deliveries" => deliveries}}}
       when is_list(deliveries) ->
         {:ok, deliveries}
 
@@ -45,13 +47,13 @@ defmodule Manifold.Cloud.Client do
           {:ok, binary()} | {:error, Error.t()}
   def fetch_raw(source, edge_delivery_id, opts \\ []) do
     with :ok <- validate_edge_delivery_id(edge_delivery_id),
-         {:ok, %Req.Response{status: 200, body: body}} when is_binary(body) <-
+         {:ok, %HTTPClient.Response{status: 200, body: body}} when is_binary(body) <-
            request(
              source,
              :get,
              "#{@deliveries_path}/#{edge_delivery_id}/raw",
              "",
-             opts
+             Keyword.put(opts, :max_body_bytes, :infinity)
            ) do
       {:ok, body}
     else
@@ -64,7 +66,7 @@ defmodule Manifold.Cloud.Client do
           {:ok, Enumerable.t()} | {:error, Error.t()}
   def stream_raw(source, edge_delivery_id, opts \\ []) do
     with :ok <- validate_edge_delivery_id(edge_delivery_id),
-         {:ok, %Req.Response{status: 200, body: body}} <-
+         {:ok, %HTTPClient.Response{status: 200, body: body}} <-
            request(
              source,
              :get,
@@ -73,12 +75,19 @@ defmodule Manifold.Cloud.Client do
              Keyword.put(opts, :response_into, :self)
            ) do
       case body do
-        %Req.Response.Async{} = stream -> {:ok, stream}
         body when is_binary(body) -> {:ok, [body]}
+        stream -> {:ok, stream}
       end
     else
-      {:error, %Error{}} = failure -> failure
-      response -> classify_read_response(response)
+      {:error, %Error{}} = failure ->
+        failure
+
+      {:ok, %HTTPClient.Response{} = response} ->
+        HTTPClient.cancel(response)
+        classify_read_response({:ok, response})
+
+      response ->
+        classify_read_response(response)
     end
   end
 
@@ -95,7 +104,7 @@ defmodule Manifold.Cloud.Client do
       path = "#{@deliveries_path}/#{edge_delivery_id}/acknowledgements"
 
       case request(source, :post, path, body, opts) do
-        {:ok, %Req.Response{status: status}} when status in 200..299 ->
+        {:ok, %HTTPClient.Response{status: status}} when status in 200..299 ->
           :ok
 
         response ->
@@ -118,7 +127,7 @@ defmodule Manifold.Cloud.Client do
       path = "#{@deliveries_path}/#{edge_delivery_id}/failures"
 
       case request(source, :post, path, body, opts) do
-        {:ok, %Req.Response{status: status}} when status in 200..299 ->
+        {:ok, %HTTPClient.Response{status: status}} when status in 200..299 ->
           :ok
 
         response ->
@@ -178,21 +187,26 @@ defmodule Manifold.Cloud.Client do
 
     request_options =
       case Keyword.get(opts, :response_into) do
-        nil -> request_options
-        into -> Keyword.put(request_options, :into, into)
+        nil ->
+          request_options
+
+        into ->
+          Keyword.put(request_options, :stream_response, into == :self)
+          |> Keyword.put(:max_body_bytes, :infinity)
       end
 
     request_options
+    |> Keyword.merge(Keyword.take(opts, [:max_body_bytes]))
     |> Keyword.merge(Keyword.get(source, :req_options, []))
     |> Keyword.put(:redirect, false)
-    |> Req.request()
+    |> HTTPClient.request()
   end
 
-  defp classify_read_response({:ok, %Req.Response{status: status}}) when status >= 500 do
+  defp classify_read_response({:ok, %HTTPClient.Response{status: status}}) when status >= 500 do
     {:error, Error.new(:temporary, :edge_http_error, "edge returned HTTP #{status}")}
   end
 
-  defp classify_read_response({:ok, %Req.Response{status: status}}) do
+  defp classify_read_response({:ok, %HTTPClient.Response{status: status}}) do
     {:error, Error.new(:permanent, :edge_protocol_error, "edge returned HTTP #{status}")}
   end
 

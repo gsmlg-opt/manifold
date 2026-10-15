@@ -10,6 +10,9 @@
   records. It does not rerun tests, verify remote publication, or inspect current
   provider accounts, background jobs or mailbox backfill completion.
 
+HTTP-client migration checkpoint: **2026-10-15**, based on `1d150fc` in
+`codex/http-fetch-client`, accepted for the v0.6.4 release candidate; see [HTTP clients](HTTP_CLIENT.md) for its scope and evidence.
+
 Use [the documentation index](README.md) for current setup and architecture.
 Historical plan checkboxes and test totals are not a project-wide completion
 percentage. **Implemented** describes code; **verified** requires evidence for
@@ -19,6 +22,7 @@ the specific behavior, revision and environment being claimed.
 
 | Area | Current implementation | Evidence and limits |
 | --- | --- | --- |
+| Business HTTP clients | Shared native Fetch 0.21.10 for Gmail/Graph/OAuth, outbound Gmail/Graph/Resend, Cloud, DAV and EAS | [Migration and acceptance](HTTP_CLIENT.md): 910 affected tests passed; upstream #114/#115/#121 fixed and verified. Accepted for v0.6.4 integration into main; credentialed provider staging and runtime switching remain separate. |
 | Foundation and inbound (M0–1) | Umbrella, PostgreSQL/Oban, recipient resolution, durable spool, atomic acceptance, archival and recovery | [Original plan](IMPLEMENTATION_PLAN.md), [crash boundaries](CRASH_BOUNDARIES.md); current SMTP listener runs in the optional edge release |
 | Mailbox (M2) | MIME projection, safe HTML display, inbound attachments, threading, search, folders and read/star/archive/trash actions | [M2](MILESTONE_2_PLAN.md); Gmail/Graph read changes remain local |
 | Outbound (M3 and later extensions) | Plain-text drafts, reply/forward, frozen queue payloads, Gmail API/Graph/SMTP submission, legacy Resend webhooks and uncertain-submission handling | [Current send contract](DESIGN.md#225-account-selected-outbound-methods); HTML composition and outbound attachments are pending extensions |
@@ -53,7 +57,6 @@ separate from the completed original milestone checklists.
 | I1 | Before public inbound deployment | Integrate production authentication/scanning — Security, Ingest, Edge | Configure and verify real DNS-backed SPF/DKIM/DMARC and chosen malware/spam services, including unavailable-engine policy and quarantine. [M4](MILESTONE_4_PLAN.md) completed adapter contracts; [default adapters](../apps/manifold_security/lib/manifold/security/adapters.ex) do not evaluate messages. |
 | I2 | When object storage is needed | ESS/S3-compatible raw/blob adapters — Storage, Ingest | Implement the existing behavior contracts and verify object-store outage/recovery while the spool has capacity. Current adapters are local filesystem only. [Storage plan](DESIGN.md#133-storage-adapters). |
 | I3 | Before production rollout | Operational health and backup/restore acceptance — API, Data, Storage, Edge, operators | Verify dependency/queue/spool health and a restore of database, raw mail, blobs, encryption key/configuration and unarchived spool. [Design health requirements](DESIGN.md#193-operational-health), [backup requirements](DESIGN.md#204-backup-and-recovery); the [API health response](../apps/manifold_api/lib/manifold_api/json.ex) currently returns a static service status. A complete deployment acceptance record is still needed. |
-| D1 | After dependency verification and design approval | Default HTTP client migration — Core, Connectors, Outbound, Cloud | The local lock still selects Fetch 0.17.1. The [audit](../.agents/skills/develop/references/http-client-migration.md) records upstream #31 as closed, but consumer upgrade, independent secret-safe verification and migration design remain pending. Preserve raw bytes, redirects, timeouts, streaming and uncertain submission contracts; do not treat an issue closure as consumer acceptance. |
 | D2 | After upstream fix is available | Icon-button accessibility dependency — Web | Verify an updated dependency forwards accessible names, then review the temporary slotted text with keyboard/screen-reader checks. [Upstream duskmoon-elements#86 and current compensation](../.agents/skills/develop/references/contacts-calendar-workspace.md#upstream-accessibility-follow-up). The compensation permits current use. |
 
 For multiple Graph-calling VMs, shared admission enforcement needs a separate

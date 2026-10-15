@@ -1,13 +1,15 @@
 defmodule Manifold.Outbound.Provider.ResendTest do
   use ExUnit.Case, async: true
 
+  alias Manifold.Core.HTTPClient
+
   alias Manifold.Outbound.Provider
   alias Manifold.Outbound.Provider.Resend
 
   @config [
     api_key: "re_test_secret",
     base_url: "https://api.resend.test",
-    req_options: [plug: {Req.Test, Resend}]
+    req_options: [plug: {HTTPClient.Test, Resend}]
   ]
 
   @envelope %Provider.Envelope{
@@ -23,7 +25,7 @@ defmodule Manifold.Outbound.Provider.ResendTest do
   }
 
   test "submits the exact payload with provider idempotency and threading headers" do
-    Req.Test.expect(Resend, fn conn ->
+    HTTPClient.Test.expect(Resend, fn conn ->
       assert conn.method == "POST"
       assert conn.request_path == "/emails"
       assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer re_test_secret"]
@@ -47,7 +49,7 @@ defmodule Manifold.Outbound.Provider.ResendTest do
                }
              }
 
-      Req.Test.json(conn, %{"id" => "resend-message-1"})
+      HTTPClient.Test.json(conn, %{"id" => "resend-message-1"})
     end)
 
     request = %Provider.Request{
@@ -67,11 +69,16 @@ defmodule Manifold.Outbound.Provider.ResendTest do
   end
 
   test "classifies retryable provider and transport failures" do
-    Req.Test.expect(Resend, 3, fn conn ->
+    HTTPClient.Test.expect(Resend, 3, fn conn ->
       case Process.get(:resend_failure) do
-        :server -> conn |> Plug.Conn.put_status(503) |> Req.Test.json(%{"message" => "later"})
-        :rate -> conn |> Plug.Conn.put_status(429) |> Req.Test.json(%{"message" => "slow down"})
-        :network -> Req.Test.transport_error(conn, :timeout)
+        :server ->
+          conn |> Plug.Conn.put_status(503) |> HTTPClient.Test.json(%{"message" => "later"})
+
+        :rate ->
+          conn |> Plug.Conn.put_status(429) |> HTTPClient.Test.json(%{"message" => "slow down"})
+
+        :network ->
+          HTTPClient.Test.transport_error(conn, :timeout)
       end
     end)
 
@@ -90,11 +97,11 @@ defmodule Manifold.Outbound.Provider.ResendTest do
   end
 
   test "parses Retry-After seconds from rate-limit responses" do
-    Req.Test.expect(Resend, fn conn ->
+    HTTPClient.Test.expect(Resend, fn conn ->
       conn
       |> Plug.Conn.put_resp_header("retry-after", "90")
       |> Plug.Conn.put_status(429)
-      |> Req.Test.json(%{"message" => "slow down"})
+      |> HTTPClient.Test.json(%{"message" => "slow down"})
     end)
 
     assert {:error,
@@ -109,11 +116,11 @@ defmodule Manifold.Outbound.Provider.ResendTest do
     retry_at = DateTime.add(DateTime.utc_now(), 120, :second)
     retry_after = Calendar.strftime(retry_at, "%a, %d %b %Y %H:%M:%S GMT")
 
-    Req.Test.expect(Resend, fn conn ->
+    HTTPClient.Test.expect(Resend, fn conn ->
       conn
       |> Plug.Conn.put_resp_header("retry-after", retry_after)
       |> Plug.Conn.put_status(429)
-      |> Req.Test.json(%{"message" => "slow down"})
+      |> HTTPClient.Test.json(%{"message" => "slow down"})
     end)
 
     assert {:error, %Provider.Error{class: :transient, retry_after: seconds}} =
@@ -123,7 +130,7 @@ defmodule Manifold.Outbound.Provider.ResendTest do
   end
 
   test "distinguishes concurrent idempotency from a divergent payload" do
-    Req.Test.expect(Resend, 2, fn conn ->
+    HTTPClient.Test.expect(Resend, 2, fn conn ->
       {error_type, message} =
         case Process.get(:resend_conflict) do
           :concurrent -> {"concurrent_idempotent_requests", "in progress"}
@@ -132,7 +139,7 @@ defmodule Manifold.Outbound.Provider.ResendTest do
 
       conn
       |> Plug.Conn.put_status(409)
-      |> Req.Test.json(%{"name" => error_type, "message" => message})
+      |> HTTPClient.Test.json(%{"name" => error_type, "message" => message})
     end)
 
     Process.put(:resend_conflict, :concurrent)
@@ -149,10 +156,10 @@ defmodule Manifold.Outbound.Provider.ResendTest do
   end
 
   test "classifies other client errors as permanent without exposing the API key" do
-    Req.Test.expect(Resend, fn conn ->
+    HTTPClient.Test.expect(Resend, fn conn ->
       conn
       |> Plug.Conn.put_status(422)
-      |> Req.Test.json(%{"name" => "validation_error", "message" => "bad sender"})
+      |> HTTPClient.Test.json(%{"name" => "validation_error", "message" => "bad sender"})
     end)
 
     assert {:error, error} = Resend.submit(@config, @envelope)

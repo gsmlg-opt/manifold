@@ -9,6 +9,8 @@ defmodule Manifold.Outbound.Provider.Gmail do
 
   @behaviour Manifold.Outbound.Provider
 
+  alias Manifold.Core.HTTPClient
+
   alias Manifold.Outbound.Provider.{Error, Request, Submission}
 
   @default_base_url "https://gmail.googleapis.com"
@@ -50,11 +52,11 @@ defmodule Manifold.Outbound.Provider.Gmail do
       |> Keyword.put(:retry, false)
       |> Keyword.put(:redirect, false)
 
-    case Req.post(request_options) do
-      {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
+    case HTTPClient.post(request_options) do
+      {:ok, %HTTPClient.Response{status: status, body: body}} when status in 200..299 ->
         accepted(body)
 
-      {:ok, %Req.Response{} = response} ->
+      {:ok, %HTTPClient.Response{} = response} ->
         {:error, classify_response(response)}
 
       {:error, reason} ->
@@ -96,7 +98,7 @@ defmodule Manifold.Outbound.Provider.Gmail do
      )}
   end
 
-  defp classify_response(%Req.Response{status: status, body: body} = response) do
+  defp classify_response(%HTTPClient.Response{status: status, body: body} = response) do
     cond do
       status == 401 or invalid_grant?(body) ->
         error(
@@ -151,8 +153,8 @@ defmodule Manifold.Outbound.Provider.Gmail do
     end
   end
 
-  defp classify_transport_failure(%Req.TransportError{
-         reason: {:manifold_transport_phase, :pre_transmission, _reason}
+  defp classify_transport_failure(%HTTPClient.TransportError{
+         phase: :pre_transmission
        }) do
     error(
       :transient,
@@ -192,7 +194,7 @@ defmodule Manifold.Outbound.Provider.Gmail do
   defp provider_reasons(_body), do: []
 
   defp retry_after(response) do
-    case Req.Response.get_header(response, "retry-after") do
+    case HTTPClient.Response.get_header(response, "retry-after") do
       [value] -> parse_retry_after(value)
       _missing_or_ambiguous -> nil
     end
@@ -204,7 +206,7 @@ defmodule Manifold.Outbound.Provider.Gmail do
         seconds
 
       _not_seconds ->
-        with {:ok, retry_at} <- Req.Utils.parse_http_date(value),
+        with {:ok, retry_at} <- HTTPClient.parse_http_date(value),
              seconds when seconds >= 0 <- DateTime.diff(retry_at, DateTime.utc_now(), :second) do
           seconds
         else

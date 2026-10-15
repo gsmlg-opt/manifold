@@ -1,4 +1,5 @@
 defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
+  alias Manifold.Core.HTTPClient
   use ManifoldWeb.ConnCase, async: false
   import Phoenix.LiveViewTest
   import Ecto.Query
@@ -13,7 +14,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
     microsoft =
       previous
       |> Keyword.fetch!(:microsoft)
-      |> Keyword.put(:req_options, plug: {Req.Test, __MODULE__})
+      |> Keyword.put(:req_options, plug: {HTTPClient.Test, __MODULE__})
 
     Application.put_env(
       :manifold_connectors,
@@ -42,7 +43,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
     owner = stub_graph()
 
     {:ok, view, _} = live(conn, "/settings/accounts/#{account.id}/microsoft/device?purpose=send")
-    Req.Test.allow(__MODULE__, owner, view.pid)
+    HTTPClient.Test.allow(__MODULE__, owner, view.pid)
     view |> element("#start-microsoft-device") |> render_click()
     html = render_async(view)
     assert_receive :device_requested
@@ -79,8 +80,8 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
     conn: conn,
     account: account
   } do
-    Req.Test.stub(__MODULE__, fn request ->
-      Req.Test.json(request, %{
+    HTTPClient.Test.stub(__MODULE__, fn request ->
+      HTTPClient.Test.json(request, %{
         device_code: "private-cancel-code",
         user_code: "CANCEL-CODE",
         verification_uri: "https://login.microsoft.com/device",
@@ -90,7 +91,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
     end)
 
     {:ok, view, _} = live(conn, "/settings/accounts/#{account.id}/microsoft/device")
-    Req.Test.allow(__MODULE__, self(), view.pid)
+    HTTPClient.Test.allow(__MODULE__, self(), view.pid)
     view |> element("#start-microsoft-device") |> render_click()
     render_async(view)
     assert has_element?(view, "#microsoft-device-user-code")
@@ -108,7 +109,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
   } do
     owner = stub_graph()
     {:ok, view, _} = live(conn, "/settings/accounts/#{account.id}/microsoft/device?purpose=send")
-    Req.Test.allow(__MODULE__, owner, view.pid)
+    HTTPClient.Test.allow(__MODULE__, owner, view.pid)
     view |> element("#start-microsoft-device") |> render_click()
     render_async(view)
     [transaction] = Repo.all(OAuthDeviceTransaction)
@@ -151,7 +152,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
   defp stub_graph do
     owner = self()
 
-    Req.Test.stub(__MODULE__, fn request ->
+    HTTPClient.Test.stub(__MODULE__, fn request ->
       {:ok, bytes, request} = Plug.Conn.read_body(request)
       form = URI.decode_query(bytes)
       refute Map.has_key?(form, "client_secret")
@@ -161,7 +162,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
         "/devicecode" ->
           send(owner, :device_requested)
 
-          Req.Test.json(request, %{
+          HTTPClient.Test.json(request, %{
             device_code: "private-device-sentinel",
             user_code: "ABCD-EFGH",
             verification_uri: "https://login.microsoft.com/device",
@@ -173,7 +174,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
           assert form["device_code"] == "private-device-sentinel"
           assert form["grant_type"] == "urn:ietf:params:oauth:grant-type:device_code"
 
-          Req.Test.json(request, %{
+          HTTPClient.Test.json(request, %{
             access_token: "private-access-sentinel",
             refresh_token: "private-refresh-sentinel",
             expires_in: 3600,
@@ -181,7 +182,7 @@ defmodule ManifoldWeb.MicrosoftDeviceLiveTest do
           })
 
         "/v1.0/me" ->
-          Req.Test.json(request, %{id: "device-subject", mail: "device@outlook.com"})
+          HTTPClient.Test.json(request, %{id: "device-subject", mail: "device@outlook.com"})
       end
     end)
 

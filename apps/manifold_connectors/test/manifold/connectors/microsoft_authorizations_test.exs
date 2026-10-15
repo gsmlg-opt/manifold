@@ -1,4 +1,5 @@
 defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
+  alias Manifold.Core.HTTPClient
   use Manifold.DataCase, async: false
 
   import Ecto.Query
@@ -170,7 +171,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
         userinfo_url: "https://graph.microsoft.test/oidc/userinfo",
         base_url: "https://graph.microsoft.test/v1.0",
         req_options: [
-          plug: {Req.Test, __MODULE__},
+          plug: {HTTPClient.Test, __MODULE__},
           headers: [{"authorization", "unsafe-request-secret"}]
         ]
       ]
@@ -772,13 +773,13 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
         MicrosoftScopes.read()
       ])
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       form = Plug.Conn.Query.decode(body)
 
       assert form["scope"] == Enum.join(requested_scopes, " ")
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "access_token" => "snapshotted-union-access-token",
         "refresh_token" => "snapshotted-union-refresh-token",
         "expires_in" => 3_600
@@ -790,7 +791,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
       client_secret: "scope-union-secret",
       token_url: "https://login.microsoft.test/organizations/oauth2/v2.0/token",
       scopes: MicrosoftScopes.read(),
-      req_options: [plug: {Req.Test, __MODULE__}]
+      req_options: [plug: {HTTPClient.Test, __MODULE__}]
     ]
 
     assert {:ok, %Token{scopes: ^requested_scopes}} =
@@ -807,13 +808,13 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
   test "Microsoft token exchange preserves configured fallback scope order" do
     configured_scopes = "openid profile offline_access User.Read Mail.Read"
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       form = Plug.Conn.Query.decode(body)
 
       assert form["scope"] == configured_scopes
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "access_token" => "legacy-fallback-access-token",
         "refresh_token" => "legacy-fallback-refresh-token",
         "expires_in" => 3_600
@@ -825,7 +826,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
       client_secret: "legacy-fallback-secret",
       token_url: "https://login.microsoft.test/organizations/oauth2/v2.0/token",
       scopes: configured_scopes,
-      req_options: [plug: {Req.Test, __MODULE__}]
+      req_options: [plug: {HTTPClient.Test, __MODULE__}]
     ]
 
     assert {:ok, %Token{scopes: scopes}} =
@@ -1516,7 +1517,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
       tenant: "organizations",
       base_url: "https://graph.microsoft.test/v1.0",
       req_options: [
-        plug: {Req.Test, __MODULE__},
+        plug: {HTTPClient.Test, __MODULE__},
         headers: [{"authorization", "unsafe-authorized-add-secret"}]
       ]
     ]
@@ -2210,7 +2211,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
   defp assert_microsoft_operation_config(config) do
     assert config == [
              base_url: "https://graph.microsoft.test/v1.0",
-             req_options: [plug: {Req.Test, __MODULE__}]
+             req_options: [plug: {HTTPClient.Test, __MODULE__}]
            ]
 
     refute Enum.any?(

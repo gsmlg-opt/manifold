@@ -1,6 +1,8 @@
 defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
   use ExUnit.Case, async: false
 
+  alias Manifold.Core.HTTPClient
+
   import ExUnit.CaptureLog
 
   alias Manifold.Outbound.Provider
@@ -11,7 +13,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
   @config [
     access_token: @access_token,
     base_url: "https://graph.microsoft.test",
-    req_options: [plug: {Req.Test, MicrosoftGraph}]
+    req_options: [plug: {HTTPClient.Test, MicrosoftGraph}]
   ]
   @request %Provider.Request{
     provider: "microsoft",
@@ -37,7 +39,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
   ]
 
   setup context do
-    Req.Test.verify_on_exit!(context)
+    HTTPClient.Test.verify_on_exit!(context)
     :ok
   end
 
@@ -63,7 +65,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
 
     test_pid = self()
 
-    Req.Test.stub(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.stub(MicrosoftGraph, fn conn ->
       send(test_pid, :post_dispatched)
       Plug.Conn.send_resp(conn, 202, "")
     end)
@@ -85,7 +87,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     context =
       Manifold.Connectors.MicrosoftSyncLimiter.context({:microsoft, "mailbox"}, server: limiter)
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       conn
       |> Plug.Conn.put_resp_header("retry-after", "75")
       |> Plug.Conn.send_resp(429, "")
@@ -108,19 +110,19 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
       Manifold.Connectors.MicrosoftSyncLimiter.context({:microsoft, "mailbox"}, server: limiter)
 
     config = Keyword.put(@config, :microsoft_sync, context)
-    Req.Test.expect(MicrosoftGraph, fn conn -> Plug.Conn.send_resp(conn, 503, "") end)
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn -> Plug.Conn.send_resp(conn, 503, "") end)
 
     assert {:error, %Provider.Error{class: :uncertain, code: "acceptance_unknown"}} =
              MicrosoftGraph.submit(config, @request)
 
-    Req.Test.expect(MicrosoftGraph, fn conn -> tagged_transport_error(conn, :timeout) end)
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn -> tagged_transport_error(conn, :timeout) end)
 
     assert {:error, %Provider.Error{class: :uncertain, code: "acceptance_unknown"}} =
              MicrosoftGraph.submit(config, @request)
   end
 
   test "posts the exact base64 MIME message and accepts only a 202 response" do
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       assert conn.method == "POST"
       assert conn.request_path == "/me/sendMail"
       assert conn.query_string == ""
@@ -165,7 +167,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
           "json" -> JSON.encode!(%{"unexpected" => secret})
         end
 
-      Req.Test.expect(MicrosoftGraph, fn conn ->
+      HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
         conn
         |> Plug.Conn.put_resp_content_type(content_type)
         |> Plug.Conn.send_resp(202, body)
@@ -185,7 +187,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     response_secret = "diagnostic-response-private-sentinel"
     valid_128 = String.duplicate("a", 128)
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       conn
       |> Plug.Conn.put_resp_header("request-id", valid_128)
       |> Plug.Conn.put_resp_header("client-request-id", "graph.client:1_safe")
@@ -205,7 +207,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     refute inspect(submission) =~ response_secret
     refute inspect(submission) =~ @request.envelope.idempotency_key
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       conn
       |> Plug.Conn.prepend_resp_headers([
         {"request-id", "ambiguous-request-1"},
@@ -221,7 +223,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
               metadata: %{"client_request_id" => "valid-client-id"}
             }} = secure_submit(@config, response_secret)
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       conn
       |> Plug.Conn.put_resp_header("request-id", String.duplicate("b", 129))
       |> Plug.Conn.put_resp_header("client-request-id", "unsafe client id")
@@ -248,7 +250,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     retry_at = DateTime.utc_now() |> DateTime.add(120, :second) |> DateTime.truncate(:second)
 
     expect_graph_error(429, "TooManyRequests", date_secret,
-      retry_after: Req.Utils.format_http_date(retry_at)
+      retry_after: HTTPClient.format_http_date(retry_at)
     )
 
     assert {:error,
@@ -272,7 +274,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     ]
 
     for {reason, expected_class, expected_code, expected_message} <- cases do
-      Req.Test.expect(MicrosoftGraph, fn conn -> tagged_transport_error(conn, reason) end)
+      HTTPClient.Test.expect(MicrosoftGraph, fn conn -> tagged_transport_error(conn, reason) end)
 
       assert {:error,
               %Provider.Error{
@@ -282,8 +284,11 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
               }} = secure_submit(@config, "transport-response-private-sentinel")
     end
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
-      put_in(conn.private[:req_test_exception], RuntimeError.exception("unknown-private-failure"))
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
+      put_in(
+        conn.private[:http_client_test_exception],
+        RuntimeError.exception("unknown-private-failure")
+      )
     end)
 
     assert {:error,
@@ -387,9 +392,9 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     end
   end
 
-  test "Req.Test ignores code-shaped text outside a structural Graph error response" do
+  test "HTTPClient.Test ignores code-shaped text outside a structural Graph error response" do
     for {content_type, body, secret} <- non_structural_graph_code_bodies("req") do
-      Req.Test.expect(MicrosoftGraph, fn conn ->
+      HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
         conn
         |> Plug.Conn.put_resp_content_type(content_type)
         |> Plug.Conn.send_resp(403, body)
@@ -404,12 +409,12 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     end
   end
 
-  test "Req.Test bounds oversized Graph error classification to the retained prefix" do
+  test "HTTPClient.Test bounds oversized Graph error classification to the retained prefix" do
     for {status, graph_code, placement, expected_code} <- oversized_graph_cases() do
       secret = "req-#{placement}-#{graph_code}-private-sentinel"
       body = oversized_graph_error_body(graph_code, placement, secret)
 
-      Req.Test.expect(MicrosoftGraph, fn conn ->
+      HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
         |> Plug.Conn.send_resp(status, body)
@@ -465,11 +470,11 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
              secure_submit(blank_config, secret)
   end
 
-  test "ignores hostile Req semantics and never follows a bearer-authenticated redirect" do
+  test "ignores hostile request options and never follows a bearer-authenticated redirect" do
     test_pid = self()
     response_secret = "redirect-response-private-sentinel"
 
-    Req.Test.stub(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.stub(MicrosoftGraph, fn conn ->
       case conn.host do
         "graph.microsoft.test" ->
           {:ok, body, conn} = Plug.Conn.read_body(conn)
@@ -484,7 +489,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
           conn
           |> Plug.Conn.put_resp_header("location", "https://redirect-attacker.test/capture")
           |> Plug.Conn.put_status(302)
-          |> Req.Test.json(%{"error" => %{"message" => response_secret}})
+          |> HTTPClient.Test.json(%{"error" => %{"message" => response_secret}})
 
         "redirect-attacker.test" ->
           send(
@@ -498,7 +503,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
 
     config =
       Keyword.put(@config, :req_options,
-        plug: {Req.Test, MicrosoftGraph},
+        plug: {HTTPClient.Test, MicrosoftGraph},
         receive_timeout: 2_000,
         connect_options: [timeout: 500, hostname: "redirect-attacker.test"],
         url: "https://redirect-attacker.test/capture",
@@ -561,8 +566,8 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     end
   end
 
-  test "permits a non-production HTTPS authority only through the owned Req.Test plug" do
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+  test "permits a non-production HTTPS authority only through the owned HTTPClient.Test plug" do
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       assert conn.host == "graph.microsoft.test"
       assert conn.request_path == "/v1.0/me/sendMail"
       Plug.Conn.send_resp(conn, 202, "")
@@ -618,7 +623,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
             }} = secure_submit(config, "config-private-sentinel")
   end
 
-  test "production transport does not emit bearer or MIME bytes in Finch telemetry" do
+  test "production transport does not emit bearer or MIME bytes in HTTP telemetry" do
     handler_id = {__MODULE__, self(), make_ref()}
     test_pid = self()
 
@@ -628,18 +633,38 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
         [
           [:finch, :request, :start],
           [:finch, :request, :stop],
-          [:finch, :request, :exception]
+          [:finch, :request, :exception],
+          [:http_fetch, :request, :start],
+          [:http_fetch, :request, :stop],
+          [:http_fetch, :request, :exception]
         ],
         fn event, measurements, metadata, pid ->
-          send(pid, {:finch_transport_telemetry, event, measurements, metadata})
+          send(pid, {:http_transport_telemetry, event, measurements, metadata})
         end,
         test_pid
       )
 
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+
+    {:ok, {_address, port}} = :inet.sockname(listener)
+    :ok = :gen_tcp.close(listener)
+    base_url = "https://127.0.0.1:#{port}/v1.0"
+    previous_providers = Application.fetch_env!(:manifold_connectors, :providers)
+    microsoft = Keyword.put(previous_providers[:microsoft], :base_url, base_url)
+
+    Application.put_env(
+      :manifold_connectors,
+      :providers,
+      Keyword.put(previous_providers, :microsoft, microsoft)
+    )
+
+    on_exit(fn -> Application.put_env(:manifold_connectors, :providers, previous_providers) end)
+
     config = [
       access_token: @access_token,
-      base_url: "https://graph.microsoft.invalid/v1.0",
-      req_options: [receive_timeout: 100, connect_options: [timeout: 100]]
+      base_url: base_url,
+      req_options: [receive_timeout: 2_000, connect_options: [timeout: 2_000]]
     ]
 
     log =
@@ -652,7 +677,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
         :telemetry.detach(handler_id)
       end
 
-    telemetry = drain_finch_telemetry([])
+    telemetry = drain_transport_telemetry([])
 
     assert telemetry == []
 
@@ -797,7 +822,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
   end
 
   defp expect_graph_body(status, body, opts \\ []) do
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       conn =
         case Keyword.get(opts, :retry_after) do
           nil -> conn
@@ -806,7 +831,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
 
       conn
       |> Plug.Conn.put_status(status)
-      |> Req.Test.json(body)
+      |> HTTPClient.Test.json(body)
     end)
   end
 
@@ -858,10 +883,10 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
     end
   end
 
-  defp drain_finch_telemetry(entries) do
+  defp drain_transport_telemetry(entries) do
     receive do
-      {:finch_transport_telemetry, event, measurements, metadata} ->
-        drain_finch_telemetry([{event, measurements, metadata} | entries])
+      {:http_transport_telemetry, event, measurements, metadata} ->
+        drain_transport_telemetry([{event, measurements, metadata} | entries])
     after
       0 -> Enum.reverse(entries)
     end
@@ -1091,7 +1116,14 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraphTest do
   defp status_reason(429), do: "Too Many Requests"
   defp status_reason(503), do: "Service Unavailable"
 
+  defp tagged_transport_error(conn, {:manifold_transport_phase, phase, reason}) do
+    put_in(conn.private[:http_client_test_exception], %HTTPClient.TransportError{
+      phase: phase,
+      reason: reason
+    })
+  end
+
   defp tagged_transport_error(conn, reason) do
-    put_in(conn.private[:req_test_exception], %Req.TransportError{reason: reason})
+    put_in(conn.private[:http_client_test_exception], %HTTPClient.TransportError{reason: reason})
   end
 end

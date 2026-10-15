@@ -31,7 +31,6 @@ defmodule Manifold.Cloud.MixProject do
       {:manifold_accounts, in_umbrella: true},
       {:manifold_storage, in_umbrella: true},
       {:manifold_ingest, in_umbrella: true},
-      {:req, "~> 0.5"},
       {:plug, "~> 1.18", only: :test},
       {:oban, "~> 2.20"}
     ]

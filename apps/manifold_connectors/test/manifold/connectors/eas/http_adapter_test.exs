@@ -5,6 +5,8 @@ defmodule Manifold.Connectors.EAS.HTTPAdapterTest do
 
   alias Manifold.Connectors.EAS.{Client, HTTPAdapter, WBXML}
   alias Manifold.Connectors.TLS
+  alias Manifold.Core.HTTPClient.{Response, TransportError}
+  alias Manifold.Core.HTTPClient.Test, as: HTTPTest
   alias Manifold.TestSupport.TLSPeer
   alias SSL.ClientHello.WireProfile
   alias SSL.Protocol.{ClientOffer, HandshakeFramer, RecordFramer}
@@ -73,7 +75,7 @@ defmodule Manifold.Connectors.EAS.HTTPAdapterTest do
         :ok = :ssl.close(socket)
       end)
 
-    assert {:ok, %Req.Response{status: 200, body: ^body}} = request(peer.port)
+    assert {:ok, %Response{status: 200, body: ^body}} = request(peer.port)
     assert :ok = TLSPeer.stop(peer)
   end
 
@@ -97,8 +99,8 @@ defmodule Manifold.Connectors.EAS.HTTPAdapterTest do
         :ok = :ssl.close(socket)
       end)
 
-    assert {:ok, %Req.Response{body: "hello world", trailers: trailers}} = request(peer.port)
-    assert {"x-result", "complete"} in Req.Fields.get_list(trailers)
+    assert {:ok, %Response{body: "hello world", trailers: trailers}} = request(peer.port)
+    assert trailers["x-result"] == ["complete"]
     assert :ok = TLSPeer.stop(peer)
   end
 
@@ -110,11 +112,11 @@ defmodule Manifold.Connectors.EAS.HTTPAdapterTest do
         :ok = :ssl.close(socket)
       end)
 
-    assert {:ok, %Req.Response{body: "complete"}} = request(peer.port)
+    assert {:ok, %Response{body: "complete"}} = request(peer.port)
     assert :ok = TLSPeer.stop(peer)
   end
 
-  test "compressed responses are rejected before Req response processing" do
+  test "compressed responses are rejected before body processing" do
     {:ok, peer} =
       TLSPeer.start(fn socket ->
         {:ok, _request} = recv_request(socket)
@@ -128,7 +130,7 @@ defmodule Manifold.Connectors.EAS.HTTPAdapterTest do
         :ok = :ssl.close(socket)
       end)
 
-    assert {:error, %Req.HTTPError{reason: :unsupported_content_encoding}} = request(peer.port)
+    assert {:error, %TransportError{reason: :unsupported_content_encoding}} = request(peer.port)
     assert :ok = TLSPeer.stop(peer)
   end
 
@@ -142,12 +144,12 @@ defmodule Manifold.Connectors.EAS.HTTPAdapterTest do
     untrusted_options =
       replace_option(TLSPeer.client_options(), :cacerts, :public_key.cacerts_get())
 
-    assert {:error, %Req.TransportError{}} = request(untrusted_peer.port, untrusted_options)
+    assert {:error, %TransportError{}} = request(untrusted_peer.port, untrusted_options)
     assert {:handshake_error, _reason} = TLSPeer.stop(untrusted_peer)
 
     {:ok, observer} = TLSPeer.observe_client_hello(self())
 
-    assert {:error, %Req.TransportError{}} = request(observer.port)
+    assert {:error, %TransportError{}} = request(observer.port)
     assert_receive {:client_hello_observed, _bytes}
     assert :ok = Task.await(observer.task, 6_000)
   end
@@ -170,53 +172,87 @@ defmodule Manifold.Connectors.EAS.HTTPAdapterTest do
     Task.shutdown(proxy.task, :brutal_kill)
     :gen_tcp.close(proxy.listener)
 
-    assert {:error, %Req.TransportError{reason: :econnreset}} = Task.await(response, 5_000)
+    assert {:error, %TransportError{reason: :econnreset}} = Task.await(response, 5_000)
     assert :ok = TLSPeer.stop(peer)
   end
 
-  test "one receive deadline is retained across response fragments" do
+  test "one receive deadline expires while a partial response remains open" do
+    observer = self()
+
     {:ok, peer} =
       TLSPeer.start(fn socket ->
         {:ok, _request} = recv_request(socket)
-        _ = :ssl.send(socket, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\na")
-        Process.sleep(80)
-        _ = :ssl.send(socket, "bcd")
-        :ssl.close(socket)
+        :ok = :ssl.send(socket, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\na")
+        send(observer, :partial_response_started)
+        assert {:error, _reason} = :ssl.recv(socket, 0, 5_000)
+        send(observer, :partial_response_peer_closed)
+        :ok
       end)
 
-    assert {:error, %Req.TransportError{reason: :timeout}} = request(peer.port, nil, 30)
+    response = Task.async(fn -> request(peer.port, nil, 1_000) end)
+    assert_receive :partial_response_started, 5_000
+
+    assert {:error, %TransportError{reason: :timeout, phase: :unknown}} =
+             Task.await(response, 5_000)
+
+    assert_receive :partial_response_peer_closed, 5_000
     assert :ok = TLSPeer.stop(peer)
+  end
+
+  for backend <- [:otp, :ex_ssl], version <- ["0.9", "2.0"] do
+    test "#{backend} HTTP/1 transport rejects an HTTP/#{version} textual response status line" do
+      backend = unquote(backend)
+      version = unquote(version)
+      existing_connections = connection_pids()
+
+      {:ok, peer} =
+        TLSPeer.start(fn socket ->
+          {:ok, _request} = recv_request(socket)
+          :ok = :ssl.send(socket, "HTTP/#{version} 200 OK\r\nContent-Length: 0\r\n\r\n")
+          :ok = :ssl.close(socket)
+        end)
+
+      config = %{tls_config(TLSPeer.client_options()) | backend: backend}
+
+      try do
+        assert {:error, %TransportError{reason: :invalid_status_line}} =
+                 HTTPAdapter.request(adapter_request(peer.port), config)
+      after
+        assert :ok = TLSPeer.stop(peer)
+        assert_no_new_connections(existing_connections)
+      end
+    end
   end
 
   test "malformed or oversized response framing fails and releases each connection" do
     cases = [
       {"conflicting transfer framing",
        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n0\r\n\r\n",
-       %Req.HTTPError{reason: :conflicting_response_framing}},
+       %TransportError{reason: :conflicting_response_framing}},
       {"invalid chunk terminator",
        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\naX0\r\n\r\n",
-       %Req.HTTPError{reason: :invalid_chunk_terminator}},
+       %TransportError{reason: :invalid_chunk}},
       {"chunk size with leading whitespace",
        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n 1\r\na\r\n0\r\n\r\n",
-       %Req.HTTPError{reason: :invalid_chunk_size}},
+       %TransportError{reason: :invalid_chunk_size}},
       {"chunk size with trailing whitespace",
        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1 \r\na\r\n0\r\n\r\n",
-       %Req.HTTPError{reason: :invalid_chunk_size}},
+       %TransportError{reason: :invalid_chunk_size}},
       {"chunk size with NUL",
        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\0\r\na\r\n0\r\n\r\n",
-       %Req.HTTPError{reason: :invalid_chunk_size}},
+       %TransportError{reason: :invalid_chunk_size}},
       {"malformed chunk extension",
        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;name=\"unterminated\r\na\r\n0\r\n\r\n",
-       %Req.HTTPError{reason: :invalid_chunk_size}},
+       %TransportError{reason: :invalid_chunk_size}},
       {"out-of-range response status", "HTTP/1.1 600 Invalid\r\nContent-Length: 0\r\n\r\n",
-       %Req.HTTPError{reason: :invalid_status_line}},
+       %TransportError{reason: :invalid_status_line}},
       {"truncated declared body", "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc",
-       %Req.TransportError{reason: :closed}},
+       %TransportError{reason: :closed}},
       {"oversized content length", "HTTP/1.1 200 OK\r\nContent-Length: 67108865\r\n\r\n",
-       %Req.HTTPError{reason: :invalid_content_length}},
+       %TransportError{reason: :response_limit}},
       {"oversized header",
        ["HTTP/1.1 200 OK\r\nX-Large: ", :binary.copy("x", 65_536), "\r\n\r\n"],
-       %Req.HTTPError{reason: :headers_too_large}}
+       %TransportError{reason: :headers_too_large}}
     ]
 
     Enum.each(cases, fn {name, response, expected_error} ->
@@ -310,13 +346,33 @@ defmodule Manifold.Connectors.EAS.HTTPAdapterTest do
     config = tls_config(TLSPeer.client_options())
 
     assert {:error, :unsupported_ex_ssl_http_options} =
-             HTTPAdapter.validate_options([plug: {Req.Test, __MODULE__}], config)
+             HTTPAdapter.validate_options([plug: {HTTPTest, __MODULE__}], config)
 
     assert {:error, :unsupported_ex_ssl_http_options} =
              HTTPAdapter.validate_options([decode_body: true], config)
   end
 
-  test "malformed bodies and adapter options return Req errors before network activity" do
+  test "native timeout policy admits finite zero and rejects infinity before connect" do
+    config = tls_config(TLSPeer.client_options())
+
+    assert :ok =
+             HTTPAdapter.validate_options(
+               [decode_body: false, receive_timeout: 0, connect_options: [timeout: 0]],
+               config
+             )
+
+    {listener, port} = tcp_listener()
+    on_exit(fn -> :gen_tcp.close(listener) end)
+
+    for overrides <- [[receive_timeout: :infinity], [connect_options: [timeout: :infinity]]] do
+      assert {:error, %TransportError{reason: :unsupported_ex_ssl_http_options}} =
+               HTTPAdapter.request(adapter_request(port, overrides), config)
+
+      assert {:error, :timeout} = :gen_tcp.accept(listener, 25)
+    end
+  end
+
+  test "malformed bodies and adapter options return HTTP errors before network activity" do
     {listener, port} = tcp_listener()
     on_exit(fn -> :gen_tcp.close(listener) end)
 
@@ -324,49 +380,36 @@ defmodule Manifold.Connectors.EAS.HTTPAdapterTest do
     config = tls_config(TLSPeer.client_options())
 
     malformed_requests = [
-      {%{request | body: [<<1>>, {:not, :iodata}]}, :unsupported_request_body},
-      {%{request | options: Map.put(request.options, :decode_body, true)},
+      {Keyword.put(request, :body, [<<1>>, {:not, :iodata}]), config, :unsupported_request_body},
+      {Keyword.put(request, :decode_body, true), config, :unsafe_request_policy},
+      {request, %{config | options: replace_option(config.options, :ex_ssl, :not_a_keyword)},
        :unsafe_request_policy},
-      {HTTPAdapter.put_tls_config(
-         request,
-         %{config | options: replace_option(config.options, :ex_ssl, :not_a_keyword)}
-       ), :unsafe_request_policy},
-      {HTTPAdapter.put_tls_config(
-         request,
-         %{
-           config
-           | options:
-               replace_option(config.options, :ex_ssl,
-                 profile: :default,
-                 profile: :default
-               )
-         }
-       ), :unsafe_request_policy},
-      {HTTPAdapter.put_tls_config(
-         request,
-         %{
-           config
-           | options:
-               replace_option(config.options, :ex_ssl,
-                 profile: :default,
-                 unsupported: "secret-option-value"
-               )
-         }
-       ), :unsafe_request_policy},
-      {HTTPAdapter.put_tls_config(
-         request,
-         %{
-           config
-           | options:
-               replace_option(config.options, :ex_ssl,
-                 profile: %WireProfile{extensions: :not_a_list}
-               )
-         }
-       ), :unsafe_request_policy}
+      {request,
+       %{
+         config
+         | options: replace_option(config.options, :ex_ssl, profile: :default, profile: :default)
+       }, :unsafe_request_policy},
+      {request,
+       %{
+         config
+         | options:
+             replace_option(config.options, :ex_ssl,
+               profile: :default,
+               unsupported: "secret-option-value"
+             )
+       }, :unsafe_request_policy},
+      {request,
+       %{
+         config
+         | options:
+             replace_option(config.options, :ex_ssl,
+               profile: %WireProfile{extensions: :not_a_list}
+             )
+       }, :unsafe_request_policy}
     ]
 
-    Enum.each(malformed_requests, fn {malformed_request, reason} ->
-      assert {_request, %Req.HTTPError{reason: ^reason}} = HTTPAdapter.run(malformed_request)
+    Enum.each(malformed_requests, fn {options, config, reason} ->
+      assert {:error, %TransportError{reason: ^reason}} = HTTPAdapter.request(options, config)
       assert {:error, :timeout} = :gen_tcp.accept(listener, 25)
     end)
   end
@@ -374,22 +417,22 @@ defmodule Manifold.Connectors.EAS.HTTPAdapterTest do
   test "full request head size and final injected header count are bounded before connect" do
     {listener, port} = tcp_listener()
     on_exit(fn -> :gen_tcp.close(listener) end)
-
+    config = tls_config(TLSPeer.client_options())
     oversized_target = "/" <> :binary.copy("a", 65_500)
 
     target_request =
-      adapter_request(port, nil, url: "https://127.0.0.1:#{port}#{oversized_target}")
+      adapter_request(port, url: "https://127.0.0.1:#{port}#{oversized_target}")
 
-    assert {_request, %Req.HTTPError{reason: :request_headers_too_large}} =
-             HTTPAdapter.run(target_request)
+    assert {:error, %TransportError{reason: :request_headers_too_large}} =
+             HTTPAdapter.request(target_request, config)
 
     assert {:error, :timeout} = :gen_tcp.accept(listener, 25)
 
     headers = for index <- 1..198, do: {"x-header-#{index}", "v"}
-    header_request = %{adapter_request(port) | headers: Req.Fields.new(headers)}
+    header_request = Keyword.put(adapter_request(port), :headers, headers)
 
-    assert {_request, %Req.HTTPError{reason: :request_headers_too_large}} =
-             HTTPAdapter.run(header_request)
+    assert {:error, %TransportError{reason: :request_headers_too_large}} =
+             HTTPAdapter.request(header_request, config)
 
     assert {:error, :timeout} = :gen_tcp.accept(listener, 25)
   end
@@ -404,31 +447,22 @@ defmodule Manifold.Connectors.EAS.HTTPAdapterTest do
   end
 
   defp request(port, tls_options \\ nil, receive_timeout \\ 5_000) do
-    port
-    |> adapter_request(tls_options, receive_timeout: receive_timeout)
-    |> Req.request()
+    options = adapter_request(port, receive_timeout: receive_timeout)
+    HTTPAdapter.request(options, tls_config(tls_options || TLSPeer.client_options()))
   end
 
-  defp adapter_request(port, tls_options \\ nil, overrides \\ []) do
-    tls_options = tls_options || TLSPeer.client_options()
-    config = tls_config(tls_options)
-
+  defp adapter_request(port, overrides \\ []) do
     [
       method: :post,
       url: "https://127.0.0.1:#{port}/Microsoft-Server-ActiveSync?Cmd=Sync",
       headers: [{"content-type", "application/vnd.ms-sync.wbxml"}],
       body: <<0, 1, 2, 3>>,
-      adapter: HTTPAdapter,
-      retry: false,
-      redirect: false,
       decode_body: false,
       compressed: false,
       receive_timeout: 5_000,
       connect_options: [timeout: 5_000, protocols: [:http1]]
     ]
     |> Keyword.merge(overrides)
-    |> Req.new()
-    |> HTTPAdapter.put_tls_config(config)
   end
 
   defp tcp_listener do

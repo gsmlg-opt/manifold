@@ -9,21 +9,46 @@ defmodule Manifold.Connectors.DAV.TransportTest do
              )
   end
 
-  test "real HTTP dispatch preserves DAV method and authorization with bounded body" do
-    {url, peer} =
-      server("HTTP/1.1 207 Multi-Status\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
+  test "native HTTP dispatch preserves extension methods, XML and authorization" do
+    body = "<D:propfind xmlns:D=\"DAV:\"><D:allprop/></D:propfind>\n"
+    response = "<D:multistatus xmlns:D=\"DAV:\">原样</D:multistatus>\n"
 
-    assert {:ok, %{status: 207, body: "hello"}} =
-             Transport.request(
-               :propfind,
-               url,
-               [{"authorization", "Basic dummy"}, {"depth", "1"}],
-               "<propfind/>"
-             )
+    for method <- [:propfind, :report, :mkcalendar, :put, :delete, "X-CUSTOM"] do
+      {url, peer} =
+        server([
+          "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\n",
+          "Content-Length: #{byte_size(response)}\r\nConnection: close\r\n\r\n",
+          response
+        ])
 
-    request = Task.await(peer)
-    assert request =~ "PROPFIND / HTTP/1.1"
-    assert String.downcase(request) =~ "authorization: basic dummy"
+      assert {:ok, %{status: 207, body: ^response}} =
+               Transport.request(
+                 method,
+                 url,
+                 [{"authorization", "Basic dummy"}, {"depth", "1"}],
+                 body
+               )
+
+      request = Task.await(peer)
+      assert request =~ "#{method |> to_string() |> String.upcase()} / HTTP/1.1"
+      assert String.downcase(request) =~ "authorization: basic dummy"
+      assert [_headers, ^body] = String.split(request, "\r\n\r\n", parts: 2)
+    end
+  end
+
+  test "invalid extension tokens fail before dispatch" do
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+
+    on_exit(fn -> :gen_tcp.close(listener) end)
+    {:ok, {_, port}} = :inet.sockname(listener)
+
+    for method <- ["BAD METHOD", "REPORT\r\nX-Header: injected", "REPORT\0", "Méthod"] do
+      assert {:error, :transport_failure} =
+               Transport.request(method, "http://127.0.0.1:#{port}/", [], "<xml/>")
+
+      assert {:error, :timeout} = :gen_tcp.accept(listener, 25)
+    end
   end
 
   test "transport does not automatically follow redirects or retry errors" do
@@ -64,6 +89,34 @@ defmodule Manifold.Connectors.DAV.TransportTest do
     Task.await(peer)
   end
 
+  test "DAV metadata from HTTP trailers remains available in response headers" do
+    {url, peer} =
+      server(
+        "HTTP/1.1 207 Multi-Status\r\nTransfer-Encoding: chunked\r\nTrailer: ETag\r\n" <>
+          "Connection: close\r\n\r\n3\r\nxml\r\n0\r\nETag: \"trailing\"\r\n\r\n"
+      )
+
+    assert {:ok, %{status: 207, body: "xml", headers: headers}} =
+             Transport.request(:report, url, [], "<report/>")
+
+    assert headers["etag"] == ["\"trailing\""]
+    Task.await(peer)
+  end
+
+  test "response header field bound also counts trailers" do
+    headers = Enum.map_join(1..997, "", &"X-Field-#{&1}: value\r\n")
+    trailers = "X-Trailer-1: value\r\nX-Trailer-2: value\r\n"
+
+    {url, peer} =
+      server(
+        "HTTP/1.1 207 Multi-Status\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n" <>
+          headers <> "\r\n0\r\n" <> trailers <> "\r\n"
+      )
+
+    assert {:error, :header_limit} = Transport.request(:report, url, [], "<report/>")
+    Task.await(peer)
+  end
+
   test "peer closing without an HTTP response remains a transport failure" do
     {url, peer} = server("")
 
@@ -71,7 +124,7 @@ defmodule Manifold.Connectors.DAV.TransportTest do
     assert Task.await(peer) =~ "GET / HTTP/1.1"
   end
 
-  test "DAV request credentials never enter Finch telemetry" do
+  test "DAV request credentials never enter HTTP telemetry" do
     handler = "dav-no-credential-telemetry-#{System.unique_integer([:positive])}"
 
     events = [
@@ -82,14 +135,20 @@ defmodule Manifold.Connectors.DAV.TransportTest do
       [:finch, :send, :start],
       [:finch, :send, :stop],
       [:finch, :recv, :start],
-      [:finch, :recv, :stop]
+      [:finch, :recv, :stop],
+      [:http_fetch, :request, :start],
+      [:http_fetch, :request, :stop],
+      [:http_fetch, :request, :exception],
+      [:http_fetch, :streaming, :start],
+      [:http_fetch, :streaming, :chunk],
+      [:http_fetch, :streaming, :stop]
     ]
 
     :ok =
       :telemetry.attach_many(
         handler,
         events,
-        fn event, _, metadata, parent -> send(parent, {:finch_event, event, metadata}) end,
+        fn event, _, metadata, parent -> send(parent, {:http_event, event, metadata}) end,
         self()
       )
 
@@ -101,7 +160,7 @@ defmodule Manifold.Connectors.DAV.TransportTest do
              Transport.request(:get, url, [{"authorization", "Basic " <> secret}], nil)
 
     assert Task.await(peer) =~ secret
-    refute_received {:finch_event, _, _}
+    refute_received {:http_event, _, _}
   end
 
   test "absolute request timeout terminates a stalled peer" do
@@ -114,7 +173,7 @@ defmodule Manifold.Connectors.DAV.TransportTest do
     peer =
       Task.async(fn ->
         {:ok, socket} = :gen_tcp.accept(listener, 5_000)
-        _ = read_headers(socket, "")
+        _ = read_request(socket, "")
         send(parent, :peer_received)
         result = :gen_tcp.recv(socket, 0, 5_000)
         :gen_tcp.close(socket)
@@ -129,7 +188,7 @@ defmodule Manifold.Connectors.DAV.TransportTest do
     assert {:error, :closed} = Task.await(peer)
   end
 
-  test "Mint receive timeout stays a timeout when the adapter task finishes first" do
+  test "absolute deadline includes a partially received DAV response body" do
     {:ok, listener} =
       :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
 
@@ -139,63 +198,43 @@ defmodule Manifold.Connectors.DAV.TransportTest do
     peer =
       Task.async(fn ->
         {:ok, socket} = :gen_tcp.accept(listener, 5_000)
-        request = read_headers(socket, "")
-        send(parent, {:stalled_request, request})
+        request = read_request(socket, "")
+
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "HTTP/1.1 207 Multi-Status\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n"
+          )
+
+        send(parent, {:partial_dav_response, request})
         result = :gen_tcp.recv(socket, 0, 5_000)
         :gen_tcp.close(socket)
         :gen_tcp.close(listener)
         result
       end)
 
-    requester =
-      Task.async(fn ->
-        receive do
-          :request ->
-            Transport.request(:get, "http://127.0.0.1:#{port}/", [], nil, timeout: 1_000)
-        end
-      end)
+    assert {:error, :timeout} =
+             Transport.request(:report, "http://127.0.0.1:#{port}/", [], "<report/>",
+               timeout: 500
+             )
 
-    Code.ensure_loaded!(Mint.HTTP)
+    assert_received {:partial_dav_response, request}
+    assert request =~ "REPORT / HTTP/1.1"
+    assert {:error, :closed} = Task.await(peer)
+  end
 
-    assert :erlang.trace_pattern({Mint.HTTP, :recv, 3}, [{:_, [], [{:return_trace}]}], [:local]) ==
-             1
+  test "response header field count is bounded independently of byte size" do
+    headers = Enum.map_join(1..1_001, "", &"X-Field-#{&1}: value\r\n")
 
-    :erlang.trace(requester.pid, true, [:call, :set_on_spawn, {:tracer, self()}])
+    {url, peer} =
+      server(
+        "HTTP/1.1 207 Multi-Status\r\n" <>
+          headers <>
+          "Content-Length: 0\r\nConnection: close\r\n\r\n"
+      )
 
-    try do
-      send(requester.pid, :request)
-      assert_receive {:trace, worker, :call, {Mint.HTTP, :recv, [_, 0, remaining]}}, 2_000
-      assert remaining > 0
-
-      # Let the real socket timeout finish before the outer Task.yield can win.
-      :erlang.suspend_process(requester.pid)
-      monitor = Process.monitor(worker)
-      assert_receive {:stalled_request, request}, 2_000
-      assert request =~ "GET / HTTP/1.1"
-
-      assert_receive {:trace, ^worker, :return_from, {Mint.HTTP, :recv, 3},
-                      {:error, _, %Mint.TransportError{reason: :timeout}, _}},
-                     2_000
-
-      assert_receive {:DOWN, ^monitor, :process, ^worker, :normal}, 2_000
-      :erlang.resume_process(requester.pid)
-      assert {:error, :timeout} = Task.await(requester)
-      assert {:error, :closed} = Task.await(peer)
-    after
-      :erlang.trace_pattern({Mint.HTTP, :recv, 3}, false, [:local])
-
-      if Process.alive?(requester.pid) do
-        try do
-          :erlang.resume_process(requester.pid)
-        rescue
-          ArgumentError -> :ok
-        end
-      end
-
-      Task.shutdown(requester, :brutal_kill)
-      Task.shutdown(peer, :brutal_kill)
-      :gen_tcp.close(listener)
-    end
+    assert {:error, :header_limit} = Transport.request(:propfind, url, [], "<propfind/>")
+    Task.await(peer)
   end
 
   defp server(response) do
@@ -207,7 +246,7 @@ defmodule Manifold.Connectors.DAV.TransportTest do
     peer =
       Task.async(fn ->
         {:ok, socket} = :gen_tcp.accept(listener, 5_000)
-        request = read_headers(socket, "")
+        request = read_request(socket, "")
         :gen_tcp.send(socket, response)
         :gen_tcp.close(socket)
         :gen_tcp.close(listener)
@@ -217,12 +256,27 @@ defmodule Manifold.Connectors.DAV.TransportTest do
     {"http://127.0.0.1:#{port}/", peer}
   end
 
-  defp read_headers(socket, buffer) do
-    if String.contains?(buffer, "\r\n\r\n") do
+  defp read_request(socket, buffer) do
+    complete? =
+      case String.split(buffer, "\r\n\r\n", parts: 2) do
+        [headers, body] ->
+          length =
+            case Regex.run(~r/content-length: ([0-9]+)/i, headers) do
+              [_, length] -> String.to_integer(length)
+              _ -> 0
+            end
+
+          byte_size(body) >= length
+
+        _ ->
+          false
+      end
+
+    if complete? do
       buffer
     else
       {:ok, chunk} = :gen_tcp.recv(socket, 0, 5_000)
-      read_headers(socket, buffer <> chunk)
+      read_request(socket, buffer <> chunk)
     end
   end
 end

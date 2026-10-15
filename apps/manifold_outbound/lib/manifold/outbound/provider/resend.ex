@@ -5,6 +5,8 @@ defmodule Manifold.Outbound.Provider.Resend do
 
   @behaviour Manifold.Outbound.Provider
 
+  alias Manifold.Core.HTTPClient
+
   alias Manifold.Outbound.Provider.{Envelope, Error, Event, Request, Submission}
 
   @default_base_url "https://api.resend.com"
@@ -52,11 +54,11 @@ defmodule Manifold.Outbound.Provider.Resend do
       ]
       |> Keyword.merge(Keyword.get(config, :req_options, []))
 
-    case Req.post(request_options) do
-      {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
+    case HTTPClient.post(request_options) do
+      {:ok, %HTTPClient.Response{status: status, body: body}} when status in 200..299 ->
         accepted(body)
 
-      {:ok, %Req.Response{} = response} ->
+      {:ok, %HTTPClient.Response{} = response} ->
         {:error, classify_response(response)}
 
       {:error, reason} ->
@@ -236,7 +238,7 @@ defmodule Manifold.Outbound.Provider.Resend do
      }}
   end
 
-  defp classify_response(%Req.Response{status: 409, body: body}) do
+  defp classify_response(%HTTPClient.Response{status: 409, body: body}) do
     code = provider_code(body, "http_409")
 
     class =
@@ -249,7 +251,7 @@ defmodule Manifold.Outbound.Provider.Resend do
     response_error(class, 409, code, body)
   end
 
-  defp classify_response(%Req.Response{status: 429, body: body} = response) do
+  defp classify_response(%HTTPClient.Response{status: 429, body: body} = response) do
     response_error(
       :transient,
       429,
@@ -259,11 +261,11 @@ defmodule Manifold.Outbound.Provider.Resend do
     )
   end
 
-  defp classify_response(%Req.Response{status: status, body: body}) when status >= 500 do
+  defp classify_response(%HTTPClient.Response{status: status, body: body}) when status >= 500 do
     response_error(:transient, status, provider_code(body, "http_#{status}"), body)
   end
 
-  defp classify_response(%Req.Response{status: status, body: body}) do
+  defp classify_response(%HTTPClient.Response{status: status, body: body}) do
     response_error(:permanent, status, provider_code(body, "http_#{status}"), body)
   end
 
@@ -278,7 +280,7 @@ defmodule Manifold.Outbound.Provider.Resend do
   end
 
   defp retry_after(response) do
-    case Req.Response.get_header(response, "retry-after") do
+    case HTTPClient.Response.get_header(response, "retry-after") do
       [value] -> parse_retry_after(value)
       _missing_or_ambiguous -> nil
     end
@@ -290,7 +292,7 @@ defmodule Manifold.Outbound.Provider.Resend do
         seconds
 
       _not_seconds ->
-        with {:ok, retry_at} <- Req.Utils.parse_http_date(value),
+        with {:ok, retry_at} <- HTTPClient.parse_http_date(value),
              seconds when seconds >= 0 <- DateTime.diff(retry_at, DateTime.utc_now(), :second) do
           seconds
         else

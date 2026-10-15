@@ -1,4 +1,5 @@
 defmodule Manifold.Connectors.SyncTest do
+  alias Manifold.Core.HTTPClient
   use Manifold.DataCase, async: false
 
   alias Manifold.Accounts
@@ -244,7 +245,7 @@ defmodule Manifold.Connectors.SyncTest do
       microsoft: [
         base_url: "https://graph.microsoft.test/v1.0",
         req_options: [
-          plug: {Req.Test, __MODULE__},
+          plug: {HTTPClient.Test, __MODULE__},
           headers: [{"authorization", "unsafe-request-secret"}]
         ]
       ]
@@ -371,7 +372,7 @@ defmodule Manifold.Connectors.SyncTest do
     Application.put_env(
       :manifold_connectors,
       :providers,
-      Keyword.put(providers, :gmail, req_options: [plug: {Req.Test, __MODULE__}])
+      Keyword.put(providers, :gmail, req_options: [plug: {HTTPClient.Test, __MODULE__}])
     )
 
     owner = self()
@@ -380,13 +381,13 @@ defmodule Manifold.Connectors.SyncTest do
     |> SyncCursor.changeset(%{phase: "initial", bootstrap_cursor: "100", committed_cursor: nil})
     |> Repo.update!()
 
-    Req.Test.stub(__MODULE__, fn conn ->
+    HTTPClient.Test.stub(__MODULE__, fn conn ->
       send(owner, {:gmail_request, conn.request_path, Agent.get(clock, & &1)})
 
       case conn.request_path do
         "/gmail/v1/users/me/messages" ->
           assert URI.decode_query(conn.query_string)["maxResults"] == "50"
-          Req.Test.json(conn, %{messages: [%{id: "paced-1"}, %{id: "paced-2"}]})
+          HTTPClient.Test.json(conn, %{messages: [%{id: "paced-1"}, %{id: "paced-2"}]})
 
         "/gmail/v1/users/me/messages/paced-2" ->
           count = Process.get(:paced_second_attempts, 0)
@@ -396,7 +397,7 @@ defmodule Manifold.Connectors.SyncTest do
             conn
             |> Plug.Conn.put_status(429)
             |> Plug.Conn.put_resp_header("retry-after", "90")
-            |> Req.Test.json(%{error: %{message: "private-quota-response"}})
+            |> HTTPClient.Test.json(%{error: %{message: "private-quota-response"}})
           else
             gmail_raw_response(conn, "paced-2")
           end
@@ -405,7 +406,7 @@ defmodule Manifold.Connectors.SyncTest do
           gmail_raw_response(conn, "paced-1")
 
         "/gmail/v1/users/me/history" ->
-          Req.Test.json(conn, %{historyId: "101"})
+          HTTPClient.Test.json(conn, %{historyId: "101"})
       end
     end)
 
@@ -521,7 +522,7 @@ defmodule Manifold.Connectors.SyncTest do
   end
 
   defp gmail_raw_response(conn, id) do
-    Req.Test.json(conn, %{
+    HTTPClient.Test.json(conn, %{
       raw:
         Base.url_encode64("From: sender@example.net\r\nSubject: #{id}\r\n\r\nBody\r\n",
           padding: false
@@ -3094,7 +3095,7 @@ defmodule Manifold.Connectors.SyncTest do
   defp assert_microsoft_operation_config(config) do
     assert config == [
              base_url: "https://graph.microsoft.test/v1.0",
-             req_options: [plug: {Req.Test, __MODULE__}]
+             req_options: [plug: {HTTPClient.Test, __MODULE__}]
            ]
 
     refute Enum.any?(

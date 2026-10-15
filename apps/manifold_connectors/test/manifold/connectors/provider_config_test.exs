@@ -1,4 +1,5 @@
 defmodule Manifold.Connectors.ProviderConfigTest do
+  alias Manifold.Core.HTTPClient
   use Manifold.DataCase, async: false
 
   alias Manifold.Connectors
@@ -101,7 +102,7 @@ defmodule Manifold.Connectors.ProviderConfigTest do
         userinfo_url: "https://openid.example/userinfo",
         base_url: "https://gmail.example",
         req_options: [
-          plug: {Req.Test, __MODULE__},
+          plug: {HTTPClient.Test, __MODULE__},
           headers: [{"authorization", "legacy-request-secret"}]
         ],
         untrusted_extra: "ignored"
@@ -117,7 +118,7 @@ defmodule Manifold.Connectors.ProviderConfigTest do
              base_url: "https://gmail.example",
              client_id: "db-client",
              client_secret: secret,
-             req_options: [plug: {Req.Test, __MODULE__}]
+             req_options: [plug: {HTTPClient.Test, __MODULE__}]
            }
 
     refute inspect(resolved) =~ secret
@@ -202,7 +203,7 @@ defmodule Manifold.Connectors.ProviderConfigTest do
         base_url: "https://graph.example/v1.0",
         tenant: "consumers",
         req_options: [
-          plug: {Req.Test, __MODULE__},
+          plug: {HTTPClient.Test, __MODULE__},
           headers: [{"authorization", "legacy-request-secret"}]
         ],
         untrusted_extra: "ignored-secret"
@@ -218,7 +219,7 @@ defmodule Manifold.Connectors.ProviderConfigTest do
              tenant: "common",
              client_id: "microsoft-db-client",
              client_secret: secret,
-             req_options: [plug: {Req.Test, __MODULE__}]
+             req_options: [plug: {HTTPClient.Test, __MODULE__}]
            }
 
     inspected = inspect(resolved)
@@ -240,7 +241,7 @@ defmodule Manifold.Connectors.ProviderConfigTest do
         token_url: "https://login.example/token",
         base_url: "https://graph.example/v1.0",
         req_options: [
-          plug: {Req.Test, __MODULE__},
+          plug: {HTTPClient.Test, __MODULE__},
           headers: [{"authorization", "unsafe-request-secret"}]
         ]
       ]
@@ -250,7 +251,7 @@ defmodule Manifold.Connectors.ProviderConfigTest do
 
     assert ProviderConfig.provider_operation_config("microsoft", resolved.config) == [
              base_url: "https://graph.example/v1.0",
-             req_options: [plug: {Req.Test, __MODULE__}]
+             req_options: [plug: {HTTPClient.Test, __MODULE__}]
            ]
 
     operation_config = ProviderConfig.provider_operation_config("microsoft", resolved.config)

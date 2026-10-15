@@ -1,4 +1,6 @@
 defmodule Manifold.Connectors.Provider.MicrosoftGraph do
+  alias Manifold.Core.HTTPClient
+
   @moduledoc """
   Microsoft Graph OAuth and mailbox synchronization adapter.
   """
@@ -138,7 +140,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
            [params: %{"$select" => "id"}],
            opts
          ) do
-      {:ok, %Req.Response{status: status, body: %{"id" => id}}}
+      {:ok, %HTTPClient.Response{status: status, body: %{"id" => id}}}
       when status in 200..299 and is_binary(id) ->
         if String.trim(id) == "" do
           {:error, invalid_response("Microsoft Graph well-known folder ID is blank")}
@@ -146,16 +148,16 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
           {:ok, {id, folder_kind}}
         end
 
-      {:ok, %Req.Response{status: status}} when status in 200..299 ->
+      {:ok, %HTTPClient.Response{status: status}} when status in 200..299 ->
         {:error, invalid_response("Microsoft Graph well-known folder response is invalid")}
 
-      {:ok, %Req.Response{status: 404}} when well_known_name == "archive" ->
+      {:ok, %HTTPClient.Response{status: 404}} when well_known_name == "archive" ->
         :skip
 
-      {:ok, %Req.Response{status: 404}} ->
+      {:ok, %HTTPClient.Response{status: 404}} ->
         {:error, required_folder_missing_error(well_known_name)}
 
-      {:ok, %Req.Response{} = response} ->
+      {:ok, %HTTPClient.Response{} = response} ->
         {:error, classify_response(response)}
 
       {:error, %Error{} = error} ->
@@ -242,7 +244,8 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
              base_url <> "/me/messages/" <> encoded_id <> "/$value",
              access_token,
              config,
-             [],
+             # Preserve Sync's permanent raw-size rejection rather than a transport retry.
+             [max_body_bytes: :infinity],
              opts
            ) do
       normalize_raw_response(response)
@@ -258,10 +261,10 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
       case request(:post, url, config,
              form: [client_id: client_id, scope: Enum.join(scopes, " ")]
            ) do
-        {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
+        {:ok, %HTTPClient.Response{status: status, body: body}} when status in 200..299 ->
           normalize_device_authorization(body)
 
-        {:ok, %Req.Response{} = response} ->
+        {:ok, %HTTPClient.Response{} = response} ->
           {:error, classify_response(response)}
 
         {:error, reason} ->
@@ -284,11 +287,11 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
         )
 
       case response do
-        {:ok, %Req.Response{status: 400, body: %{"error" => error}}}
+        {:ok, %HTTPClient.Response{status: 400, body: %{"error" => error}}}
         when error in ["authorization_pending", "slow_down"] ->
           {:pending, if(error == "slow_down", do: :slow_down, else: :authorization_pending)}
 
-        {:ok, %Req.Response{status: status, body: %{"error" => error}}}
+        {:ok, %HTTPClient.Response{status: status, body: %{"error" => error}}}
         when status in 400..499 and
                error in [
                  "authorization_declined",
@@ -392,7 +395,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
 
   defp normalize_token_response(
          {:ok,
-          %Req.Response{
+          %HTTPClient.Response{
             status: status,
             body:
               %{
@@ -414,8 +417,12 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
      }}
   end
 
-  defp normalize_token_response({:ok, %Req.Response{} = response}, _now, _requested_scopes),
-    do: {:error, classify_response(response)}
+  defp normalize_token_response(
+         {:ok, %HTTPClient.Response{} = response},
+         _now,
+         _requested_scopes
+       ),
+       do: {:error, classify_response(response)}
 
   defp normalize_token_response({:error, reason}, _now, _requested_scopes),
     do: {:error, transport_error(reason)}
@@ -425,7 +432,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
 
   defp token_scopes(_scopes, requested_scopes), do: requested_scopes
 
-  defp normalize_identity_response(%Req.Response{
+  defp normalize_identity_response(%HTTPClient.Response{
          status: status,
          body: %{"id" => id} = body
        })
@@ -439,19 +446,19 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
     end
   end
 
-  defp normalize_identity_response(%Req.Response{} = response),
+  defp normalize_identity_response(%HTTPClient.Response{} = response),
     do: {:error, classify_response(response)}
 
-  defp normalize_raw_response(%Req.Response{status: status, body: bytes})
+  defp normalize_raw_response(%HTTPClient.Response{status: status, body: bytes})
        when status in 200..299 and is_binary(bytes) do
     {:ok, %RawMessage{bytes: bytes}}
   end
 
-  defp normalize_raw_response(%Req.Response{} = response),
+  defp normalize_raw_response(%HTTPClient.Response{} = response),
     do: {:error, classify_response(response)}
 
   defp normalize_sync_response(
-         %Req.Response{status: status, body: %{"value" => values} = body},
+         %HTTPClient.Response{status: status, body: %{"value" => values} = body},
          cursor,
          base_url
        )
@@ -468,7 +475,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
     end
   end
 
-  defp normalize_sync_response(%Req.Response{} = response, _cursor, _base_url),
+  defp normalize_sync_response(%HTTPClient.Response{} = response, _cursor, _base_url),
     do: {:error, classify_response(response)}
 
   defp advance_cursor(%SyncCursor{} = cursor, %{"@odata.nextLink" => next_link}, base_url)
@@ -647,11 +654,11 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
 
     callback = fn ->
       case request(method, url, config, request_options) do
-        {:ok, %Req.Response{status: status} = response}
+        {:ok, %HTTPClient.Response{status: status} = response}
         when status in [429, 500, 502, 503, 504] ->
           {:error, classify_response(response)}
 
-        {:ok, %Req.Response{} = response} ->
+        {:ok, %HTTPClient.Response{} = response} ->
           {:ok, response}
 
         {:error, reason} ->
@@ -672,7 +679,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
       |> Keyword.merge(Keyword.get(config, :req_options, []))
       |> Keyword.put(:retry, false)
 
-    Req.request(options)
+    HTTPClient.request(options)
   end
 
   defp fetch_config(config, key) do
@@ -690,7 +697,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
     end
   end
 
-  defp classify_response(%Req.Response{body: %{"error" => "invalid_grant"}}) do
+  defp classify_response(%HTTPClient.Response{body: %{"error" => "invalid_grant"}}) do
     %Error{
       class: :reconnect,
       code: :invalid_grant,
@@ -698,9 +705,9 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
     }
   end
 
-  defp classify_response(%Req.Response{status: 410}), do: cursor_reset_error()
+  defp classify_response(%HTTPClient.Response{status: 410}), do: cursor_reset_error()
 
-  defp classify_response(%Req.Response{status: 401}) do
+  defp classify_response(%HTTPClient.Response{status: 401}) do
     %Error{
       class: :reconnect,
       code: :invalid_token,
@@ -708,7 +715,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
     }
   end
 
-  defp classify_response(%Req.Response{body: body} = response) when is_map(body) do
+  defp classify_response(%HTTPClient.Response{body: body} = response) when is_map(body) do
     if graph_error_code?(body, "syncStateNotFound") do
       cursor_reset_error()
     else
@@ -716,9 +723,9 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
     end
   end
 
-  defp classify_response(%Req.Response{} = response), do: classify_status(response)
+  defp classify_response(%HTTPClient.Response{} = response), do: classify_status(response)
 
-  defp classify_status(%Req.Response{status: status} = response)
+  defp classify_status(%HTTPClient.Response{status: status} = response)
        when status in [429, 500, 502, 503, 504] do
     %Error{
       class: :temporary,
@@ -728,7 +735,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
     }
   end
 
-  defp classify_status(%Req.Response{status: 404}) do
+  defp classify_status(%HTTPClient.Response{status: 404}) do
     %Error{
       class: :permanent,
       code: :not_found,
@@ -736,7 +743,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
     }
   end
 
-  defp classify_status(%Req.Response{status: status}) do
+  defp classify_status(%HTTPClient.Response{status: status}) do
     %Error{
       class: :permanent,
       code: http_code(status),
@@ -787,7 +794,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   end
 
   defp retry_after(response) do
-    case Req.Response.get_header(response, "retry-after") do
+    case HTTPClient.Response.get_header(response, "retry-after") do
       [value] ->
         case Integer.parse(value) do
           {seconds, ""} when seconds > 0 -> seconds
@@ -800,7 +807,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraph do
   end
 
   defp retry_after_date(value) do
-    with {:ok, datetime} <- Req.Utils.parse_http_date(value),
+    with {:ok, datetime} <- HTTPClient.parse_http_date(value),
          seconds when seconds > 0 <- DateTime.diff(datetime, DateTime.utc_now(), :second) do
       seconds
     else

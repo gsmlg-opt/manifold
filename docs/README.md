@@ -13,6 +13,7 @@ implementation snapshot, recorded acceptance gaps, and suggested next tasks.
 | [Web UI design](../DESIGN.md) | DuskMoon tokens, themes and app chrome conventions |
 | [OAuth setup](OAUTH_SETUP.md) | Microsoft device-code login and Google redirect/pasted-URL completion |
 | [iCloud setup](ICLOUD.md) | Account-owned Contacts/Calendar, bidirectional sync, conflicts and migration |
+| [HTTP clients](HTTP_CLIENT.md) | Native Fetch business clients, response/stream contracts and migration verification |
 | [TLS backends](TLS_BACKENDS.md) | Default OTP TLS and the explicit ex_ssl consumer boundary |
 | [Crash boundaries](CRASH_BOUNDARIES.md) | Persistence, retry and recovery invariants |
 | [API guide](../apps/manifold_api/README.md) | REST, GraphQL and deployment access boundary |

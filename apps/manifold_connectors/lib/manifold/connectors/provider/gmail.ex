@@ -1,4 +1,6 @@
 defmodule Manifold.Connectors.Provider.Gmail do
+  alias Manifold.Core.HTTPClient
+
   @moduledoc """
   Gmail OAuth and mailbox synchronization adapter.
 
@@ -160,7 +162,11 @@ defmodule Manifold.Connectors.Provider.Gmail do
     path = "/gmail/v1/users/me/messages/" <> URI.encode(message_id, &URI.char_unreserved?/1)
 
     with {:ok, response} <-
-           api_request(access_token, :get, path, config, opts, params: [format: "RAW"]),
+           api_request(access_token, :get, path, config, opts,
+             params: [format: "RAW"],
+             # Sync owns the decoded MIME import limit; RAW JSON adds base64 overhead.
+             max_body_bytes: :infinity
+           ),
          {:ok, encoded_raw} <- required_string(response.body, "raw"),
          {:ok, raw} <- decode_raw(encoded_raw),
          {:ok, labels} <- labels(response.body["labelIds"]),
@@ -392,16 +398,15 @@ defmodule Manifold.Connectors.Provider.Gmail do
       |> Keyword.put(:retry, false)
       |> Keyword.put(:redirect, false)
 
-    # TODO(upstream): gsmlg-dev/http_fetch#31 - verify a compatible secret-safe release before approved default-client migration.
-    case Req.request(request_options) do
-      {:ok, %Req.Response{status: status} = response} when status in 200..299 ->
+    case HTTPClient.request(request_options) do
+      {:ok, %HTTPClient.Response{status: status} = response} when status in 200..299 ->
         if is_map(response.body) do
           {:ok, response}
         else
           invalid_response()
         end
 
-      {:ok, %Req.Response{} = response} ->
+      {:ok, %HTTPClient.Response{} = response} ->
         {:error, classify_response(response, Keyword.get(opts, :now, DateTime.utc_now()))}
 
       {:error, _reason} ->
@@ -409,7 +414,7 @@ defmodule Manifold.Connectors.Provider.Gmail do
     end
   end
 
-  defp classify_response(%Req.Response{status: status, body: body, headers: headers}, now) do
+  defp classify_response(%HTTPClient.Response{status: status, body: body, headers: headers}, now) do
     cond do
       invalid_grant?(body) ->
         error(:reconnect, :invalid_grant, "Gmail authorization must be reconnected")
@@ -498,7 +503,7 @@ defmodule Manifold.Connectors.Provider.Gmail do
         seconds
 
       _invalid ->
-        case Req.Utils.parse_http_date(value) do
+        case HTTPClient.parse_http_date(value) do
           {:ok, datetime} -> seconds_until(datetime, now)
           _invalid -> nil
         end

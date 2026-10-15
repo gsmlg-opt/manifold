@@ -26,7 +26,7 @@ defmodule Manifold.Outbound.MixProject do
       {:manifold_connectors, in_umbrella: true},
       {:manifold_mail, in_umbrella: true},
       {:oban, "~> 2.20"},
-      {:req, "~> 0.5"},
+      {:plug, "~> 1.16", only: :test},
       {:telemetry, "~> 1.3"}
     ]
   end

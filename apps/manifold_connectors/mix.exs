@@ -26,10 +26,8 @@ defmodule Manifold.Connectors.MixProject do
       {:manifold_ingest, in_umbrella: true},
       {:manifold_mail, in_umbrella: true},
       {:oban, "~> 2.23"},
-      {:req, "~> 0.7"},
-      {:mint, "~> 1.9"},
       {:saxy, "~> 1.6"},
-      {:ex_ssl, "== 0.17.1"},
+      {:ex_ssl, "== 0.21.10"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.3"}
     ]

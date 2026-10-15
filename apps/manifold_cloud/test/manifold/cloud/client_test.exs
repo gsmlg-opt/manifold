@@ -1,4 +1,5 @@
 defmodule Manifold.Cloud.ClientTest do
+  alias Manifold.Core.HTTPClient
   use ExUnit.Case, async: true
 
   alias Manifold.Accounts.RecipientSnapshot
@@ -11,7 +12,7 @@ defmodule Manifold.Cloud.ClientTest do
     authority: "edge.example.test",
     installation_id: "installation-1",
     secret: "shared-edge-secret",
-    req_options: [plug: {Req.Test, Client}]
+    req_options: [plug: {HTTPClient.Test, Client}]
   ]
 
   test "publishes a recipient snapshot with a signature bound to the request" do
@@ -25,7 +26,7 @@ defmodule Manifold.Cloud.ClientTest do
       routes: []
     }
 
-    Req.Test.expect(Client, fn conn ->
+    HTTPClient.Test.expect(Client, fn conn ->
       assert conn.method == "PUT"
       assert conn.request_path == "/api/v1/route-snapshots"
       assert [timestamp] = Plug.Conn.get_req_header(conn, "x-manifold-timestamp")
@@ -62,12 +63,12 @@ defmodule Manifold.Cloud.ClientTest do
   end
 
   test "lists, fetches, and acknowledges edge deliveries through signed requests" do
-    Req.Test.expect(Client, 4, fn conn ->
+    HTTPClient.Test.expect(Client, 4, fn conn ->
       case {conn.method, conn.request_path} do
         {"GET", "/api/v1/deliveries"} ->
           assert_signed(conn, "")
 
-          Req.Test.json(conn, %{
+          HTTPClient.Test.json(conn, %{
             "deliveries" => [
               %{
                 "edge_delivery_id" => "edge-1",

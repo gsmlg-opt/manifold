@@ -1,4 +1,5 @@
 defmodule Manifold.Connectors.SubmissionMethodTest do
+  alias Manifold.Core.HTTPClient
   use Manifold.DataCase, async: false
 
   alias Manifold.Accounts
@@ -70,7 +71,7 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
         authorization_url: "https://accounts.google.test/authorize",
         base_url: "https://gmail.test",
         req_options: [
-          plug: {Req.Test, __MODULE__},
+          plug: {HTTPClient.Test, __MODULE__},
           headers: [{"cookie", "gmail-config-cookie-secret"}]
         ]
       ],
@@ -79,7 +80,7 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
         token_url: "https://login.microsoft.test/token",
         base_url: "https://graph.microsoft.test/v1.0",
         tenant: "organizations",
-        req_options: [plug: {Req.Test, __MODULE__}]
+        req_options: [plug: {HTTPClient.Test, __MODULE__}]
       ]
     )
 
@@ -187,7 +188,7 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
     assert account_id == account.id
     assert sender == Accounts.account_address(account)
     assert gmail_config[:base_url] == "https://gmail.test"
-    assert gmail_config[:req_options][:plug] == {Req.Test, __MODULE__}
+    assert gmail_config[:req_options][:plug] == {HTTPClient.Test, __MODULE__}
     refute Keyword.has_key?(gmail_config, :client_id)
     refute Keyword.has_key?(gmail_config, :client_secret)
     refute inspect(checked_out) =~ "sender-token"
@@ -357,7 +358,7 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
 
       assert Enum.sort(Keyword.keys(config)) == [:base_url, :req_options]
       assert config[:base_url] == "https://graph.microsoft.test/v1.0"
-      assert config[:req_options] == [plug: {Req.Test, __MODULE__}]
+      assert config[:req_options] == [plug: {HTTPClient.Test, __MODULE__}]
 
       assert_receive {:microsoft_checkout_telemetry, _event, measurements, metadata}
 

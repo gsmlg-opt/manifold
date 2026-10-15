@@ -1,4 +1,5 @@
 defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
+  alias Manifold.Core.HTTPClient
   use ExUnit.Case, async: true
 
   alias Manifold.Connectors.Provider
@@ -10,7 +11,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
     client_secret: "graph-secret",
     token_url: "https://login.microsoftonline.test/organizations/oauth2/v2.0/token",
     base_url: "https://graph.microsoft.test/v1.0",
-    req_options: [plug: {Req.Test, MicrosoftGraph}]
+    req_options: [plug: {HTTPClient.Test, MicrosoftGraph}]
   ]
 
   test "device authorization and public-client refresh never send a secret or redirect" do
@@ -21,7 +22,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
           "https://login.microsoftonline.test/organizations/oauth2/v2.0/devicecode"
       )
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       assert conn.request_path == "/organizations/oauth2/v2.0/devicecode"
       {:ok, body, conn} = Plug.Conn.read_body(conn)
 
@@ -30,7 +31,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
                "scope" => "Mail.Read User.Read offline_access openid profile"
              }
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "device_code" => "private-device-code",
         "user_code" => "ABCD-EFGH",
         "verification_uri" => "https://microsoft.com/devicelogin",
@@ -42,7 +43,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
     assert {:ok, %{device_code: "private-device-code", interval: 5}} =
              MicrosoftGraph.request_device_code(config, [])
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       form = Plug.Conn.Query.decode(body)
       refute Map.has_key?(form, "client_secret")
@@ -52,7 +53,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
 
       conn
       |> Plug.Conn.put_status(400)
-      |> Req.Test.json(%{
+      |> HTTPClient.Test.json(%{
         "error" => "authorization_pending",
         "error_description" => "private description"
       })
@@ -61,10 +62,10 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
     assert {:pending, :authorization_pending} =
              MicrosoftGraph.poll_device_code("private-device-code", config, [])
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       refute Map.has_key?(Plug.Conn.Query.decode(body), "client_secret")
-      Req.Test.json(conn, %{"access_token" => "new", "expires_in" => 3600})
+      HTTPClient.Test.json(conn, %{"access_token" => "new", "expires_in" => 3600})
     end)
 
     assert {:ok, %Provider.Token{}} = MicrosoftGraph.refresh_token("refresh", config, [])
@@ -85,8 +86,8 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
           "https://login.microsoftonline.com/common/oauth2/deviceauth",
           "https://login.microsoftonline.com/organizations/oauth2/deviceauth"
         ] do
-      Req.Test.expect(MicrosoftGraph, fn conn ->
-        Req.Test.json(conn, %{
+      HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
+        HTTPClient.Test.json(conn, %{
           "device_code" => "private-device-code",
           "user_code" => "ABCD-EFGH",
           "verification_uri" => uri,
@@ -124,8 +125,8 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
           "https://login.microsoft.com@evil.test/device",
           "https://evil.test/device"
         ] do
-      Req.Test.expect(MicrosoftGraph, fn conn ->
-        Req.Test.json(conn, %{
+      HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
+        HTTPClient.Test.json(conn, %{
           "device_code" => "private",
           "user_code" => "CODE",
           "verification_uri" => uri,
@@ -139,7 +140,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
   end
 
   test "exchanges an authorization code with PKCE and normalizes the token" do
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       assert conn.method == "POST"
       assert conn.host == "login.microsoftonline.test"
       assert conn.request_path == "/organizations/oauth2/v2.0/token"
@@ -156,7 +157,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
                "scope" => "openid profile offline_access User.Read Mail.Read"
              }
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "access_token" => "access-token",
         "refresh_token" => "refresh-token",
         "expires_in" => 3600,
@@ -181,7 +182,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
   end
 
   test "refresh preserves requested scopes and leaves an omitted rotated token unset" do
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
 
       assert Plug.Conn.Query.decode(body) == %{
@@ -192,7 +193,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
                "scope" => "openid profile offline_access User.Read Mail.Read"
              }
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "access_token" => "new-access-token",
         "expires_in" => 1800
       })
@@ -209,10 +210,10 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
   end
 
   test "classifies invalid_grant as requiring reconnection" do
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       conn
       |> Plug.Conn.put_status(400)
-      |> Req.Test.json(%{
+      |> HTTPClient.Test.json(%{
         "error" => "invalid_grant",
         "error_description" => "The refresh token was revoked"
       })
@@ -227,11 +228,11 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
   end
 
   test "loads the signed-in mailbox identity" do
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       assert_graph_request(conn, "GET", "/v1.0/me", "access-token")
       assert conn.query_string == "%24select=id%2Cmail%2CuserPrincipalName"
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "id" => "azure-user-id",
         "mail" => nil,
         "userPrincipalName" => "Owner@Example.test"
@@ -262,7 +263,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
       "/v1.0/me/mailFolders/sentitems" => %{"id" => "graph-sent-id", "displayName" => "Gesendet"}
     }
 
-    Req.Test.expect(MicrosoftGraph, 4, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, 4, fn conn ->
       assert_graph_request(conn, "GET", conn.request_path, "access-token")
       assert conn.query_string == "%24select=id"
 
@@ -274,7 +275,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
         2_000 -> flunk("folder lookup barrier was not released")
       end
 
-      Req.Test.json(conn, Map.fetch!(responses, conn.request_path))
+      HTTPClient.Test.json(conn, Map.fetch!(responses, conn.request_path))
     end)
 
     initial_cursors =
@@ -323,13 +324,13 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
       "/v1.0/me/mailFolders/sentitems" => "graph-sent-id"
     }
 
-    Req.Test.expect(MicrosoftGraph, 4, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, 4, fn conn ->
       if conn.request_path == "/v1.0/me/mailFolders/archive" do
         conn
         |> Plug.Conn.put_status(404)
-        |> Req.Test.json(%{"error" => %{"code" => "ErrorFolderNotFound"}})
+        |> HTTPClient.Test.json(%{"error" => %{"code" => "ErrorFolderNotFound"}})
       else
-        Req.Test.json(conn, %{"id" => Map.fetch!(ids_by_path, conn.request_path)})
+        HTTPClient.Test.json(conn, %{"id" => Map.fetch!(ids_by_path, conn.request_path)})
       end
     end)
 
@@ -374,10 +375,10 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
 
     for {ids_by_path, index} <- Enum.with_index(invalid_ids) do
       stub_name = {MicrosoftGraph, :invalid_folder_ids, index, make_ref()}
-      config = Keyword.put(@config, :req_options, plug: {Req.Test, stub_name})
+      config = Keyword.put(@config, :req_options, plug: {HTTPClient.Test, stub_name})
 
-      Req.Test.stub(stub_name, fn conn ->
-        Req.Test.json(conn, %{"id" => Map.fetch!(ids_by_path, conn.request_path)})
+      HTTPClient.Test.stub(stub_name, fn conn ->
+        HTTPClient.Test.json(conn, %{"id" => Map.fetch!(ids_by_path, conn.request_path)})
       end)
 
       assert {:error,
@@ -393,7 +394,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
       fn conn ->
         conn
         |> Plug.Conn.put_status(401)
-        |> Req.Test.json(%{"error" => %{"code" => "InvalidAuthenticationToken"}})
+        |> HTTPClient.Test.json(%{"error" => %{"code" => "InvalidAuthenticationToken"}})
       end,
       :reconnect,
       :invalid_token,
@@ -407,7 +408,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
         conn
         |> Plug.Conn.put_resp_header("retry-after", "45")
         |> Plug.Conn.put_status(429)
-        |> Req.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
+        |> HTTPClient.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
       end,
       :temporary,
       :http_429,
@@ -417,7 +418,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
 
   test "retains the transport classification during folder resolution" do
     assert_folder_mapping_failure(
-      &Req.Test.transport_error(&1, :timeout),
+      &HTTPClient.Test.transport_error(&1, :timeout),
       :temporary,
       :transport_error,
       nil
@@ -428,11 +429,11 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
     next_link =
       "https://graph.microsoft.test/v1.0/me/mailFolders/delta?%24skiptoken=opaque%2Bvalue"
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       assert_graph_request(conn, "GET", "/v1.0/me/mailFolders/delta", "access-token")
       assert conn.query_string == "$select=id,displayName"
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "value" => [
           %{"id" => "folder-inbox", "displayName" => "Bandeja de entrada"},
           %{"id" => "folder-sent", "displayName" => "Gesendet"},
@@ -511,7 +512,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
     delta_link =
       "https://graph.microsoft.test/v1.0/me/mailFolders/folder-inbox/messages/delta?%24deltatoken=final%2Fopaque"
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       assert_graph_request(
         conn,
         "GET",
@@ -519,7 +520,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
         "access-token"
       )
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "value" => [
           %{
             "id" => "immutable-message-id",
@@ -581,11 +582,11 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
     next_link =
       "https://graph.microsoft.test/v1.0/me/mailFolders/folder-inbox/messages/delta?%24skiptoken=A%2BB%2FC%3D"
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       assert conn.request_path == "/v1.0/me/mailFolders/folder-inbox/messages/delta"
       assert conn.query_string == "%24skiptoken=A%2BB%2FC%3D"
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "value" => [],
         "@odata.deltaLink" =>
           "https://graph.microsoft.test/v1.0/me/mailFolders/folder-inbox/messages/delta?%24deltatoken=done"
@@ -624,17 +625,17 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
   end
 
   test "requires a cursor reset for expired delta state" do
-    Req.Test.expect(MicrosoftGraph, 2, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, 2, fn conn ->
       case Process.get(:graph_reset_response) do
         :gone ->
           conn
           |> Plug.Conn.put_status(410)
-          |> Req.Test.json(%{"error" => %{"code" => "resyncRequired"}})
+          |> HTTPClient.Test.json(%{"error" => %{"code" => "resyncRequired"}})
 
         :sync_state ->
           conn
           |> Plug.Conn.put_status(400)
-          |> Req.Test.json(%{
+          |> HTTPClient.Test.json(%{
             "error" => %{
               "code" => "BadRequest",
               "innerError" => %{"code" => "syncStateNotFound"}
@@ -693,10 +694,10 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
   end
 
   test "resets the folder-discovery lane without discarding accepted state" do
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       conn
       |> Plug.Conn.put_status(410)
-      |> Req.Test.json(%{"error" => %{"code" => "resyncRequired"}})
+      |> HTTPClient.Test.json(%{"error" => %{"code" => "resyncRequired"}})
     end)
 
     cursor = %Provider.SyncCursor{
@@ -732,8 +733,8 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
   end
 
   test "rejects an untrusted continuation returned by Graph" do
-    Req.Test.expect(MicrosoftGraph, fn conn ->
-      Req.Test.json(conn, %{
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
+      HTTPClient.Test.json(conn, %{
         "value" => [],
         "@odata.nextLink" => "https://graph.microsoft.test.attacker.example/steal"
       })
@@ -752,7 +753,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
   test "fetches raw MIME through the message value endpoint" do
     raw = "From: sender@example.test\r\nSubject: Raw\r\n\r\nBody\r\n"
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       assert_graph_request(
         conn,
         "GET",
@@ -772,11 +773,21 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
              )
   end
 
+  test "raw MIME below the import limit can exceed the common buffered response limit" do
+    raw = :binary.copy("x", 65 * 1024 * 1024)
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn -> Plug.Conn.send_resp(conn, 200, raw) end)
+
+    assert {:ok, %Provider.RawMessage{bytes: bytes}} =
+             MicrosoftGraph.fetch_raw("access-token", "large-message", @config, [])
+
+    assert bytes == raw
+  end
+
   test "classifies a raw message deleted before fetch as not found" do
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       conn
       |> Plug.Conn.put_status(404)
-      |> Req.Test.json(%{"error" => %{"code" => "ErrorItemNotFound"}})
+      |> HTTPClient.Test.json(%{"error" => %{"code" => "ErrorItemNotFound"}})
     end)
 
     assert {:error, %Provider.Error{class: :permanent, code: :not_found}} =
@@ -784,31 +795,31 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
   end
 
   test "classifies retry, authorization, permanent, and transport failures" do
-    Req.Test.expect(MicrosoftGraph, 5, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, 5, fn conn ->
       case Process.get(:graph_failure) do
         :rate_limited ->
           conn
           |> Plug.Conn.put_resp_header("retry-after", "75")
           |> Plug.Conn.put_status(429)
-          |> Req.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
+          |> HTTPClient.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
 
         :unavailable ->
           conn
           |> Plug.Conn.put_status(503)
-          |> Req.Test.json(%{"error" => %{"code" => "ServiceUnavailable"}})
+          |> HTTPClient.Test.json(%{"error" => %{"code" => "ServiceUnavailable"}})
 
         :invalid_token ->
           conn
           |> Plug.Conn.put_status(401)
-          |> Req.Test.json(%{"error" => %{"code" => "InvalidAuthenticationToken"}})
+          |> HTTPClient.Test.json(%{"error" => %{"code" => "InvalidAuthenticationToken"}})
 
         :forbidden ->
           conn
           |> Plug.Conn.put_status(403)
-          |> Req.Test.json(%{"error" => %{"code" => "ErrorAccessDenied"}})
+          |> HTTPClient.Test.json(%{"error" => %{"code" => "ErrorAccessDenied"}})
 
         :network ->
-          Req.Test.transport_error(conn, :timeout)
+          HTTPClient.Test.transport_error(conn, :timeout)
       end
     end)
 
@@ -866,15 +877,15 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
     }
 
     stub_name = {MicrosoftGraph, :required_folder_missing, required_path, make_ref()}
-    config = Keyword.put(@config, :req_options, plug: {Req.Test, stub_name})
+    config = Keyword.put(@config, :req_options, plug: {HTTPClient.Test, stub_name})
 
-    Req.Test.stub(stub_name, fn conn ->
+    HTTPClient.Test.stub(stub_name, fn conn ->
       if conn.request_path == required_path do
         conn
         |> Plug.Conn.put_status(404)
-        |> Req.Test.json(%{"error" => %{"code" => "ErrorFolderNotFound"}})
+        |> HTTPClient.Test.json(%{"error" => %{"code" => "ErrorFolderNotFound"}})
       else
-        Req.Test.json(conn, %{"id" => Map.fetch!(ids_by_path, conn.request_path)})
+        HTTPClient.Test.json(conn, %{"id" => Map.fetch!(ids_by_path, conn.request_path)})
       end
     end)
 
@@ -896,11 +907,11 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
 
     context = Manifold.Connectors.MicrosoftSyncLimiter.context("mailbox", server: server)
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       conn
       |> Plug.Conn.put_resp_header("retry-after", "45")
       |> Plug.Conn.put_status(429)
-      |> Req.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
+      |> HTTPClient.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
     end)
 
     assert {:error, %Provider.Error{code: :http_429, retry_after_seconds: 45}} =
@@ -920,7 +931,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
 
     context = Manifold.Connectors.MicrosoftSyncLimiter.context("mailbox", server: server)
 
-    Req.Test.expect(MicrosoftGraph, 4, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, 4, fn conn ->
       send(parent, {:slow_folder_lookup, self()})
 
       receive do
@@ -929,7 +940,7 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
         10_000 -> flunk("folder lookup barrier was not released")
       end
 
-      Req.Test.json(conn, %{"id" => Path.basename(conn.request_path)})
+      HTTPClient.Test.json(conn, %{"id" => Path.basename(conn.request_path)})
     end)
 
     task =
@@ -983,13 +994,13 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
   end
 
   test "HTTP-date Retry-After is accepted and trusted options cannot enable automatic replay" do
-    until = DateTime.utc_now() |> DateTime.add(120, :second) |> Req.Utils.format_http_date()
+    until = DateTime.utc_now() |> DateTime.add(120, :second) |> HTTPClient.format_http_date()
 
-    Req.Test.expect(MicrosoftGraph, fn conn ->
+    HTTPClient.Test.expect(MicrosoftGraph, fn conn ->
       conn
       |> Plug.Conn.put_resp_header("retry-after", until)
       |> Plug.Conn.put_status(429)
-      |> Req.Test.json(%{"error" => "TooManyRequests"})
+      |> HTTPClient.Test.json(%{"error" => "TooManyRequests"})
     end)
 
     config = Keyword.update!(@config, :req_options, &Keyword.put(&1, :retry, :safe_transient))
@@ -1008,13 +1019,13 @@ defmodule Manifold.Connectors.Provider.MicrosoftGraphTest do
     }
 
     stub_name = {MicrosoftGraph, code, make_ref()}
-    config = Keyword.put(@config, :req_options, plug: {Req.Test, stub_name})
+    config = Keyword.put(@config, :req_options, plug: {HTTPClient.Test, stub_name})
 
-    Req.Test.stub(stub_name, fn conn ->
+    HTTPClient.Test.stub(stub_name, fn conn ->
       if conn.request_path == "/v1.0/me/mailFolders/inbox" do
         failure_response.(conn)
       else
-        Req.Test.json(conn, %{"id" => Map.fetch!(ids_by_path, conn.request_path)})
+        HTTPClient.Test.json(conn, %{"id" => Map.fetch!(ids_by_path, conn.request_path)})
       end
     end)
 

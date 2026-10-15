@@ -1,4 +1,5 @@
 defmodule Manifold.Connectors.Provider.GmailTest do
+  alias Manifold.Core.HTTPClient
   use ExUnit.Case, async: true
 
   import ExUnit.CaptureLog
@@ -13,11 +14,11 @@ defmodule Manifold.Connectors.Provider.GmailTest do
     token_url: "https://oauth.gmail.test/token",
     userinfo_url: "https://openid.gmail.test/v1/userinfo",
     base_url: "https://gmail.test",
-    req_options: [plug: {Req.Test, Gmail}]
+    req_options: [plug: {HTTPClient.Test, Gmail}]
   ]
 
   test "exchanges an authorization code with PKCE" do
-    Req.Test.expect(Gmail, fn conn ->
+    HTTPClient.Test.expect(Gmail, fn conn ->
       assert conn.method == "POST"
       assert conn.request_path == "/token"
 
@@ -36,7 +37,7 @@ defmodule Manifold.Connectors.Provider.GmailTest do
                "redirect_uri" => "https://mail.example.test/oauth/gmail/callback"
              }
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "access_token" => "access-token",
         "refresh_token" => "refresh-token",
         "expires_in" => 3_600,
@@ -68,8 +69,8 @@ defmodule Manifold.Connectors.Provider.GmailTest do
           [GmailScopes.send()],
           [GmailScopes.read(), GmailScopes.send()]
         ] do
-      Req.Test.expect(Gmail, fn conn ->
-        Req.Test.json(conn, %{
+      HTTPClient.Test.expect(Gmail, fn conn ->
+        HTTPClient.Test.json(conn, %{
           "access_token" => "access-token",
           "refresh_token" => "refresh-token",
           "expires_in" => 3_600,
@@ -90,8 +91,8 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   end
 
   test "prefers provider response scopes over the callback fallback" do
-    Req.Test.expect(Gmail, fn conn ->
-      Req.Test.json(conn, %{
+    HTTPClient.Test.expect(Gmail, fn conn ->
+      HTTPClient.Test.json(conn, %{
         "access_token" => "access-token",
         "refresh_token" => "refresh-token",
         "expires_in" => 3_600,
@@ -114,7 +115,7 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   end
 
   test "refreshes access without inventing a replacement refresh token" do
-    Req.Test.expect(Gmail, fn conn ->
+    HTTPClient.Test.expect(Gmail, fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
 
       assert URI.decode_query(body) == %{
@@ -124,7 +125,7 @@ defmodule Manifold.Connectors.Provider.GmailTest do
                "refresh_token" => "stored-refresh-token"
              }
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "access_token" => "refreshed-access-token",
         "expires_in" => 1_800,
         "scope" => "https://www.googleapis.com/auth/gmail.readonly"
@@ -146,12 +147,12 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   end
 
   test "loads the stable OpenID subject and current email identity" do
-    Req.Test.expect(Gmail, fn conn ->
+    HTTPClient.Test.expect(Gmail, fn conn ->
       assert conn.method == "GET"
       assert conn.request_path == "/v1/userinfo"
       assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer access-token"]
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "sub" => "google-subject-91234",
         "email" => "Person@Example.COM"
       })
@@ -165,8 +166,8 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   end
 
   test "freezes the profile history ID before the initial mailbox scan" do
-    Req.Test.expect(Gmail, fn conn ->
-      Req.Test.json(conn, %{"emailAddress" => "person@example.com", "historyId" => "1000"})
+    HTTPClient.Test.expect(Gmail, fn conn ->
+      HTTPClient.Test.json(conn, %{"emailAddress" => "person@example.com", "historyId" => "1000"})
     end)
 
     assert {:ok,
@@ -182,7 +183,7 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   end
 
   test "pages the initial message listing and keeps the frozen history anchor" do
-    Req.Test.expect(Gmail, 2, fn conn ->
+    HTTPClient.Test.expect(Gmail, 2, fn conn ->
       query = URI.decode_query(conn.query_string)
 
       assert conn.request_path == "/gmail/v1/users/me/messages"
@@ -191,7 +192,7 @@ defmodule Manifold.Connectors.Provider.GmailTest do
 
       case query["pageToken"] do
         nil ->
-          Req.Test.json(conn, %{
+          HTTPClient.Test.json(conn, %{
             "messages" => [
               %{"id" => "message-1", "threadId" => "thread-1"},
               %{"id" => "message-2", "threadId" => "thread-2"}
@@ -201,7 +202,7 @@ defmodule Manifold.Connectors.Provider.GmailTest do
           })
 
         "page-2" ->
-          Req.Test.json(conn, %{
+          HTTPClient.Test.json(conn, %{
             "messages" => [%{"id" => "message-3", "threadId" => "thread-3"}]
           })
       end
@@ -242,7 +243,7 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   end
 
   test "normalizes paginated history without duplicating generic messages" do
-    Req.Test.expect(Gmail, 2, fn conn ->
+    HTTPClient.Test.expect(Gmail, 2, fn conn ->
       query = URI.decode_query(conn.query_string)
 
       assert conn.request_path == "/gmail/v1/users/me/history"
@@ -251,7 +252,7 @@ defmodule Manifold.Connectors.Provider.GmailTest do
 
       case query["pageToken"] do
         nil ->
-          Req.Test.json(conn, %{
+          HTTPClient.Test.json(conn, %{
             "history" => [
               %{
                 "id" => "1001",
@@ -282,7 +283,7 @@ defmodule Manifold.Connectors.Provider.GmailTest do
           })
 
         "history-page-2" ->
-          Req.Test.json(conn, %{
+          HTTPClient.Test.json(conn, %{
             "history" => [
               %{
                 "id" => "1003",
@@ -356,15 +357,15 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   end
 
   test "resets an expired history cursor with a newly frozen profile history ID" do
-    Req.Test.expect(Gmail, 2, fn conn ->
+    HTTPClient.Test.expect(Gmail, 2, fn conn ->
       case conn.request_path do
         "/gmail/v1/users/me/history" ->
           conn
           |> Plug.Conn.put_status(404)
-          |> Req.Test.json(%{"error" => %{"code" => 404, "message" => "history expired"}})
+          |> HTTPClient.Test.json(%{"error" => %{"code" => 404, "message" => "history expired"}})
 
         "/gmail/v1/users/me/profile" ->
-          Req.Test.json(conn, %{
+          HTTPClient.Test.json(conn, %{
             "emailAddress" => "person@example.com",
             "historyId" => "2000"
           })
@@ -393,11 +394,11 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   test "decodes unpadded base64url RAW bytes and internal date" do
     raw = "From: sender@example.net\r\nSubject: hello\r\n\r\nbody\r\n"
 
-    Req.Test.expect(Gmail, fn conn ->
+    HTTPClient.Test.expect(Gmail, fn conn ->
       assert conn.request_path == "/gmail/v1/users/me/messages/message-1"
       assert URI.decode_query(conn.query_string) == %{"format" => "RAW"}
 
-      Req.Test.json(conn, %{
+      HTTPClient.Test.json(conn, %{
         "id" => "message-1",
         "threadId" => "thread-1",
         "labelIds" => ["INBOX", "STARRED"],
@@ -417,29 +418,45 @@ defmodule Manifold.Connectors.Provider.GmailTest do
             }} = Gmail.fetch_raw("access-token", "message-1", @config, [])
   end
 
+  test "RAW JSON base64 overhead does not reduce the existing MIME import limit" do
+    raw = :binary.copy("x", 49 * 1024 * 1024)
+
+    HTTPClient.Test.expect(Gmail, fn conn ->
+      HTTPClient.Test.json(conn, %{"raw" => Base.url_encode64(raw, padding: false)})
+    end)
+
+    assert {:ok, %Provider.RawMessage{bytes: bytes}} =
+             Gmail.fetch_raw("access-token", "large-message", @config, [])
+
+    assert bytes == raw
+  end
+
   test "classifies retryable, reconnect, and permanent provider failures" do
-    Req.Test.expect(Gmail, 4, fn conn ->
+    HTTPClient.Test.expect(Gmail, 4, fn conn ->
       case Process.get(:gmail_failure) do
         :rate ->
           conn
           |> Plug.Conn.put_resp_header("retry-after", "90")
           |> Plug.Conn.put_status(429)
-          |> Req.Test.json(%{"error" => %{"message" => "quota details must not escape"}})
+          |> HTTPClient.Test.json(%{"error" => %{"message" => "quota details must not escape"}})
 
         :server ->
           conn
           |> Plug.Conn.put_status(503)
-          |> Req.Test.json(%{"error" => %{"message" => "backend details must not escape"}})
+          |> HTTPClient.Test.json(%{"error" => %{"message" => "backend details must not escape"}})
 
         :invalid_grant ->
           conn
           |> Plug.Conn.put_status(400)
-          |> Req.Test.json(%{"error" => "invalid_grant", "error_description" => "token leaked"})
+          |> HTTPClient.Test.json(%{
+            "error" => "invalid_grant",
+            "error_description" => "token leaked"
+          })
 
         :forbidden ->
           conn
           |> Plug.Conn.put_status(403)
-          |> Req.Test.json(%{
+          |> HTTPClient.Test.json(%{
             "error" => %{
               "errors" => [%{"reason" => "domainPolicy"}],
               "message" => "policy details"
@@ -476,15 +493,15 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   end
 
   test "transport failures are temporary and errors and logs omit tokens and response bodies" do
-    Req.Test.expect(Gmail, 2, fn conn ->
+    HTTPClient.Test.expect(Gmail, 2, fn conn ->
       case Process.get(:gmail_transport) do
         :timeout ->
-          Req.Test.transport_error(conn, :timeout)
+          HTTPClient.Test.transport_error(conn, :timeout)
 
         :body ->
           conn
           |> Plug.Conn.put_status(400)
-          |> Req.Test.json(%{
+          |> HTTPClient.Test.json(%{
             "error" => %{
               "message" => "private body marker",
               "errors" => [%{"reason" => "badRequest"}]
@@ -519,7 +536,7 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   test "paces list, history, raw and expired-history profile requests with one sync context" do
     {context, clock} = sync_context()
 
-    Req.Test.expect(Gmail, 5, fn conn ->
+    HTTPClient.Test.expect(Gmail, 5, fn conn ->
       Agent.update(clock, fn state ->
         %{state | requests: state.requests ++ [{conn.request_path, state.now}]}
       end)
@@ -527,20 +544,20 @@ defmodule Manifold.Connectors.Provider.GmailTest do
       case {conn.request_path, URI.decode_query(conn.query_string)} do
         {"/gmail/v1/users/me/messages", query} ->
           assert query["maxResults"] == "50"
-          Req.Test.json(conn, %{})
+          HTTPClient.Test.json(conn, %{})
 
         {"/gmail/v1/users/me/history", %{"startHistoryId" => "1000"} = query} ->
           assert query["maxResults"] == "50"
-          Req.Test.json(conn, %{"historyId" => "1001"})
+          HTTPClient.Test.json(conn, %{"historyId" => "1001"})
 
         {"/gmail/v1/users/me/messages/message-1", %{"format" => "RAW"}} ->
-          Req.Test.json(conn, %{"raw" => Base.url_encode64("raw", padding: false)})
+          HTTPClient.Test.json(conn, %{"raw" => Base.url_encode64("raw", padding: false)})
 
         {"/gmail/v1/users/me/history", %{"startHistoryId" => "expired"}} ->
-          conn |> Plug.Conn.put_status(404) |> Req.Test.json(%{"error" => %{}})
+          conn |> Plug.Conn.put_status(404) |> HTTPClient.Test.json(%{"error" => %{}})
 
         {"/gmail/v1/users/me/profile", _query} ->
-          Req.Test.json(conn, %{"historyId" => "2000"})
+          HTTPClient.Test.json(conn, %{"historyId" => "2000"})
       end
     end)
 
@@ -581,13 +598,13 @@ defmodule Manifold.Connectors.Provider.GmailTest do
       wait: fn _ -> flunk("OAuth calls must not wait for receive sync") end
     }
 
-    Req.Test.expect(Gmail, 3, fn conn ->
+    HTTPClient.Test.expect(Gmail, 3, fn conn ->
       case conn.request_path do
         "/token" ->
-          Req.Test.json(conn, %{"access_token" => "access-token", "expires_in" => 3600})
+          HTTPClient.Test.json(conn, %{"access_token" => "access-token", "expires_in" => 3600})
 
         "/v1/userinfo" ->
-          Req.Test.json(conn, %{"sub" => "subject", "email" => "person@example.test"})
+          HTTPClient.Test.json(conn, %{"sub" => "subject", "email" => "person@example.test"})
       end
     end)
 
@@ -601,7 +618,7 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   end
 
   test "uncontexted mailbox requests remain unpaced" do
-    Req.Test.expect(Gmail, 2, fn conn -> Req.Test.json(conn, %{}) end)
+    HTTPClient.Test.expect(Gmail, 2, fn conn -> HTTPClient.Test.json(conn, %{}) end)
     cursor = %Provider.SyncCursor{scope: "mailbox", phase: "initial", bootstrap_cursor: "1000"}
 
     assert {:ok, %Provider.Page{}} = Gmail.sync_page("access-token", cursor, @config, [])
@@ -611,11 +628,11 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   test "normalized mailbox rate errors install cooldown before the next real request" do
     {context, clock} = sync_context()
 
-    Req.Test.expect(Gmail, fn conn ->
+    HTTPClient.Test.expect(Gmail, fn conn ->
       conn
       |> Plug.Conn.put_status(429)
       |> Plug.Conn.put_resp_header("retry-after", "90")
-      |> Req.Test.json(%{"error" => %{"message" => "private rate details"}})
+      |> HTTPClient.Test.json(%{"error" => %{"message" => "private rate details"}})
     end)
 
     cursor = %Provider.SyncCursor{scope: "mailbox", phase: "initial", bootstrap_cursor: "1000"}
@@ -678,9 +695,12 @@ defmodule Manifold.Connectors.Provider.GmailTest do
           {"Fri, 09 Oct 2026 00:02:00 GMT", "Retry after 2026-10-09T00:01:00Z", 120},
           {nil, "Retry after 2026-10-09T00:00:00.001Z", 1}
         ] do
-      Req.Test.expect(Gmail, fn conn ->
+      HTTPClient.Test.expect(Gmail, fn conn ->
         conn = if header, do: Plug.Conn.put_resp_header(conn, "retry-after", header), else: conn
-        conn |> Plug.Conn.put_status(429) |> Req.Test.json(%{"error" => %{"message" => message}})
+
+        conn
+        |> Plug.Conn.put_status(429)
+        |> HTTPClient.Test.json(%{"error" => %{"message" => message}})
       end)
 
       assert {:error,
@@ -702,11 +722,11 @@ defmodule Manifold.Connectors.Provider.GmailTest do
           {"not-a-date", "Retry after 2026-99-99T00:00:00Z"},
           {"Thu, 08 Oct 2026 00:00:00 GMT", "Retry after 2026-10-09T00:00:00Z"}
         ] do
-      Req.Test.expect(Gmail, fn conn ->
+      HTTPClient.Test.expect(Gmail, fn conn ->
         conn
         |> Plug.Conn.put_resp_header("retry-after", header)
         |> Plug.Conn.put_status(429)
-        |> Req.Test.json(%{"error" => %{"message" => message}})
+        |> HTTPClient.Test.json(%{"error" => %{"message" => message}})
       end)
 
       assert {:error, %Provider.Error{code: :rate_limited, retry_after_seconds: nil}} =
@@ -738,10 +758,10 @@ defmodule Manifold.Connectors.Provider.GmailTest do
   end
 
   defp quota_response(reason, status \\ 403) do
-    Req.Test.expect(Gmail, fn conn ->
+    HTTPClient.Test.expect(Gmail, fn conn ->
       conn
       |> Plug.Conn.put_status(status)
-      |> Req.Test.json(%{
+      |> HTTPClient.Test.json(%{
         "error" => %{"errors" => [%{"reason" => reason}], "message" => "private provider detail"}
       })
     end)

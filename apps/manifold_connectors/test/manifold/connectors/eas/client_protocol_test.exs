@@ -4,6 +4,7 @@ defmodule Manifold.Connectors.EAS.ClientProtocolTest do
   alias Manifold.Connectors.EAS.Client
   alias Manifold.Connectors.EAS.WBXML
   alias Manifold.Connectors.Provider.Error
+  alias Manifold.Core.HTTPClient
 
   test "auth_username prefixes optional domain" do
     assert Client.auth_username(%{username: "user@ex.com", domain: nil}) == "user@ex.com"
@@ -14,12 +15,12 @@ defmodule Manifold.Connectors.EAS.ClientProtocolTest do
   end
 
   test "format_transport_reason clarifies DNS Host failures vs Domain field" do
-    message = Client.format_transport_reason(%Req.TransportError{reason: :nxdomain})
+    message = Client.format_transport_reason(%HTTPClient.TransportError{reason: :nxdomain})
     assert message =~ "DNS lookup failed for Host"
     assert message =~ "not the optional Domain"
     refute message =~ "non-existing domain"
 
-    message = Client.format_transport_reason(%Req.TransportError{reason: :econnrefused})
+    message = Client.format_transport_reason(%HTTPClient.TransportError{reason: :econnrefused})
     assert message =~ "connection to Host failed"
   end
 
@@ -114,7 +115,7 @@ defmodule Manifold.Connectors.EAS.ClientProtocolTest do
   end
 
   test "provision request WBXML includes DeviceInformation for 14.1" do
-    Req.Test.stub(EASClientProtocol, fn conn ->
+    HTTPClient.Test.stub(EASClientProtocol, fn conn ->
       case conn.method do
         "OPTIONS" ->
           conn
@@ -163,7 +164,7 @@ defmodule Manifold.Connectors.EAS.ClientProtocolTest do
       device_type: "iPhone",
       protocol_version: "14.1",
       emit_activity: false,
-      req_options: [plug: {Req.Test, EASClientProtocol}]
+      req_options: [plug: {HTTPClient.Test, EASClientProtocol}]
     }
 
     assert {:ok, conn} = Client.connect(settings)
@@ -171,7 +172,7 @@ defmodule Manifold.Connectors.EAS.ClientProtocolTest do
   end
 
   test "provision 14.0 omits DeviceInformation and sends Settings instead" do
-    Req.Test.stub(EASClientProtocol140, fn conn ->
+    HTTPClient.Test.stub(EASClientProtocol140, fn conn ->
       case {conn.method, conn.query_string} do
         {"OPTIONS", _} ->
           conn
@@ -241,7 +242,7 @@ defmodule Manifold.Connectors.EAS.ClientProtocolTest do
       device_type: "iPhone",
       protocol_version: "14.0",
       emit_activity: false,
-      req_options: [plug: {Req.Test, EASClientProtocol140}]
+      req_options: [plug: {HTTPClient.Test, EASClientProtocol140}]
     }
 
     assert {:ok, conn} = Client.connect(settings)
@@ -249,7 +250,7 @@ defmodule Manifold.Connectors.EAS.ClientProtocolTest do
   end
 
   test "FolderSync HTTP HTML 400 yields gateway-specific error" do
-    Req.Test.stub(EASClientProtocolHtml400, fn conn ->
+    HTTPClient.Test.stub(EASClientProtocolHtml400, fn conn ->
       case conn.method do
         "OPTIONS" ->
           conn
@@ -275,7 +276,7 @@ defmodule Manifold.Connectors.EAS.ClientProtocolTest do
       device_type: "iPhone",
       protocol_version: "14.1",
       emit_activity: false,
-      req_options: [plug: {Req.Test, EASClientProtocolHtml400}]
+      req_options: [plug: {HTTPClient.Test, EASClientProtocolHtml400}]
     }
 
     assert {:ok, conn} = Client.connect(settings)

@@ -1,4 +1,5 @@
 defmodule ManifoldWeb.GoogleLoginLiveTest do
+  alias Manifold.Core.HTTPClient
   use ManifoldWeb.ConnCase, async: false
 
   import Phoenix.LiveViewTest
@@ -19,7 +20,7 @@ defmodule ManifoldWeb.GoogleLoginLiveTest do
     gmail =
       previous
       |> Keyword.fetch!(:gmail)
-      |> Keyword.put(:req_options, plug: {Req.Test, __MODULE__})
+      |> Keyword.put(:req_options, plug: {HTTPClient.Test, __MODULE__})
 
     Application.put_env(:manifold_connectors, :providers, Keyword.put(previous, :gmail, gmail))
     on_exit(fn -> Application.put_env(:manifold_connectors, :providers, previous) end)
@@ -51,7 +52,7 @@ defmodule ManifoldWeb.GoogleLoginLiveTest do
       {:ok, view, _html} =
         live(conn, "/settings/accounts/#{account.id}/google/login?purpose=#{purpose}")
 
-      Req.Test.allow(__MODULE__, owner, view.pid)
+      HTTPClient.Test.allow(__MODULE__, owner, view.pid)
       assert Repo.all(OAuthTransaction) == []
 
       view |> element("#start-google-login") |> render_click()
@@ -153,17 +154,17 @@ defmodule ManifoldWeb.GoogleLoginLiveTest do
     conn: conn,
     account: account
   } do
-    Req.Test.stub(__MODULE__, fn request ->
+    HTTPClient.Test.stub(__MODULE__, fn request ->
       request
       |> Plug.Conn.put_status(400)
-      |> Req.Test.json(%{
+      |> HTTPClient.Test.json(%{
         error: "invalid_grant",
         error_description: "private-provider-description-sentinel"
       })
     end)
 
     {:ok, view, _html} = live(conn, "/settings/accounts/#{account.id}/google/login")
-    Req.Test.allow(__MODULE__, self(), view.pid)
+    HTTPClient.Test.allow(__MODULE__, self(), view.pid)
     view |> element("#start-google-login") |> render_click()
     query = login_query(view)
     url = response_url(query)
@@ -249,7 +250,7 @@ defmodule ManifoldWeb.GoogleLoginLiveTest do
   end
 
   defp stub_google(owner, purpose) do
-    Req.Test.stub(__MODULE__, fn request ->
+    HTTPClient.Test.stub(__MODULE__, fn request ->
       case request.request_path do
         "/token" ->
           {:ok, body, request} = Plug.Conn.read_body(request)
@@ -260,7 +261,7 @@ defmodule ManifoldWeb.GoogleLoginLiveTest do
               do: "https://www.googleapis.com/auth/gmail.readonly",
               else: "https://www.googleapis.com/auth/gmail.send"
 
-          Req.Test.json(request, %{
+          HTTPClient.Test.json(request, %{
             access_token: "private-access-token",
             refresh_token: "private-refresh-token",
             expires_in: 3600,
@@ -269,10 +270,10 @@ defmodule ManifoldWeb.GoogleLoginLiveTest do
           })
 
         "/v1/userinfo" ->
-          Req.Test.json(request, %{sub: "google-subject", email: "google@example.test"})
+          HTTPClient.Test.json(request, %{sub: "google-subject", email: "google@example.test"})
 
         "/gmail/v1/users/me/profile" ->
-          Req.Test.json(request, %{historyId: "100"})
+          HTTPClient.Test.json(request, %{historyId: "100"})
       end
     end)
   end

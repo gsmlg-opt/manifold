@@ -7,6 +7,7 @@ defmodule Manifold.Connectors.EAS.Client do
   alias Manifold.Connectors.EAS.HTTPAdapter
   alias Manifold.Connectors.Provider.Error
   alias Manifold.Connectors.TLS
+  alias Manifold.Core.HTTPClient.Response
 
   defstruct [
     :settings,
@@ -609,35 +610,20 @@ defmodule Manifold.Connectors.EAS.Client do
       [
         receive_timeout: @receive_timeout,
         connect_options: [timeout: @connect_timeout, protocols: [:http1]],
-        decode_body: decode_body_default(conn.tls_config),
+        decode_body: false,
         compressed: false,
-        # Use Req's user_agent option so we do not end up with "Apple…, req/x.y".
         user_agent: @user_agent
       ]
       |> Keyword.merge(conn.req_options || [])
       |> Keyword.merge(opts)
 
     result =
-      case conn.tls_config do
-        %TLS.Config{backend: :ex_ssl} = tls_config ->
-          with :ok <- HTTPAdapter.validate_options(options, tls_config) do
-            options
-            |> Keyword.put(:adapter, HTTPAdapter)
-            |> Keyword.put(:retry, false)
-            |> Keyword.put(:redirect, false)
-            |> Req.new()
-            |> HTTPAdapter.put_tls_config(tls_config)
-            |> Req.request()
-          else
-            {:error, reason} -> {:error, reason}
-          end
-
-        _ ->
-          Req.request(options)
+      with :ok <- HTTPAdapter.validate_options(options, conn.tls_config) do
+        HTTPAdapter.request(options, conn.tls_config)
       end
 
     case result do
-      {:ok, %Req.Response{} = response} ->
+      {:ok, %Response{} = response} ->
         {:ok, %{status: response.status, body: response.body, headers: response.headers}}
 
       {:error, reason} ->
@@ -670,9 +656,6 @@ defmodule Manifold.Connectors.EAS.Client do
         message
     end
   end
-
-  defp decode_body_default(%TLS.Config{backend: :ex_ssl}), do: false
-  defp decode_body_default(_tls_config), do: true
 
   defp connect_failed_error(reason) do
     %Error{

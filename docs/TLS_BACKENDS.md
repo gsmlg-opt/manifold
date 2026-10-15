@@ -1,7 +1,7 @@
 # Opt-in TLS client backends
 
 Manifold defaults to OTP `:ssl`. The experimental ex_ssl backend is limited to
-outbound IMAP, SMTP submission and the EAS HTTP/1.1 adapter. It is an OTP-compatible
+outbound IMAP, SMTP submission and EAS HTTP/1.1 requests. It is an OTP-compatible
 client API for an implemented subset, not a universal SSL replacement.
 
 ## Revisions and acceptance contract
@@ -11,16 +11,23 @@ baseline was `04180a504c55c65d4f339d459e011e2e2307bc49`; the authenticated clien
 implementation was pinned at `75ad1da8832a24f0d7f730e54ec80717b7346664`.
 Dependency maintenance on 2026-10-09 replaced that unavailable Git revision
 with exact Hex `ex_ssl == 0.17.1`, matching the Fetch dependency graph introduced
-by DuskMoon 9.16.7. The default backend remains OTP.
-Library and consumer changes are reviewed separately. No release or production
-configuration change is required by this development change.
+by DuskMoon 9.16.7. The 2026-10-15 HTTP-client migration uses locked Hex
+`http_fetch == 0.21.10` and `ex_ssl == 0.21.10`. Business HTTP requests in the
+v0.6.4 release candidate use `Manifold.Core.HTTPClient`, which calls native `HTTP.fetch`; EAS
+explicitly selects its account's TLS backend. The published upstream fix and
+complete affected regression pass, accepting the native migration for the
+release candidate. The default backend remains OTP. Publication is tracked
+separately from this local acceptance evidence.
+Library and consumer changes are reviewed separately. The release candidate
+does not change production TLS backend configuration.
 
 | Consumer | Audited contract | Backend boundary |
 | --- | --- | --- |
 | IMAP | Host and existing-socket connect; send, raw recv length 0 (30 seconds), close. Binary/passive/raw, verify_peer, system cacerts, DNS SNI and HTTPS hostname match function. | `IMAP.Client` resolves TLS configuration before connecting; direct TLS and STARTTLS retain a backend-tagged handle. |
 | SMTP submission | Same TLS calls/options; connect 15 seconds, remaining monotonic reply deadline; EHLO/STARTTLS/220/re-EHLO, AUTH, envelope, DATA and QUIT. | `SMTP.Client` uses the same handle boundary. Checked-out submission account identity selects the backend. Definite versus uncertain DATA outcomes remain unchanged. |
-| EAS | Req OPTIONS/POST, URL/query, Basic auth headers, cookies, binary WBXML and response headers/body; connect 15 seconds, receive 60 seconds; HTTP/1 only, compression disabled. | Locked Req 0.7.5 supports a request adapter. Finch 0.24.0 and Mint 1.11.0 still use OTP; ex_ssl selects `EAS.HTTPAdapter` explicitly. |
-| Unchanged consumers | Inbound SMTP, Phoenix/server TLS, database TLS, cloud HTTP, Gmail/Microsoft Graph HTTP, Resend and other Req calls. | Existing implementation and configuration. |
+| EAS | OPTIONS/POST, URL/query, Basic auth headers, cookies, binary WBXML and response headers/body; connect 15 seconds, total request 60 seconds; HTTP/1 only, compression disabled. | `EAS.HTTPAdapter` validates application policy and calls the shared native Fetch client with explicit OTP or ex_ssl selection. |
+| Other business HTTP | DAV extension methods/raw XML, cloud HTTP, Gmail/Microsoft Graph HTTP, Resend and connector requests. | Shared native Fetch client; existing default OTP TLS. DAV uses bounded responses and one total deadline, preserving trailer metadata. |
+| Server/database consumers | Inbound SMTP, Phoenix/server TLS and database TLS. | Existing implementation and configuration. |
 
 ## Enable a controlled account
 
@@ -93,7 +100,21 @@ queued-write buffers and uses internal active-once TCP delivery.
 
 ## EAS HTTP scope
 
-The explicit adapter uses a fresh verified connection for each request. There is
+Published `http_fetch` 0.21.10 includes
+[PR #124](https://github.com/gsmlg-dev/http_fetch/pull/124), resolving
+[issue #121](https://github.com/gsmlg-dev/http_fetch/issues/121). The native
+HTTP/1 parser rejects a textual `HTTP/2.0 200 OK` response, and the controlled
+TLS regression now passes. The complete affected suite also passes, including
+OTP and ex_ssl rejection gates for both HTTP/0.9 and HTTP/2.0 status lines. The
+native EAS migration is accepted for the v0.6.4 release candidate. No local parser workaround
+or global TLS backend change is required.
+Native parsing also handles valid 100/103 interim responses and rejects 101;
+the former custom parser rejected all informational responses.
+
+
+The EAS policy adapter calls `Manifold.Core.HTTPClient`; native Fetch owns HTTP
+framing, TLS dispatch and cancellation. There is no private EAS HTTP parser or
+DAV Mint adapter. The shared client uses a fresh verified connection for each request. There is
 no pool, HTTP/2 negotiation, redirect following, transport retry or TLS downgrade.
 This costs an authenticated handshake per request but avoids cross-account or
 cross-trust connection reuse. Read-only EAS requests may negotiate protocol/query
@@ -101,8 +122,8 @@ formats after HTTP 400. The ex_ssl path does not replay Sync changes, Provision
 or Settings requests; configure a supported protocol/query format before these
 operations. Unsuccessful OPTIONS responses fail connection authentication.
 
-The adapter accepts only its documented finite request-option subset; unsupported
-Req/Finch transport, streaming, proxy, compression and custom adapter options fail
+The ex_ssl adapter accepts only its documented finite request-option subset; unsupported
+transport, streaming, proxy, compression and custom adapter options fail
 explicitly. It supports content-length, chunked and authenticated connection-close
 responses. Abrupt TLS transport loss is an error, never the successful end of a
 close-delimited response. Request and response data do not enter transport errors.
@@ -111,19 +132,74 @@ Supported request options are `method` (`:options` or `:post`), HTTPS `url`,
 `headers`, binary/iodata `body`, `receive_timeout`, `user_agent`,
 `connect_options: [timeout: ..., protocols: [:http1]]`, `compressed: false`,
 and `decode_body: false`. EAS keeps WBXML bytes intact for its own decoder.
-Timeouts accept non-negative milliseconds or `:infinity`; one monotonic receive
-deadline covers all response fragments. The default connection/receive timeouts
-are 15/60 seconds. Unknown or conflicting options fail before connecting.
+Timeouts accept finite non-negative milliseconds, including `0`; `:infinity` is
+rejected. One monotonic total request deadline includes connecting, headers and
+all body fragments. The default connection/total request timeouts are 15/60
+seconds. Unknown or conflicting ex_ssl options fail before connecting.
 
-Request and response bodies are limited to 64 MiB; each HTTP head/trailer section
-is limited to 64 KiB and 200 fields, and each chunk-size line to 1 KiB. Streaming,
-informational responses, HTTP upgrades, compressed responses and arbitrary HTTP
+Request and response bodies are limited to 64 MiB. EAS applies a combined
+64 KiB/200-field cap to initial response headers and trailers. Native HTTP/1
+framing independently limits trailers to 64 KiB/128 fields and chunk-size lines
+to 8 KiB. Streaming, HTTP upgrades, compressed responses and arbitrary HTTP
 methods are outside this adapter's scope. Every request closes its connection.
 Chunk sizes and extensions are validated against the bounded
 [HTTP/1.1 grammar](https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1);
 unrecognized valid extensions are ignored and trailers remain separate headers.
 
 ## Compatibility evidence
+
+With published 0.21.10, the full affected regression passed on 2026-10-15:
+**910 tests, zero failures or exclusions**, seed 42. The counts are 41 core,
+664 connectors, 179 outbound, 13 cloud and 13 OAuth tests. This includes four
+actual-TLS HTTP-version rejection gates: OTP/ex_ssl × HTTP/0.9/HTTP/2.0.
+Strict development and test compilation also passed. These are local consumer
+results for the v0.6.4 release candidate; OTP remains the default TLS
+backend, and credentialed provider staging remains outside this evidence.
+
+Earlier on 2026-10-15, the 0.21.8 native HTTP migration focused gate passed 41 shared-client tests
+and 102 DAV/EAS tests with seed 42 and no failures. Controlled actual-wire
+fixtures cover DAV extension methods, raw XML, header/trailer bounds, credentials
+and cancellation, plus EAS TLS/WBXML framing and finite timeout policy. This is
+local consumer evidence preceding the new #121 gate. The subsequent 0.21.8 full
+affected run reported 907 tests, one failure (#121) and 906 passes. That dated
+failure is preserved as migration history and is fixed by the published 0.21.10
+dependency. These controlled consumer checks do not
+replace credentialed provider staging or the dated standalone library gates below.
+
+### 2026-10-14 replacement audit (historical)
+
+With Elixir 1.18.5 / OTP 28 in Devenv, the then-installed Hex `ex_ssl 0.17.1`
+passed 39 connector TLS/mail/EAS tests (seed 181930) and 7 outbound SMTP
+provider tests (seed 42). The then-latest Hex `ex_ssl 0.21.7` passed the same
+39 connector tests (seed 42) in an isolated consumer project loading Manifold's
+compiled modules with matching Req/Mint versions. Protocol consolidation was
+disabled so dynamically loaded Manifold Inspect implementations remained
+available. This bounded compatibility check did not validate a full umbrella
+dependency upgrade; the application still locked 0.17.1 at the time.
+
+Unauthenticated public TLS 1.3 exchanges with 0.21.7, mandatory system CA trust
+and hostname verification succeeded against iCloud IMAP/SMTP and Microsoft
+Graph. Google TLS 1.2/1.3 attempts timed out with both backends, so those public
+checks remained unverified. No provider login, authenticated sync or mail
+delivery was tested, and the audit changed no dependency or production backend
+configuration.
+
+The audit identified an iCloud DAV certificate-path failure recorded in
+[gsmlg-dev/http_fetch#113](https://github.com/gsmlg-dev/http_fetch/issues/113).
+At the same CalDAV IP and SNI, ex_ssl failed twice with `unknown_ca` while OTP
+succeeded twice. The captured three-certificate server chain failed ex_ssl's
+pure PKIX verification, while its two-certificate prefix succeeded with
+identical system trust. The upstream issue contains the public fixture and
+deterministic reproduction and is now closed.
+
+The audit's advice to retain DAV's Mint/OTP transport is superseded by the
+verified native Fetch migration above, which still uses OTP TLS by default.
+Its Req/Mint transport inventory is historical; server and database TLS remain
+outside the selective IMAP/SMTP/EAS ex_ssl boundary. The audit and local
+migration gate do not establish credentialed public CalDAV acceptance with
+ex_ssl or universal OTP replacement.
+
+### Earlier acceptance evidence
 
 The 2026-10-09 upgrade gate used the actual Hex 0.17.1 library and `mix.exs`,
 with unmodified tests/fixtures from release tag `v0.17.1`

@@ -1,6 +1,8 @@
 defmodule Manifold.Outbound.SubmissionTest do
   use Manifold.DataCase, async: false
 
+  alias Manifold.Core.HTTPClient
+
   alias Manifold.Accounts
   alias Manifold.Connectors
   alias Manifold.Connectors.{Crypto, GmailScopes, MicrosoftScopes}
@@ -686,20 +688,20 @@ defmodule Manifold.Outbound.SubmissionTest do
   test "Gmail dispatch checks out the snapshotted method and verifies rendered bytes" do
     %{message: message, method: method} = queued_operational_fixture("gmail")
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer gmail-access-token"]
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       assert %{"raw" => encoded} = Jason.decode!(body)
       assert {:ok, raw} = Base.url_decode64(encoded, padding: false)
       send(self(), {:gmail_raw, raw})
-      Req.Test.json(conn, %{"id" => "gmail-message-1", "threadId" => "thread-1"})
+      HTTPClient.Test.json(conn, %{"id" => "gmail-message-1", "threadId" => "thread-1"})
     end)
 
     assert :ok =
              Outbound.submit_message(message.id,
                provider_config: [
                  base_url: "https://gmail.test",
-                 req_options: [plug: {Req.Test, __MODULE__}]
+                 req_options: [plug: {HTTPClient.Test, __MODULE__}]
                ]
              )
 
@@ -743,7 +745,7 @@ defmodule Manifold.Outbound.SubmissionTest do
 
     test_pid = self()
 
-    Req.Test.stub(__MODULE__, fn conn ->
+    HTTPClient.Test.stub(__MODULE__, fn conn ->
       send(test_pid, :post_dispatched)
       Plug.Conn.send_resp(conn, 202, "")
     end)
@@ -753,7 +755,7 @@ defmodule Manifold.Outbound.SubmissionTest do
       microsoft_sync_limiter: [server: limiter],
       provider_config: [
         base_url: "https://graph.microsoft.test/v1.0",
-        req_options: [plug: {Req.Test, __MODULE__}]
+        req_options: [plug: {HTTPClient.Test, __MODULE__}]
       ]
     ]
 
@@ -873,7 +875,7 @@ defmodule Manifold.Outbound.SubmissionTest do
       |> then(&Repo.get_by!(ProviderSubmission, outbound_message_id: &1))
       |> then(&explicit_request_payload(&1.id))
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       {:ok, body, conn} = Plug.Conn.read_body(conn)
       assert Base.decode64!(body) == expected_payload
 
@@ -888,7 +890,7 @@ defmodule Manifold.Outbound.SubmissionTest do
              Outbound.submit_message(message.id,
                provider_config: [
                  base_url: "https://graph.microsoft.test/v1.0",
-                 req_options: [plug: {Req.Test, __MODULE__}]
+                 req_options: [plug: {HTTPClient.Test, __MODULE__}]
                ]
              )
 
@@ -905,13 +907,15 @@ defmodule Manifold.Outbound.SubmissionTest do
     configure_microsoft_oauth_provider!()
     %{message: message} = queued_operational_fixture("microsoft")
 
-    Req.Test.expect(__MODULE__, fn conn -> Req.Test.transport_error(conn, :timeout) end)
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
+      HTTPClient.Test.transport_error(conn, :timeout)
+    end)
 
     assert {:error, %{class: :permanent, reason: :submission_uncertain}} =
              Outbound.submit_message(message.id,
                provider_config: [
                  base_url: "https://graph.microsoft.test/v1.0",
-                 req_options: [plug: {Req.Test, __MODULE__}]
+                 req_options: [plug: {HTTPClient.Test, __MODULE__}]
                ]
              )
 
@@ -1125,17 +1129,17 @@ defmodule Manifold.Outbound.SubmissionTest do
 
     receive_method = insert_microsoft_receive!(account, method.oauth_authorization_id, address)
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       conn
       |> Plug.Conn.put_status(401)
-      |> Req.Test.json(%{"error" => %{"code" => "InvalidAuthenticationToken"}})
+      |> HTTPClient.Test.json(%{"error" => %{"code" => "InvalidAuthenticationToken"}})
     end)
 
     assert {:error, %Provider.Error{class: :permanent, code: "reconnect_required"}} =
              Outbound.submit_message(message.id,
                provider_config: [
                  base_url: "https://graph.microsoft.test/v1.0",
-                 req_options: [plug: {Req.Test, __MODULE__}]
+                 req_options: [plug: {HTTPClient.Test, __MODULE__}]
                ]
              )
 
@@ -1156,7 +1160,7 @@ defmodule Manifold.Outbound.SubmissionTest do
     configure_microsoft_oauth_provider!()
     %{message: message, method: method} = queued_operational_fixture("microsoft")
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       authorization = Repo.get!(OAuthAuthorization, method.oauth_authorization_id)
 
       {:ok, replacement} =
@@ -1171,12 +1175,12 @@ defmodule Manifold.Outbound.SubmissionTest do
 
       conn
       |> Plug.Conn.put_status(401)
-      |> Req.Test.json(%{"error" => %{"code" => "InvalidAuthenticationToken"}})
+      |> HTTPClient.Test.json(%{"error" => %{"code" => "InvalidAuthenticationToken"}})
     end)
 
     config = [
       base_url: "https://graph.microsoft.test/v1.0",
-      req_options: [plug: {Req.Test, __MODULE__}]
+      req_options: [plug: {HTTPClient.Test, __MODULE__}]
     ]
 
     assert {:error, %Provider.Error{class: :transient, code: "stale_access_token"}} =
@@ -1186,7 +1190,7 @@ defmodule Manifold.Outbound.SubmissionTest do
     assert Repo.get!(SendMethod, method.id).status == "connected"
     assert Repo.get!(OutboundMessage, message.id).state == "queued"
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       assert Plug.Conn.get_req_header(conn, "authorization") == [
                "Bearer rotated-microsoft-token"
              ]
@@ -1811,15 +1815,15 @@ defmodule Manifold.Outbound.SubmissionTest do
   test "Gmail API reconnect marks the current token generation and retries a stale token" do
     %{message: current_message, method: current_method} = queued_operational_fixture("gmail")
 
-    Req.Test.expect(__MODULE__, fn conn ->
-      conn |> Plug.Conn.put_status(401) |> Req.Test.json(%{"error" => "invalid_grant"})
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
+      conn |> Plug.Conn.put_status(401) |> HTTPClient.Test.json(%{"error" => "invalid_grant"})
     end)
 
     assert {:error, %Provider.Error{class: :permanent, code: "reconnect_required"}} =
              Outbound.submit_message(current_message.id,
                provider_config: [
                  base_url: "https://gmail.test",
-                 req_options: [plug: {Req.Test, __MODULE__}]
+                 req_options: [plug: {HTTPClient.Test, __MODULE__}]
                ]
              )
 
@@ -1830,7 +1834,7 @@ defmodule Manifold.Outbound.SubmissionTest do
 
     %{message: stale_message, method: stale_method} = queued_operational_fixture("gmail")
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       authorization = Repo.get!(OAuthAuthorization, stale_method.oauth_authorization_id)
 
       {:ok, replacement} =
@@ -1843,14 +1847,14 @@ defmodule Manifold.Outbound.SubmissionTest do
       })
       |> Repo.update!()
 
-      conn |> Plug.Conn.put_status(401) |> Req.Test.json(%{"error" => "invalid_grant"})
+      conn |> Plug.Conn.put_status(401) |> HTTPClient.Test.json(%{"error" => "invalid_grant"})
     end)
 
     assert {:error, %Provider.Error{class: :transient, code: "stale_access_token"}} =
              Outbound.submit_message(stale_message.id,
                provider_config: [
                  base_url: "https://gmail.test",
-                 req_options: [plug: {Req.Test, __MODULE__}]
+                 req_options: [plug: {HTTPClient.Test, __MODULE__}]
                ]
              )
 
@@ -1869,16 +1873,16 @@ defmodule Manifold.Outbound.SubmissionTest do
     Application.put_env(:manifold_connectors, :providers,
       gmail: [
         base_url: "https://gmail.test",
-        req_options: [plug: {Req.Test, __MODULE__}]
+        req_options: [plug: {HTTPClient.Test, __MODULE__}]
       ]
     )
 
     on_exit(fn -> restore_env(:manifold_connectors, :providers, previous_providers) end)
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer new-access-token"]
 
-      Req.Test.json(conn, %{"id" => "gmail-retried", "threadId" => "thread-retried"})
+      HTTPClient.Test.json(conn, %{"id" => "gmail-retried", "threadId" => "thread-retried"})
     end)
 
     assert :ok =
@@ -1895,10 +1899,10 @@ defmodule Manifold.Outbound.SubmissionTest do
   test "Gmail insufficient scope marks the current authorization actionable" do
     %{message: message, method: method} = queued_operational_fixture("gmail")
 
-    Req.Test.expect(__MODULE__, fn conn ->
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
       conn
       |> Plug.Conn.put_status(403)
-      |> Req.Test.json(%{
+      |> HTTPClient.Test.json(%{
         "error" => %{
           "errors" => [%{"reason" => "insufficientPermissions"}]
         }
@@ -1909,7 +1913,7 @@ defmodule Manifold.Outbound.SubmissionTest do
              Outbound.submit_message(message.id,
                provider_config: [
                  base_url: "https://gmail.test",
-                 req_options: [plug: {Req.Test, __MODULE__}]
+                 req_options: [plug: {HTTPClient.Test, __MODULE__}]
                ]
              )
 
@@ -1939,15 +1943,15 @@ defmodule Manifold.Outbound.SubmissionTest do
 
     {:ok, second_message} = Outbound.queue_draft(method.account_id, second_draft.id)
 
-    Req.Test.expect(__MODULE__, fn conn ->
-      conn |> Plug.Conn.put_status(401) |> Req.Test.json(%{"error" => "invalid_grant"})
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
+      conn |> Plug.Conn.put_status(401) |> HTTPClient.Test.json(%{"error" => "invalid_grant"})
     end)
 
     result =
       Outbound.submit_message(first_message.id,
         provider_config: [
           base_url: "https://gmail.test",
-          req_options: [plug: {Req.Test, __MODULE__}]
+          req_options: [plug: {HTTPClient.Test, __MODULE__}]
         ],
         reconnect_opts: [fail_at: :after_methods_before_event]
       )
@@ -1967,15 +1971,15 @@ defmodule Manifold.Outbound.SubmissionTest do
 
     refute_receive {:provider_submit, _, _}
 
-    Req.Test.expect(__MODULE__, fn conn ->
-      conn |> Plug.Conn.put_status(401) |> Req.Test.json(%{"error" => "invalid_grant"})
+    HTTPClient.Test.expect(__MODULE__, fn conn ->
+      conn |> Plug.Conn.put_status(401) |> HTTPClient.Test.json(%{"error" => "invalid_grant"})
     end)
 
     assert {:error, %Provider.Error{class: :permanent, code: "reconnect_required"}} =
              Outbound.submit_message(second_message.id,
                provider_config: [
                  base_url: "https://gmail.test",
-                 req_options: [plug: {Req.Test, __MODULE__}]
+                 req_options: [plug: {HTTPClient.Test, __MODULE__}]
                ]
              )
 

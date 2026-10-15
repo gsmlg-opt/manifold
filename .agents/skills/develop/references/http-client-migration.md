@@ -1,4 +1,55 @@
-# Default HTTP client migration audit
+# HTTP client migration
+
+## Current implementation — 2026-10-15
+
+Status: Gmail/Graph connector/OAuth, Gmail/Graph/Resend outbound, Cloud and DAV
+and EAS use native Fetch for the v0.6.4 release candidate, developed in
+`codex/http-fetch-client`; the dependency is upgraded
+to the release fixing [http_fetch#121](https://github.com/gsmlg-dev/http_fetch/issues/121).
+
+- Core owns `Manifold.Core.HTTPClient`, Response/TransportError normalization,
+  request encoding, bounded raw/content decoding, lazy streams, cancellation
+  and a process-owned test-only injection seam.
+- Provider authentication, admission, Retry-After, no replay/redirect and
+  uncertain-submission policy remain in their owning apps. Graph counts every
+  raw byte while retaining at most 64 KiB; only raw-empty 202 is accepted.
+- Raw imports bypass the generic 64 MiB cap; Sync/spool retain import limits.
+  Cloud cancels rejected bodies and returns lazy raw response Enumerables.
+- DAV owns authority checks; its transport preserves method tokens/XML bytes,
+  trailing ETags, 8 MiB body / combined 64 KiB and 1,000-field header limits,
+  and a finite total deadline. The obsolete MintAdapter is removed.
+- EAS keeps protocol policy/preflight in HTTPAdapter and uses the common client.
+  Its finite total deadline includes connect, rejects infinity, supports zero;
+  native chunk lines cap at 8 KiB and trailers at 128 fields / 64 KiB. Combined
+  EAS initial/trailer limits remain 200 fields / 64 KiB; raw WBXML, verified TLS,
+  no replay/fallback and request/body limits remain explicit.
+- Fetch/ex_ssl and paired HTTP/TLS/QUIC packages use exact 0.21.10. DuskMoon
+  tooling stays 9.16.16, UI 9.16.7 and Decimal 3.1.1. The npm lock adds missing
+  transitive records without changing existing versions.
+- OTP TLS remains default. No global ex_ssl switch is authorized by this task.
+- Legacy `:req_options` containers remain; application sources/dependencies
+  no longer use Req/Mint transports. Mint remains transitively for tooling.
+
+Upstream #114/#115/#121 are closed. Published 0.21.10 includes the #121
+response-version rejection fix (PR #124) and activation-cancellation fix
+(PR #125). EAS wire regression coverage includes both OTP/ex_ssl backends and
+HTTP/0.9/HTTP/2.0 text status lines. Remove the resolved callsite TODO; there is
+no local response-parser workaround. See
+[HTTP_CLIENT.md](../../../../docs/HTTP_CLIENT.md) for full contracts,
+compatibility changes and current verification results.
+
+Historical 2026-10-14 checkpoint: 898 affected tests passed, seed 42, on an
+isolated database; dev/test compile, format, npm install/verify and asset build
+passed. At that date DAV/EAS were blocked by #114/#115 on 0.21.7. Preserve that
+history in the implementation plan. The 2026-10-15 focused checkpoint passed
+core 41 plus DAV/EAS 102 before the new #121 gate was added. Credentialed provider
+staging, merge/publication and runtime switching remain NOT RUN.
+
+Historical 0.21.8 affected regression: 907 tests, 906 passed, one #121 gate failed,
+no exclusions. Dev/test strict compile, changed-file format, diff/Markdown
+checks passed. That checkpoint was blocked and is superseded by 0.21.10 verification.
+
+## Historical default-client audit
 
 - Date: 2026-10-09.
 - Status: investigation complete; installed Fetch 0.17.1 still fails the
@@ -95,3 +146,41 @@ and empty-body 202, and absence of secrets in telemetry/logs/errors. Req.Test
 alone cannot prove Fetch traffic: Req plug mocks bypass network adapters.
 Credentialed Google/Microsoft/Resend staging is a separate verification step.
 No schema, OAuth credential configuration, or production default changed here.
+
+## Final native acceptance — 2026-10-15
+
+**PASS:** Fetch/ex_ssl and all eight installed companion packages are 0.21.10.
+All business clients (Gmail/Graph/OAuth, outbound Gmail/Graph/Resend, Cloud,
+DAV and EAS) use the common native client. #121 is fixed and its TODO removed;
+four actual TLS gates reject HTTP/0.9/HTTP/2.0 on OTP and ex_ssl. No private
+response parser or Req/Mint application transport remains.
+
+Affected regression: core 41, connectors 664, outbound 179, cloud 13 and OAuth
+13 = **910 tests, zero failures/exclusions**, seed 42, isolated DB. Dev/test
+strict compile, changed-file formatting, diff and local Markdown targets passed.
+No new frontend source/lock changes were needed in this resumed checkpoint.
+The prior 0.21.8 failure remains historical. The user authorized integration
+into `main` and release v0.6.4 through the existing workflow. Publication evidence
+is the [GitHub release](https://github.com/gsmlg-opt/manifold/releases/tag/v0.6.4);
+credentialed staging and a running-service switch remain NOT RUN. OTP default
+and finite request timeout policy remain unchanged by this dependency repair.
+
+## v0.6.4 integration/release preparation
+
+User-authorized merge and release preparation passed the full umbrella suite:
+**1,469 tests, zero failures**, seed 42, 17 apps, isolated database. Global format
+passed; JS checks had zero errors and two pre-existing unused catch warnings.
+Prior main TLS audit records are combined into historical documentation; the
+original dirty files remain in a named stash. Release workflow owns the patch
+version bump and both application/Edge artifacts. See [HTTP_CLIENT.md](../../../../docs/HTTP_CLIENT.md)
+for the current release checkpoint and [v0.6.4](https://github.com/gsmlg-opt/manifold/releases/tag/v0.6.4)
+for publication evidence when the workflow completes.
+
+Production preparation also passed: strict prod compile, production assets,
+assembly of both `manifold` and `manifold_edge`, verification of their paired
+0.21.10 HTTP/TLS/QUIC application closures and absence of the test-only HTTP
+injection module. Each assembled release passed an actual local HTTP request
+through `Manifold.Core.HTTPClient` using `release eval`, without starting the
+business/database applications. These checks validate the release candidate;
+GitHub artifacts and Docker publication are verified separately by the release
+workflow. No running development service or provider account was restarted.

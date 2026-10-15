@@ -9,6 +9,8 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
 
   @behaviour Manifold.Outbound.Provider
 
+  alias Manifold.Core.HTTPClient
+
   alias Manifold.Connectors.MicrosoftSyncLimiter
   alias Manifold.Connectors.Provider.Error, as: ConnectorError
   alias Manifold.Outbound.Provider.{Error, Request, Submission}
@@ -134,13 +136,13 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
 
   defp perform_request(uri, access_token, raw_message, transport) do
     case request(uri, access_token, Base.encode64(raw_message), transport) do
-      {:ok, %Req.Response{status: 202, private: %{manifold_raw_body_size: 0}} = response} ->
+      {:ok, %HTTPClient.Response{status: 202, private: %{manifold_raw_body_size: 0}} = response} ->
         accepted(response)
 
-      {:ok, %Req.Response{status: 202}} ->
+      {:ok, %HTTPClient.Response{status: 202}} ->
         {:error, invalid_response(202)}
 
-      {:ok, %Req.Response{} = response} ->
+      {:ok, %HTTPClient.Response{} = response} ->
         {:error, classify_response(response)}
 
       {:error, reason} ->
@@ -156,187 +158,34 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
      }}
   end
 
-  defp request(uri, access_token, encoded_message, %{plug: plug} = transport)
-       when not is_nil(plug) do
-    case Req.request(
-           method: :post,
-           url: URI.to_string(uri),
-           auth: {:bearer, access_token},
-           body: encoded_message,
-           headers: [{"content-type", "text/plain"}],
-           plug: plug,
-           receive_timeout: transport.receive_timeout,
-           retry: false,
-           redirect: false,
-           decode_body: false
-         ) do
-      {:ok, %Req.Response{} = response} ->
-        {:ok, normalize_req_response(response)}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
   defp request(uri, access_token, encoded_message, transport) do
-    mint_request(uri, access_token, encoded_message, transport)
-  end
-
-  defp mint_request(uri, access_token, encoded_message, transport) do
-    connect_options = [
-      mode: :passive,
-      protocols: [:http1],
-      log: false,
-      max_header_list_size: 32 * 1024,
-      transport_opts: [
-        timeout: transport.connect_timeout,
-        send_timeout: transport.pool_timeout,
-        send_timeout_close: true,
-        cacerts: :public_key.cacerts_get()
-      ]
+    options = [
+      method: :post,
+      url: URI.to_string(uri),
+      auth: {:bearer, access_token},
+      body: encoded_message,
+      headers: [{"content-type", "text/plain"}],
+      receive_timeout: transport.receive_timeout,
+      pool_timeout: transport.pool_timeout,
+      connect_options: [timeout: transport.connect_timeout, protocols: [:http1]],
+      retry: false,
+      redirect: false,
+      decode_body: false,
+      retain_body_bytes: @max_response_body_bytes,
+      max_body_bytes: :infinity,
+      max_header_bytes: 32 * 1024
     ]
 
-    case Mint.HTTP.connect(:https, uri.host, uri.port || 443, connect_options) do
-      {:ok, conn} ->
-        mint_send(conn, uri, access_token, encoded_message, transport.receive_timeout)
+    options = if transport.plug, do: Keyword.put(options, :plug, transport.plug), else: options
 
-      {:error, reason} ->
-        {:error, pre_transmission_error(reason)}
+    case HTTPClient.request(options) do
+      {:ok, %HTTPClient.Response{body: body} = response} when is_binary(body) ->
+        {:ok, normalize_response(response, body, Map.fetch!(response.private, :raw_body_size))}
+
+      result ->
+        result
     end
   end
-
-  defp mint_send(conn, uri, access_token, encoded_message, receive_timeout) do
-    headers = [
-      {"authorization", "Bearer " <> access_token},
-      {"content-type", "text/plain"}
-    ]
-
-    result =
-      case Mint.HTTP.request(conn, "POST", request_target(uri), headers, encoded_message) do
-        {:ok, conn, request_ref} ->
-          mint_receive(conn, request_ref, receive_timeout, %{
-            status: nil,
-            headers: [],
-            body: [],
-            body_size: 0,
-            raw_body_size: 0
-          })
-
-        {:error, conn, reason} ->
-          close_mint(conn)
-          {:error, post_transmission_error(reason)}
-      end
-
-    result
-  end
-
-  defp mint_receive(conn, request_ref, receive_timeout, response) do
-    case Mint.HTTP.recv(conn, 0, receive_timeout) do
-      {:ok, conn, responses} ->
-        handle_mint_responses(conn, request_ref, receive_timeout, response, responses)
-
-      {:error, conn, reason, responses} ->
-        close_mint(conn)
-
-        case accumulate_mint_responses(response, request_ref, responses) do
-          {:done, complete} -> {:ok, mint_response(complete)}
-          {:error, stream_reason} -> {:error, post_transmission_error(stream_reason)}
-          {:more, _partial} -> {:error, post_transmission_error(reason)}
-        end
-    end
-  end
-
-  defp handle_mint_responses(conn, request_ref, receive_timeout, response, responses) do
-    case accumulate_mint_responses(response, request_ref, responses) do
-      {:done, complete} ->
-        close_mint(conn)
-        {:ok, mint_response(complete)}
-
-      {:error, reason} ->
-        close_mint(conn)
-        {:error, post_transmission_error(reason)}
-
-      {:more, partial} ->
-        mint_receive(conn, request_ref, receive_timeout, partial)
-    end
-  end
-
-  defp accumulate_mint_responses(response, request_ref, responses) do
-    Enum.reduce_while(responses, {:more, response}, fn
-      {:status, ^request_ref, status}, {:more, acc} ->
-        {:cont, {:more, %{acc | status: status}}}
-
-      {:headers, ^request_ref, headers}, {:more, acc} ->
-        {:cont, {:more, %{acc | headers: retain_relevant_headers(acc.headers, headers)}}}
-
-      {:data, ^request_ref, data}, {:more, acc} ->
-        append_mint_body(acc, data)
-
-      {:done, ^request_ref}, {:more, acc} ->
-        {:halt, {:done, acc}}
-
-      {:error, ^request_ref, reason}, {:more, _acc} ->
-        {:halt, {:error, reason}}
-
-      _other_response, state ->
-        {:cont, state}
-    end)
-  end
-
-  defp retain_relevant_headers(retained, headers) do
-    Enum.reduce(headers, retained, fn
-      {name, value}, acc
-      when is_binary(name) and is_binary(value) and
-             byte_size(name) <= @max_response_header_bytes and
-             byte_size(value) <= @max_response_header_bytes ->
-        normalized_name = String.downcase(name, :ascii)
-
-        if normalized_name in @relevant_response_headers and
-             Enum.count(acc, &(elem(&1, 0) == normalized_name)) < 2 do
-          [{normalized_name, value} | acc]
-        else
-          acc
-        end
-
-      _invalid_header, acc ->
-        acc
-    end)
-  end
-
-  defp append_mint_body(%{body_size: size} = acc, data) when is_binary(data) do
-    remaining = max(@max_response_body_bytes - size, 0)
-    retained_size = min(byte_size(data), remaining)
-    retained = binary_part(data, 0, retained_size)
-
-    {:cont,
-     {:more,
-      %{
-        acc
-        | body: if(retained == "", do: acc.body, else: [retained | acc.body]),
-          body_size: size + retained_size,
-          raw_body_size: acc.raw_body_size + byte_size(data)
-      }}}
-  end
-
-  defp mint_response(response) do
-    retained_body = response.body |> Enum.reverse() |> IO.iodata_to_binary()
-
-    normalize_response(
-      %Req.Response{
-        status: response.status,
-        headers: Req.Fields.new(response.headers),
-        body: retained_body
-      },
-      retained_body,
-      response.raw_body_size
-    )
-  end
-
-  defp normalize_req_response(%Req.Response{body: body} = response) when is_binary(body) do
-    normalize_response(response, body, byte_size(body))
-  end
-
-  defp normalize_req_response(%Req.Response{} = response), do: response
 
   defp normalize_response(response, body, raw_body_size) do
     retained_body = binary_part(body, 0, min(byte_size(body), @max_response_body_bytes))
@@ -349,7 +198,17 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
         bounded_graph_error_codes(retained_body, raw_body_size > byte_size(retained_body))
       )
 
-    %{response | body: decode_body(retained_body), private: private}
+    headers =
+      response.headers
+      |> Map.take(@relevant_response_headers)
+      |> Map.new(fn {name, values} ->
+        values =
+          Enum.filter(values, &(is_binary(&1) and byte_size(&1) <= @max_response_header_bytes))
+
+        {name, Enum.take(values, 2)}
+      end)
+
+    %{response | headers: headers, body: decode_body(retained_body), private: private}
   end
 
   defp bounded_graph_error_codes(body, true) do
@@ -438,8 +297,6 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
     end
   end
 
-  defp request_target(%URI{path: path, query: nil}), do: path
-
   defp transport_config(options) when is_list(options) do
     with :ok <- validate_keyword_options(options),
          {:ok, plug} <- plug_option(options),
@@ -468,7 +325,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
   defp plug_option(options) do
     case Keyword.get(options, :plug) do
       nil -> {:ok, nil}
-      {Req.Test, _name} = plug -> {:ok, plug}
+      {HTTPClient.Test, _name} = plug -> {:ok, plug}
       _invalid -> :error
     end
   end
@@ -519,7 +376,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
 
   defp validate_base_uri(_uri), do: :error
 
-  defp validate_authority(%URI{}, %{plug: {Req.Test, _name}}), do: :ok
+  defp validate_authority(%URI{}, %{plug: {HTTPClient.Test, _name}}), do: :ok
 
   defp validate_authority(%URI{} = uri, _transport) do
     with {:ok, trusted_uri} <- trusted_base_uri(),
@@ -592,30 +449,9 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
     {:error, error(:permanent, "invalid_config", "Microsoft Graph transport options are invalid")}
   end
 
-  defp pre_transmission_error(reason) do
-    %Req.TransportError{
-      reason: {:manifold_transport_phase, :pre_transmission, safe_reason(reason)}
-    }
-  end
-
-  defp post_transmission_error(reason) do
-    %Req.TransportError{
-      reason: {:manifold_transport_phase, :post_transmission, safe_reason(reason)}
-    }
-  end
-
-  defp safe_reason(%{reason: reason}) when is_atom(reason), do: reason
-  defp safe_reason(reason) when is_atom(reason), do: reason
-  defp safe_reason(_reason), do: :transport_failure
-
-  defp close_mint(conn) do
-    _ = Mint.HTTP.close(conn)
-    :ok
-  end
-
   defp diagnostic_metadata(response) do
     Enum.reduce(@diagnostic_headers, %{}, fn {header, metadata_key}, metadata ->
-      case Req.Response.get_header(response, header) do
+      case HTTPClient.Response.get_header(response, header) do
         [value] when is_binary(value) ->
           if Regex.match?(@diagnostic_id, value),
             do: Map.put(metadata, metadata_key, value),
@@ -627,7 +463,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
     end)
   end
 
-  defp classify_response(%Req.Response{status: status, body: body} = response) do
+  defp classify_response(%HTTPClient.Response{status: status, body: body} = response) do
     codes = graph_error_codes(body) ++ Map.get(response.private, :manifold_graph_error_codes, [])
 
     cond do
@@ -678,8 +514,8 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
     end
   end
 
-  defp classify_transport_failure(%Req.TransportError{
-         reason: {:manifold_transport_phase, :pre_transmission, _reason}
+  defp classify_transport_failure(%HTTPClient.TransportError{
+         phase: :pre_transmission
        }) do
     error(:transient, "transport_error", "Microsoft request could not be transmitted")
   end
@@ -749,7 +585,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
   end
 
   defp retry_after(response) do
-    case Req.Response.get_header(response, "retry-after") do
+    case HTTPClient.Response.get_header(response, "retry-after") do
       [value] -> parse_retry_after(value)
       _missing_or_ambiguous -> nil
     end
@@ -761,7 +597,7 @@ defmodule Manifold.Outbound.Provider.MicrosoftGraph do
         seconds
 
       _not_seconds ->
-        with {:ok, retry_at} <- Req.Utils.parse_http_date(value),
+        with {:ok, retry_at} <- HTTPClient.parse_http_date(value),
              seconds when seconds >= 0 <- DateTime.diff(retry_at, DateTime.utc_now(), :second) do
           seconds
         else
