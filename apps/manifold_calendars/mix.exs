@@ -11,7 +11,14 @@ defmodule Manifold.Calendars.MixProject do
       lockfile: "../../mix.lock",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
-      deps: [{:manifold_data, in_umbrella: true}]
+      deps: [
+        {:manifold_data, in_umbrella: true},
+        {:tzdata, "~> 1.2"},
+        {:rrule, "~> 0.7"},
+        # rrule's precompiled loader also works with the loader required by our bundler.
+        {:rustler_precompiled, "~> 0.10", override: true},
+        {:rustler, "~> 0.38", override: true, runtime: false}
+      ]
     ]
   end
 

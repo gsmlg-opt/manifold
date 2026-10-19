@@ -19,6 +19,9 @@ defmodule ManifoldWeb.AccountLive.ICloudComponent do
 
   @impl true
   def handle_event("save", %{"icloud" => params}, socket) do
+    params =
+      Map.take(params, ~w(apple_id app_password contacts_enabled default_contacts_collection_id))
+
     result =
       if socket.assigns.connection,
         do: ICloud.update_connection(socket.assigns.connection.id, params),
@@ -27,7 +30,7 @@ defmodule ManifoldWeb.AccountLive.ICloudComponent do
     safe =
       Map.take(
         params,
-        ~w(apple_id contacts_enabled calendars_enabled default_contacts_collection_id)
+        ~w(apple_id contacts_enabled default_contacts_collection_id)
       )
       |> Map.put("app_password", "")
 
@@ -80,7 +83,7 @@ defmodule ManifoldWeb.AccountLive.ICloudComponent do
       outcome(
         socket,
         ICloud.disconnect(socket.assigns.connection.id),
-        "iCloud disconnected. Local contacts and events retained."
+        "iCloud Contacts disconnected. Local contacts retained."
       )
 
     {:noreply, socket |> assign(:disconnecting, false) |> reset_form()}
@@ -93,9 +96,15 @@ defmodule ManifoldWeb.AccountLive.ICloudComponent do
       id={@id}
       class="bg-surface-container text-on-surface border border-outline-variant rounded-lg p-6 space-y-4 mt-6"
     >
-      <h2>iCloud Contacts and Calendar</h2>
+      <h2>iCloud Contacts</h2>
       <p>
-        Configure iCloud for this Account. Contact and event saves commit locally before asynchronous synchronization.
+        Configure contact synchronization for this Account. Contact saves commit locally before asynchronous synchronization.
+      </p>
+      <p>
+        Calendar connections and synchronization targets are configured in <.link
+          navigate={~p"/calendars"}
+          class="text-primary"
+        >Calendars</.link>.
       </p>
       <p :if={!@account.active} class="text-on-surface-variant">
         This Account is disabled. Local saves remain available and synchronization is paused.
@@ -133,7 +142,6 @@ defmodule ManifoldWeb.AccountLive.ICloudComponent do
           helper={if @connection, do: "Leave blank to keep the saved password.", else: nil}
         />
         <.dm_input field={@form[:contacts_enabled]} label="Sync contacts" type="checkbox" />
-        <.dm_input field={@form[:calendars_enabled]} label="Sync calendars" type="checkbox" />
         <.dm_select
           :if={@connection}
           field={@form[:default_contacts_collection_id]}
@@ -162,16 +170,6 @@ defmodule ManifoldWeb.AccountLive.ICloudComponent do
               class="settings-error"
             >
               {@connection.contacts_error}
-            </dd>
-          </div>
-          <div>
-            <dt>Calendar</dt><dd>
-              {service_status(@connection.calendars_enabled, @connection.calendars_status)}
-            </dd><dd>Last successful sync: {sync_time(@connection.calendars_synced_at)}</dd><dd
-              :if={@connection.calendars_error}
-              class="settings-error"
-            >
-              {@connection.calendars_error}
             </dd>
           </div>
         </dl>
@@ -219,7 +217,7 @@ defmodule ManifoldWeb.AccountLive.ICloudComponent do
       >
         <h2 id="icloud-disconnect-title">Disconnect iCloud?</h2>
         <p>
-          This removes the saved credential and cloud target. Local contacts, calendars and event drafts are retained. Your iCloud data is unchanged.
+          This removes this Account's contact connection. Local contacts are retained. Calendar connections are managed separately. Your iCloud data is unchanged.
         </p>
         <div class="flex gap-4 mt-4">
           <.dm_btn
@@ -260,13 +258,11 @@ defmodule ManifoldWeb.AccountLive.ICloudComponent do
           Map.take(socket.assigns.connection, [
             :apple_id,
             :contacts_enabled,
-            :calendars_enabled,
             :default_contacts_collection_id
           ]),
         else: %{
           apple_id: "",
           contacts_enabled: true,
-          calendars_enabled: true,
           default_contacts_collection_id: ""
         }
 

@@ -1,171 +1,91 @@
 defmodule Manifold.Calendars do
-  @moduledoc "Local calendars and events with durable full-resource iCloud intents."
-
+  @moduledoc "Provider-independent local calendars, series and durable target intents."
   import Ecto.Query
-
-  alias Manifold.Data.Schema.{
-    Calendar,
-    CalendarEvent,
-    DAVCollection,
-    DAVResource,
-    ICloudConnection
-  }
-
-  alias Manifold.Data.SyncState
+  alias Manifold.Data.Schema.{Calendar, CalendarEvent, CalendarBinding, CalendarEventBinding}
+  alias Manifold.Data.CalendarSyncState
+  alias Manifold.Calendars.{Recurrence, Time}
   alias Manifold.Repo
 
-  def list_calendars(opts \\ []) do
-    query = from c in Calendar, order_by: [asc: fragment("lower(?)", c.name), asc: c.id]
+  @fields ~w(summary description location starts_at ends_at timezone all_day recurrence_rules recurrence_dates excluded_dates recurrence_timezone reminders)a
 
-    query =
-      if account_id = Keyword.get(opts, :account_id),
-        do: where(query, [c], c.account_id == ^account_id),
-        else: query
-
-    query |> Repo.all() |> preload_sources()
+  def list_calendars(_opts \\ []) do
+    Repo.all(
+      from c in Calendar,
+        where: is_nil(c.deleted_at),
+        order_by: [asc: fragment("lower(?)", c.name), asc: c.id]
+    )
+    |> Repo.preload(:bindings)
   end
 
   def get_calendar(id) do
     with {:ok, uuid} <- Ecto.UUID.cast(id),
-         %Calendar{} = calendar <- Repo.get(Calendar, uuid),
-         do: preload_sources(calendar),
+         %Calendar{deleted_at: nil} = calendar <- Repo.get(Calendar, uuid),
+         do: Repo.preload(calendar, :bindings),
          else: (_ -> nil)
   end
 
   def change_calendar(calendar, attrs \\ %{}), do: Calendar.changeset(calendar, attrs)
 
   def create_calendar(attrs) do
-    changeset = Calendar.changeset(%Calendar{}, attrs)
-
-    transaction_if_valid(changeset, fn ->
-      account_id = Ecto.Changeset.get_field(changeset, :account_id)
-      lock_target!(account_id)
-      collection_id = Ecto.Changeset.get_field(changeset, :collection_id)
-      ensure_destination!(account_id, collection_id)
-      {_, destination, events} = lock_mapping!(nil, account_id, collection_id, attrs)
-      if destination, do: Repo.delete!(destination)
-      created = persist!(changeset, :insert)
-      adopt_events!(destination, created, events)
-      created
-    end)
+    if legacy_settings?(attrs),
+      do: {:error, :use_sync_bindings},
+      else: transaction(fn -> persist!(Calendar.changeset(%Calendar{}, attrs), :insert) end)
   end
 
   def update_calendar(id, attrs) do
-    case get_calendar(id) do
-      nil ->
-        {:error, :not_found}
-
-      calendar ->
-        changeset = Calendar.changeset(calendar, attrs)
-
-        transaction_if_valid(changeset, fn ->
-          account_id = Ecto.Changeset.get_field(changeset, :account_id)
-          collection_id = Ecto.Changeset.get_field(changeset, :collection_id)
-          lock_accounts!([calendar.account_id, account_id])
-          ensure_mapping_change!(calendar, account_id, collection_id)
-          lock_target!(calendar.account_id)
-          lock_target!(account_id)
-          ensure_destination!(account_id, collection_id)
-
-          {current, destination, events} =
-            lock_mapping!(calendar, account_id, collection_id, attrs)
-
-          ensure_mapping_change!(current, account_id, collection_id)
-
-          if destination do
-            move_events!(destination.id, current.id)
-            Repo.delete!(destination)
-          end
-
-          updated = current |> Calendar.changeset(attrs) |> persist!(:update)
-          update_adopted_preference!(destination, updated, events)
-
-          if updated.sync_to_icloud != current.sync_to_icloud or
-               collection_id != current.collection_id or account_id != current.account_id do
-            Enum.each(events, fn event ->
-              if event.calendar_id == current.id and is_nil(event.deleted_at) and
-                   (is_nil(event.resource_id) or updated.sync_to_icloud != current.sync_to_icloud),
-                 do: SyncState.stage_event(event, updated)
-            end)
-          end
-
-          updated
+    if legacy_settings?(attrs),
+      do: {:error, :use_sync_bindings},
+      else:
+        transaction(fn ->
+          lock_calendar!(id) |> Calendar.changeset(attrs) |> persist!(:update)
         end)
-    end
   end
 
-  def delete_calendar(id) do
-    case get_calendar(id) do
-      nil ->
-        {:error, :not_found}
+  @doc "Archives local data and synchronization identities without deleting remote data."
+  def delete_calendar(id, _opts \\ []) do
+    transaction(fn ->
+      calendar = lock_calendar!(id)
+      now = DateTime.utc_now()
 
-      calendar ->
-        Repo.transaction(fn ->
-          lock_target!(calendar.account_id)
-          current = Repo.one(from c in Calendar, where: c.id == ^calendar.id, lock: "FOR UPDATE")
-          if is_nil(current), do: Repo.rollback(:not_found)
-          ensure_identity!(current, calendar, [:account_id, :collection_id])
+      bindings =
+        Repo.all(
+          from b in CalendarBinding,
+            where: b.calendar_id == ^calendar.id,
+            order_by: b.id,
+            lock: "FOR UPDATE"
+        )
 
-          if Repo.exists?(
-               from e in CalendarEvent,
-                 join: r in DAVResource,
-                 on: r.id == e.resource_id,
-                 where:
-                   e.calendar_id == ^current.id and
-                     (r.desired_revision > r.acknowledged_revision or
-                        not is_nil(r.sent_revision) or r.status == "conflict")
-             ),
-             do: Repo.rollback(:sync_pending)
+      Enum.each(bindings, fn binding ->
+        binding
+        |> Ecto.Changeset.change(
+          state: "detached",
+          generation: binding.generation + 1,
+          suppressed_at: now
+        )
+        |> Repo.update!()
+      end)
 
-          if Repo.exists?(
-               CalendarEvent
-               |> where([e], e.calendar_id == ^calendar.id)
-               |> visible_events(true)
-             ),
-             do: Repo.rollback(:not_empty)
-
-          Repo.delete!(current)
-        end)
-    end
+      calendar |> Ecto.Changeset.change(deleted_at: now) |> Repo.update!()
+    end)
   end
 
   def list_events(calendar_id, opts \\ []) do
-    with {:ok, uuid} <- Ecto.UUID.cast(calendar_id) do
-      limit = bounded_integer(Keyword.get(opts, :limit), 100, 1, 500)
-      offset = bounded_integer(Keyword.get(opts, :offset), 0, 0, 1_000_000)
+    with {:ok, uuid} <- Ecto.UUID.cast(calendar_id), %Calendar{} <- get_calendar(uuid) do
+      query =
+        from e in CalendarEvent,
+          where: e.calendar_id == ^uuid,
+          order_by: [asc: e.starts_at, asc: e.uid, asc: e.recurrence_id, asc: e.id]
 
-      CalendarEvent
-      |> where([e], e.calendar_id == ^uuid or e.collection_id == ^uuid)
-      |> visible_events(Keyword.get(opts, :include_deleted_conflicts, false))
-      |> order_by([e], asc: e.starts_at, asc: e.uid, asc: e.recurrence_id, asc: e.id)
-      |> limit(^limit)
-      |> offset(^offset)
+      query =
+        if Keyword.get(opts, :include_deleted, false),
+          do: query,
+          else: where(query, [e], is_nil(e.deleted_at))
+
+      query
+      |> limit(^bounded(Keyword.get(opts, :limit), 500, 1, 10_000))
+      |> offset(^bounded(Keyword.get(opts, :offset), 0, 0, 1_000_000))
       |> Repo.all()
-      |> preload_sources()
-    else
-      _ -> []
-    end
-  end
-
-  @doc "Lists every stored event overlapping a wall-date range; the end date is exclusive."
-  def list_events_in_range(calendar_id, %Date{} = first, %Date{} = until, opts \\ []) do
-    with {:ok, uuid} <- Ecto.UUID.cast(calendar_id),
-         :lt <- Date.compare(first, until) do
-      first_date = Elixir.Calendar.strftime(first, "%Y%m%d")
-      until_date = Elixir.Calendar.strftime(until, "%Y%m%d")
-      first_time = first_date <> "T000000"
-
-      CalendarEvent
-      |> where([e], e.calendar_id == ^uuid or e.collection_id == ^uuid)
-      |> visible_events(Keyword.get(opts, :include_deleted_conflicts, false))
-      |> where(
-        [e],
-        e.starts_at < ^until_date and
-          (e.starts_at >= ^first_date or fragment("rtrim(?, 'Z')", e.ends_at) > ^first_time)
-      )
-      |> order_by([e], asc: e.starts_at, asc: e.uid, asc: e.recurrence_id, asc: e.id)
-      |> Repo.all()
-      |> preload_sources()
+      |> preload_event()
     else
       _ -> []
     end
@@ -173,319 +93,440 @@ defmodule Manifold.Calendars do
 
   def get_event(id, opts \\ []) do
     with {:ok, uuid} <- Ecto.UUID.cast(id),
-         %CalendarEvent{} = event <- Repo.get(CalendarEvent, uuid) do
-      event = preload_sources(event)
+         %CalendarEvent{} = event <- Repo.get(CalendarEvent, uuid),
+         %Calendar{} <- get_calendar(event.calendar_id),
+         true <- is_nil(event.deleted_at) or Keyword.get(opts, :include_deleted, false),
+         do: preload_event(event),
+         else: (_ -> nil)
+  end
 
-      if is_nil(event.deleted_at) or
-           (Keyword.get(opts, :include_deleted_conflicts, false) and
-              match?(%{status: "conflict"}, event.resource)),
-         do: event
-    else
-      _ -> nil
+  @doc "Expands all selected calendars in a bounded viewing range; errors are explicit."
+  def list_occurrences(calendar_ids, opts) do
+    first = Keyword.fetch!(opts, :from)
+    until = Keyword.fetch!(opts, :until)
+    zone = Keyword.get(opts, :timezone, "Etc/UTC")
+    ids = List.wrap(calendar_ids) |> Enum.filter(&match?({:ok, _}, Ecto.UUID.cast(&1)))
+
+    events =
+      Repo.all(
+        from e in CalendarEvent,
+          join: c in Calendar,
+          on: c.id == e.calendar_id,
+          where: e.calendar_id in ^ids and is_nil(c.deleted_at),
+          order_by: e.id,
+          limit: 10_001
+      )
+
+    if length(events) > 10_000,
+      do: {:error, [%{event_id: nil, reason: :event_limit}]},
+      else: Recurrence.occurrences(preload_event(events), first, until, zone)
+  end
+
+  # Compatibility for record consumers. New views consume list_occurrences/2.
+  def list_events_in_range(id, first, until, opts \\ []) do
+    case list_occurrences([id],
+           from: first,
+           until: until,
+           timezone: Keyword.get(opts, :timezone, "Etc/UTC")
+         ) do
+      {:ok, occurrences} -> occurrences |> Enum.map(& &1.event) |> Enum.uniq_by(& &1.id)
+      {:error, _} = error -> error
     end
   end
 
   def change_event(event, attrs \\ %{}), do: CalendarEvent.local_changeset(event, attrs)
 
+  def create_event(calendar_id, attrs),
+    do: create_event(Map.put(attrs, :calendar_id, calendar_id))
+
   def create_event(attrs) do
-    changeset = CalendarEvent.local_changeset(%CalendarEvent{}, attrs)
-
-    transaction_if_valid(changeset, fn ->
-      calendar = Repo.get(Calendar, Ecto.Changeset.get_field(changeset, :calendar_id))
-      if is_nil(calendar), do: Repo.rollback(:calendar_not_found)
-      lock_target!(calendar.account_id)
-      calendar = lock_calendar!(calendar)
-      ensure_editable!(calendar, :create)
-
-      event =
-        changeset
-        |> Ecto.Changeset.change(uid: Ecto.UUID.generate(), local_revision: 1)
-        |> persist!(:insert)
-
-      SyncState.stage_event(event, calendar)
+    transaction(fn ->
+      calendar = lock_calendar!(value(attrs, :calendar_id))
+      event = new_event!(calendar, attrs, Ecto.UUID.generate(), Ecto.UUID.generate())
+      CalendarSyncState.stage_events!(calendar, [event])
+      event
     end)
   end
 
-  def update_event(id, attrs) do
-    case get_event(id) do
-      nil ->
-        {:error, :not_found}
+  def update_event(id, attrs, opts \\ []) do
+    with_event(id, fn calendar, event ->
+      expect_revision!(event, opts)
+      editable!(event)
 
-      event ->
-        changeset = CalendarEvent.local_changeset(event, attrs)
+      if value(attrs, :calendar_id, event.calendar_id) != event.calendar_id,
+        do: Repo.rollback(:copy_required)
 
-        transaction_if_valid(changeset, fn ->
-          if Ecto.Changeset.get_field(changeset, :calendar_id) != event.calendar_id,
-            do: Repo.rollback(:local_copy_required)
-
-          calendar = Repo.get(Calendar, event.calendar_id)
-          if is_nil(calendar), do: Repo.rollback(:calendar_not_found)
-          lock_target!(calendar.account_id, event.resource_id)
-          calendar = lock_calendar!(calendar)
-
-          current =
-            Repo.one(from e in CalendarEvent, where: e.id == ^event.id, lock: "FOR UPDATE")
-
-          if is_nil(current) or current.deleted_at, do: Repo.rollback(:not_found)
-          ensure_identity!(current, event, [:calendar_id, :collection_id, :resource_id])
-          ensure_editable!(calendar, :update)
-
-          updated =
-            current
-            |> CalendarEvent.local_changeset(attrs)
-            |> Ecto.Changeset.put_change(:local_revision, current.local_revision + 1)
-            |> persist!(:update)
-
-          SyncState.stage_event(updated, calendar)
-        end)
-    end
+      updated = revise!(event, attrs)
+      CalendarSyncState.stage_events!(calendar, [updated])
+      updated
+    end)
   end
 
-  @doc "Deletes a stored component; whole_series: true deletes matching UID components."
+  @doc "Edits an occurrence while retaining its original recurrence identity."
+  def update_occurrence(id, recurrence_id, attrs, opts \\ []) do
+    with_event(id, fn calendar, event ->
+      editable!(event)
+      master = master!(event)
+      validate_slot!(master, recurrence_id)
+
+      current =
+        Repo.one(
+          from e in CalendarEvent,
+            where:
+              e.calendar_id == ^calendar.id and e.series_id == ^master.series_id and
+                e.recurrence_id == ^recurrence_id,
+            lock: "FOR UPDATE"
+        )
+
+      expect_revision!(current || master, opts)
+      if current, do: editable!(current)
+
+      updated =
+        if current do
+          revise!(current, attrs)
+        else
+          occurrence_attrs =
+            occurrence_attrs!(master, recurrence_id) |> Map.merge(atom_attrs(attrs))
+
+          new_event!(calendar, occurrence_attrs, master.uid, master.series_id,
+            recurrence_id: recurrence_id,
+            recurrence_timezone: master.timezone
+          )
+        end
+
+      CalendarSyncState.stage_events!(calendar, [updated])
+      updated
+    end)
+  end
+
+  @doc "Deletes a single occurrence or an entire series with canonical tombstones."
   def delete_event(id, opts \\ []) do
+    with_event(id, fn calendar, event ->
+      editable!(event)
+      expect_revision!(event, opts)
+
+      scope =
+        Keyword.get(opts, :scope, if(Keyword.get(opts, :whole_series), do: :series, else: :event))
+
+      cond do
+        scope == :series ->
+          events =
+            Repo.all(
+              from e in CalendarEvent,
+                where:
+                  e.calendar_id == ^calendar.id and e.series_id == ^event.series_id and
+                    is_nil(e.deleted_at),
+                order_by: e.id,
+                lock: "FOR UPDATE"
+            )
+
+          changed = Enum.map(events, &tombstone!/1)
+          CalendarSyncState.stage_events!(calendar, changed)
+          hd(changed)
+
+        scope == :occurrence or event.recurrence_id not in [nil, ""] ->
+          master = master!(event)
+          rid = Keyword.get(opts, :recurrence_id, event.recurrence_id)
+          validate_slot!(master, rid)
+          excluded = Enum.uniq((master.excluded_dates || []) ++ [exclusion(master, rid)])
+          updated_master = revise!(master, %{excluded_dates: excluded})
+
+          exception =
+            Repo.one(
+              from e in CalendarEvent,
+                where:
+                  e.calendar_id == ^calendar.id and e.series_id == ^master.series_id and
+                    e.recurrence_id == ^rid,
+                lock: "FOR UPDATE"
+            )
+
+          changed =
+            [updated_master] ++
+              if(exception && is_nil(exception.deleted_at), do: [tombstone!(exception)], else: [])
+
+          CalendarSyncState.stage_events!(calendar, changed)
+          List.last(changed)
+
+        event.recurrence_rules != [] or event.recurrence_dates != [] ->
+          Repo.rollback(:scope_required)
+
+        true ->
+          deleted = tombstone!(event)
+          CalendarSyncState.stage_events!(calendar, [deleted])
+          deleted
+      end
+    end)
+  end
+
+  def copy_event(id, attrs \\ %{}, opts \\ []) do
     case get_event(id) do
       nil ->
         {:error, :not_found}
 
-      event ->
-        Repo.transaction(fn ->
-          calendar = Repo.get(Calendar, event.calendar_id)
-          if is_nil(calendar), do: Repo.rollback(:calendar_not_found)
-          lock_target!(calendar.account_id, event.resource_id)
-          calendar = lock_calendar!(calendar)
+      source ->
+        destination = value(attrs, :calendar_id, source.calendar_id)
+        # Lock both calendars in stable order before their components/targets.
+        transaction(fn ->
+          calendars =
+            [source.calendar_id, destination]
+            |> Enum.uniq()
+            |> Enum.sort()
+            |> Enum.map(&lock_calendar!/1)
 
-          current =
-            Repo.one(from e in CalendarEvent, where: e.id == ^event.id, lock: "FOR UPDATE")
+          target = Enum.find(calendars, &(&1.id == destination))
+          current = Repo.get!(CalendarEvent, source.id)
+          if current.deleted_at, do: Repo.rollback(:not_found)
+          scope = Keyword.get(opts, :scope, :event)
 
-          if is_nil(current) or current.deleted_at, do: Repo.rollback(:not_found)
-          ensure_identity!(current, event, [:calendar_id, :collection_id, :resource_id])
+          series? =
+            current.recurrence_rules != [] or current.recurrence_dates != [] or
+              current.recurrence_id not in [nil, ""]
 
-          if is_nil(current.resource_id) and is_nil(current.collection_id) do
-            Repo.delete!(current)
-          else
-            targets =
-              if Keyword.get(opts, :whole_series, false),
-                do:
-                  Repo.all(
-                    from e in resource_events_query(current),
-                      where:
-                        e.uid == ^current.uid and
-                          is_nil(e.deleted_at),
-                      order_by: e.id,
-                      lock: "FOR UPDATE"
-                  ),
-                else: [current]
+          if scope == :event and series?, do: Repo.rollback(:scope_required)
 
-            Enum.each(targets, fn target ->
-              target
-              |> Ecto.Changeset.change(
-                deleted_at: DateTime.utc_now(),
-                local_revision: target.local_revision + 1
-              )
-              |> persist!(:update)
+          components =
+            if scope == :series,
+              do:
+                Repo.all(
+                  from e in CalendarEvent,
+                    where:
+                      e.calendar_id == ^current.calendar_id and e.series_id == ^current.series_id,
+                    order_by: e.recurrence_id
+                ),
+              else: [current]
+
+          components =
+            if scope == :occurrence do
+              master = master!(current)
+              rid = Keyword.get(opts, :recurrence_id, current.recurrence_id)
+              validate_slot!(master, rid)
+
+              exception =
+                Repo.one(
+                  from e in CalendarEvent,
+                    where:
+                      e.calendar_id == ^master.calendar_id and e.series_id == ^master.series_id and
+                        e.recurrence_id == ^rid
+                )
+
+              if exception && exception.deleted_at, do: Repo.rollback(:not_found)
+              [exception || Map.merge(master, occurrence_attrs!(master, rid))]
+            else
+              components
+            end
+
+          uid = Ecto.UUID.generate()
+          series = Ecto.UUID.generate()
+
+          copies =
+            Enum.map(components, fn component ->
+              properties =
+                Map.take(component, @fields)
+                |> Map.merge(atom_attrs(attrs))
+                |> Map.put(:calendar_id, target.id)
+
+              properties =
+                if scope == :occurrence,
+                  do:
+                    Map.merge(properties, %{
+                      recurrence_rules: [],
+                      recurrence_dates: [],
+                      excluded_dates: []
+                    }),
+                  else: properties
+
+              copy =
+                new_event!(target, properties, uid, series,
+                  recurrence_id: if(scope == :series, do: component.recurrence_id, else: "")
+                )
+
+              if scope == :series and component.deleted_at, do: tombstone!(copy), else: copy
             end)
 
-            sibling_query = from e in resource_events_query(current), where: is_nil(e.deleted_at)
-
-            operation = if Repo.exists?(sibling_query), do: "upsert", else: "delete"
-            ensure_editable!(calendar, if(operation == "upsert", do: :update, else: :delete))
-            SyncState.stage_event(Repo.get!(CalendarEvent, current.id), calendar, operation)
-          end
+          CalendarSyncState.stage_events!(target, copies)
+          Enum.find(copies, hd(copies), &(&1.recurrence_id in [nil, ""]))
         end)
     end
   end
 
-  def copy_event(id, attrs \\ %{}) do
+  def list_bindings(calendar_id) do
+    connections =
+      from c in Manifold.Data.Schema.CalendarConnection,
+        select:
+          struct(c, [:id, :provider, :display_name, :status, :generation, :identity_verified_at])
+
+    Repo.all(from b in CalendarBinding, where: b.calendar_id == ^calendar_id, order_by: b.id)
+    |> Repo.preload(connection: connections)
+  end
+
+  def sync_summary(calendar_id) do
+    Enum.map(list_bindings(calendar_id), fn binding ->
+      mappings = Repo.all(from e in CalendarEventBinding, where: e.binding_id == ^binding.id)
+
+      %{
+        binding: binding,
+        pending: Enum.count(mappings, &(&1.desired_revision > &1.acknowledged_revision)),
+        conflicts: Enum.count(mappings, &(not is_nil(&1.conflict))),
+        limited: Enum.count(mappings, &(&1.state == "limited"))
+      }
+    end)
+  end
+
+  defp with_event(id, fun) do
     case get_event(id) do
       nil ->
         {:error, :not_found}
 
-      event ->
-        fields = [:summary, :description, :location, :starts_at, :ends_at, :timezone, :all_day]
+      observed ->
+        transaction(fn ->
+          calendar = lock_calendar!(observed.calendar_id)
 
-        overrides =
-          Map.new(
-            for key <- fields ++ [:calendar_id],
-                Map.has_key?(attrs, key) or Map.has_key?(attrs, Atom.to_string(key)),
-                do: {key, Map.get(attrs, key, Map.get(attrs, Atom.to_string(key)))}
-          )
+          current =
+            Repo.one(from e in CalendarEvent, where: e.id == ^observed.id, lock: "FOR UPDATE")
 
-        create_event(Map.merge(Map.take(event, fields), overrides))
+          if is_nil(current) or current.deleted_at, do: Repo.rollback(:not_found)
+          fun.(calendar, current)
+        end)
     end
   end
 
-  defp lock_target!(account_id, resource_id \\ nil) do
-    case SyncState.lock_target("calendars", account_id, resource_id) do
-      {:ok, target} -> target
-      {:error, reason} -> Repo.rollback(reason)
-    end
-  end
-
-  defp resource_events_query(%CalendarEvent{resource_id: resource_id})
-       when not is_nil(resource_id),
-       do: from(e in CalendarEvent, where: e.resource_id == ^resource_id)
-
-  defp resource_events_query(event),
-    do:
-      from(e in CalendarEvent,
-        where: e.collection_id == ^event.collection_id and e.resource_href == ^event.resource_href
-      )
-
-  defp lock_resources!(account_id, events) do
-    events
-    |> Enum.map(& &1.resource_id)
-    |> Enum.reject(&is_nil/1)
-    |> Enum.uniq()
-    |> Enum.sort()
-    |> Enum.each(&lock_target!(account_id, &1))
-  end
-
-  defp lock_accounts!(account_ids) do
-    case SyncState.lock_accounts(account_ids) do
-      {:ok, accounts} -> accounts
-      {:error, reason} -> Repo.rollback(reason)
-    end
-  end
-
-  defp lock_mapping!(source, account_id, collection_id, attrs) do
-    destination =
-      if collection_id, do: Repo.get_by(Calendar, collection_id: collection_id)
-
-    destination =
-      if destination && source && destination.id == source.id, do: nil, else: destination
-
-    if destination do
-      if Map.get(attrs, :merge_destination, Map.get(attrs, "merge_destination")) not in [
-           true,
-           "true"
-         ],
-         do: Repo.rollback(:merge_required)
-
-      if is_nil(account_id) or destination.account_id != account_id,
-        do: Repo.rollback(:invalid_destination)
-    end
-
-    observed = Enum.reject([source, destination], &is_nil/1)
-    ids = Enum.map(observed, & &1.id)
-    events = Repo.all(from e in CalendarEvent, where: e.calendar_id in ^ids, order_by: e.id)
-    lock_resources!(account_id, events)
-    locked = Repo.all(from c in Calendar, where: c.id in ^ids, order_by: c.id, lock: "FOR UPDATE")
-
-    Enum.each(observed, fn calendar ->
-      current = Enum.find(locked, &(&1.id == calendar.id))
-      if is_nil(current), do: Repo.rollback(:stale)
-      ensure_identity!(current, calendar, [:account_id, :collection_id])
-    end)
-
-    events =
-      Repo.all(
-        from e in CalendarEvent, where: e.calendar_id in ^ids, order_by: e.id, lock: "FOR UPDATE"
-      )
-
-    {if(source, do: Enum.find(locked, &(&1.id == source.id))),
-     if(destination, do: Enum.find(locked, &(&1.id == destination.id))), events}
-  end
-
-  defp adopt_events!(nil, _created, _events), do: :ok
-
-  defp adopt_events!(destination, created, events) do
-    ids = Enum.map(events, & &1.id)
-    Repo.update_all(from(e in CalendarEvent, where: e.id in ^ids), set: [calendar_id: created.id])
-    update_adopted_preference!(destination, created, events)
-  end
-
-  defp move_events!(previous_id, current_id) do
-    Repo.update_all(from(e in CalendarEvent, where: e.calendar_id == ^previous_id),
-      set: [calendar_id: current_id]
+  defp new_event!(calendar, attrs, uid, series, extra \\ []) do
+    %CalendarEvent{}
+    |> CalendarEvent.local_changeset(Map.put(atom_attrs(attrs), :calendar_id, calendar.id))
+    |> Ecto.Changeset.change(
+      Keyword.merge([uid: uid, series_id: series, local_revision: 1], extra)
     )
+    |> persist!(:insert)
   end
 
-  defp update_adopted_preference!(nil, _updated, _events), do: :ok
+  defp revise!(event, attrs),
+    do:
+      event
+      |> CalendarEvent.local_changeset(attrs)
+      |> Ecto.Changeset.put_change(:local_revision, event.local_revision + 1)
+      |> persist!(:update)
 
-  defp update_adopted_preference!(previous, updated, events) do
-    if previous.sync_to_icloud != updated.sync_to_icloud do
-      account = lock_target!(updated.account_id)
+  defp tombstone!(event),
+    do:
+      event
+      |> Ecto.Changeset.change(
+        deleted_at: DateTime.utc_now(),
+        local_revision: event.local_revision + 1
+      )
+      |> Repo.update!()
 
-      enabled =
-        updated.sync_to_icloud and account.active and not is_nil(account.connection) and
-          account.connection.enabled and account.connection.calendars_enabled
+  defp editable!(%{read_only: true}), do: Repo.rollback(:read_only)
+  defp editable!(_), do: :ok
 
-      events
-      |> Enum.filter(&(&1.calendar_id == previous.id))
-      |> Enum.map(& &1.resource_id)
-      |> Enum.reject(&is_nil/1)
-      |> Enum.uniq()
-      |> Enum.each(fn id ->
-        resource = Repo.get!(DAVResource, id)
+  defp expect_revision!(event, opts) do
+    if Keyword.get(opts, :expected_revision, event.local_revision) != event.local_revision,
+      do: Repo.rollback(:stale)
+  end
 
-        status =
-          cond do
-            resource.status in ["uncertain", "conflict"] or resource.sent_revision ->
-              resource.status
+  defp master!(event) do
+    master =
+      Repo.one(
+        from e in CalendarEvent,
+          where:
+            e.calendar_id == ^event.calendar_id and e.series_id == ^event.series_id and
+              e.recurrence_id == "",
+          lock: "FOR UPDATE"
+      )
 
-            not enabled ->
-              "paused"
+    if is_nil(master) or master.deleted_at, do: Repo.rollback(:series_not_found), else: master
+  end
 
-            resource.desired_revision > resource.acknowledged_revision ->
-              "pending"
-
-            true ->
-              "synced"
-          end
-
-        resource |> Ecto.Changeset.change(status: status) |> Repo.update!()
-      end)
+  defp validate_slot!(master, rid) do
+    with true <- is_binary(rid) and rid != "",
+         {:ok, instant} <- Time.parse(rid, master.recurrence_timezone || master.timezone),
+         first = if(is_struct(instant, Date), do: instant, else: DateTime.to_date(instant)),
+         {:ok, occurrences} <-
+           Recurrence.occurrences(
+             [master],
+             Date.add(first, -1),
+             Date.add(first, 2),
+             master.timezone || "Etc/UTC"
+           ),
+         true <- Enum.any?(occurrences, &(&1.recurrence_id == rid)) do
+      :ok
+    else
+      _ -> Repo.rollback(:invalid_occurrence)
     end
   end
 
-  defp lock_calendar!(observed) do
-    current = Repo.one(from c in Calendar, where: c.id == ^observed.id, lock: "FOR UPDATE")
-    if is_nil(current), do: Repo.rollback(:calendar_not_found)
-    ensure_identity!(current, observed, [:account_id, :collection_id])
-    current
+  defp occurrence_attrs!(master, rid) do
+    with {:ok, original} <- Time.parse(master.starts_at, master.timezone),
+         {:ok, slot} <- Time.parse(rid, master.recurrence_timezone || master.timezone) do
+      finish =
+        case Time.parse(master.ends_at, master.timezone) do
+          {:ok, stop} when is_struct(stop, Date) and is_struct(original, Date) ->
+            Date.add(slot, Date.diff(stop, original))
+
+          {:ok, stop} when is_struct(stop, DateTime) and is_struct(original, DateTime) ->
+            DateTime.add(slot, DateTime.diff(stop, original))
+
+          _ ->
+            nil
+        end
+
+      Map.take(master, @fields)
+      |> Map.merge(%{
+        starts_at: rid,
+        ends_at: if(finish, do: source_compact(finish, master), else: nil),
+        recurrence_rules: [],
+        recurrence_dates: [],
+        excluded_dates: []
+      })
+    else
+      _ -> Repo.rollback(:invalid_occurrence)
+    end
   end
 
-  defp ensure_identity!(current, observed, fields) do
-    if Map.take(current, fields) != Map.take(observed, fields), do: Repo.rollback(:stale)
+  defp source_compact(%Date{} = value, _), do: Time.compact(value)
+
+  defp source_compact(value, %{time_kind: "utc"}),
+    do: Time.compact(DateTime.shift_zone!(value, "Etc/UTC"))
+
+  defp source_compact(value, _), do: Elixir.Calendar.strftime(value, "%Y%m%dT%H%M%S")
+
+  defp exclusion(master, rid) do
+    zone = master.recurrence_timezone || master.timezone
+
+    cond do
+      master.all_day -> "EXDATE;VALUE=DATE:" <> rid
+      String.ends_with?(rid, "Z") or zone in [nil, "", "Etc/UTC", "UTC"] -> rid
+      true -> "EXDATE;TZID=#{zone}:#{rid}"
+    end
   end
 
-  defp ensure_mapping_change!(calendar, account_id, collection_id) do
-    if (account_id != calendar.account_id or collection_id != calendar.collection_id) and
-         Repo.exists?(
-           from e in CalendarEvent,
-             where: e.calendar_id == ^calendar.id and not is_nil(e.resource_id)
-         ),
-       do: Repo.rollback(:local_copy_required)
+  defp lock_calendar!(id) do
+    with {:ok, uuid} <- Ecto.UUID.cast(id),
+         %Calendar{deleted_at: nil} = calendar <-
+           Repo.one(from c in Calendar, where: c.id == ^uuid, lock: "FOR UPDATE"),
+         do: calendar,
+         else: (_ -> Repo.rollback(:calendar_not_found))
   end
 
-  defp ensure_destination!(_account_id, nil), do: :ok
+  defp legacy_settings?(attrs),
+    do:
+      Enum.any?(
+        [:account_id, :collection_id, :sync_to_icloud, :merge_destination],
+        &(Map.has_key?(attrs, &1) or Map.has_key?(attrs, Atom.to_string(&1)))
+      )
 
-  defp ensure_destination!(account_id, collection_id) do
-    collection = Repo.get(DAVCollection, collection_id)
-    connection = if collection, do: Repo.get(ICloudConnection, collection.connection_id)
+  defp value(attrs, key, default \\ nil),
+    do: Map.get(attrs, key, Map.get(attrs, Atom.to_string(key), default))
 
-    if is_nil(collection) or collection.kind != "calendars" or is_nil(connection) or
-         is_nil(account_id) or connection.account_id != account_id,
-       do: Repo.rollback(:invalid_destination)
-  end
+  defp atom_attrs(attrs),
+    do:
+      Map.new(
+        for key <- @fields ++ [:calendar_id],
+            Map.has_key?(attrs, key) or Map.has_key?(attrs, Atom.to_string(key)),
+            do: {key, value(attrs, key)}
+      )
 
-  defp ensure_editable!(%Calendar{sync_to_icloud: true, collection_id: collection_id}, operation)
-       when not is_nil(collection_id) do
-    collection = Repo.get(DAVCollection, collection_id)
-    capability = %{create: :can_create, update: :can_update, delete: :can_delete}[operation]
-
-    if collection &&
-         (Map.get(collection, capability) == false or
-            (Map.get(collection, capability) != true and not collection.writable)),
-       do: Repo.rollback(:read_only)
-  end
-
-  defp ensure_editable!(_, _), do: :ok
-
-  defp transaction_if_valid(%Ecto.Changeset{valid?: false} = changeset, _fun),
-    do: {:error, changeset}
-
-  defp transaction_if_valid(_changeset, fun), do: Repo.transaction(fun)
+  defp bounded(value, _, low, high) when is_integer(value), do: value |> max(low) |> min(high)
+  defp bounded(_, default, _, _), do: default
 
   defp persist!(changeset, operation) do
     case apply(Repo, operation, [changeset]) do
@@ -494,45 +535,11 @@ defmodule Manifold.Calendars do
     end
   end
 
-  defp preload_sources(%Calendar{} = calendar),
-    do: Repo.preload(calendar, collection: [connection: public_connections()])
-
-  defp preload_sources([%Calendar{} | _] = calendars),
-    do: Repo.preload(calendars, collection: [connection: public_connections()])
-
-  defp preload_sources(events),
-    do:
-      Repo.preload(events, [:calendar, :resource, collection: [connection: public_connections()]])
-
-  defp public_connections do
-    from c in ICloudConnection,
-      select:
-        struct(c, [
-          :id,
-          :account_id,
-          :apple_id,
-          :enabled,
-          :contacts_enabled,
-          :calendars_enabled,
-          :contacts_status,
-          :contacts_synced_at,
-          :calendars_status,
-          :calendars_synced_at
-        ])
+  defp transaction(fun) do
+    result = Repo.transaction(fun)
+    if match?({:ok, _}, result), do: CalendarSyncState.notify()
+    result
   end
 
-  defp visible_events(query, false), do: where(query, [e], is_nil(e.deleted_at))
-
-  defp visible_events(query, true),
-    do:
-      from(e in query,
-        left_join: r in DAVResource,
-        on: e.resource_id == r.id,
-        where: is_nil(e.deleted_at) or r.status == "conflict"
-      )
-
-  defp bounded_integer(value, _default, minimum, maximum) when is_integer(value),
-    do: value |> max(minimum) |> min(maximum)
-
-  defp bounded_integer(_, default, _, _), do: default
+  defp preload_event(events), do: Repo.preload(events, [:calendar, :resource, :collection])
 end

@@ -5,6 +5,8 @@ defmodule Manifold.Connectors.ICloud.Inbound do
   alias Manifold.Repo
 
   # Called only inside the connection's generation/lease fenced transaction.
+  def apply(%{kind: "calendars"}, _snapshot, _account_id), do: {:error, :calendar_sync_moved}
+
   def apply(collection, snapshot, account_id) do
     calendar = if collection.kind == "calendars", do: calendar(collection, account_id)
     Enum.each(snapshot.entries, fn entry -> observe(collection, calendar, entry, account_id) end)
@@ -34,8 +36,12 @@ defmodule Manifold.Connectors.ICloud.Inbound do
   def missing_collection(collection) do
     calendar = Repo.get_by(Calendar, collection_id: collection.id)
 
-    Repo.all(from(r in DAVResource, where: r.collection_id == ^collection.id, lock: "FOR UPDATE"))
-    |> Enum.each(&absent(&1, calendar))
+    if collection.kind != "calendars" do
+      Repo.all(
+        from(r in DAVResource, where: r.collection_id == ^collection.id, lock: "FOR UPDATE")
+      )
+      |> Enum.each(&absent(&1, calendar))
+    end
 
     # Retain the collection identity: drafts and suppression mappings depend on it.
     Repo.update!(
@@ -48,6 +54,8 @@ defmodule Manifold.Connectors.ICloud.Inbound do
       )
     )
   end
+
+  def project(%{kind: "calendars"}, _raw, _etag, _account_id), do: {:error, :calendar_sync_moved}
 
   def project(resource, raw, etag, account_id) do
     parser =

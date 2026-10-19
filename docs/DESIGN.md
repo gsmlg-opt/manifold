@@ -33,8 +33,9 @@ configured domains, validates recipients during the SMTP transaction, and
 durably spools mail before acknowledgement. The main release pulls edge mail
 through the signed import protocol; it does not include an inbound SMTP listener.
 All receive paths preserve the original RFC 5322 message and process it
-asynchronously into mailbox-oriented views. Local Account-owned contacts and
-calendars synchronize with iCloud in both directions.
+asynchronously into mailbox-oriented views. Account-owned contacts synchronize
+with iCloud. Independent local calendars can synchronize with Google and iCloud
+simultaneously through separate target bindings.
 
 Outbound mail is delegated to the Account's Gmail, Graph, or authenticated SMTP
 method. Manifold owns composition, local queueing, immutable submission
@@ -502,8 +503,8 @@ lifecycle:
 - Bounded Oban synchronization and remote-state jobs.
 - Mapping provider identities to durable local inbound deliveries.
 - IMAP and EAS receive methods, read-state writeback, and SMTP credential checkout.
-- Account-owned iCloud credentials, DAV discovery, and bidirectional contact/event
-  synchronization through generation/lease-fenced jobs.
+- Account-owned iCloud Contacts credentials and DAV synchronization, plus independent
+  Calendar credentials, Google/iCloud adapters and generation/lease-fenced jobs.
 
 The application depends only on public APIs from Core, Data, Accounts, Ingest,
 and Mail. Provider adapters never write another application's schemas directly.
@@ -547,11 +548,14 @@ or native desktop client is not required.
 ### 6.15 `manifold_contacts` and `manifold_calendars`
 
 Both applications depend on `manifold_data`. Contacts owns local contact CRUD,
-search, Account assignment, and opt-in sync intentions. Calendars owns local
-calendar/event CRUD, Account-owned collection mapping, and sync intentions.
-Neither context performs network I/O; `manifold_connectors` executes DAV work
-from shared durable resource state. See [ICLOUD.md](ICLOUD.md) for supported edits,
-conflicts, and lifecycle behavior.
+search, Account assignment, and opt-in sync intentions. Calendars owns independent
+local calendar/event CRUD, bounded occurrence expansion, timezone semantics and
+transactional intents for multiple targets. Neither context performs network I/O;
+`manifold_connectors` executes provider work from shared durable resource state.
+Calendar connection/binding/resource/component/immutable-attempt schemas belong
+to Data. Each target keeps independent desired/acknowledged revisions and a common
+semantic baseline; only accepted canonical changes propagate to other targets.
+See [CALENDARS.md](CALENDARS.md) and [ICLOUD.md](ICLOUD.md).
 
 ### 6.16 `manifold_account_lifecycle`
 
@@ -2006,19 +2010,19 @@ The repository should record at least these ADRs:
 10. **Future cloud edge uses local-initiated, idempotent synchronization.**
 
 
-## iCloud contacts and calendars
+## Contacts and local calendars
 
 The historical Release 0.1 contact/calendar non-goal is superseded by local
-contact/calendar/event CRUD and bidirectional iCloud synchronization. Each local
-Account has at most one iCloud connection with encrypted app-specific credentials;
-the Account address and Apple login may differ. Connections are configured on
-the Account page, separate from its mail receive/send methods. Legacy unassigned
-connections require explicit Account assignment before sync resumes.
+contact/calendar/event CRUD. Contacts retains an Account-owned iCloud connection
+with encrypted app-specific credentials; the Account address and Apple login may
+differ. Calendar connections are independent of Accounts and mail receive/send
+methods. A local Calendar can bind multiple Google/iCloud targets without changing
+its identity. Provider subjects/principals must be verified before reusing mappings.
 
 Shared schemas and central migrations are owned by `manifold_data`;
 `manifold_contacts` owns local contact CRUD/query contracts and
-`manifold_calendars` owns local calendar/event CRUD and collection mapping.
-`manifold_connectors` owns DAV transport, parsing, credentials and
+`manifold_calendars` owns local calendar/event CRUD, recurrence and timezone queries.
+`manifold_connectors` owns Calendar coordination, Google and DAV transport, credentials and
 generation/lease-fenced jobs. Web exposes
 `/contacts`, `/calendars`, and Account configuration with existing trusted-local
 authorization and DuskMoon themes. `/settings/icloud` is a compatibility list
@@ -2026,18 +2030,26 @@ linking to Accounts. Main includes these services; edge remains ingress-only.
 
 Local saves commit revision/intention state before asynchronous writes. Contacts
 need explicit Account ownership, sync opt-in, and a default writable address
-book; calendar events need a mapped iCloud collection. Unassigned contacts and
-unmapped calendars remain local. Writes use stable UID/href, conditional ETags,
-and read reconciliation after uncertain responses. Conflicts require explicit
-Use local/Use iCloud choices; disabling, disconnecting, or Account purge does
-not delete cloud resources. Remote container management, invitation/RSVP flows,
-recurrence-rule editing, and occurrence expansion remain excluded.
+book. Calendars work fully locally; each optional target requires a persisted
+initial enrollment preview. Independently existing events are never merged by
+UID/title/time. Accepted inbound edits/deletions produce canonical revisions and
+fan out atomically; source echoes do not produce revisions. Conditional writes
+have immutable component revision vectors. Acknowledgments cannot clear newer
+edits, and unknown outcomes require read reconciliation before replay. Pausing or
+detaching one target retains history and leaves other targets operational.
+Account purge retains local calendars/events. Calendar queries expand bounded
+RRULE/RDATE/EXDATE and detached exceptions; copy/delete commands have explicit
+occurrence/series scope. Remote container management, invitation/RSVP flows and
+future-series splits remain excluded.
 
 Only complete validated collection results commit deletions/checkpoints. Each
 service commits independently. Unknown or malformed projections retain previous
 data. Credential replacement, disable/disconnect and expired/replaced sync
 leases reject stale commits. Full setup and rollback guidance is in
-[ICLOUD.md](ICLOUD.md), which is the current guide. Verification evidence and the
-separate credentialed Apple gate are tracked in
+[ICLOUD.md](ICLOUD.md) and [CALENDARS.md](CALENDARS.md). Migrated Calendar bindings
+remain paused pending identity verification and a read-only comparison; legacy
+resource counters never become invented per-component acknowledgments. Current
+Calendar evidence is in [calendar-validation.md](superpowers/implementation/calendar-validation.md).
+The separate credentialed Apple Contacts gate remains tracked in
 [ICLOUD_ACCEPTANCE.md](ICLOUD_ACCEPTANCE.md); historical designs remain indexed
 from [README.md](README.md).

@@ -158,7 +158,7 @@ defmodule Manifold.Connectors.ICloud.SyncTest do
     assert Manifold.Contacts.list_contacts() == []
   end
 
-  test "a later service throttle controls retries and no request bypasses Retry-After" do
+  test "Contacts throttling controls retries without entering the retired Calendar path" do
     {:ok, c} =
       connect(%{
         apple_id: "+8613912345678",
@@ -170,8 +170,8 @@ defmodule Manifold.Connectors.ICloud.SyncTest do
     assert {:error, {:rate_limited, 3600}} =
              Sync.run(c.id, c.generation,
                client: FakeClient,
-               contacts: {:error, :incomplete_response},
-               calendars: {:error, {:rate_limited, 3600}}
+               contacts: {:error, {:rate_limited, 3600}},
+               calendars: {:error, :incomplete_response}
              )
 
     assert {:error, {:rate_limited, remaining}} =
@@ -184,7 +184,7 @@ defmodule Manifold.Connectors.ICloud.SyncTest do
     assert {:error, :rate_limited} = ICloud.sync_now(c.id)
   end
 
-  test "calendar success remains visible despite contact authentication failure" do
+  test "mailbox Contacts authorization failure cannot import or delete Calendar data" do
     {:ok, c} =
       connect(%{
         apple_id: "apple@example.test",
@@ -212,11 +212,10 @@ defmodule Manifold.Connectors.ICloud.SyncTest do
                calendars: calendar
              )
 
-    assert [event] = Repo.all(CalendarEvent)
-    assert event.summary == "Meeting"
+    assert Repo.all(CalendarEvent) == []
     stored = Repo.get!(ICloudConnection, c.id)
     assert stored.contacts_status == "reconnect_required"
-    assert stored.calendars_status == "connected"
+    assert stored.calendars_status == "disabled"
   end
 
   defp connect(attrs) do

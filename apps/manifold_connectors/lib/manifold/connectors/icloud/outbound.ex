@@ -646,6 +646,5 @@ defmodule Manifold.Connectors.ICloud.Outbound do
   defp selected?(connection, "contacts"),
     do: connection.contacts_enabled and connection.contacts_status != "reconnect_required"
 
-  defp selected?(connection, "calendars"),
-    do: connection.calendars_enabled and connection.calendars_status != "reconnect_required"
+  defp selected?(_connection, "calendars"), do: false
 end

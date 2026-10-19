@@ -298,108 +298,17 @@ defmodule Manifold.Connectors.ICloud.BidirectionalTest do
     assert {:error, :account_disabled} = run(stored)
   end
 
-  test "calendar local CRUD writes full resources and acknowledged component deletion does not block later edits",
-       %{connection: original} do
-    {:ok, c} =
+  test "legacy mailbox sync never admits Calendar reads or writes", %{connection: original} do
+    {:ok, connection} =
       ICloud.update_connection(original.id, %{contacts_enabled: false, calendars_enabled: true})
 
-    assert :ok = run(c)
-    [calendar] = Manifold.Calendars.list_calendars()
-
-    {:ok, event} =
-      Manifold.Calendars.create_event(%{
-        calendar_id: calendar.id,
-        summary: "Local event",
-        starts_at: "20261010T100000Z",
-        ends_at: "20261010T110000Z",
-        timezone: "Etc/UTC"
-      })
-
-    assert :ok = run(c)
-    event = Repo.get!(Manifold.Data.Schema.CalendarEvent, event.id)
-    state = Repo.get!(DAVResource, event.resource_id)
-    assert Process.get(:remote)[state.href].content =~ "SUMMARY:Local event"
-    {:ok, _} = Manifold.Calendars.update_event(event.id, %{summary: "Updated event"})
-    assert :ok = run(c)
-    assert Process.get(:remote)[state.href].content =~ "SUMMARY:Updated event"
-    {:ok, _} = Manifold.Calendars.delete_event(event.id)
-    assert :ok = run(c)
-    refute Map.has_key?(Process.get(:remote), state.href)
-
-    href = "https://contacts.icloud.com/calendar/series.ics"
-
-    raw =
-      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nX-PRESERVE:yes\r\nBEGIN:VEVENT\r\nUID:series\r\nDTSTART:20261010T100000Z\r\nSUMMARY:Master\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:series\r\nRECURRENCE-ID:20261011T100000Z\r\nDTSTART:20261011T110000Z\r\nSUMMARY:Exception\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-
-    Process.put(:remote, %{href => %{content: raw, etag: "\"series\""}})
-    assert :ok = run(c)
-    events = Manifold.Calendars.list_events(calendar.id)
-    exception = Enum.find(events, &(&1.recurrence_id != ""))
-    master = Enum.find(events, &(&1.recurrence_id == ""))
-    {:ok, _} = Manifold.Calendars.delete_event(exception.id)
-    assert :ok = run(c)
-    refute Process.get(:remote)[href].content =~ "RECURRENCE-ID"
-    assert Process.get(:remote)[href].content =~ "RRULE:FREQ=DAILY"
-    {:ok, _} = Manifold.Calendars.update_event(master.id, %{summary: "Later master"})
-    assert :ok = run(c)
-    assert Process.get(:remote)[href].content =~ "SUMMARY:Later master"
-    assert Process.get(:remote)[href].content =~ "X-PRESERVE:yes"
-  end
-
-  test "invitation edits and whole-resource deletion retain local intents without cloud dispatch",
-       %{connection: original} do
-    {:ok, c} =
-      ICloud.update_connection(original.id, %{contacts_enabled: false, calendars_enabled: true})
-
-    href = "https://contacts.icloud.com/calendar/invitation.ics"
-
-    raw =
-      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:invitation\r\nDTSTART:20261010T100000Z\r\nSUMMARY:Invitation\r\nORGANIZER:mailto:host@example.test\r\nATTENDEE:mailto:guest@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
-
-    Process.put(:remote, %{href => %{content: raw, etag: "\"invitation\""}})
-    assert :ok = run(c)
-    [calendar] = Manifold.Calendars.list_calendars()
-    [event] = Manifold.Calendars.list_events(calendar.id)
-    {:ok, _} = Manifold.Calendars.update_event(event.id, %{summary: "Local edit"})
-    assert {:error, :invalid_document} = run(c)
-    state = Repo.get!(DAVResource, event.resource_id)
-    assert state.status == "failed"
-    assert state.last_error =~ "scheduling are unsupported"
-    assert is_nil(state.sent_revision)
+    {:ok, calendar} = Manifold.Calendars.create_calendar(%{name: "Independent"})
+    {:ok, event} = Manifold.Calendars.create_event(calendar.id, %{starts_at: "20261010T100000Z"})
+    assert {:error, :disabled} = run(connection)
+    assert Manifold.Calendars.get_event(event.id).id == event.id
     assert Process.get(:writes) == []
-    assert Process.get(:remote)[href].content == raw
-    assert Manifold.Calendars.get_event(event.id).summary == "Local edit"
-
-    {:ok, _} = Manifold.Calendars.delete_event(event.id, whole_series: true)
-    assert Repo.get!(DAVResource, event.resource_id).operation == "delete"
-    Repo.update!(Ecto.Changeset.change(Repo.get!(DAVResource, event.resource_id), retry_at: nil))
-    assert {:error, :invalid_document} = run(c)
-    assert Process.get(:writes) == []
-    assert Process.get(:remote)[href].content == raw
-  end
-
-  test "deleting the final event never dispatches DELETE for a resource containing a task",
-       %{connection: original} do
-    {:ok, c} =
-      ICloud.update_connection(original.id, %{contacts_enabled: false, calendars_enabled: true})
-
-    href = "https://contacts.icloud.com/calendar/mixed.ics"
-
-    raw =
-      "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:meeting\r\nDTSTART:20261010T100000Z\r\nSUMMARY:Meeting\r\nEND:VEVENT\r\nBEGIN:VTODO\r\nUID:task\r\nSUMMARY:Retained task\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
-
-    Process.put(:remote, %{href => %{content: raw, etag: "\"mixed\""}})
-    assert :ok = run(c)
-    [calendar] = Manifold.Calendars.list_calendars()
-    [event] = Manifold.Calendars.list_events(calendar.id)
-    {:ok, _} = Manifold.Calendars.delete_event(event.id)
-    assert {:error, :invalid_document} = run(c)
-    assert Process.get(:writes) == []
-    assert Process.get(:remote)[href].content == raw
-    state = Repo.get!(DAVResource, event.resource_id)
-    assert state.status == "failed"
-    assert state.last_error =~ "other components"
-    assert is_nil(state.sent_revision)
+    assert Repo.get_by(DAVResource, kind: "calendars") == nil
+    assert Enum.all?(Manifold.Calendars.list_calendars(), &(&1.id == calendar.id))
   end
 
   test "a newer repeated-property edit rebases IDs after an older removal is acknowledged", %{

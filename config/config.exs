@@ -1,5 +1,8 @@
 import Config
 
+config :elixir, :time_zone_database, Tzdata.TimeZoneDatabase
+config :tzdata, :autoupdate, :disabled
+
 config :manifold_data,
   ecto_repos: [Manifold.Repo],
   oban_enabled: config_env() != :test,
@@ -28,7 +31,8 @@ config :manifold_data, Oban,
        {"*/5 * * * *", Manifold.Cloud.Jobs.PublishRoutes},
        {"* * * * *", Manifold.Cloud.Jobs.PullDeliveries},
        {"*/5 * * * *", Manifold.Connectors.Jobs.PollAccounts},
-       {"*/5 * * * *", Manifold.Connectors.Jobs.PollICloud}
+       {"*/5 * * * *", Manifold.Connectors.Jobs.PollICloud},
+       {"*/5 * * * *", Manifold.Connectors.Jobs.PollCalendars}
      ]}
   ]
 

@@ -64,7 +64,7 @@ defmodule Manifold.Connectors.DAV.ParsersTest do
     assert master.all_day
     assert master.starts_at == "20261010"
     assert master.recurrence_rules == ["FREQ=WEEKLY;COUNT=4"]
-    assert master.excluded_dates == ["20261017"]
+    assert master.excluded_dates == ["EXDATE;VALUE=DATE:20261017"]
     assert exception.recurrence_id == "20261024"
     assert exception.timezone == "Asia/Shanghai"
     assert exception.summary == "Moved, event"

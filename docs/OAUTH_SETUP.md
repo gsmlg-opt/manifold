@@ -90,6 +90,13 @@ saved callback URLs before rolling back that migration.
 
 ## Storage and configuration changes
 
+Google Calendar has a separate authorization started from `/calendars`, using
+the shared Google client settings and Calendar-specific scopes. Gmail grants and
+mailbox methods do not authorize Calendar access. Enable the Calendar API and
+register the saved callback exactly. The Calendar callback must be reachable;
+the Gmail pasted-URL page does not complete Calendar authorization. See
+[Calendar setup](CALENDARS.md#connect-providers-and-choose-targets).
+
 Client IDs, callback URLs, and login modes are public configuration. Browser-mode client secrets,
 device codes, and user tokens are encrypted with the stable
 `MANIFOLD_CONNECTOR_ENCRYPTION_KEY`. Do not rotate that key without a credential

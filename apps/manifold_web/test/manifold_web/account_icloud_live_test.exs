@@ -21,7 +21,9 @@ defmodule ManifoldWeb.AccountICloudLiveTest do
     account: account
   } do
     {:ok, view, _} = live(conn, ~p"/settings/accounts/#{account.id}")
-    assert has_element?(view, "#account-icloud", "iCloud Contacts and Calendar")
+    assert has_element?(view, "#account-icloud", "iCloud Contacts")
+    refute has_element?(view, "input[name='icloud[calendars_enabled]']")
+    assert has_element?(view, "#account-icloud a[href='/calendars']")
     assert has_element?(view, "#receive-methods")
     assert has_element?(view, "#send-methods")
     assert has_element?(view, "input[name='icloud[contacts_enabled]'][type='checkbox'][checked]")
@@ -32,8 +34,7 @@ defmodule ManifoldWeb.AccountICloudLiveTest do
       icloud: %{
         apple_id: "different-apple@example.test",
         app_password: password,
-        contacts_enabled: "true",
-        calendars_enabled: "false"
+        contacts_enabled: "true"
       }
     )
     |> render_submit()
@@ -100,7 +101,7 @@ defmodule ManifoldWeb.AccountICloudLiveTest do
     assert render(view) =~ "Synchronization queued"
 
     view
-    |> form("#icloud-form", icloud: %{contacts_enabled: "false", calendars_enabled: "false"})
+    |> form("#icloud-form", icloud: %{contacts_enabled: "false"})
     |> render_submit()
 
     refute ICloud.for_account(account.id).contacts_enabled
@@ -153,7 +154,7 @@ defmodule ManifoldWeb.AccountICloudLiveTest do
     view |> element("#disconnect-icloud-#{connection.id}") |> render_click()
     view |> element("#confirm-icloud-disconnect") |> render_click()
     assert Repo.get(ICloudConnection, connection.id) == nil
-    assert render(view) =~ "iCloud disconnected. Local contacts and events retained."
+    assert render(view) =~ "iCloud Contacts disconnected. Local contacts retained."
     assert Contacts.get_contact(imported.id)
     assert Contacts.get_contact(imported.id).collection_id == nil
     assert has_element?(view, "input[name='icloud[apple_id]']:not([readonly])")

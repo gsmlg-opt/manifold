@@ -114,7 +114,7 @@ defmodule Manifold.Connectors.DAV.Document do
   end
 
   def event(raw, attrs, uid, recurrence_id \\ "") do
-    with {:ok, raw} <- event_base(raw, uid),
+    with {:ok, raw} <- event_base(raw, uid, recurrence_id, attrs),
          true <- not scheduling?(raw) || {:error, :scheduling_not_supported},
          {:ok, projections} <- ICalendar.parse(raw),
          {:ok, lines} <- tokenize(raw),
@@ -164,8 +164,12 @@ defmodule Manifold.Connectors.DAV.Document do
           end
         end)
 
-      result = render(Enum.take(lines, first) ++ component ++ Enum.drop(lines, last + 1))
-      with {:ok, _} <- ICalendar.parse(result), do: {:ok, result}
+      component = update_recurrence(component, attrs, base)
+
+      with {:ok, component} <- update_reminders(component, attrs, base) do
+        result = render(Enum.take(lines, first) ++ component ++ Enum.drop(lines, last + 1))
+        with {:ok, _} <- ICalendar.parse(result), do: {:ok, result}
+      end
     else
       nil -> {:error, :event_not_found}
       {:error, _} = error -> error
@@ -187,7 +191,10 @@ defmodule Manifold.Connectors.DAV.Document do
             (recurrence_id == :series or property(props, "RECURRENCE-ID", "") == recurrence_id)
         end)
 
-      if selected == [] do
+      occurrence? = is_binary(recurrence_id) and recurrence_id != ""
+      master? = match?({:ok, _, _}, event_range(lines, uid, ""))
+
+      if selected == [] and not (occurrence? and master?) do
         {:error, :event_not_found}
       else
         removed =
@@ -204,7 +211,9 @@ defmodule Manifold.Connectors.DAV.Document do
         if length(selected) == length(ranges) do
           with :ok <- safe_complete_deletion(lines), do: {:ok, :empty}
         else
-          {:ok, render(kept)}
+          if occurrence? and master?,
+            do: {:ok, render(add_exclusion(kept, uid, recurrence_id, lines))},
+            else: {:ok, render(kept)}
         end
       end
     end
@@ -266,12 +275,173 @@ defmodule Manifold.Connectors.DAV.Document do
 
   defp contact_base(raw, _), do: {:ok, raw}
 
-  defp event_base(nil, uid),
-    do:
-      {:ok,
-       "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Manifold//Calendar//EN\r\nBEGIN:VEVENT\r\nUID:#{escape(uid)}\r\nDTSTAMP:#{Calendar.strftime(DateTime.utc_now(), "%Y%m%dT%H%M%SZ")}\r\nDTSTART:19700101T000000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"}
+  defp event_base(nil, uid, rid, attrs) do
+    {:ok,
+     "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Manifold//Calendar//EN\r\n" <>
+       new_component(uid, rid, attrs) <> "END:VCALENDAR\r\n"}
+  end
 
-  defp event_base(raw, _), do: {:ok, raw}
+  defp event_base(raw, uid, rid, attrs) do
+    with {:ok, lines} <- tokenize(raw) do
+      case event_range(lines, uid, rid) do
+        {:ok, _, _} ->
+          {:ok, raw}
+
+        {:error, :event_not_found} ->
+          if rid not in [nil, ""] and match?({:ok, _, _}, event_range(lines, uid, "")) do
+            {body, ending} = Enum.split(lines, -1)
+            {:ok, render(body) <> new_component(uid, rid, attrs) <> render(ending)}
+          else
+            {:error, :event_not_found}
+          end
+
+        error ->
+          error
+      end
+    end
+  end
+
+  defp new_component(uid, rid, attrs) do
+    start = value(attrs, :starts_at, nil)
+    if start in [nil, ""], do: raise(ArgumentError, "missing start")
+
+    recurrence =
+      if rid in [nil, ""],
+        do: "",
+        else: recurrence_header(rid, attrs) <> ":" <> safe_content(rid) <> "\r\n"
+
+    "BEGIN:VEVENT\r\nUID:#{escape(uid)}\r\nDTSTAMP:#{Calendar.strftime(DateTime.utc_now(), "%Y%m%dT%H%M%SZ")}\r\n" <>
+      recurrence <> "DTSTART:19700101T000000Z\r\nEND:VEVENT\r\n"
+  end
+
+  defp recurrence_header(rid, attrs) do
+    zone = value(attrs, :recurrence_timezone, value(attrs, :timezone, nil))
+
+    cond do
+      byte_size(rid) == 8 -> "RECURRENCE-ID;VALUE=DATE"
+      String.ends_with?(rid, "Z") or zone in [nil, "", "Etc/UTC", "UTC"] -> "RECURRENCE-ID"
+      true -> "RECURRENCE-ID;TZID=" <> safe_parameter(zone)
+    end
+  end
+
+  defp update_recurrence(component, attrs, base) do
+    Enum.reduce(
+      [recurrence_rules: "RRULE", recurrence_dates: "RDATE", excluded_dates: "EXDATE"],
+      component,
+      fn {field, name}, lines ->
+        desired = value(attrs, field, Map.get(base, field, []))
+
+        if desired == Map.get(base, field, []) do
+          lines
+        else
+          additions =
+            Enum.map(desired || [], fn value ->
+              if String.starts_with?(value, [name <> ":", name <> ";"]) do
+                {:ok, [parsed]} = tokenize(safe_content(value) <> "\r\n")
+                if parsed.name != name, do: raise(ArgumentError, "invalid recurrence property")
+                parsed
+              else
+                header =
+                  cond do
+                    name == "RRULE" -> name
+                    byte_size(value) == 8 -> name <> ";VALUE=DATE"
+                    String.ends_with?(value, "Z") -> name
+                    true -> time_header(name, attrs, base, nil)
+                  end
+
+                make_line(header, safe_content(value))
+              end
+            end)
+
+          stripped = remove_top_property(lines, name)
+          {body, ending} = Enum.split(stripped, -1)
+          body ++ additions ++ ending
+        end
+      end
+    )
+  end
+
+  defp update_reminders(component, attrs, base) do
+    desired = value(attrs, :reminders, base.reminders)
+
+    cond do
+      desired == base.reminders ->
+        {:ok, component}
+
+      base.unsupported_alarms or not is_list(desired) or length(desired) > 5 ->
+        {:error, :unsupported_alarms}
+
+      Enum.any?(desired, fn reminder ->
+        not is_map(reminder) or reminder["method"] != "popup" or
+          not is_integer(reminder["minutes"]) or reminder["minutes"] not in 0..40_320
+      end) ->
+        {:error, :unsupported_alarms}
+
+      true ->
+        additions =
+          Enum.flat_map(desired, fn reminder ->
+            minutes = Map.get(reminder, "minutes")
+
+            [
+              make_line("BEGIN", "VALARM"),
+              make_line("ACTION", "DISPLAY"),
+              make_line("TRIGGER", "-PT#{minutes}M"),
+              make_line("DESCRIPTION", "Reminder"),
+              make_line("END", "VALARM")
+            ]
+          end)
+
+        {kept, _} =
+          Enum.reduce(component, {[], 0}, fn line, {kept, depth} ->
+            cond do
+              line.name == "BEGIN" and (line.value == "VALARM" or depth > 0) -> {kept, depth + 1}
+              line.name == "END" and depth > 0 -> {kept, depth - 1}
+              depth > 0 -> {kept, depth}
+              true -> {[line | kept], depth}
+            end
+          end)
+
+        {body, ending} = kept |> Enum.reverse() |> Enum.split(-1)
+        {:ok, body ++ additions ++ ending}
+    end
+  end
+
+  defp add_exclusion(lines, uid, rid, original) do
+    {:ok, first, last} = event_range(lines, uid, "")
+    component = Enum.slice(lines, first..last)
+
+    header =
+      case event_range(original, uid, rid) do
+        {:ok, from, to} -> Enum.slice(original, from..to) |> top_property("RECURRENCE-ID")
+        _ -> top_property(component, "DTSTART")
+      end
+
+    head =
+      if header,
+        do: String.replace(header.head, ~r/\A(?:DTSTART|RECURRENCE-ID)/, "EXDATE"),
+        else: "EXDATE"
+
+    head = if String.ends_with?(rid, "Z"), do: "EXDATE", else: head
+    addition = make_line(head, safe_content(rid))
+    already? = Enum.any?(component, &(&1.name == "EXDATE" and rid in String.split(&1.value, ",")))
+    {body, ending} = Enum.split(component, -1)
+    changed = if already?, do: component, else: body ++ [addition] ++ ending
+    Enum.take(lines, first) ++ changed ++ Enum.drop(lines, last + 1)
+  end
+
+  defp safe_content(value) do
+    if not is_binary(value) or String.contains?(value, ["\r", "\n", <<0>>]),
+      do: raise(ArgumentError, "invalid content")
+
+    value
+  end
+
+  defp safe_parameter(value) do
+    if String.contains?(safe_content(value), [";", ":", "\"", "\\"]),
+      do: raise(ArgumentError, "invalid parameter")
+
+    value
+  end
 
   defp tokenize(raw) when is_binary(raw) and byte_size(raw) <= @limit do
     if String.valid?(raw) and not String.contains?(raw, <<0>>) do

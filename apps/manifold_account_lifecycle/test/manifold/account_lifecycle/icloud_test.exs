@@ -44,15 +44,16 @@ defmodule Manifold.AccountLifecycle.ICloudTest do
     assert Enum.all?(Repo.all(Oban.Job), &(&1.state == "cancelled"))
   end
 
-  test "durable Account purge removes its local cloud data and preserves other Accounts", %{
-    account: account,
-    other: other,
-    connection: c
-  } do
+  test "Account purge preserves local calendar identity and removes only mailbox-owned cloud data",
+       %{
+         account: account,
+         other: other,
+         connection: c
+       } do
     {:ok, mine} = Contacts.create_contact(%{account_id: account.id, full_name: "Mine"})
     {:ok, retained} = Contacts.create_contact(%{account_id: other.id, full_name: "Other"})
     {:ok, unassigned} = Contacts.create_contact(%{full_name: "Unassigned"})
-    {:ok, calendar} = Calendars.create_calendar(%{account_id: account.id, name: "Local calendar"})
+    {:ok, calendar} = Calendars.create_calendar(%{name: "Local calendar"})
 
     {:ok, event} =
       Calendars.create_event(%{calendar_id: calendar.id, starts_at: "20261010T120000Z"})
@@ -75,15 +76,15 @@ defmodule Manifold.AccountLifecycle.ICloudTest do
     assert Accounts.get_account(account.id) == nil
     assert Repo.get(ICloudConnection, c.id) == nil
     assert Repo.get(Contact, mine.id) == nil
-    assert Repo.get(Calendar, calendar.id) == nil
-    assert Repo.get(CalendarEvent, event.id) == nil
+    assert Repo.get!(Calendar, calendar.id).name == "Local calendar"
+    assert Repo.get!(CalendarEvent, event.id).calendar_id == calendar.id
     assert Contacts.get_contact(retained.id)
     assert Contacts.get_contact(unassigned.id)
     assert Repo.aggregate(DAVResource, :count) == 0
     refute Connectors.account_data_remaining?(account.id)
   end
 
-  test "Account purge removes retained event tombstones after their local calendar is deleted", %{
+  test "Account purge preserves legacy calendar tombstones after local calendar archival", %{
     account: account,
     other: other,
     connection: connection
@@ -97,8 +98,8 @@ defmodule Manifold.AccountLifecycle.ICloudTest do
         writable: true
       })
 
-    {:ok, calendar} =
-      Calendars.create_calendar(%{
+    calendar =
+      Repo.insert!(%Calendar{
         account_id: account.id,
         collection_id: collection.id,
         name: "Retained tombstones"
@@ -142,8 +143,8 @@ defmodule Manifold.AccountLifecycle.ICloudTest do
       })
 
     assert {:ok, _} = Calendars.delete_calendar(calendar.id)
-    assert Repo.get!(CalendarEvent, bound.id).calendar_id == nil
-    assert Repo.get!(CalendarEvent, legacy.id).calendar_id == nil
+    assert Repo.get!(CalendarEvent, bound.id).calendar_id == calendar.id
+    assert Repo.get!(CalendarEvent, legacy.id).calendar_id == calendar.id
 
     other_resource =
       Repo.insert!(%DAVResource{
@@ -180,8 +181,8 @@ defmodule Manifold.AccountLifecycle.ICloudTest do
 
     assert outcome == :ok
     assert Accounts.get_account(account.id) == nil
-    assert Repo.get(CalendarEvent, bound.id) == nil
-    assert Repo.get(CalendarEvent, legacy.id) == nil
+    assert Repo.get!(CalendarEvent, bound.id).raw == bound.raw
+    assert Repo.get!(CalendarEvent, legacy.id).raw == legacy.raw
     assert Repo.get(DAVResource, resource.id) == nil
     assert Repo.get!(CalendarEvent, other_event.id).raw == other_event.raw
     assert Repo.get!(DAVResource, other_resource.id).account_id == other.id

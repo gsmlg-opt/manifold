@@ -12,7 +12,8 @@ implementation snapshot, recorded acceptance gaps, and suggested next tasks.
 | [Product and architecture](DESIGN.md) | Application boundaries, durable mail contracts and product scope |
 | [Web UI design](../DESIGN.md) | DuskMoon tokens, themes and app chrome conventions |
 | [OAuth setup](OAUTH_SETUP.md) | Microsoft device-code login and Google redirect/pasted-URL completion |
-| [iCloud setup](ICLOUD.md) | Account-owned Contacts/Calendar, bidirectional sync, conflicts and migration |
+| [Local calendars](CALENDARS.md) | Independent calendars, simultaneous Google/iCloud targets, recurrence, conflicts and migration |
+| [iCloud setup](ICLOUD.md) | Account-owned Contacts and links to independent Calendar setup |
 | [HTTP clients](HTTP_CLIENT.md) | Native Fetch business clients, response/stream contracts and migration verification |
 | [TLS backends](TLS_BACKENDS.md) | Default OTP TLS and the explicit ex_ssl consumer boundary |
 | [Crash boundaries](CRASH_BOUNDARIES.md) | Persistence, retry and recovery invariants |

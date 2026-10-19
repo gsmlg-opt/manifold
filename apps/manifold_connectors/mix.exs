@@ -22,6 +22,7 @@ defmodule Manifold.Connectors.MixProject do
     [
       {:manifold_core, in_umbrella: true},
       {:manifold_data, in_umbrella: true},
+      {:manifold_calendars, in_umbrella: true},
       {:manifold_accounts, in_umbrella: true},
       {:manifold_ingest, in_umbrella: true},
       {:manifold_mail, in_umbrella: true},

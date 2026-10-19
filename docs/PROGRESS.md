@@ -13,6 +13,12 @@
 HTTP-client migration checkpoint: **2026-10-15**, based on `1d150fc` in
 `codex/http-fetch-client`, accepted for the v0.6.4 release candidate; see [HTTP clients](HTTP_CLIENT.md) for its scope and evidence.
 
+Calendar correction checkpoint: **2026-10-19**, `codex/calendar-local-first` based
+on `5a6825f`. Independent local calendars and simultaneous Google/iCloud bindings
+supersede the Account-owned Calendar model below. See the [current guide](CALENDARS.md)
+and [scoped implementation evidence](superpowers/implementation/calendar-validation.md).
+This checkpoint does not re-audit unrelated areas or claim deployment.
+
 Use [the documentation index](README.md) for current setup and architecture.
 Historical plan checkboxes and test totals are not a project-wide completion
 percentage. **Implemented** describes code; **verified** requires evidence for
@@ -31,7 +37,8 @@ the specific behavior, revision and environment being claimed.
 | Connectors (M6 and later extensions) | Gmail/Graph polling, IMAP/EAS Inbox receive, encrypted credentials, durable provider identities/cursors, Google pasted-redirect completion and Microsoft device login | [OAuth setup](OAUTH_SETUP.md), [feature index](superpowers/README.md); Gmail/Graph receive remains read-only |
 | Sync admission | Gmail pacing/cooldown and Microsoft shared receive/send admission | [Gmail record](../.agents/skills/develop/references/gmail-sync-rate-limiting.md), [Microsoft record](../.agents/skills/develop/references/microsoft-sync-throttling.md); limits coordinate within one VM |
 | Account lifecycle | Disable and asynchronous local deletion with lifecycle fencing and retained shared-data safety | [Account actions](../.agents/skills/develop/references/account-actions.md); provider-side deletion/revocation is separate scope |
-| Contacts/Calendar | Account-owned local CRUD, iCloud conditional bidirectional resource sync, explicit destinations, conflict resolution, offline saves and redesigned workspaces | [Current guide](ICLOUD.md), [acceptance](ICLOUD_ACCEPTANCE.md), [workspace record](../.agents/skills/develop/references/contacts-calendar-workspace.md); recurring occurrences are not expanded |
+| Contacts | Account-owned local CRUD, iCloud conditional bidirectional resource sync, explicit destinations and offline saves | [Current guide](ICLOUD.md), [historical acceptance](ICLOUD_ACCEPTANCE.md) |
+| Calendar | Independent local CRUD, bounded recurrence/timezones, simultaneous Google/iCloud targets, independent revisions/conflicts/unknown attempts, persisted enrollment and live workspace | [Current guide](CALENDARS.md), [implementation evidence](superpowers/implementation/calendar-validation.md); real-provider joint acceptance NOT RUN |
 | Interfaces | Phoenix webmail, separate REST/GraphQL read/search API, settings, job/delivery views and build-version badge | [API guide](../apps/manifold_api/README.md), [build badge](../.agents/skills/develop/references/appbar-version.md); web/API access is trusted at the deployment boundary |
 
 ## Remaining verification
@@ -42,6 +49,7 @@ suggested order is advisory.
 | ID | Suggested order | Task / owner | Completion evidence |
 | --- | --- | --- | --- |
 | V1 | First | Credentialed Apple writes — Connectors, Contacts, Calendars, Web | On an authorized disposable account, verify contact/event create/edit/delete, conditional conflicts, lost-response reconciliation and recovery. Real Apple discovery/read imported 132 contacts and 79 events in the [recorded repair](ICLOUD_ACCEPTANCE.md#configured-account-error-repairs--2026-10-11); that run issued zero writes. [Credentialed writes remain NOT RUN](../.agents/skills/develop/references/icloud-contacts-calendars.md#constraints-and-follow-ups). |
+| V4 | Before Calendar rollout | Joint Google/iCloud acceptance — Calendars, Connectors, Web | Use authorized disposable calendars to verify Calendar authorization, simultaneous CRUD, reconnection, exceptions and uncertain outcomes. Localhost HTTP and migration probes are recorded separately in [Calendar evidence](superpowers/implementation/calendar-validation.md); real-provider reads/writes for the new path are NOT RUN. |
 | V2 | First | Microsoft work/school and outbound staging — Connectors, Outbound, Web | Exercise work/school device login, receive/send grants, actual sending, authoritative Sent import, credential rotation and reconnect. [Personal Outlook login and 258 received messages were verified](../.agents/skills/develop/references/microsoft-device-oauth.md#personal-account-and-verification-url-repair-2026-10-09); work/school authorization and credentialed sending were not exercised. Use the current device flow instead of historical callback-only instructions. |
 | V3 | First | Gmail/SMTP lifecycle and backfill evidence — Connectors, Outbound, Web | Complete the [staging checklist](../.agents/skills/develop/references/gmail-receive-send-methods.md#staging-smoke-checklist) with the [current OAuth flow](OAUTH_SETUP.md), including real sending, reconnect and no blind resend after an uncertain outcome. Inspect current cursors/jobs before claiming Gmail or IMAP backfill completion; historical import samples do not establish today's state. Controlled tests cover cooldown; the [Gmail sample](../.agents/skills/develop/references/gmail-sync-rate-limiting.md#validation) did not trigger a real long cooldown. |
 
@@ -74,8 +82,8 @@ being scheduled. They are not incomplete steps in Milestones 0–6.
 | Writing mail | Outbound attachments, HTML/rich-text composition, Gmail/SMTP sender aliases | [Send follow-ups](../.agents/skills/develop/references/gmail-receive-send-methods.md#follow-ups) |
 | Mailbox interactions | Gmail/Graph read-state write-back, Shift range selection, configurable auto-mark delay | [Read/unread follow-ups](../.agents/skills/develop/references/mailbox-read-unread-controls.md#follow-ups) |
 | Sync latency | Gmail watch and Graph subscriptions, retaining durable polling fallback | [Send/connector follow-ups](../.agents/skills/develop/references/gmail-receive-send-methods.md#follow-ups) |
-| Calendar | Recurrence occurrence expansion, recurrence-rule editing, future-series splits, invitations and RSVP | [Supported calendar boundary](ICLOUD.md#calendars-and-events) |
-| Contacts/Calendar providers | Google synchronization; remote address-book/calendar container management | [iCloud scope](../.agents/skills/develop/references/icloud-contacts-calendars.md#constraints-and-follow-ups) |
+| Calendar | Future-series splits, invitations and RSVP | [Supported calendar boundary](CALENDARS.md#using-the-workspace) |
+| Contacts/Calendar providers | Google Contacts synchronization; remote address-book/calendar container management | [Contacts scope](ICLOUD.md), [Calendar scope](CALENDARS.md) |
 | Additional protocols | POP3/EWS (current placeholders), JMAP, EAS Autodiscover | [Receive kinds](../apps/manifold_connectors/lib/manifold/connectors/schema/receive_method.ex), [EAS follow-ups](../.agents/skills/develop/references/eas-activesync-client.md#follow-ups) |
 
 Direct recipient-MX delivery remains an architectural non-goal; it is not a

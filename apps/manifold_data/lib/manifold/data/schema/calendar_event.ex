@@ -11,6 +11,9 @@ defmodule Manifold.Data.Schema.CalendarEvent do
     belongs_to(:calendar, Manifold.Data.Schema.Calendar)
     belongs_to(:resource, Manifold.Data.Schema.DAVResource)
     field(:local_revision, :integer, default: 0)
+    field(:series_id, :binary_id)
+    field(:time_kind, :string, default: "floating")
+    field(:read_only, :boolean, default: false)
     field(:deleted_at, :utc_datetime_usec)
     field(:resource_href, :string)
     field(:uid, :string)
@@ -25,7 +28,10 @@ defmodule Manifold.Data.Schema.CalendarEvent do
     field(:timezone, :string)
     field(:all_day, :boolean, default: false)
     field(:recurrence_rules, {:array, :string}, default: [])
+    field(:recurrence_dates, {:array, :string}, default: [])
+    field(:recurrence_timezone, :string)
     field(:excluded_dates, {:array, :string}, default: [])
+    field(:reminders, {:array, :map}, default: [])
     belongs_to(:collection, Manifold.Data.Schema.DAVCollection)
     timestamps(type: :utc_datetime_usec)
   end
@@ -38,6 +44,9 @@ defmodule Manifold.Data.Schema.CalendarEvent do
         :calendar_id,
         :resource_id,
         :local_revision,
+        :series_id,
+        :time_kind,
+        :read_only,
         :deleted_at,
         :collection_id,
         :resource_href,
@@ -53,7 +62,10 @@ defmodule Manifold.Data.Schema.CalendarEvent do
         :timezone,
         :all_day,
         :recurrence_rules,
-        :excluded_dates
+        :recurrence_dates,
+        :recurrence_timezone,
+        :excluded_dates,
+        :reminders
       ],
       empty_values: []
     )
@@ -81,16 +93,24 @@ defmodule Manifold.Data.Schema.CalendarEvent do
         :starts_at,
         :ends_at,
         :timezone,
-        :all_day
+        :all_day,
+        :recurrence_rules,
+        :recurrence_dates,
+        :excluded_dates,
+        :recurrence_timezone,
+        :reminders
       ],
       empty_values: []
     )
     |> infer_all_day(attrs)
+    |> infer_time_kind()
+    |> normalize_empty_fields()
     |> validate_required([:calendar_id, :starts_at, :all_day])
     |> validate_length(:summary, max: 512)
     |> validate_length(:description, max: 10_000)
     |> validate_length(:location, max: 4096)
     |> validate_length(:timezone, max: 255)
+    |> validate_reminders()
     |> validate_format(:timezone, ~r/\A[^\x00-\x20;:"\\]+\z/,
       message: "must be a valid time zone identifier"
     )
@@ -98,6 +118,65 @@ defmodule Manifold.Data.Schema.CalendarEvent do
     |> validate_change(:ends_at, &validate_time/2)
     |> validate_interval()
     |> foreign_key_constraint(:calendar_id)
+  end
+
+  defp validate_reminders(changeset) do
+    case fetch_change(changeset, :reminders) do
+      {:ok, values} ->
+        if is_list(values) and length(values) <= 5 and
+             Enum.all?(values, fn value ->
+               is_map(value) and map_size(value) == 2 and
+                 Map.get(value, "method") in ["popup", "email"] and
+                 is_integer(Map.get(value, "minutes")) and
+                 Map.get(value, "minutes") in 0..40_320
+             end) do
+          put_change(
+            changeset,
+            :reminders,
+            Enum.sort_by(Enum.uniq(values), fn value -> {value["method"], value["minutes"]} end)
+          )
+        else
+          add_error(
+            changeset,
+            :reminders,
+            "must contain at most five popup or email reminders from 0 to 40320 minutes"
+          )
+        end
+
+      :error ->
+        changeset
+    end
+  end
+
+  defp infer_time_kind(changeset) do
+    start = get_field(changeset, :starts_at) || ""
+
+    kind =
+      cond do
+        byte_size(start) == 8 -> "date"
+        String.ends_with?(start, "Z") -> "utc"
+        get_field(changeset, :timezone) not in [nil, ""] -> "tzid"
+        true -> "floating"
+      end
+
+    zone =
+      case kind do
+        "utc" -> "Etc/UTC"
+        "tzid" -> get_field(changeset, :timezone)
+        _ -> nil
+      end
+
+    changeset |> put_change(:time_kind, kind) |> put_change(:timezone, zone)
+  end
+
+  defp normalize_empty_fields(changeset) do
+    Enum.reduce(
+      [:summary, :description, :location, :ends_at, :recurrence_timezone],
+      changeset,
+      fn field, acc ->
+        update_change(acc, field, fn value -> if value == "", do: nil, else: value end)
+      end
+    )
   end
 
   defp infer_all_day(changeset, attrs) do

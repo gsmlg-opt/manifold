@@ -31,8 +31,19 @@ defmodule ManifoldWeb.ConnectorOAuthController do
     connector_error(conn, "The account connection could not be started.")
   end
 
-  def callback(conn, %{"provider" => provider, "code" => code, "state" => state})
-      when provider in @providers do
+  def callback(conn, params) do
+    calendar_state = get_session(conn, :calendar_oauth_state)
+
+    if params["provider"] == "gmail" and is_binary(calendar_state) and
+         params["state"] == calendar_state do
+      ManifoldWeb.CalendarOAuthController.callback(conn, params)
+    else
+      mail_callback(conn, params)
+    end
+  end
+
+  defp mail_callback(conn, %{"provider" => provider, "code" => code, "state" => state})
+       when provider in @providers do
     with {:ok, redirect_uri} <- callback_url(provider),
          {:ok, consumed} <- OAuth.consume(provider, state, redirect_uri) do
       complete_authorization(conn, provider, code, consumed)
@@ -45,14 +56,14 @@ defmodule ManifoldWeb.ConnectorOAuthController do
     end
   end
 
-  def callback(conn, %{"provider" => provider}) when provider in @providers do
+  defp mail_callback(conn, %{"provider" => provider}) when provider in @providers do
     connector_error(
       conn,
       "The #{provider_name(provider)} authorization request is invalid or expired."
     )
   end
 
-  def callback(conn, _params) do
+  defp mail_callback(conn, _params) do
     connector_error(conn, "The account authorization request is invalid or expired.")
   end
 

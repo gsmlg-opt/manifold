@@ -1,5 +1,5 @@
 defmodule Manifold.Connectors.ICloud do
-  @moduledoc "Account-owned, encrypted iCloud contacts and calendar synchronization."
+  @moduledoc "Account-owned, encrypted iCloud Contacts synchronization. Calendar uses independent connections."
   import Ecto.Query
   alias Manifold.Connectors.Crypto
   alias Manifold.Connectors.Jobs.SyncICloud
@@ -8,9 +8,7 @@ defmodule Manifold.Connectors.ICloud do
     ICloudConnection,
     DAVCollection,
     DAVResource,
-    Contact,
-    Calendar,
-    CalendarEvent
+    Contact
   }
 
   alias Manifold.Data.SyncState
@@ -33,7 +31,7 @@ defmodule Manifold.Connectors.ICloud do
     password = value(attrs, :app_password, "")
 
     with true <- valid_credentials?(apple_id, password),
-         {:ok, contacts, calendars} <- services(attrs, true, true) do
+         {:ok, contacts, calendars} <- services(attrs, true, false) do
       id = Ecto.UUID.generate()
 
       with {:ok, encrypted} <- Crypto.encrypt(password, "icloud:#{id}:app_password") do
@@ -50,6 +48,7 @@ defmodule Manifold.Connectors.ICloud do
                 password_ciphertext: encrypted,
                 contacts_enabled: contacts,
                 calendars_enabled: calendars,
+                calendars_status: "disabled",
                 next_sync_at: DateTime.utc_now()
               })
             )
@@ -110,7 +109,7 @@ defmodule Manifold.Connectors.ICloud do
           calendars_enabled: calendars,
           generation: c.generation + 1,
           contacts_status: if(c.enabled and contacts, do: "pending", else: "disabled"),
-          calendars_status: if(c.enabled and calendars, do: "pending", else: "disabled"),
+          calendars_status: "disabled",
           contacts_error: nil,
           calendars_error: nil,
           sync_owner: nil,
@@ -138,7 +137,7 @@ defmodule Manifold.Connectors.ICloud do
           sync_owner: nil,
           sync_expires_at: nil,
           contacts_status: if(enabled and c.contacts_enabled, do: "pending", else: "disabled"),
-          calendars_status: if(enabled and c.calendars_enabled, do: "pending", else: "disabled"),
+          calendars_status: "disabled",
           contacts_error: nil,
           calendars_error: nil,
           next_sync_at: DateTime.utc_now()
@@ -168,7 +167,7 @@ defmodule Manifold.Connectors.ICloud do
       c = locked!(id)
       if is_nil(c.account_id), do: Repo.rollback(:account_assignment_required)
 
-      if not c.enabled or (not c.contacts_enabled and not c.calendars_enabled),
+      if not c.enabled or not c.contacts_enabled,
         do: Repo.rollback(:disabled)
 
       if rate_limited?(c), do: Repo.rollback(:rate_limited)
@@ -251,10 +250,6 @@ defmodule Manifold.Connectors.ICloud do
         set: [account_id: account_id]
       )
 
-      Repo.update_all(from(r in Calendar, where: r.collection_id in ^collection_ids),
-        set: [account_id: account_id]
-      )
-
       queue_locked(c)
       public(c)
     end)
@@ -287,21 +282,12 @@ defmodule Manifold.Connectors.ICloud do
   def account_data_remaining?(repo, account_id) do
     repo.exists?(from(c in ICloudConnection, where: c.account_id == ^account_id)) or
       repo.exists?(from(c in Contact, where: c.account_id == ^account_id)) or
-      repo.exists?(from(c in Calendar, where: c.account_id == ^account_id)) or
-      repo.exists?(from(r in DAVResource, where: r.account_id == ^account_id)) or
-      repo.exists?(account_events_query(account_id))
+      repo.exists?(from(r in DAVResource, where: r.account_id == ^account_id))
   end
 
   @doc false
   def purge_account_batch(repo, account_id, limit) do
-    events =
-      account_events_query(account_id)
-      |> select([e], e.id)
-      |> order_by([e], e.id)
-      |> limit(^limit)
-
     queries = [
-      {CalendarEvent, events},
       {Contact,
        from(c in Contact,
          where: c.account_id == ^account_id,
@@ -314,13 +300,6 @@ defmodule Manifold.Connectors.ICloud do
          where: r.account_id == ^account_id,
          select: r.id,
          order_by: r.id,
-         limit: ^limit
-       )},
-      {Calendar,
-       from(c in Calendar,
-         where: c.account_id == ^account_id,
-         select: c.id,
-         order_by: c.id,
          limit: ^limit
        )},
       {ICloudConnection,
@@ -349,22 +328,6 @@ defmodule Manifold.Connectors.ICloud do
       done?: not account_data_remaining?(repo, account_id),
       activity_log_ids: []
     }
-  end
-
-  defp account_events_query(account_id) do
-    from(e in CalendarEvent,
-      left_join: c in Calendar,
-      on: c.id == e.calendar_id,
-      left_join: r in DAVResource,
-      on: r.id == e.resource_id,
-      left_join: d in DAVCollection,
-      on: d.id == e.collection_id,
-      left_join: connection in ICloudConnection,
-      on: connection.id == d.connection_id,
-      where:
-        c.account_id == ^account_id or r.account_id == ^account_id or
-          connection.account_id == ^account_id
-    )
   end
 
   @doc false
@@ -422,7 +385,7 @@ defmodule Manifold.Connectors.ICloud do
   def update!(c, attrs), do: c |> ICloudConnection.changeset(attrs) |> persist!(:update)
 
   defp queue_locked(%{account_id: nil}), do: {nil, false}
-  defp queue_locked(%{contacts_enabled: false, calendars_enabled: false}), do: {nil, false}
+  defp queue_locked(%{contacts_enabled: false}), do: {nil, false}
 
   defp queue_locked(c) do
     existing =
@@ -488,15 +451,12 @@ defmodule Manifold.Connectors.ICloud do
   defp boolean(_), do: nil
 
   defp syncable?(c),
-    do:
-      (c.contacts_enabled and c.contacts_status != "reconnect_required") or
-        (c.calendars_enabled and c.calendars_status != "reconnect_required")
+    do: c.contacts_enabled and c.contacts_status != "reconnect_required"
 
   @doc false
   def cooldown_seconds(c) do
     limited =
-      c.contacts_error == "Rate limited; synchronization will retry." or
-        c.calendars_error == "Rate limited; synchronization will retry."
+      c.contacts_error == "Rate limited; synchronization will retry."
 
     if limited and c.next_sync_at do
       milliseconds = DateTime.diff(c.next_sync_at, DateTime.utc_now(), :millisecond)

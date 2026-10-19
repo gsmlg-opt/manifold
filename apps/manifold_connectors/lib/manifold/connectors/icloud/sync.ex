@@ -86,6 +86,9 @@ defmodule Manifold.Connectors.ICloud.Sync do
         not c.enabled ->
           Repo.rollback(:disabled)
 
+        not c.contacts_enabled ->
+          Repo.rollback(:disabled)
+
         ICloud.cooldown_seconds(c) > 0 ->
           Repo.rollback({:rate_limited, ICloud.cooldown_seconds(c)})
 
@@ -113,7 +116,8 @@ defmodule Manifold.Connectors.ICloud.Sync do
   end
 
   defp selected(c) do
-    Enum.filter(["contacts", "calendars"], fn kind ->
+    # Calendar requests are owned by CalendarSync, including final write admission.
+    Enum.filter(["contacts"], fn kind ->
       f = fields(kind)
       Map.fetch!(c, f.enabled) and Map.fetch!(c, f.status) != "reconnect_required"
     end)

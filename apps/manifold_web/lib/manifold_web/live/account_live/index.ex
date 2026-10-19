@@ -329,8 +329,8 @@ defmodule ManifoldWeb.AccountLive.Index do
           </p>
           <p id="delete-account-warning">
             This permanently deletes this account's local methods, credentials, messages,
-            drafts, sent mail, folders, attachments, contacts, calendars, events, and stored objects.
-            Mail and accounts held by the remote provider are not deleted. iCloud contacts and calendars are retained remotely.
+            drafts, sent mail, folders, attachments, contacts, and stored objects.
+            Local calendars and events are retained. Mail and accounts held by the remote provider are not deleted. iCloud contacts and calendars are retained remotely.
           </p>
           <.form
             for={%{}}

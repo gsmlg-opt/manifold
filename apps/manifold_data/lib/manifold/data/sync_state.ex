@@ -98,8 +98,9 @@ defmodule Manifold.Data.SyncState do
 
   @doc "Stages one full calendar resource; sibling components share its revision."
   def stage_event(%CalendarEvent{} = event, %Calendar{} = calendar, operation \\ "upsert") do
-    collection = if calendar.collection_id, do: Repo.get(DAVCollection, calendar.collection_id)
-    stage(event, "calendars", calendar.account_id, collection, calendar.sync_to_icloud, operation)
+    _ = operation
+    Manifold.Data.CalendarSyncState.stage_events!(calendar, [event])
+    event
   end
 
   @doc "Enrolls only explicitly Account-owned drafts after destination configuration."
@@ -122,29 +123,8 @@ defmodule Manifold.Data.SyncState do
 
           Enum.each(contacts, &stage_contact/1)
 
-          calendars =
-            Repo.all(
-              from c in Calendar,
-                where:
-                  c.account_id == ^account_id and c.sync_to_icloud and not is_nil(c.collection_id),
-                order_by: c.id
-            )
-
-          Enum.each(calendars, fn calendar ->
-            events =
-              Repo.all(
-                from e in CalendarEvent,
-                  where:
-                    e.calendar_id == ^calendar.id and is_nil(e.deleted_at) and
-                      is_nil(e.resource_id),
-                  order_by: e.id,
-                  lock: "FOR UPDATE"
-              )
-
-            Enum.each(events, &stage_event(&1, calendar))
-          end)
-
-          %{contacts: length(contacts), calendars: length(calendars)}
+          # Calendar history is enrolled only through its persisted binding preview.
+          %{contacts: length(contacts), calendars: 0}
       end
     end)
   end

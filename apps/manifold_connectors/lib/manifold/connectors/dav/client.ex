@@ -55,7 +55,9 @@ defmodule Manifold.Connectors.DAV.Client do
              &(URL.resolve(home, &1.href) == {:ok, home} && not failed?(&1))
            ) || {:error, :incomplete_snapshot},
          {:ok, collections} <- collections(data.responses, home, {namespace, collection_type}) do
-      {:ok, collections}
+      if Keyword.get(opts, :include_identity, false),
+        do: {:ok, %{identity: principal, collections: collections}},
+        else: {:ok, collections}
     end
   end
 

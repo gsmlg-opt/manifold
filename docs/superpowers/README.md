@@ -6,6 +6,10 @@
 
 “已实现”表示有实现或后续验收记录，不表示全部真实服务验收已经通过，也不表示本次重新运行了测试。验收结果应读取链接记录的日期、范围及 `PASS` / `FAIL` / `NOT RUN` 限制；当前验收缺口统一维护在 [开发进度](../PROGRESS.md)。
 
+## Calendar 修正与实施
+
+- [2026-10-19 Calendar 重新审核与修正计划](plans/2026-10-19-calendar-local-first-correction.md)：已按批准方案实现独立本地日历、Google/iCloud 多目标、时间/重复事件及迁移审核；[当前操作说明](../CALENDARS.md)、[实施与验证证据](implementation/calendar-validation.md)、[维护记录](../../.agents/skills/develop/references/calendar-local-first-review.md)。真实两家服务联合验收单独标记为 NOT RUN。
+
 ## 近期实现
 
 | 功能 / 当前归类 | 设计 | 执行计划 | 维护记录与验收入口 |
@@ -15,7 +19,7 @@
 | iCloud 通讯录 / 日历导入：已实现，Account 双向方案继承并扩展 | [2026-10-09](specs/2026-10-09-icloud-contacts-calendars-design.md) | [2026-10-10](plans/2026-10-10-icloud-contacts-calendars.md) | [当前 iCloud 维护记录](../../.agents/skills/develop/references/icloud-contacts-calendars.md)、[验收与发布记录](../ICLOUD_ACCEPTANCE.md) |
 | Account 所属 iCloud 双向同步：已实现；真实 Apple 写入验收仍有缺口 | [2026-10-10](specs/2026-10-10-account-icloud-bidirectional-design.md) | [2026-10-10](plans/2026-10-10-account-icloud-bidirectional.md) | [iCloud 维护记录](../../.agents/skills/develop/references/icloud-contacts-calendars.md)、[操作说明](../ICLOUD.md)、[验收记录](../ICLOUD_ACCEPTANCE.md) |
 
-后续通讯录 / 日历工作台改版没有单独的本目录设计或计划文件；实现边界、70 项历史 scoped 测试及两主题 / 手机浏览器验收见 [工作台维护记录](../../.agents/skills/develop/references/contacts-calendar-workspace.md)。其 UI 改版保留 Account 双向同步流程。
+此前通讯录 / 日历工作台改版的实现边界、70 项历史 scoped 测试及浏览器验收见 [工作台维护记录](../../.agents/skills/develop/references/contacts-calendar-workspace.md)。其中 Calendar 的 Account 所属/单目标模型已由上面的 2026-10-19 修正方案取代；Contacts 保持原有流程。
 
 ## 历史执行计划
 

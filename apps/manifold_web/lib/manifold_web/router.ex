@@ -19,6 +19,8 @@ defmodule ManifoldWeb.Router do
 
     get("/connectors/:provider/start", ConnectorOAuthController, :start)
     get("/connectors/:provider/callback", ConnectorOAuthController, :callback)
+    get("/calendar-connections/google/start", CalendarOAuthController, :start)
+    get("/calendar-connections/google/callback", CalendarOAuthController, :callback)
     get("/settings", SettingsRedirectController, :redirect_general)
     get("/mail/:mailbox_id/sent", SentRedirectController, :index)
     get("/mail/:mailbox_id/sent/:outbound_message_id", SentRedirectController, :show)

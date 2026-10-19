@@ -49,10 +49,13 @@ defmodule ManifoldWeb.SettingsLive.ICloud do
       <div class="settings-heading">
         <div>
           <h1>iCloud</h1><p class="settings-intro">
-            Contacts and Calendar are configured inside an Account.
+            Configure iCloud Contacts in an Account. Manage Calendar connections and targets in Calendars.
           </p>
         </div><.dm_btn navigate={~p"/settings/accounts"} variant="primary">Manage Accounts</.dm_btn>
       </div>
+      <.dm_btn id="icloud-manage-calendars" navigate={~p"/calendars"} variant="outline">
+        Manage Calendar synchronization
+      </.dm_btn>
       <p>
         Choose an existing Account or create a local Account before connecting iCloud. Its address can differ from the Apple Account.
       </p>
@@ -60,7 +63,7 @@ defmodule ManifoldWeb.SettingsLive.ICloud do
         Create local Account
       </.dm_btn>
       <p :if={@connections == []} id="icloud-empty">
-        No iCloud connections yet. Open an Account to configure Contacts and Calendar.
+        No iCloud contact connections yet. Open an Account to configure Contacts.
       </p>
       <article
         :for={connection <- @connections}

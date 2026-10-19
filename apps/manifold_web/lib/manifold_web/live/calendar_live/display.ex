@@ -1,19 +1,19 @@
 defmodule ManifoldWeb.CalendarLive.Display do
   @moduledoc false
+  alias Manifold.Calendars.Time, as: CalendarTime
 
-  def date(value) when is_binary(value) do
-    case value do
-      <<year::binary-size(4), month::binary-size(2), day::binary-size(2), _rest::binary>> ->
-        Date.from_iso8601("#{year}-#{month}-#{day}") |> valid_date()
+  def date(value, timezone \\ "Etc/UTC")
+  def date(%Date{} = date, _), do: date
+  def date(%DateTime{} = datetime, _), do: DateTime.to_date(datetime)
 
-      _ ->
-        nil
+  def date(value, timezone) when is_binary(value) do
+    case CalendarTime.parse(value, nil, timezone) do
+      {:ok, time} -> date(time, timezone)
+      _ -> nil
     end
   end
 
-  def date(_), do: nil
-  defp valid_date({:ok, date}), do: date
-  defp valid_date(_), do: nil
+  def date(_, _), do: nil
 
   def month(%Date{} = date), do: %{date | day: 1}
 
@@ -28,53 +28,76 @@ defmodule ManifoldWeb.CalendarLive.Display do
     Enum.map(0..41, &Date.add(first, &1))
   end
 
-  def last_day(event) do
-    first = date(event.starts_at)
-    finish = date(event.ends_at)
+  def last_day(event, timezone \\ "Etc/UTC") do
+    case period(event, timezone) do
+      {:ok, %{starts_at: %Date{} = first, ends_at: %Date{} = finish}} ->
+        if Date.compare(finish, first) == :gt, do: Date.add(finish, -1), else: first
 
-    cond do
-      is_nil(finish) -> first
-      event.all_day or midnight?(event.ends_at) -> Date.add(finish, -1)
-      true -> finish
+      {:ok, %{starts_at: %DateTime{} = first, ends_at: %DateTime{} = finish}} ->
+        if DateTime.compare(finish, first) == :gt,
+          do: finish |> DateTime.add(-1, :microsecond) |> DateTime.to_date(),
+          else: DateTime.to_date(first)
+
+      _ ->
+        nil
     end
   end
 
-  def on_day?(event, day) do
-    first = date(event.starts_at)
-    last = last_day(event)
-    first && last && Date.compare(first, day) != :gt && Date.compare(last, day) != :lt
+  def on_day?(event, day, timezone \\ "Etc/UTC") do
+    with {:ok, period} <- period(event, timezone),
+         first when not is_nil(first) <- date(period.starts_at),
+         last when not is_nil(last) <- last_day(event, timezone) do
+      Date.compare(first, day) != :gt and Date.compare(last, day) != :lt
+    else
+      _ -> false
+    end
   end
 
-  def agenda(events, anchor) do
+  def agenda(occurrences, anchor) do
     first = month(anchor)
     until = shift_month(first, 1)
 
-    events
-    |> Enum.filter(fn event ->
-      start = date(event.starts_at)
-      finish = last_day(event)
-      start && finish && Date.compare(start, until) == :lt && Date.compare(finish, first) != :lt
+    occurrences
+    |> Enum.filter(fn occurrence ->
+      on_day?(occurrence, max_date(date(occurrence.starts_at), first)) &&
+        Date.compare(date(occurrence.starts_at), until) == :lt &&
+        Date.compare(last_day(occurrence), first) != :lt
     end)
-    |> Enum.group_by(fn event ->
-      start = date(event.starts_at)
-      if Date.compare(start, first) == :lt, do: first, else: start
-    end)
+    |> Enum.group_by(&max_date(date(&1.starts_at), first))
     |> Enum.sort_by(fn {date, _} -> Date.to_gregorian_days(date) end)
   end
 
-  def clock(%{all_day: true}), do: "All day"
-  def clock(%{starts_at: value}), do: clock(value)
+  def clock(event, timezone \\ "Etc/UTC")
+  def clock(%{all_day: true}, _), do: "All day"
+  def clock(%{clock: clock}, _), do: clock
 
-  def clock(
-        <<_date::binary-size(8), "T", hour::binary-size(2), minute::binary-size(2),
-          _rest::binary>>
-      ),
-      do: hour <> ":" <> minute
+  def clock(%{starts_at: _} = event, timezone) do
+    case period(event, timezone) do
+      {:ok, period} -> clock(period.starts_at, timezone)
+      _ -> "Invalid time"
+    end
+  end
 
-  def clock(_), do: "All day"
+  def clock(%DateTime{} = datetime, _), do: Calendar.strftime(datetime, "%H:%M")
+  def clock(%Date{}, _), do: "All day"
 
-  def recurring?(event), do: event.recurrence_rules != [] or event.recurrence_id not in [nil, ""]
+  def clock(value, timezone) when is_binary(value) do
+    case CalendarTime.parse(value, nil, timezone) do
+      {:ok, time} -> clock(time, timezone)
+      _ -> "Invalid time"
+    end
+  end
 
-  defp midnight?(value) when is_binary(value), do: String.slice(value, 8, 7) == "T000000"
-  defp midnight?(_), do: false
+  def clock(_, _), do: "Invalid time"
+
+  def recurring?(event),
+    do:
+      Map.get(event, :recurrence_rules, []) != [] or Map.get(event, :recurrence_dates, []) != [] or
+        Map.get(event, :recurrence_id) not in [nil, ""]
+
+  defp period(%{starts_at: %DateTime{}} = occurrence, _), do: {:ok, occurrence}
+  defp period(%{starts_at: %Date{}} = occurrence, _), do: {:ok, occurrence}
+  defp period(event, timezone), do: CalendarTime.period(event, timezone)
+  defp max_date(nil, right), do: right
+  defp max_date(left, right), do: if(Date.compare(left, right) == :lt, do: right, else: left)
 end
