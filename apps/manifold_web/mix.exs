@@ -4,7 +4,7 @@ defmodule ManifoldWeb.MixProject do
   def project do
     [
       app: :manifold_web,
-      version: "0.6.4",
+      version: "0.6.5",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
