@@ -1,7 +1,7 @@
 # Mail body recognition and recovery
 
 - Date: 2026-10-20.
-- Status: implemented and locally verified in `.trees/mail-inline-body` on `codex/mail-inline-body`; production deployment and recovery remain NOT RUN.
+- Status: merged and pushed to `main` as `590556f`; local services restarted and initial recovery verified. v0.6.6 publication is the next authorized step; public production deployment and recovery remain NOT RUN.
 - Scope selected by the user: repair body recognition and recover existing messages; design HTML fidelity separately.
 - Design: [Inline body recognition and recovery](../../../../docs/superpowers/specs/2026-10-20-mail-inline-body-recovery-design.md).
 
@@ -25,7 +25,7 @@ Configured parser_version is now 6; sanitizer_version remains 1. After deploymen
 
 ## Constraints
 
-No schema migration, provider refetch, resend, new API contract or frontend renderer change. Sanitizer, CSP, sandbox, mailbox and quarantine boundaries are unchanged. HTML styles/images remain blocked in this repair. Missing/corrupt raw and failed reparse preserve the existing projection. No production actions were performed.
+No schema migration, provider refetch, resend, new API contract or frontend renderer change. Sanitizer, CSP, sandbox, mailbox and quarantine boundaries are unchanged. HTML styles/images remain blocked in this repair. Missing/corrupt raw and failed reparse preserve the existing projection. No public production deployment or replay was performed.
 
 ## Verification
 
@@ -34,9 +34,11 @@ No schema migration, provider refetch, resend, new API contract or frontend rend
 - PASS: final five-file scoped suite, seed 792712: manifold_mail 45, manifold_ingest 57, manifold_web 31; **133 tests, 0 failures**. Existing resource tests include body/attachment security boundaries.
 - PASS: changed Elixir files formatted and `mix format --check-formatted`; `MIX_ENV=test mix compile --warnings-as-errors`; `git diff --check`.
 - PASS: actual zero-timeout checks over approximately 2 MiB valid raw assert `parser_timeout` without retrying or accepting alternate outcomes. These exercise the immediate-deadline boundary; they do not prove scheduler-independent timing. The reread fixture changes state inside the existing fault callback; it is not a full concurrent-writer test.
-- NOT RUN: full umbrella suite, actual production raw replay, deployment and production recovery. No frontend assets changed, so no asset build was required.
+- PASS (integration checkpoint): merged-main scoped suite, seed 947535, **133 tests, 0 failures**, scoped formatting and strict test compilation. Source CI, TLS backends and remote full ExUnit suite passed; the full suite contains **1,597 tests, 0 failures, no exclusions or skips**.
+- PASS (local runtime, 2026-10-20 15:38:37 UTC): PostgreSQL accepts connections; devenv services ready; web and API health return 200 on source `590556f`. Initial reconciliation rebuilt 500 messages as parser 6/parsed; stale rows decreased from 39,497 to 38,997. Message count 39,497 and mailbox-entry count 39,499 are unchanged, as are aggregate identity/timestamp/user-state fingerprints. Existing 251 fallback rows are unchanged; two parser-6 jobs were retryable. This checkpoint does not establish complete recovery.
+- NOT RUN: actual public production raw replay, deployment and production recovery. The reported target message is absent from the local database, so local recovery cannot establish that message's acceptance. No frontend assets changed, so no local asset build was required.
 
-Run from the main project root using `devenv shell`, unset `TEST_DATABASE_URL`, set `POSTGRES_TEST_DB=manifold_mail_inline_body_test` and change directory to the worktree. Exact commands and RED evidence are in the [implementation plan](../../../../docs/superpowers/plans/2026-10-20-mail-inline-body-recovery.md).
+Run from the main project root using `devenv shell`, unset `TEST_DATABASE_URL` and set `POSTGRES_TEST_DB=manifold_mail_inline_body_test`. The implementation worktree and branch were removed after integration. Historical worktree commands and RED evidence are in the [implementation plan](../../../../docs/superpowers/plans/2026-10-20-mail-inline-body-recovery.md).
 
 ## Follow-ups
 

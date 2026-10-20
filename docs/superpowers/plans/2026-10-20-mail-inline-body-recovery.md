@@ -8,7 +8,7 @@
 
 **Tech Stack:** Elixir, Mail 0.5.2, Ecto/PostgreSQL, ExUnit, Phoenix LiveView, existing Oban jobs.
 
-Approved scope: [design](../specs/2026-10-20-mail-inline-body-recovery-design.md), user approval on 2026-10-20. Worktree: `.trees/mail-inline-body`, branch `codex/mail-inline-body`. HTML fidelity and production deployment remain separate.
+Approved scope: [design](../specs/2026-10-20-mail-inline-body-recovery-design.md), user approval on 2026-10-20. Implementation used `.trees/mail-inline-body` on `codex/mail-inline-body`; both were removed after integration. The commands below retain that historical execution context. Run future checks from the main project root without the worktree `cd`. HTML fidelity and public production deployment remain separate.
 
 ## Execution boundaries
 
@@ -93,7 +93,7 @@ Production acceptance after a separately authorized deployment must check actual
 
 ## Final validation evidence
 
-Implementation is complete locally on `codex/mail-inline-body`; no commit, push, release, deployment or production replay was performed.
+At the initial implementation checkpoint, work was complete locally on `codex/mail-inline-body`; no commit, push, release, deployment or production replay had been performed. The later authorized integration checkpoint below supersedes that operational status.
 
 - Parser-only check after the scoped resource fixture correction: seed 248309, 26 tests, 0 failures.
 - Actual immediate-deadline checks: seed 434418, no failures; exact `parser_timeout`, preserved projection snapshots and processed Ingest state. These use real approximately 2 MiB raw and zero timeout, with no sleep, retry or production hook. They are deadline-boundary coverage, not scheduler-independent timing proof.
@@ -108,6 +108,17 @@ Final command (from the main project root):
 devenv shell -- env -u TEST_DATABASE_URL MIX_ENV=test POSTGRES_TEST_DB=manifold_mail_inline_body_test sh -c 'cd /home/gao/Workspace/gsmlg-opt/manifold/.trees/mail-inline-body && mix format --check-formatted apps/manifold_mail/lib/manifold/mail/parser.ex apps/manifold_mail/test/manifold/mail/parser_test.exs apps/manifold_mail/lib/manifold/mail/projector.ex apps/manifold_mail/test/manifold/mail/projector_test.exs apps/manifold_ingest/test/manifold/ingest_test.exs apps/manifold_web/test/manifold_web/mail_live_test.exs config/config.exs && mix compile --warnings-as-errors && mix test apps/manifold_mail/test/manifold/mail/parser_test.exs apps/manifold_mail/test/manifold/mail/projector_test.exs apps/manifold_ingest/test/manifold/ingest_test.exs apps/manifold_web/test/manifold_web/mail_live_test.exs apps/manifold_web/test/manifold_web_test.exs'
 ```
 
-The initial GREEN attempt found an additional, pre-existing binary charset conversion in the new PNG role fixture: mail 0.5.2 supplies us-ascii, and the existing Charset callback replaces invalid bytes. No encoding code was changed; the role regression uses valid ASCII SVG with exact byte assertions. Binary attachment integrity is recorded as a separate follow-up in the feature reference. No tests outside the approved five-file scope were run or repaired.
+The initial GREEN attempt found an additional, pre-existing binary charset conversion in the new PNG role fixture: mail 0.5.2 supplies us-ascii, and the existing Charset callback replaces invalid bytes. No encoding code was changed; the role regression uses valid ASCII SVG with exact byte assertions. Binary attachment integrity is recorded as a separate follow-up in the feature reference. Initial local implementation checks stayed within the approved five-file scope; later integration CI is recorded below.
+
+## Authorized integration checkpoint
+
+- User subsequently authorized worktree merge, commit/push, devenv restart and the next release. Repair commit `590556f28850bc7005198b2e96272e5577f1de9a` was fast-forwarded into `main` and pushed; the task worktree and branch were removed. Earlier root design drafts remain preserved in the named stash `preserve inline-body design drafts before main integration`.
+- Merged-main validation: seed 947535, **133 tests, 0 failures**, scoped formatting and strict test compilation passed; `mix.lock` is unchanged.
+- Source workflows passed at `590556f`: CI `39449532991`, full ExUnit `39449533388` (**1,597 tests, 0 failures, no exclusions or skips**) and TLS backends `39449533651`.
+- Local restart passed at 2026-10-20 15:38:37 UTC: PostgreSQL accepts connections, both devenv services ready, web and API health return 200, runtime metadata confirms source `590556f`.
+- The first native PostgreSQL restart raced its previous shutdown and hit the existing PID file. Recovery stopped app and database, confirmed the old postmaster exited, started PostgreSQL and verified readiness before starting the app. No PID files were deleted and no runtime code was changed.
+- Initial local recovery rebuilt 500 messages to parser 6/parsed; stale projections decreased from 39,497 to 38,997. Message count 39,497 and entry count 39,499, plus aggregate identity/timestamp/user-state fingerprints, are unchanged. Existing 251 fallback rows are unchanged; two parser-6 jobs were retryable. Complete backfill was not awaited.
+- Local evidence: `/tmp/manifold-inline-body-main-validation.log`, `/tmp/manifold-v066-source-exunit.log` and `/tmp/manifold-v066-runtime-evidence/{pre,post,comparison,readiness}.json`. Runtime snapshots contain counts/fingerprints, not message content or credentials; these temporary files are not release assets.
+- The original target message is absent locally. Public production deployment and its API/browser acceptance remain NOT RUN. Next authorized step: dispatch the existing release workflow for v0.6.6 and verify both archives and container images.
 
 Production acceptance remains NOT RUN: after a separately authorized deployment, verify actual API text/HTML, removal of false attachments, browser readability and stale-projection/failure counts. HTML fidelity remains separate.
