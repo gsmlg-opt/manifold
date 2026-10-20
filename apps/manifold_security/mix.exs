@@ -4,7 +4,7 @@ defmodule Manifold.Security.MixProject do
   def project do
     [
       app: :manifold_security,
-      version: "0.6.5",
+      version: "0.6.6",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps()
