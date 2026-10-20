@@ -1779,7 +1779,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
   end
 
   defp ensure_sync_job(receive_method_id) do
-    Oban.Job
+    Styx.Job
     |> where([job], job.worker == ^inspect(SyncAccount))
     |> where([job], job.state in ~w(available scheduled executing retryable suspended))
     |> where(
@@ -1790,7 +1790,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
     |> limit(1)
     |> Repo.one()
     |> case do
-      %Oban.Job{} = job ->
+      %Styx.Job{} = job ->
         job
 
       nil ->
@@ -2262,7 +2262,7 @@ defmodule Manifold.Connectors.OAuthAuthorizations do
   end
 
   defp cancel_receive_jobs(method_id) do
-    Oban.Job
+    Styx.Job
     |> where([job], job.worker == ^inspect(SyncAccount))
     |> where([job], job.state in ~w(available scheduled retryable suspended))
     |> where(

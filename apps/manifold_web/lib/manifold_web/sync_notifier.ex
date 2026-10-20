@@ -8,9 +8,9 @@ defmodule ManifoldWeb.SyncNotifier do
 
   @handler_id "manifold-web-sync-notifier"
   @events [
-    [:oban, :job, :start],
-    [:oban, :job, :stop],
-    [:oban, :job, :exception]
+    [:styx, :job, :start],
+    [:styx, :job, :stop],
+    [:styx, :job, :exception]
   ]
   @sync_worker inspect(SyncAccount)
 
@@ -32,7 +32,7 @@ defmodule ManifoldWeb.SyncNotifier do
   def terminate(_reason, _state), do: :telemetry.detach(@handler_id)
 
   @doc false
-  def handle_event([:oban, :job, event], _measurements, %{job: %Oban.Job{} = job}, _config)
+  def handle_event([:styx, :job, event], _measurements, %{job: %Styx.Job{} = job}, _config)
       when event in [:start, :stop, :exception] do
     with @sync_worker <- job.worker,
          account_id when is_binary(account_id) <- job.args["external_account_id"] do

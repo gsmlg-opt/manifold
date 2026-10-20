@@ -9,7 +9,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutbound do
   @cleanup_attempt @submission_attempt_limit + 1
   @cleanup_snooze_seconds 7_200
 
-  use Oban.Worker,
+  use Styx.Worker,
     queue: :outbound,
     max_attempts: @cleanup_attempt,
     unique: [
@@ -19,11 +19,11 @@ defmodule Manifold.Outbound.Jobs.SubmitOutbound do
     ]
 
   @impl true
-  def perform(%Oban.Job{} = job), do: perform(job, [])
+  def perform(%Styx.Job{} = job), do: perform(job, [])
 
   @doc false
   def perform(
-        %Oban.Job{args: %{"outbound_message_id" => outbound_message_id}} = job,
+        %Styx.Job{args: %{"outbound_message_id" => outbound_message_id}} = job,
         opts
       )
       when is_list(opts) do
@@ -114,7 +114,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutbound do
   defp handle_cleanup_result(result, _job), do: handle_submission_result(result)
 
   @impl true
-  def backoff(%Oban.Job{attempt: attempt}), do: min(300 * attempt * attempt, 7_200)
+  def backoff(%Styx.Job{attempt: attempt}), do: min(300 * attempt * attempt, 7_200)
 
   defp retry_transient(%Provider.Error{retry_after: retry_after})
        when is_integer(retry_after) and retry_after >= 0,
@@ -122,10 +122,10 @@ defmodule Manifold.Outbound.Jobs.SubmitOutbound do
 
   defp retry_transient(%Provider.Error{code: code}), do: {:error, code}
 
-  defp cleanup_attempt?(%Oban.Job{attempt: attempt}), do: attempt >= @cleanup_attempt
+  defp cleanup_attempt?(%Styx.Job{attempt: attempt}), do: attempt >= @cleanup_attempt
 
-  defp final_raw_attempt?(%Oban.Job{attempt: attempt}),
+  defp final_raw_attempt?(%Styx.Job{attempt: attempt}),
     do: attempt >= @submission_attempt_limit
 
-  defp cleanup_backoff(%Oban.Job{} = job), do: max(backoff(job), @cleanup_snooze_seconds)
+  defp cleanup_backoff(%Styx.Job{} = job), do: max(backoff(job), @cleanup_snooze_seconds)
 end

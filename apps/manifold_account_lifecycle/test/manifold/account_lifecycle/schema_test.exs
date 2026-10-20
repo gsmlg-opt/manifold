@@ -13,6 +13,6 @@ defmodule Manifold.AccountLifecycle.SchemaTest do
   end
 
   test "account purge queue is configured and visible" do
-    assert "account_purge" in Manifold.Data.ObanJobs.queues()
+    assert "account_purge" in Manifold.Data.StyxJobs.queues()
   end
 end

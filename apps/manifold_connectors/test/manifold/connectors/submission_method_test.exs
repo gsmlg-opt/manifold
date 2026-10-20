@@ -367,7 +367,7 @@ defmodule Manifold.Connectors.SubmissionMethodTest do
       refute inspect(Repo.get!(SendMethod, microsoft.id)) =~ sentinel
       refute inspect(Repo.get!(OAuthAuthorization, microsoft.oauth_authorization_id)) =~ sentinel
       refute inspect(Repo.all(ConnectorEvent)) =~ sentinel
-      refute inspect(Repo.all(Oban.Job)) =~ sentinel
+      refute inspect(Repo.all(Styx.Job)) =~ sentinel
       refute inspect({measurements, metadata}) =~ sentinel
 
       refute inspect(method.config) =~ "microsoft-db-client-id-must-not-escape"

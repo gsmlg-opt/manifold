@@ -54,17 +54,17 @@ EAS, or another remote system.
 ## Lifecycle ownership and queue
 
 The `manifold_account_lifecycle` umbrella app owns purge schemas, atomic
-request/enqueue and retry orchestration, the Oban worker, persisted stage
+request/enqueue and retry orchestration, the Styx worker, persisted stage
 progress, error classification, and final completion. Existing contexts retain
 ownership of their own write fences and cleanup operations.
 
 `Manifold.AccountLifecycle.Jobs.PurgeAccount` runs on the `account_purge` queue,
-configured with concurrency `1` per Oban producer/node, not as a cluster-global
+configured with concurrency `1` per Styx producer/node, not as a cluster-global
 limit. Its only argument is the opaque `%{"purge_id" => purge_id}`; account
 addresses, delivery IDs, message IDs, and object keys are never put in job
 arguments. One incomplete job is unique by worker and `purge_id`, and each
 request transaction persists the inactive purge marker, connector quiescence,
-purge record, and Oban job atomically.
+purge record, and Styx job atomically.
 
 ## Purge stages and bounds
 
@@ -124,7 +124,7 @@ purge to the durable failed state; no failure path reactivates the mailbox.
 
 | Owner | Public contract / implementation file |
 | --- | --- |
-| Data | Purge tables and cleanup indexes in `apps/manifold_data/priv/repo/migrations`; queue visibility in `Manifold.Data.ObanJobs` |
+| Data | Purge tables and cleanup indexes in `apps/manifold_data/priv/repo/migrations`; queue visibility in `Manifold.Data.StyxJobs` |
 | Accounts | `disable_account/1,2`, `active_account_for_update/2`, `begin_purge/4`, and `delete_purging_account/2` in `apps/manifold_accounts/lib/manifold/accounts.ex` |
 | Account lifecycle | `disable_account/1`, `request_deletion/2`, `retry_deletion/1`, and `states_by_mailbox/1` in `apps/manifold_account_lifecycle/lib/manifold/account_lifecycle.ex`; stage engine in `purge.ex`; worker in `jobs/purge_account.ex` |
 | Connectors | `quiesce_account/2`, account job drain/discovery/ownership, `purge_account_batch/3`, and residual checks in `apps/manifold_connectors/lib/manifold/connectors.ex`; activity-log deletion in `activity_log.ex` |
@@ -138,7 +138,7 @@ purge to the durable failed state; no failure path reactivates the mailbox.
 
 Inspect jobs at `/jobs` and filter Queue to `account_purge`. Production commands
 must target the already-running main `manifold` release with `bin/manifold rpc`;
-do not use `mix run`, which would boot another application and Oban instance.
+do not use `mix run`, which would boot another application and Styx instance.
 Run these commands from the extracted release directory on a release node.
 
 List recent purge records without loading account or message content:
@@ -150,7 +150,7 @@ bin/manifold rpc 'import Ecto.Query; alias Manifold.AccountLifecycle.Schema.Acco
 Inspect the dedicated queue from the same environment:
 
 ```bash
-bin/manifold rpc 'Manifold.Data.ObanJobs.list_jobs(%{queue: "account_purge", limit: 50}) |> Enum.map(&Map.take(&1, [:id, :state, :queue, :args, :attempt, :max_attempts, :scheduled_at])) |> IO.inspect(pretty: true)'
+bin/manifold rpc 'Manifold.Data.StyxJobs.list_jobs(%{queue: "account_purge", limit: 50}) |> Enum.map(&Map.take(&1, [:id, :state, :queue, :args, :attempt, :max_attempts, :scheduled_at])) |> IO.inspect(pretty: true)'
 ```
 
 Before retrying a failed purge, inspect any retained matching worker jobs by the
@@ -159,7 +159,7 @@ is not an error. Replace the example UUID inside each expression; a caller
 environment variable is not visible inside the running release node:
 
 ```bash
-bin/manifold rpc 'import Ecto.Query; purge_id = "00000000-0000-0000-0000-000000000000"; Oban.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}) |> order_by([job], desc: job.id) |> Oban.all_jobs() |> Enum.map(&Map.take(&1, [:id, :state, :attempt, :max_attempts, :scheduled_at])) |> IO.inspect(pretty: true)'
+bin/manifold rpc 'import Ecto.Query; purge_id = "00000000-0000-0000-0000-000000000000"; Styx.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}) |> order_by([job], desc: job.id) |> Styx.all_jobs() |> Enum.map(&Map.take(&1, [:id, :state, :attempt, :max_attempts, :scheduled_at])) |> IO.inspect(pretty: true)'
 ```
 
 If the exact prior job is `executing`, wait for it to reach a terminal state;
@@ -169,24 +169,24 @@ choose one recovery path. Each mutation carries both the loaded job ID and
 the required `{:ok, 1}` match fails closed. Either cancel that exact job safely:
 
 ```bash
-bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; jobs = Oban.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}, state: :suspended) |> Oban.all_jobs(); case jobs do [%Oban.Job{id: id}] -> query = Oban.Job.query(id: id, state: :suspended); {:ok, 1} = Oban.cancel_all_jobs(query); %Oban.Job{state: "cancelled"} = Manifold.Repo.get!(Oban.Job, id); IO.inspect(%{id: id, state: "cancelled"}); [] -> raise "no suspended purge job found"; _ -> raise "multiple suspended purge jobs found" end'
+bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; jobs = Styx.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}, state: :suspended) |> Styx.all_jobs(); case jobs do [%Styx.Job{id: id}] -> query = Styx.Job.query(id: id, state: :suspended); {:ok, 1} = Styx.cancel_all_jobs(query); %Styx.Job{state: "cancelled"} = Manifold.Repo.get!(Styx.Job, id); IO.inspect(%{id: id, state: "cancelled"}); [] -> raise "no suspended purge job found"; _ -> raise "multiple suspended purge jobs found" end'
 ```
 
 Or make that exact suspended job available and let the worker take it to a
 terminal state:
 
 ```bash
-bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; jobs = Oban.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}, state: :suspended) |> Oban.all_jobs(); case jobs do [%Oban.Job{id: id}] -> query = Oban.Job.query(id: id, state: :suspended); {:ok, 1} = Oban.retry_all_jobs(query); IO.inspect(%{id: id, action: :made_available}); [] -> raise "no suspended purge job found"; _ -> raise "multiple suspended purge jobs found" end'
+bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; jobs = Styx.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}, state: :suspended) |> Styx.all_jobs(); case jobs do [%Styx.Job{id: id}] -> query = Styx.Job.query(id: id, state: :suspended); {:ok, 1} = Styx.retry_all_jobs(query); IO.inspect(%{id: id, action: :made_available}); [] -> raise "no suspended purge job found"; _ -> raise "multiple suspended purge jobs found" end'
 ```
 
 Before calling the lifecycle retry API, verify that the purge has no job in an
-incomplete state. `Oban.Job.query/1` coerces the incomplete state list for the
+incomplete state. `Styx.Job.query/1` coerces the incomplete state list for the
 database query. If the resumed job is still incomplete, wait and rerun this
 command. An empty result, including when terminal jobs were pruned, passes this
 check; the lifecycle API still enforces locked failed status and job uniqueness:
 
 ```bash
-bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; incomplete = Oban.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}, state: Oban.Job.unique_states(:incomplete)) |> Oban.all_jobs(); case incomplete do [] -> IO.inspect(%{incomplete_jobs: 0}); active -> active |> Enum.map(&Map.take(&1, [:id, :state])) |> then(&raise("purge job is still incomplete: #{inspect(&1)}")) end'
+bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; incomplete = Styx.Job.query(worker: Manifold.AccountLifecycle.Jobs.PurgeAccount, args: %{"purge_id" => purge_id}, state: Styx.Job.unique_states(:incomplete)) |> Styx.all_jobs(); case incomplete do [] -> IO.inspect(%{incomplete_jobs: 0}); active -> active |> Enum.map(&Map.take(&1, [:id, :state])) |> then(&raise("purge job is still incomplete: #{inspect(&1)}")) end'
 ```
 
 Only then retry a purge whose durable status is `failed` (the UI retry button
@@ -198,32 +198,32 @@ bin/manifold rpc 'purge_id = "00000000-0000-0000-0000-000000000000"; case Manifo
 
 Retry resumes the existing purge ID, stage, and work state. It does not create a
 second purge or reactivate the mailbox. Never insert a replacement purge job or
-edit purge/job status directly; use only the exact-job Oban operations above
+edit purge/job status directly; use only the exact-job Styx operations above
 and `Manifold.AccountLifecycle.retry_deletion/1`.
 
 ## Configuration, scope, and rollback
 
-- `config/config.exs` configures `account_purge: 1`; test mode keeps Oban queues
+- `config/config.exs` configures `account_purge: 1`; test mode keeps Styx queues
   disabled and uses manual job execution.
 - The main `manifold` release includes `manifold_account_lifecycle` permanently.
 - `manifold_edge` does not include the lifecycle app. No edge purge protocol or
   remote edge deletion is introduced.
 - Remote provider deletion and authorization revocation remain explicitly out
   of scope.
-- Before a rollback, publish a queue pause. In Oban 2.23.1, `local_only`
+- Before a rollback, publish a queue pause. In Styx 0.1.1, `local_only`
   defaults to `false`, so the notification is scoped by the configured database
   prefix and carries `ident: :any` for every matching `account_purge` producer.
   Successful publication is not an acknowledgement from each node:
 
   ```bash
-  bin/manifold rpc ':ok = Oban.pause_queue(queue: :account_purge); IO.inspect(:account_purge_pause_broadcast)'
+  bin/manifold rpc ':ok = Styx.pause_queue(queue: :account_purge); IO.inspect(:account_purge_pause_broadcast)'
   ```
 
   Execute the following local check with `bin/manifold rpc` on every main-release
   node and require `paused: true` from each one before proceeding:
 
   ```bash
-  bin/manifold rpc 'case Oban.check_queue(queue: :account_purge) do %{paused: true} = queue -> queue |> Map.take([:node, :queue, :paused, :running]) |> IO.inspect(pretty: true); nil -> raise "account_purge producer is not running on this node"; queue -> raise "account_purge producer is not paused on this node: #{inspect(Map.take(queue, [:node, :queue, :paused, :running]))}" end'
+  bin/manifold rpc 'case Styx.check_queue(queue: :account_purge) do %{paused: true} = queue -> queue |> Map.take([:node, :queue, :paused, :running]) |> IO.inspect(pretty: true); nil -> raise "account_purge producer is not running on this node"; queue -> raise "account_purge producer is not paused on this node: #{inspect(Map.take(queue, [:node, :queue, :paused, :running]))}" end'
   ```
 
   Pausing prevents new execution but does not stop a job that is already
@@ -231,7 +231,7 @@ and `Manifold.AccountLifecycle.retry_deletion/1`.
   check until it reports zero jobs:
 
   ```bash
-  bin/manifold rpc 'jobs = Oban.Job.query(queue: :account_purge, state: :executing) |> Oban.all_jobs(); case jobs do [] -> IO.inspect(%{executing: 0}); jobs -> jobs |> Enum.map(&Map.take(&1, [:id, :state, :args])) |> then(&raise("account purge jobs are still executing: #{inspect(&1)}")) end'
+  bin/manifold rpc 'jobs = Styx.Job.query(queue: :account_purge, state: :executing) |> Styx.all_jobs(); case jobs do [] -> IO.inspect(%{executing: 0}); jobs -> jobs |> Enum.map(&Map.take(&1, [:id, :state, :args])) |> then(&raise("account purge jobs are still executing: #{inspect(&1)}")) end'
   ```
 
   Schema rollback is prohibited while any purge is not `completed`. This
@@ -248,7 +248,7 @@ and `Manifold.AccountLifecycle.retry_deletion/1`.
   then publish a resume signal:
 
   ```bash
-  bin/manifold rpc ':ok = Oban.resume_queue(queue: :account_purge); IO.inspect(:account_purge_resume_broadcast)'
+  bin/manifold rpc ':ok = Styx.resume_queue(queue: :account_purge); IO.inspect(:account_purge_resume_broadcast)'
   ```
 
   Resume publication is also not a per-node acknowledgement. On every
@@ -256,7 +256,7 @@ and `Manifold.AccountLifecycle.retry_deletion/1`.
   service:
 
   ```bash
-  bin/manifold rpc 'case Oban.check_queue(queue: :account_purge) do %{paused: false} = queue -> queue |> Map.take([:node, :queue, :paused, :running]) |> IO.inspect(pretty: true); nil -> raise "account_purge producer is not running on this node"; queue -> raise "account_purge producer is still paused on this node: #{inspect(Map.take(queue, [:node, :queue, :paused, :running]))}" end'
+  bin/manifold rpc 'case Styx.check_queue(queue: :account_purge) do %{paused: false} = queue -> queue |> Map.take([:node, :queue, :paused, :running]) |> IO.inspect(pretty: true); nil -> raise "account_purge producer is not running on this node"; queue -> raise "account_purge producer is still paused on this node: #{inspect(Map.take(queue, [:node, :queue, :paused, :running]))}" end'
   ```
 
 ## Validation

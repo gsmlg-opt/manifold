@@ -20,7 +20,7 @@ Microsoft Graph, or SMTP submission:
   Mail, Security, Outbound, Cloud, Edge, Connectors, and Web application
   boundaries.
 - Optional `manifold_edge` release and local `manifold_cloud` pull client.
-- PostgreSQL/Ecto migrations and Oban jobs.
+- PostgreSQL/Ecto migrations and Styx jobs.
 - Domain, mailbox, alias, alias target, and recipient resolution.
 - Edge-only `gen_smtp` listener, using port `2525` in development and port `25`
   in the edge release by default.
@@ -34,7 +34,7 @@ Microsoft Graph, or SMTP submission:
   state workflows.
 - Persistent plain-text drafts with compose, reply, reply-all, and forward
   workflows.
-- Atomic outbound queueing with Oban, immutable provider MIME and frozen account
+- Atomic outbound queueing with Styx, immutable provider MIME and frozen account
   send-method snapshots, Gmail API, Microsoft Graph, authenticated SMTP
   submission, and legacy Resend compatibility.
 - Authenticated Resend webhook ingestion with per-recipient delivered, bounced,
@@ -119,7 +119,7 @@ The current implementation includes:
 - Microsoft Graph profile, folder-delta, message-delta, immutable message ID,
   and `/$value` raw-message operations using `Mail.Read`, plus independently
   scoped direct MIME `sendMail` using `Mail.Send`.
-- Transactional account, credential, cursor, event, and first Oban sync-job
+- Transactional account, credential, cursor, event, and first Styx sync-job
   persistence after OAuth completion.
 - Bounded, retryable sync pages with provider-message identity and cursor
   checkpointing only after every message in the page has crossed the local
@@ -131,7 +131,7 @@ The current implementation includes:
 - A trusted-local `/settings/oauth` LiveView for Google and Microsoft client
   credentials, with `/settings/oauth/gmail/help` and
   `/settings/oauth/microsoft/help` for mode-specific login, callbacks, scopes, and setup steps.
-- A local-release `connectors` Oban queue and five-minute polling job that
+- A local-release `connectors` Styx queue and five-minute polling job that
   recreates missing active-account sync work.
 
 Provider imports are transport-neutral. They set `source_kind` to
@@ -456,7 +456,7 @@ reconnect-required. Do not proceed until every catalog provider shows **Not
 configured**; a surviving Microsoft setting would block the zero-row preflight
 below. If the UI cannot remove any remaining setting, stop and restore a
 compatible release; do not bypass lifecycle effects with a direct table delete.
-Then drain and stop every Phoenix instance, connector process, and Oban worker
+Then drain and stop every Phoenix instance, connector process, and Styx worker
 before inspecting or changing the database.
 
 Use the deployment's approved libpq service and passfile for SQL sessions. If the
@@ -773,7 +773,7 @@ boundary. SMTP defaults to port `25` in the edge release.
 
 Configure the local release with the same `MANIFOLD_EDGE_API_URL`,
 `MANIFOLD_EDGE_INSTALLATION_ID`, and `MANIFOLD_EDGE_SHARED_SECRET`, plus a stable
-`MANIFOLD_EDGE_SOURCE_ID`. The local Oban queues publish routes every five
+`MANIFOLD_EDGE_SOURCE_ID`. The local Styx queues publish routes every five
 minutes and pull pending deliveries every minute. Operators can queue either
 operation from `/cloud`.
 
@@ -787,6 +787,6 @@ mix test
 
 ## SMTP Durability
 
-Manifold returns SMTP `250` only after the raw message and manifest have been written and fsynced into a ready spool bundle, the bundle has been atomically renamed into `ready/`, the PostgreSQL acceptance transaction has committed, and the first Oban archival job has been inserted in that same transaction.
+Manifold returns SMTP `250` only after the raw message and manifest have been written and fsynced into a ready spool bundle, the bundle has been atomically renamed into `ready/`, the PostgreSQL acceptance transaction has committed, and the first Styx archival job has been inserted in that same transaction.
 
 If the connection fails before `250`, the sender may retry and create a legitimate duplicate delivery. Manifold does not hard-delete possible duplicates based on `Message-ID` or content hash.

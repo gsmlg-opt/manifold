@@ -13,7 +13,7 @@ defmodule Manifold.Connectors.RemoteStateJobs do
   @insert_retry_attempts 100
   @insert_retry_delay_ms 10
 
-  @spec ensure(Ecto.UUID.t()) :: Oban.Job.t()
+  @spec ensure(Ecto.UUID.t()) :: Styx.Job.t()
   def ensure(remote_message_id) do
     insert_until_persisted(remote_message_id, @insert_retry_attempts)
   end
@@ -23,33 +23,33 @@ defmodule Manifold.Connectors.RemoteStateJobs do
     |> ApplyRemoteState.new(unique: @queued_unique)
     |> insert_job!()
     |> case do
-      %Oban.Job{id: nil} when attempts_left > 1 ->
+      %Styx.Job{id: nil} when attempts_left > 1 ->
         Process.sleep(@insert_retry_delay_ms)
         insert_until_persisted(remote_message_id, attempts_left - 1)
 
-      %Oban.Job{id: nil} ->
+      %Styx.Job{id: nil} ->
         raise "remote-state job insertion remained contended"
 
-      %Oban.Job{id: id} = job when is_integer(id) ->
+      %Styx.Job{id: id} = job when is_integer(id) ->
         job
     end
   end
 
   defp insert_job!(changeset) do
-    case Oban.Registry.lookup(Oban) do
+    case Styx.Registry.lookup(Styx) do
       nil -> insert_with_config!(changeset)
-      {_pid, _config} -> Oban.insert!(changeset, retry: false)
+      {_pid, _config} -> Styx.insert!(changeset, retry: false)
     end
   end
 
   defp insert_with_config!(changeset) do
     config =
       :manifold_data
-      |> Application.fetch_env!(Oban)
+      |> Application.fetch_env!(Styx)
       |> Keyword.put(:insert_trigger, false)
-      |> Oban.Config.new()
+      |> Styx.Config.new()
 
-    case Oban.Engine.insert_job(config, changeset, retry: false) do
+    case Styx.Engine.insert_job(config, changeset, retry: false) do
       {:ok, job} ->
         job
 

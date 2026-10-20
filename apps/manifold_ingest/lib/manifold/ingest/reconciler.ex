@@ -97,7 +97,7 @@ defmodule Manifold.Ingest.Reconciler do
       |> Repo.one()
 
       existing_job =
-        Oban.Job
+        Styx.Job
         |> where([job], job.worker == ^inspect(ArchiveRawEmail))
         |> where([job], job.state in ~w(available scheduled executing retryable suspended))
         |> where(

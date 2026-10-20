@@ -25,7 +25,7 @@ defmodule Manifold.Data.MixProject do
       {:manifold_core, in_umbrella: true},
       {:ecto_sql, "~> 3.14"},
       {:postgrex, "~> 0.22.3"},
-      {:oban, "~> 2.23"},
+      {:styx, "== 0.1.1"},
       {:telemetry, "~> 1.3"}
     ]
   end

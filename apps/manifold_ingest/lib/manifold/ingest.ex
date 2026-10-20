@@ -507,9 +507,9 @@ defmodule Manifold.Ingest do
       |> select([job], job.id)
 
     {:ok, cancelled} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.id in subquery(selected_ids))
-      |> Oban.cancel_all_jobs()
+      |> Styx.cancel_all_jobs()
 
     matching_executing? =
       matching
@@ -866,7 +866,7 @@ defmodule Manifold.Ingest do
     end)
   end
 
-  @spec ensure_projection_job(Ecto.UUID.t()) :: {:ok, Oban.Job.t()} | {:error, term()}
+  @spec ensure_projection_job(Ecto.UUID.t()) :: {:ok, Styx.Job.t()} | {:error, term()}
   def ensure_projection_job(delivery_id) do
     Repo.transaction(fn ->
       InboundDelivery
@@ -877,7 +877,7 @@ defmodule Manifold.Ingest do
       target_args = projection_job_args(delivery_id)
 
       existing_job =
-        Oban.Job
+        Styx.Job
         |> where([job], job.worker == ^inspect(ProjectInboundMail))
         |> where([job], job.state in ~w(available scheduled executing retryable suspended))
         |> where(
@@ -893,7 +893,7 @@ defmodule Manifold.Ingest do
     end)
   end
 
-  @spec ensure_security_job(Ecto.UUID.t()) :: {:ok, Oban.Job.t()} | {:error, term()}
+  @spec ensure_security_job(Ecto.UUID.t()) :: {:ok, Styx.Job.t()} | {:error, term()}
   def ensure_security_job(delivery_id) do
     Repo.transaction(fn ->
       InboundDelivery
@@ -904,7 +904,7 @@ defmodule Manifold.Ingest do
       target_args = security_job_args(delivery_id)
 
       existing_job =
-        Oban.Job
+        Styx.Job
         |> where([job], job.worker == ^inspect(EvaluateInboundSecurity))
         |> where([job], job.state in ~w(available scheduled executing retryable suspended))
         |> where(
@@ -1380,7 +1380,7 @@ defmodule Manifold.Ingest do
         &inspect/1
       )
 
-    Oban.Job
+    Styx.Job
     |> where([job], job.worker in ^workers)
     |> where([job], job.state in ~w(available scheduled executing retryable suspended))
     |> where(

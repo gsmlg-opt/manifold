@@ -1,7 +1,7 @@
 defmodule Manifold.Connectors.Jobs.SyncAccount do
   @moduledoc false
 
-  use Oban.Worker,
+  use Styx.Worker,
     queue: :connectors,
     max_attempts: 20,
     unique: [
@@ -12,8 +12,8 @@ defmodule Manifold.Connectors.Jobs.SyncAccount do
 
   alias Manifold.Connectors
 
-  @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"external_account_id" => account_id}}) do
+  @impl Styx.Worker
+  def perform(%Styx.Job{args: %{"external_account_id" => account_id}}) do
     Connectors.sync_account(account_id)
   end
 end

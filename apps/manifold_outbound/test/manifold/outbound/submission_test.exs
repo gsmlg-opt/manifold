@@ -519,7 +519,7 @@ defmodule Manifold.Outbound.SubmissionTest do
     assert Repo.get!(OutboundMessage, message.id).state == "submitting"
 
     assert :ok =
-             SubmitOutbound.perform(%Oban.Job{
+             SubmitOutbound.perform(%Styx.Job{
                args: %{"outbound_message_id" => message.id}
              })
 
@@ -1417,7 +1417,7 @@ defmodule Manifold.Outbound.SubmissionTest do
           |> Repo.all()
 
         job_args =
-          Repo.get_by!(Oban.Job,
+          Repo.get_by!(Styx.Job,
             worker: inspect(SubmitOutbound),
             args: %{"outbound_message_id" => message.id}
           ).args
@@ -1886,7 +1886,7 @@ defmodule Manifold.Outbound.SubmissionTest do
     end)
 
     assert :ok =
-             SubmitOutbound.perform(%Oban.Job{
+             SubmitOutbound.perform(%Styx.Job{
                args: %{"outbound_message_id" => stale_message.id}
              })
 

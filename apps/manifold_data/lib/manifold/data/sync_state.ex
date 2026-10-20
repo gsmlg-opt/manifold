@@ -273,10 +273,10 @@ defmodule Manifold.Data.SyncState do
   defp wake(connection) do
     args = %{"connection_id" => connection.id, "generation" => connection.generation}
     worker = "Manifold.Connectors.Jobs.SyncICloud"
-    # The connection row lock serializes coalescing without an Oban process.
+    # The connection row lock serializes coalescing without an Styx process.
     queued =
       Repo.exists?(
-        from j in Oban.Job,
+        from j in Styx.Job,
           where:
             j.worker == ^worker and
               j.state in ["available", "scheduled", "executing", "retryable"] and
@@ -284,7 +284,7 @@ defmodule Manifold.Data.SyncState do
       )
 
     unless queued do
-      args |> Oban.Job.new(worker: worker, queue: :connectors, max_attempts: 10) |> Repo.insert!()
+      args |> Styx.Job.new(worker: worker, queue: :connectors, max_attempts: 10) |> Repo.insert!()
     end
   end
 end

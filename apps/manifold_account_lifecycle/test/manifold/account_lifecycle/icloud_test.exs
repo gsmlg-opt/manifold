@@ -13,7 +13,7 @@ defmodule Manifold.AccountLifecycle.ICloudTest do
   }
 
   setup do
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     {:ok, account} =
       Accounts.create_account(%{address: "icloud-#{Ecto.UUID.generate()}@example.test"})
@@ -41,7 +41,7 @@ defmodule Manifold.AccountLifecycle.ICloudTest do
     refute updated.enabled
     assert updated.generation == c.generation + 1
     assert Contacts.get_contact(contact.id).full_name == "Retained"
-    assert Enum.all?(Repo.all(Oban.Job), &(&1.state == "cancelled"))
+    assert Enum.all?(Repo.all(Styx.Job), &(&1.state == "cancelled"))
   end
 
   test "Account purge preserves local calendar identity and removes only mailbox-owned cloud data",
@@ -61,7 +61,7 @@ defmodule Manifold.AccountLifecycle.ICloudTest do
     {:ok, purge} =
       AccountLifecycle.request_deletion(account.id, Accounts.account_address(account))
 
-    job = %Oban.Job{args: %{"purge_id" => purge.id}}
+    job = %Styx.Job{args: %{"purge_id" => purge.id}}
 
     outcome =
       Enum.reduce_while(1..100, nil, fn _, _ ->
@@ -168,7 +168,7 @@ defmodule Manifold.AccountLifecycle.ICloudTest do
     {:ok, purge} =
       AccountLifecycle.request_deletion(account.id, Accounts.account_address(account))
 
-    job = %Oban.Job{args: %{"purge_id" => purge.id}}
+    job = %Styx.Job{args: %{"purge_id" => purge.id}}
 
     outcome =
       Enum.reduce_while(1..100, nil, fn _, _ ->

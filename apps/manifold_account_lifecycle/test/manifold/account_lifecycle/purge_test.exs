@@ -1,6 +1,6 @@
 defmodule Manifold.AccountLifecycle.PurgeTest do
   use Manifold.DataCase, async: false
-  use Oban.Testing, repo: Manifold.Repo
+  use Styx.Testing, repo: Manifold.Repo
 
   import Ecto.Query
 
@@ -84,7 +84,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
       Base.encode64(:crypto.strong_rand_bytes(32))
     )
 
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     on_exit(fn ->
       Enum.each(old_storage, fn {key, value} ->
@@ -289,7 +289,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
     assert request_payload =~ "purge-bcc-sentinel@example.test"
 
     submit_job =
-      Repo.get_by!(Oban.Job,
+      Repo.get_by!(Styx.Job,
         worker: inspect(SubmitOutbound),
         args: %{"outbound_message_id" => queued.id}
       )
@@ -320,7 +320,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
     refute File.exists?(target_delivery.delivery.spool_bundle_path)
 
     for job <- [sync_job, remote_state_job, submit_job] do
-      refute Repo.get(Oban.Job, job.id)
+      refute Repo.get(Styx.Job, job.id)
     end
 
     assert Repo.get!(Account, other.id)
@@ -478,7 +478,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
       |> Repo.insert!()
 
     {:ok, job} =
-      %Oban.Job{
+      %Styx.Job{
         queue: "connectors",
         worker: "Manifold.Connectors.Jobs.SyncAccount",
         args: %{"external_account_id" => method.id},
@@ -492,7 +492,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
 
     assert {:snooze, 5} = perform(purge.id)
     assert Repo.get!(ReceiveMethod, method.id)
-    assert Repo.get!(Oban.Job, job.id).state == "cancelled"
+    assert Repo.get!(Styx.Job, job.id).state == "cancelled"
     assert Repo.get!(AccountPurge, purge.id).stage == "drain"
   end
 
@@ -511,7 +511,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
     assert {:ok, queued} = Outbound.queue_draft(target.id, draft.id)
 
     job =
-      Repo.get_by!(Oban.Job,
+      Repo.get_by!(Styx.Job,
         worker: "Manifold.Outbound.Jobs.SubmitOutbound",
         args: %{"outbound_message_id" => queued.id}
       )
@@ -533,7 +533,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
       |> Repo.insert!()
 
     assert {:snooze, 5} = perform(purge.id)
-    assert Repo.get!(Oban.Job, job.id).state == "cancelled"
+    assert Repo.get!(Styx.Job, job.id).state == "cancelled"
     assert Repo.get!(AccountPurge, purge.id).progress == progress
 
     assert {:snooze, 1} = perform(purge.id)
@@ -573,7 +573,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
 
     jobs =
       for index <- 1..251 do
-        Repo.insert!(%Oban.Job{
+        Repo.insert!(%Styx.Job{
           queue: "archive",
           worker: inspect(ArchiveRawEmail),
           args: %{"inbound_delivery_id" => fixture.delivery.id},
@@ -587,11 +587,11 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
 
     assert {:snooze, 5} = perform(purge.id)
     assert Repo.get!(AccountPurge, purge.id).progress == progress
-    assert Enum.count(jobs, &(Repo.get!(Oban.Job, &1.id).state == "cancelled")) == 250
+    assert Enum.count(jobs, &(Repo.get!(Styx.Job, &1.id).state == "cancelled")) == 250
 
     assert {:snooze, 5} = perform(purge.id)
     assert Repo.get!(AccountPurge, purge.id).progress == progress
-    assert Enum.all?(jobs, &(Repo.get!(Oban.Job, &1.id).state == "cancelled"))
+    assert Enum.all?(jobs, &(Repo.get!(Styx.Job, &1.id).state == "cancelled"))
 
     assert {:snooze, 1} = perform(purge.id)
     drained = Repo.get!(AccountPurge, purge.id)
@@ -943,7 +943,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
     now = DateTime.utc_now()
 
     job =
-      Repo.insert!(%Oban.Job{
+      Repo.insert!(%Styx.Job{
         queue: "archive",
         worker: inspect(ArchiveRawEmail),
         args: %{"inbound_delivery_id" => fixture.delivery.id},
@@ -980,7 +980,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
     assert Repo.get!(Account, target.id)
 
     assert {:snooze, 5} = perform(purge.id)
-    assert Repo.get!(Oban.Job, job.id).state == "cancelled"
+    assert Repo.get!(Styx.Job, job.id).state == "cancelled"
 
     assert Repo.get!(AccountPurge, purge.id).progress["complete_sources"] == [
              "connectors",
@@ -1055,7 +1055,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
 
   defp perform(purge_id, attrs \\ %{}) do
     defaults = %{args: %{"purge_id" => purge_id}, attempt: 1, max_attempts: 20, meta: %{}}
-    PurgeAccount.perform(struct!(Oban.Job, Map.merge(defaults, Map.new(attrs))))
+    PurgeAccount.perform(struct!(Styx.Job, Map.merge(defaults, Map.new(attrs))))
   end
 
   defp run_until_complete(purge_id) do
@@ -1094,7 +1094,7 @@ defmodule Manifold.AccountLifecycle.PurgeTest do
   end
 
   defp purge_job_query(worker, purge_id) do
-    from(job in Oban.Job,
+    from(job in Styx.Job,
       where:
         job.worker == ^inspect(worker) and
           fragment("?->>'purge_id'", job.args) == ^purge_id
@@ -1436,7 +1436,7 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
 
   setup %{tmp_dir: tmp_dir} do
     :ok = Sandbox.checkout(Repo, sandbox: false)
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     old_raw = Application.fetch_env!(:manifold_storage, :raw_store_dir)
     old_blob = Application.fetch_env!(:manifold_storage, :blob_store_dir)
@@ -1459,7 +1459,7 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
           Ecto.UUID.dump!(fixture.purge_id)
         ])
 
-        Repo.query!("DELETE FROM oban_jobs WHERE args->>'inbound_delivery_id' = $1", [
+        Repo.query!("DELETE FROM styx_jobs WHERE args->>'inbound_delivery_id' = $1", [
           fixture.delivery_id
         ])
 
@@ -1547,7 +1547,7 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
       now = DateTime.utc_now()
 
       job =
-        Repo.insert!(%Oban.Job{
+        Repo.insert!(%Styx.Job{
           queue: "archive",
           worker: "Manifold.Ingest.Jobs.ArchiveRawEmail",
           args: %{"inbound_delivery_id" => fixture.delivery_id},
@@ -1559,7 +1559,7 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
 
       send(first_run_pid, {:continue_done_check, barrier_ref})
       assert {:snooze, 1} = Task.await(first_run, 5_000)
-      assert Repo.get!(Oban.Job, job.id).state == "available"
+      assert Repo.get!(Styx.Job, job.id).state == "available"
 
       retained = Repo.get!(AccountPurge, fixture.purge_id)
       assert retained.stage == "drain"
@@ -1570,7 +1570,7 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
              }
 
       assert {:snooze, 5} = perform_purge(fixture.purge_id)
-      assert Repo.get!(Oban.Job, job.id).state == "cancelled"
+      assert Repo.get!(Styx.Job, job.id).state == "cancelled"
       assert Repo.get!(AccountPurge, fixture.purge_id).progress == retained.progress
 
       assert {:snooze, 1} = perform_purge(fixture.purge_id)
@@ -1622,7 +1622,7 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
           [[backend_pid]] = Repo.query!("SELECT pg_backend_pid()").rows
           send(test_pid, {:purge_started, self(), backend_pid, barrier_ref})
 
-          PurgeAccount.perform(%Oban.Job{
+          PurgeAccount.perform(%Styx.Job{
             args: %{"purge_id" => fixture.purge_id},
             attempt: 1,
             max_attempts: 20,
@@ -1648,7 +1648,7 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
   end
 
   defp perform_purge(purge_id) do
-    PurgeAccount.perform(%Oban.Job{
+    PurgeAccount.perform(%Styx.Job{
       args: %{"purge_id" => purge_id},
       attempt: 1,
       max_attempts: 20,
@@ -1657,7 +1657,7 @@ defmodule Manifold.AccountLifecycle.PurgeBlobPublicationConcurrencyTest do
   end
 
   defp ingest_cancel_update?(query) do
-    String.starts_with?(query, "UPDATE") and String.contains?(query, ~s("oban_jobs"))
+    String.starts_with?(query, "UPDATE") and String.contains?(query, ~s("styx_jobs"))
   end
 
   defp assert_advisory_wait(backend_pid, timeout_ms) do

@@ -190,7 +190,7 @@ defmodule ManifoldWeb.MailLiveTest do
     assert html =~ "Synchronization queued."
     assert html =~ "is-syncing"
     assert has_element?(view, "#sync-button[disabled]")
-    assert Enum.any?(Repo.all(Oban.Job), &(&1.args["external_account_id"] == method.id))
+    assert Enum.any?(Repo.all(Styx.Job), &(&1.args["external_account_id"] == method.id))
 
     send(view.pid, {:sync_job_changed, method.id, false})
     html = render(view)
@@ -650,7 +650,7 @@ defmodule ManifoldWeb.MailLiveTest do
 
   defp complete_sync_jobs!(account_id) do
     {count, _} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.worker == ^inspect(SyncAccount))
       |> where(
         [job],

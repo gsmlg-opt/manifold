@@ -230,7 +230,7 @@ defmodule Manifold.ContactsTest do
     assert first.uid != nil
 
     assert Repo.exists?(
-             from j in Oban.Job,
+             from j in Styx.Job,
                where:
                  j.worker == "Manifold.Connectors.Jobs.SyncICloud" and
                    fragment("?->>'connection_id'", j.args) == ^connection.id

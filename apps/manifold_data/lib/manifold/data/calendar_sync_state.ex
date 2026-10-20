@@ -140,13 +140,13 @@ defmodule Manifold.Data.CalendarSyncState do
     worker = "Manifold.Connectors.Jobs.SyncCalendar"
 
     unless Repo.exists?(
-             from j in Oban.Job,
+             from j in Styx.Job,
                where:
                  j.worker == ^worker and
                    j.state in ["available", "scheduled", "executing", "retryable"] and
                    fragment("? @> ?", j.args, type(^args, :map))
            ) do
-      args |> Oban.Job.new(worker: worker, queue: :connectors, max_attempts: 10) |> Repo.insert!()
+      args |> Styx.Job.new(worker: worker, queue: :connectors, max_attempts: 10) |> Repo.insert!()
     end
 
     :ok

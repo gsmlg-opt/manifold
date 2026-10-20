@@ -9,7 +9,7 @@ defmodule Manifold.Data.Application do
   def start(_type, _args) do
     children =
       [Manifold.Repo]
-      |> maybe_start_oban()
+      |> maybe_start_styx()
 
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
@@ -17,9 +17,9 @@ defmodule Manifold.Data.Application do
     Supervisor.start_link(children, opts)
   end
 
-  defp maybe_start_oban(children) do
+  defp maybe_start_styx(children) do
     if Application.get_env(:manifold_data, :oban_enabled, true) do
-      children ++ [{Oban, Application.fetch_env!(:manifold_data, Oban)}]
+      children ++ [{Styx, Application.fetch_env!(:manifold_data, Styx)}]
     else
       children
     end

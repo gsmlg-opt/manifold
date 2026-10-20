@@ -80,7 +80,7 @@ defmodule ManifoldWeb.Milestone2EndToEndTest do
            )
 
     archive_job =
-      Repo.get_by!(Oban.Job,
+      Repo.get_by!(Styx.Job,
         worker: inspect(ArchiveRawEmail),
         args: %{"inbound_delivery_id" => delivery.id}
       )
@@ -96,7 +96,7 @@ defmodule ManifoldWeb.Milestone2EndToEndTest do
     sanitizer_version = Application.get_env(:manifold_mail, :sanitizer_version, 1)
 
     projection_job =
-      Repo.get_by!(Oban.Job,
+      Repo.get_by!(Styx.Job,
         worker: inspect(ProjectInboundMail),
         args: %{
           "inbound_delivery_id" => delivery.id,
@@ -108,7 +108,7 @@ defmodule ManifoldWeb.Milestone2EndToEndTest do
     assert :ok = ProjectInboundMail.perform(projection_job)
 
     security_job =
-      Repo.get_by!(Oban.Job,
+      Repo.get_by!(Styx.Job,
         worker: inspect(EvaluateInboundSecurity),
         args: %{"inbound_delivery_id" => delivery.id, "evaluation_version" => 1}
       )

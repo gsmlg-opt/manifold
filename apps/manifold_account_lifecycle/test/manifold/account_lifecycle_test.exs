@@ -1,6 +1,6 @@
 defmodule Manifold.AccountLifecycleTest do
   use Manifold.DataCase, async: false
-  use Oban.Testing, repo: Manifold.Repo
+  use Styx.Testing, repo: Manifold.Repo
 
   alias Manifold.AccountLifecycle
   alias Manifold.AccountLifecycle.Jobs.PurgeAccount
@@ -11,21 +11,21 @@ defmodule Manifold.AccountLifecycleTest do
   alias Manifold.Connectors.Schema.{ReceiveMethod, SendMethod}
 
   setup context do
-    opts = Application.fetch_env!(:manifold_data, Oban)
+    opts = Application.fetch_env!(:manifold_data, Styx)
 
     opts =
-      if context[:oban_testing] == :disabled do
+      if context[:styx_testing] == :disabled do
         opts
         |> Keyword.put(:testing, :disabled)
         |> Keyword.put(:queues, [])
         |> Keyword.put(:plugins, [])
-        |> Keyword.put(:peer, {Oban.Peers.Isolated, leader?: false})
+        |> Keyword.put(:peer, {Styx.Peers.Isolated, leader?: false})
         |> Keyword.put(:stage_interval, :infinity)
       else
         opts
       end
 
-    start_supervised!({Oban, opts})
+    start_supervised!({Styx, opts})
     :ok
   end
 
@@ -117,7 +117,7 @@ defmodule Manifold.AccountLifecycleTest do
 
     assert same_purge.id == purge.id
     assert incomplete_purge_job_count(purge.id) == 1
-    assert [%Oban.Job{state: "suspended"}] = purge_jobs(purge.id)
+    assert [%Styx.Job{state: "suspended"}] = purge_jobs(purge.id)
   end
 
   test "request deletion rejects a failed purge until the explicit retry path is used" do
@@ -173,10 +173,10 @@ defmodule Manifold.AccountLifecycleTest do
     assert %AccountPurge{status: "completed", stage: "completed"} =
              Repo.get!(AccountPurge, completed.id)
 
-    assert [%Oban.Job{state: "completed"}] = purge_jobs(completed.id)
+    assert [%Styx.Job{state: "completed"}] = purge_jobs(completed.id)
   end
 
-  @tag oban_testing: :disabled
+  @tag styx_testing: :disabled
   test "retry rejects a synthetic conflict while the lock holder later rolls back" do
     {:ok, race_repo} =
       Repo.start_link(name: nil, pool: DBConnection.ConnectionPool, pool_size: 4)
@@ -214,7 +214,7 @@ defmodule Manifold.AccountLifecycleTest do
           {:start_holder, ^barrier_ref} ->
             on_repo(race_repo, fn ->
               Ecto.Multi.new()
-              |> Oban.insert(
+              |> Styx.insert(
                 :holder_job,
                 PurgeAccount.new(%{"purge_id" => fixture.purge.id}),
                 retry: false
@@ -235,7 +235,7 @@ defmodule Manifold.AccountLifecycleTest do
         handler_id,
         event,
         fn _event, _measurements, %{query: query}, {owner, ref, holder_pid} ->
-          if self() == holder_pid and oban_insert_query?(query) do
+          if self() == holder_pid and styx_insert_query?(query) do
             send(owner, {:holder_inserted_uncommitted, self(), ref})
 
             receive do
@@ -277,7 +277,7 @@ defmodule Manifold.AccountLifecycleTest do
         :telemetry.detach(handler_id)
       end
 
-    assert {:error, :force_rollback, :holder_rollback, %{holder_job: %Oban.Job{}}} = holder_result
+    assert {:error, :force_rollback, :holder_rollback, %{holder_job: %Styx.Job{}}} = holder_result
 
     assert {:error, %{class: :temporary, reason: :purge_job_concurrency}} =
              contender_result
@@ -428,10 +428,10 @@ defmodule Manifold.AccountLifecycleTest do
              error_message: "old worker is finishing"
            } = Repo.get!(AccountPurge, failed.id)
 
-    assert [%Oban.Job{state: "executing"} = old_job] = purge_jobs(failed.id)
+    assert [%Styx.Job{state: "executing"} = old_job] = purge_jobs(failed.id)
 
     {1, nil} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.id == ^old_job.id)
       |> Repo.update_all(set: [state: "completed"])
 
@@ -480,10 +480,10 @@ defmodule Manifold.AccountLifecycleTest do
              error_message: "awaiting operator action"
            } = Repo.get!(AccountPurge, failed.id)
 
-    assert [%Oban.Job{state: "suspended"} = old_job] = purge_jobs(failed.id)
+    assert [%Styx.Job{state: "suspended"} = old_job] = purge_jobs(failed.id)
 
     {1, nil} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.id == ^old_job.id)
       |> Repo.update_all(set: [state: "cancelled"])
 
@@ -599,22 +599,22 @@ defmodule Manifold.AccountLifecycleTest do
              states: :incomplete
            ]
 
-    assert Oban.Job.unique_states(opts[:unique][:states]) ==
+    assert Styx.Job.unique_states(opts[:unique][:states]) ==
              [:suspended, :available, :scheduled, :executing, :retryable]
 
     account = account_fixture("worker@example.test")
     requested = purge_fixture(account.id, %{status: "requested"})
 
     assert {:snooze, 1} =
-             PurgeAccount.perform(%Oban.Job{args: %{"purge_id" => requested.id}})
+             PurgeAccount.perform(%Styx.Job{args: %{"purge_id" => requested.id}})
 
     completed =
       requested
       |> AccountPurge.changeset(%{status: "completed", stage: "completed"})
       |> Repo.update!()
 
-    assert :ok = Purge.run(completed.id, %Oban.Job{})
-    assert {:cancel, :account_purge_not_found} = Purge.run(Ecto.UUID.generate(), %Oban.Job{})
+    assert :ok = Purge.run(completed.id, %Styx.Job{})
+    assert {:cancel, :account_purge_not_found} = Purge.run(Ecto.UUID.generate(), %Styx.Job{})
   end
 
   defp account_fixture(address) do
@@ -679,7 +679,7 @@ defmodule Manifold.AccountLifecycleTest do
   end
 
   defp purge_job_query(worker, purge_id) do
-    from(job in Oban.Job,
+    from(job in Styx.Job,
       where:
         job.worker == ^inspect(worker) and
           fragment("?->>'purge_id'", job.args) == ^purge_id
@@ -726,7 +726,7 @@ defmodule Manifold.AccountLifecycleTest do
         |> select([purge], purge.id)
         |> Repo.all()
 
-      Oban.Job
+      Styx.Job
       |> where([job], job.worker == ^inspect(PurgeAccount))
       |> where([job], fragment("?->>'purge_id'", job.args) in ^purge_ids)
       |> Repo.delete_all()
@@ -773,8 +773,8 @@ defmodule Manifold.AccountLifecycleTest do
     )
   end
 
-  defp oban_insert_query?(query) do
-    String.starts_with?(query, "INSERT INTO") and String.contains?(query, ~s("oban_jobs"))
+  defp styx_insert_query?(query) do
+    String.starts_with?(query, "INSERT INTO") and String.contains?(query, ~s("styx_jobs"))
   end
 
   defp stop_repo(race_repo) do

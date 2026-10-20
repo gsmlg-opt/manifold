@@ -36,8 +36,8 @@ defmodule Manifold.AccountLifecycle.Purge do
           | {:discard, atom()}
           | {:error, atom()}
 
-  @spec run(Ecto.UUID.t(), Oban.Job.t()) :: result()
-  def run(purge_id, %Oban.Job{} = job) do
+  @spec run(Ecto.UUID.t(), Styx.Job.t()) :: result()
+  def run(purge_id, %Styx.Job{} = job) do
     with {:ok, stage} <- ensure_running(purge_id) do
       purge_id
       |> dispatch(stage, job)
@@ -868,17 +868,17 @@ defmodule Manifold.AccountLifecycle.Purge do
     |> binary_part(0, min(byte_size(Atom.to_string(code) <> ": " <> message), 500))
   end
 
-  defp exhausted?(%Oban.Job{attempt: attempt, max_attempts: max_attempts}) do
+  defp exhausted?(%Styx.Job{attempt: attempt, max_attempts: max_attempts}) do
     is_integer(attempt) and is_integer(max_attempts) and max_attempts > 0 and
       attempt >= max_attempts
   end
 
-  defp injected_after_orphan_commit?(%Oban.Job{meta: meta}) do
+  defp injected_after_orphan_commit?(%Styx.Job{meta: meta}) do
     Map.get(meta || %{}, "fail_at") == "after_orphan_payload_commit" or
       Map.get(meta || %{}, :fail_at) == :after_orphan_payload_commit
   end
 
-  defp injected_after_connector_delete_before_object_outbox?(%Oban.Job{meta: meta}) do
+  defp injected_after_connector_delete_before_object_outbox?(%Styx.Job{meta: meta}) do
     Map.get(meta || %{}, "fail_at") == "after_connector_delete_before_object_outbox" or
       Map.get(meta || %{}, :fail_at) == :after_connector_delete_before_object_outbox
   end

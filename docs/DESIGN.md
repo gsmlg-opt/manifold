@@ -211,7 +211,7 @@ Remote sender MTA
             | acceptance transaction
             v
 +-----------------------+       +----------------------+
-| PostgreSQL            |------>| Oban                |
+| PostgreSQL            |------>| Styx                |
 | transport metadata    |       | durable jobs        |
 +-----------------------+       +----------+-----------+
                                             |
@@ -305,7 +305,7 @@ Owns shared persistence infrastructure:
 - `Manifold.Repo`.
 - Ecto repository configuration.
 - Centralized database migrations.
-- Oban repository integration and supervision.
+- Styx repository integration and supervision.
 - Database health checks.
 - Transaction helpers that do not contain domain policy.
 
@@ -362,7 +362,7 @@ Owns the transport-to-mailbox acceptance workflow:
 - Acceptance command.
 - PostgreSQL acceptance transaction.
 - Creation of transport recipients and mailbox entries.
-- Transactional Oban job insertion.
+- Transactional Styx job insertion.
 - Delivery lifecycle state.
 - Archival job.
 - Processing-stage orchestration.
@@ -436,7 +436,7 @@ Owns managed-provider submission:
 - Provider-specific adapters.
 - Direct managed-provider HTTPS integration where precise retry semantics are
   required.
-- Oban submission jobs.
+- Styx submission jobs.
 - Provider idempotency keys.
 - Webhook signature verification.
 - Delivery, bounce, complaint, and suppression events.
@@ -470,7 +470,7 @@ Owns the local side of optional cloud ingress:
 - Streamed raw transfer into the local spool.
 - Idempotent edge provenance acceptance.
 - Permanent poison-delivery isolation without blocking later deliveries.
-- Durable Oban publication and pull jobs.
+- Durable Styx publication and pull jobs.
 - Acknowledgement only after local acceptance commits.
 
 It initiates every synchronization connection. The edge never calls into the
@@ -500,7 +500,7 @@ lifecycle:
   Microsoft receive/send grants.
 - Gmail and Microsoft Graph provider adapters.
 - Provider account, message identity, cursor, and operational event schemas.
-- Bounded Oban synchronization and remote-state jobs.
+- Bounded Styx synchronization and remote-state jobs.
 - Mapping provider identities to durable local inbound deliveries.
 - IMAP and EAS receive methods, read-state writeback, and SMTP credential checkout.
 - Account-owned iCloud Contacts credentials and DAV synchronization, plus independent
@@ -906,9 +906,9 @@ One `Ecto.Multi` must:
 2. Insert all `DeliveryRecipient` rows.
 3. Create deduplicated `MailboxEntry` rows.
 4. Insert an `accepted` event.
-5. Insert the first Oban archival job.
+5. Insert the first Styx archival job.
 
-The Oban job and delivery records commit together.
+The Styx job and delivery records commit together.
 
 ### 11.4 Crash and orphan semantics
 
@@ -943,7 +943,7 @@ accepted
 
 Acceptance creates mailbox entries with quarantine visibility enforced.
 Security and MIME projection begin after archival and run independently from
-the same verified raw source. The archive transaction inserts both Oban jobs.
+the same verified raw source. The archive transaction inserts both Styx jobs.
 Only a committed allow or manual-release policy clears quarantine.
 
 Each stage:
@@ -956,7 +956,7 @@ Each stage:
 - Retries only classified transient failures.
 - Stores terminal errors without losing the raw message.
 
-Oban queues should separate latency-sensitive and resource-intensive work, for example:
+Styx queues should separate latency-sensitive and resource-intensive work, for example:
 
 - `ingest`
 - `archive`
@@ -1142,7 +1142,7 @@ Provider credentials, database credentials, storage credentials, and TLS private
 compose/API request
   -> validate sender identity
   -> persist outbound message
-  -> insert Oban submission job
+  -> insert Styx submission job
   -> render provider request
   -> call provider API
   -> store provider message ID
@@ -1291,7 +1291,7 @@ A conceptual supervision structure for the original local inbound release was:
 ```text
 Manifold.Supervisor
 ├── Manifold.Repo
-├── Oban
+├── Styx
 ├── Phoenix.PubSub
 ├── Manifold.Storage.Supervisor
 │   ├── SpoolCapacityMonitor
@@ -1370,7 +1370,7 @@ Do not log full message bodies, authentication headers, provider secrets, or att
 Expose health for:
 
 - PostgreSQL.
-- Oban queue latency.
+- Styx queue latency.
 - Spool capacity and oldest bundle age.
 - Object-store reachability.
 - SMTP listener state.
@@ -1483,7 +1483,7 @@ Back up:
 - Runtime configuration and secret references.
 - Persistent spool while it contains unarchived accepted messages.
 
-The system should resume Oban jobs and spool reconciliation after restart.
+The system should resume Styx jobs and spool reconciliation after restart.
 
 ---
 
@@ -1682,12 +1682,12 @@ Sent Items maps to the provider-neutral local Sent system folder.
 
 Each job handles one bounded page. A cursor checkpoint occurs only after every
 message represented by that page has been durably imported or idempotently
-matched. Temporary provider errors snooze Oban work and honor numeric
+matched. Temporary provider errors snooze Styx work and honor numeric
 `Retry-After`; reconnect errors stop the account until a new authorization is
 completed.
 
 The code inserts the first sync job with OAuth completion and can enqueue an
-individual account manually. The local release starts a `connectors` Oban queue,
+individual account manually. The local release starts a `connectors` Styx queue,
 and a five-minute cron job inserts missing work for connected, syncing, or
 failed accounts. Gmail watch and Microsoft Graph subscription/push delivery are
 not implemented.
@@ -1801,7 +1801,7 @@ Use a real PostgreSQL database and real temporary spool directories:
 - Unknown recipient rejection at `RCPT TO`.
 - Accepted delivery creates the exact expected records.
 - Raw message bytes and digest are preserved.
-- Oban archival succeeds and removes the ready bundle.
+- Styx archival succeeds and removes the ready bundle.
 - Object-store failure retries without losing the bundle.
 - Process restart resumes committed work.
 - Webhook replay is idempotent.
@@ -1856,7 +1856,7 @@ Implemented.
 - Umbrella repository.
 - Nix/devenv environment.
 - PostgreSQL and Ecto.
-- Oban.
+- Styx.
 - Phoenix LiveView shell.
 - Architecture documentation and ADRs.
 - Quality and CI commands.
@@ -1897,7 +1897,7 @@ Implemented.
 - Sent-mail views.
 - Provider behaviour, account-selected Gmail API and authenticated SMTP
   adapters, and legacy Resend HTTPS compatibility.
-- Outbound Oban queue.
+- Outbound Styx queue.
 - Authenticated raw-body provider webhooks.
 - Per-recipient delivery, bounce, complaint, suppression, delay, and failure
   state.
@@ -1932,7 +1932,7 @@ Implemented.
 
 Implemented. The connector domain, migration, OAuth/credential primitives,
 Gmail and Microsoft provider adapters, bounded sync engine, durable external
-import, remote-state application, runtime configuration, local-release/Oban
+import, remote-state application, runtime configuration, local-release/Styx
 wiring, polling, and no-auth account settings are implemented and verified.
 
 - Read-only Gmail API receive synchronization.
@@ -2004,7 +2004,7 @@ The repository should record at least these ADRs:
 4. **PostgreSQL as metadata source of truth.**
 5. **Raw RFC 5322 message as immutable source of truth.**
 6. **Modular umbrella monolith.**
-7. **Oban for durable asynchronous stages.**
+7. **Styx for durable asynchronous stages.**
 8. **Storage behaviour with local and ESS/S3 adapters.**
 9. **No IMAP, POP3, or direct outbound MTA in Release 0.1.**
 10. **Future cloud edge uses local-initiated, idempotent synchronization.**

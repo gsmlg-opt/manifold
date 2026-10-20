@@ -39,7 +39,7 @@ defmodule Manifold.AccountLifecycle do
       |> Multi.run(:before_job_insert, fn _repo, _changes ->
         maybe_fail_before_job_insert(opts)
       end)
-      |> Oban.insert(
+      |> Styx.insert(
         :job,
         fn %{purge: purge} -> PurgeAccount.new(%{"purge_id" => purge.id}) end,
         retry: false
@@ -87,7 +87,7 @@ defmodule Manifold.AccountLifecycle do
           error_message: nil
         })
       end)
-      |> Oban.insert(
+      |> Styx.insert(
         :job,
         fn %{reset: purge} -> PurgeAccount.new(%{"purge_id" => purge.id}) end,
         retry: false
@@ -167,7 +167,7 @@ defmodule Manifold.AccountLifecycle do
     end
   end
 
-  defp validate_retry_job(%Oban.Job{conflict?: true, state: "executing"}) do
+  defp validate_retry_job(%Styx.Job{conflict?: true, state: "executing"}) do
     {:error,
      Error.new(
        :temporary,
@@ -176,7 +176,7 @@ defmodule Manifold.AccountLifecycle do
      )}
   end
 
-  defp validate_retry_job(%Oban.Job{conflict?: true, state: "suspended"}) do
+  defp validate_retry_job(%Styx.Job{conflict?: true, state: "suspended"}) do
     {:error,
      Error.new(
        :temporary,
@@ -185,9 +185,9 @@ defmodule Manifold.AccountLifecycle do
      )}
   end
 
-  defp validate_retry_job(%Oban.Job{} = job), do: validate_persisted_job(job)
+  defp validate_retry_job(%Styx.Job{} = job), do: validate_persisted_job(job)
 
-  defp validate_persisted_job(%Oban.Job{conflict?: true, id: nil}) do
+  defp validate_persisted_job(%Styx.Job{conflict?: true, id: nil}) do
     {:error,
      Error.new(
        :temporary,
@@ -196,9 +196,9 @@ defmodule Manifold.AccountLifecycle do
      )}
   end
 
-  defp validate_persisted_job(%Oban.Job{id: id} = job) when is_integer(id), do: {:ok, job}
+  defp validate_persisted_job(%Styx.Job{id: id} = job) when is_integer(id), do: {:ok, job}
 
-  defp validate_persisted_job(%Oban.Job{}) do
+  defp validate_persisted_job(%Styx.Job{}) do
     {:error,
      Error.new(
        :temporary,

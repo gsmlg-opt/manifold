@@ -221,7 +221,7 @@ defmodule Manifold.Connectors.SyncTest do
   end
 
   setup %{tmp_dir: tmp_dir} do
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     old_key = Application.get_env(:manifold_connectors, :encryption_key)
     old_adapters = Application.get_env(:manifold_connectors, :adapters)
@@ -1188,7 +1188,7 @@ defmodule Manifold.Connectors.SyncTest do
     assert :ok = Ingest.archive_delivery(mapping.inbound_delivery_id)
     assert :ok = Ingest.project_delivery(mapping.inbound_delivery_id)
 
-    job = Repo.get_by!(Oban.Job, worker: inspect(ApplyRemoteState))
+    job = Repo.get_by!(Styx.Job, worker: inspect(ApplyRemoteState))
     assert :ok = ApplyRemoteState.perform(job)
 
     message = Repo.get_by!(Message, inbound_delivery_id: mapping.inbound_delivery_id)
@@ -1251,7 +1251,7 @@ defmodule Manifold.Connectors.SyncTest do
     assert :ok = Ingest.archive_delivery(mapping.inbound_delivery_id)
     assert :ok = Ingest.project_delivery(mapping.inbound_delivery_id)
 
-    job = Repo.get_by!(Oban.Job, worker: inspect(ApplyRemoteState))
+    job = Repo.get_by!(Styx.Job, worker: inspect(ApplyRemoteState))
     assert :ok = ApplyRemoteState.perform(job)
 
     message = Repo.get_by!(Message, inbound_delivery_id: mapping.inbound_delivery_id)
@@ -1741,7 +1741,7 @@ defmodule Manifold.Connectors.SyncTest do
       |> Repo.insert!()
 
     {1, nil} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.id == ^executing.id)
       |> Repo.update_all(set: [state: "executing"])
 
@@ -1755,12 +1755,12 @@ defmodule Manifold.Connectors.SyncTest do
                []
              )
 
-    assert Repo.get!(Oban.Job, executing.id).state == "executing"
+    assert Repo.get!(Styx.Job, executing.id).state == "executing"
 
-    assert [%Oban.Job{} = successor] = queued_remote_state_jobs(remote.id)
+    assert [%Styx.Job{} = successor] = queued_remote_state_jobs(remote.id)
     assert successor.id != executing.id
 
-    assert %Oban.Job{id: successor_id} = RemoteStateJobs.ensure(remote.id)
+    assert %Styx.Job{id: successor_id} = RemoteStateJobs.ensure(remote.id)
     assert successor_id == successor.id
     assert [^successor] = queued_remote_state_jobs(remote.id)
 
@@ -2212,18 +2212,18 @@ defmodule Manifold.Connectors.SyncTest do
 
   test "polling remains unique for 300 seconds and creates no webhook job", %{account: account} do
     _microsoft = convert_to_microsoft!(account)
-    Repo.delete_all(Oban.Job)
+    Repo.delete_all(Styx.Job)
 
     unique = SyncAccount.__opts__()[:unique]
     assert unique[:period] == 300
     assert unique[:keys] == [:external_account_id]
     assert unique[:states] == :incomplete
 
-    assert :ok = PollAccounts.perform(%Oban.Job{args: %{}})
-    assert :ok = PollAccounts.perform(%Oban.Job{args: %{}})
+    assert :ok = PollAccounts.perform(%Styx.Job{args: %{}})
+    assert :ok = PollAccounts.perform(%Styx.Job{args: %{}})
 
-    assert [%Oban.Job{worker: worker, args: %{"external_account_id" => method_id}}] =
-             Repo.all(Oban.Job)
+    assert [%Styx.Job{worker: worker, args: %{"external_account_id" => method_id}}] =
+             Repo.all(Styx.Job)
 
     assert worker == inspect(SyncAccount)
     assert method_id == account.id
@@ -2498,7 +2498,7 @@ defmodule Manifold.Connectors.SyncTest do
     assert :ok = Ingest.archive_delivery(mapping.inbound_delivery_id)
     assert :ok = Ingest.project_delivery(mapping.inbound_delivery_id)
 
-    job = Repo.get_by!(Oban.Job, worker: inspect(ApplyRemoteState))
+    job = Repo.get_by!(Styx.Job, worker: inspect(ApplyRemoteState))
     assert :ok = ApplyRemoteState.perform(job)
 
     entry =
@@ -2658,7 +2658,7 @@ defmodule Manifold.Connectors.SyncTest do
 
     assert :ok = Connectors.sync_account(account.id)
     mapping = Repo.get_by!(RemoteMessage, provider_message_id: "message-state")
-    job = Repo.get_by!(Oban.Job, worker: inspect(ApplyRemoteState))
+    job = Repo.get_by!(Styx.Job, worker: inspect(ApplyRemoteState))
 
     assert {:snooze, 5} = ApplyRemoteState.perform(job)
 
@@ -2761,7 +2761,7 @@ defmodule Manifold.Connectors.SyncTest do
       |> then(&Repo.get!(ReceiveMethod, &1))
       |> convert_to_microsoft!()
 
-    Repo.delete_all(from(job in Oban.Job, where: job.worker == ^inspect(ApplyRemoteState)))
+    Repo.delete_all(from(job in Styx.Job, where: job.worker == ^inspect(ApplyRemoteState)))
 
     Repo.delete_all(
       from(stored in SyncCursor, where: stored.external_account_id == ^microsoft.id)
@@ -2835,7 +2835,7 @@ defmodule Manifold.Connectors.SyncTest do
       |> Repo.all()
       |> MapSet.new()
 
-    Oban.Job
+    Styx.Job
     |> where([job], job.worker == ^inspect(ApplyRemoteState))
     |> order_by([job], asc: job.id)
     |> Repo.all()
@@ -2844,7 +2844,7 @@ defmodule Manifold.Connectors.SyncTest do
   end
 
   defp apply_remote_state_job_count(remote_message_id) do
-    Oban.Job
+    Styx.Job
     |> where([job], job.worker == ^inspect(ApplyRemoteState))
     |> where(
       [job],
@@ -2854,7 +2854,7 @@ defmodule Manifold.Connectors.SyncTest do
   end
 
   defp queued_remote_state_jobs(remote_message_id) do
-    Oban.Job
+    Styx.Job
     |> where([job], job.worker == ^inspect(ApplyRemoteState))
     |> where([job], job.state in ~w(available scheduled retryable suspended))
     |> where(
@@ -3325,21 +3325,21 @@ defmodule Manifold.Connectors.SyncTest do
   defp nested_terms(value), do: [value]
 end
 
-defmodule Manifold.Connectors.RemoteStateJobsWithoutObanTest do
+defmodule Manifold.Connectors.RemoteStateJobsWithoutStyxTest do
   use Manifold.DataCase, async: false
 
   alias Manifold.Connectors.RemoteStateJobs
   alias Manifold.Repo
 
   test "remote-state jobs persist when the scheduler is not running" do
-    assert is_nil(Oban.Registry.whereis(Oban))
+    assert is_nil(Styx.Registry.whereis(Styx))
 
     remote_message_id = Ecto.UUID.generate()
 
-    assert %Oban.Job{id: job_id} = RemoteStateJobs.ensure(remote_message_id)
+    assert %Styx.Job{id: job_id} = RemoteStateJobs.ensure(remote_message_id)
     assert is_integer(job_id)
-    assert %Oban.Job{id: ^job_id} = Repo.get(Oban.Job, job_id)
-    assert %Oban.Job{id: ^job_id} = RemoteStateJobs.ensure(remote_message_id)
+    assert %Styx.Job{id: ^job_id} = Repo.get(Styx.Job, job_id)
+    assert %Styx.Job{id: ^job_id} = RemoteStateJobs.ensure(remote_message_id)
   end
 end
 
@@ -3356,16 +3356,16 @@ defmodule Manifold.Connectors.RemoteStateJobsConcurrencyTest do
   setup do
     :ok = Sandbox.checkout(Repo, sandbox: false)
 
-    oban_opts =
+    styx_opts =
       :manifold_data
-      |> Application.fetch_env!(Oban)
+      |> Application.fetch_env!(Styx)
       |> Keyword.put(:testing, :disabled)
       |> Keyword.put(:queues, [])
       |> Keyword.put(:plugins, [])
-      |> Keyword.put(:peer, {Oban.Peers.Isolated, leader?: false})
+      |> Keyword.put(:peer, {Styx.Peers.Isolated, leader?: false})
       |> Keyword.put(:stage_interval, :infinity)
 
-    start_supervised!({Oban, oban_opts})
+    start_supervised!({Styx, styx_opts})
 
     remote_message_id = Ecto.UUID.generate()
 
@@ -3414,10 +3414,10 @@ defmodule Manifold.Connectors.RemoteStateJobsConcurrencyTest do
     Enum.each(caller_pids, &send(&1, {:ensure_remote_state, gate}))
 
     jobs = Task.await_many(tasks, 10_000)
-    assert [%Oban.Job{id: persisted_id}] = queued_remote_state_jobs(remote_message_id)
+    assert [%Styx.Job{id: persisted_id}] = queued_remote_state_jobs(remote_message_id)
     assert is_integer(persisted_id)
-    assert Enum.all?(jobs, &match?(%Oban.Job{id: ^persisted_id}, &1))
-    assert %Oban.Job{id: ^persisted_id} = Repo.get(Oban.Job, persisted_id)
+    assert Enum.all?(jobs, &match?(%Styx.Job{id: ^persisted_id}, &1))
+    assert %Styx.Job{id: ^persisted_id} = Repo.get(Styx.Job, persisted_id)
   end
 
   test "losing ensure persists a job when the concurrent winner rolls back", %{
@@ -3445,7 +3445,7 @@ defmodule Manifold.Connectors.RemoteStateJobsConcurrencyTest do
       end)
 
     assert_receive {:remote_state_winner_inserted, winner_pid, ^gate,
-                    %Oban.Job{id: winner_job_id}},
+                    %Styx.Job{id: winner_job_id}},
                    5_000
 
     assert is_integer(winner_job_id)
@@ -3491,10 +3491,10 @@ defmodule Manifold.Connectors.RemoteStateJobsConcurrencyTest do
 
     loser_job = Task.await(loser, 5_000)
 
-    assert %Oban.Job{id: loser_job_id} = loser_job
+    assert %Styx.Job{id: loser_job_id} = loser_job
     assert is_integer(loser_job_id)
-    assert %Oban.Job{id: ^loser_job_id} = Repo.get(Oban.Job, loser_job_id)
-    assert [%Oban.Job{id: ^loser_job_id}] = queued_remote_state_jobs(remote_message_id)
+    assert %Styx.Job{id: ^loser_job_id} = Repo.get(Styx.Job, loser_job_id)
+    assert [%Styx.Job{id: ^loser_job_id}] = queued_remote_state_jobs(remote_message_id)
   end
 
   test "job insertion rolls back with the surrounding transaction", %{
@@ -3502,7 +3502,7 @@ defmodule Manifold.Connectors.RemoteStateJobsConcurrencyTest do
   } do
     assert {:error, :forced_rollback} =
              Repo.transaction(fn ->
-               assert %Oban.Job{} = RemoteStateJobs.ensure(remote_message_id)
+               assert %Styx.Job{} = RemoteStateJobs.ensure(remote_message_id)
                assert [_job] = queued_remote_state_jobs(remote_message_id)
                Repo.rollback(:forced_rollback)
              end)
@@ -3511,7 +3511,7 @@ defmodule Manifold.Connectors.RemoteStateJobsConcurrencyTest do
   end
 
   defp queued_remote_state_jobs(remote_message_id) do
-    Oban.Job
+    Styx.Job
     |> where([job], job.worker == ^inspect(ApplyRemoteState))
     |> where([job], job.state in ~w(available scheduled retryable suspended))
     |> where(
@@ -3523,7 +3523,7 @@ defmodule Manifold.Connectors.RemoteStateJobsConcurrencyTest do
   end
 
   defp delete_remote_state_jobs(remote_message_id) do
-    Oban.Job
+    Styx.Job
     |> where([job], job.worker == ^inspect(ApplyRemoteState))
     |> where(
       [job],

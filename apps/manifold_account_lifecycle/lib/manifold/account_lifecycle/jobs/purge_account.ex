@@ -1,7 +1,7 @@
 defmodule Manifold.AccountLifecycle.Jobs.PurgeAccount do
   @moduledoc false
 
-  use Oban.Worker,
+  use Styx.Worker,
     queue: :account_purge,
     max_attempts: 20,
     unique: [
@@ -13,9 +13,9 @@ defmodule Manifold.AccountLifecycle.Jobs.PurgeAccount do
 
   alias Manifold.AccountLifecycle.Purge
 
-  @impl Oban.Worker
-  @spec perform(Oban.Job.t()) :: Purge.result()
-  def perform(%Oban.Job{args: %{"purge_id" => purge_id}} = job) do
+  @impl Styx.Worker
+  @spec perform(Styx.Job.t()) :: Purge.result()
+  def perform(%Styx.Job{args: %{"purge_id" => purge_id}} = job) do
     Purge.run(purge_id, job)
   end
 end

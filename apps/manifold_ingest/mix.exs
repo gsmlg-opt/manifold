@@ -28,7 +28,7 @@ defmodule Manifold.Ingest.MixProject do
       {:manifold_storage, in_umbrella: true},
       {:manifold_mail, in_umbrella: true},
       {:manifold_security, in_umbrella: true},
-      {:oban, "~> 2.23"},
+      {:styx, "== 0.1.1"},
       {:telemetry, "~> 1.3"}
     ]
   end

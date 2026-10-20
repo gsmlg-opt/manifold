@@ -18,7 +18,7 @@ defmodule Manifold.Connectors.ICloud.ProtocolSyncTest do
         calendars_enabled: false
       })
 
-    [job] = Repo.all(Oban.Job)
+    [job] = Repo.all(Styx.Job)
     assert job.worker == "Manifold.Connectors.Jobs.SyncICloud"
     assert job.args["connection_id"] == c.id
 

@@ -37,14 +37,14 @@ defmodule Manifold.ConfigTest do
     :ok
   end
 
-  test "development Oban configuration includes connector processing and polling" do
+  test "development Styx configuration includes connector processing and polling" do
     config = read_config(:dev)
-    oban = get_in(config, [:manifold_data, Oban])
+    styx = get_in(config, [:manifold_data, Styx])
 
-    assert oban[:queues][:connectors] == 2
+    assert styx[:queues][:connectors] == 2
 
-    assert {"*/5 * * * *", Manifold.Connectors.Jobs.PollAccounts} in oban[:plugins][
-             Oban.Plugins.Cron
+    assert {"*/5 * * * *", Manifold.Connectors.Jobs.PollAccounts} in styx[:plugins][
+             Styx.Plugins.Cron
            ][:crontab]
   end
 

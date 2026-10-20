@@ -12,7 +12,7 @@
 - `docs/README.md` and root `README.md`: operator entry points.
 - `config/runtime.exs`, `Dockerfile` and root `mix.exs`: runtime, permissions,
   image behavior and release closure contracts that examples must follow.
-- `manifold_data`: main migrations and Oban; `manifold_edge`: separate Repo,
+- `manifold_data`: main migrations and Styx; `manifold_edge`: separate Repo,
   migration helper and signed API; `manifold_smtp`: edge-only SMTP listener.
 - `manifold_storage`: local spool/raw/blob persistence; `manifold_connectors`:
   stable encryption key, database-backed provider settings and activity logs.
@@ -31,6 +31,9 @@ API path/body/Host, distinguish listener probes from authenticated readiness,
 and keep encryption keys and source identity stable across upgrades/restores.
 Do not add undocumented environment switches, automatic credential import,
 rolling OAuth cutovers or unguarded schema rollback instructions.
+
+For the 2026-10-21 engine cutover, follow the
+[Styx migration record](styx-migration.md) and its deployment runbook.
 
 ## Validation
 

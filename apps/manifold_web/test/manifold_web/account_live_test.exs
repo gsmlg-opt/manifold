@@ -49,7 +49,7 @@ defmodule ManifoldWeb.AccountLiveTest do
   end
 
   setup do
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
     :ok
   end
 
@@ -667,7 +667,7 @@ defmodule ManifoldWeb.AccountLiveTest do
     assert has_element?(view, "#account-#{account.id} [aria-live='polite']", "Deleting...")
     refute has_element?(view, "#account-#{account.id} .account-actions")
     assert render(view) =~ "Account deletion queued."
-    assert [%Oban.Job{}] = purge_jobs(purge.id)
+    assert [%Styx.Job{}] = purge_jobs(purge.id)
     assert is_reference(socket_assign(view, :refresh_timer))
     assert is_reference(socket_assign(view, :refresh_token))
   end
@@ -1050,7 +1050,7 @@ defmodule ManifoldWeb.AccountLiveTest do
   end
 
   defp purge_job_query(worker, purge_id) do
-    from(job in Oban.Job,
+    from(job in Styx.Job,
       where:
         job.worker == ^inspect(worker) and
           fragment("?->>'purge_id'", job.args) == ^purge_id

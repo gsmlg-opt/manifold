@@ -155,7 +155,7 @@ docker compose ps
 docker compose logs --tail=100 main
 ```
 
-`pg_isready` 未就绪时，等数据库健康后再迁移。迁移命令禁用一次性进程中的 Oban，避免在迁移前执行任务。
+`pg_isready` 未就绪时，等数据库健康后再迁移。迁移命令通过保留的 `:oban_enabled` 运维开关禁用一次性进程中的 Styx，避免在迁移前执行任务。
 主程序没有 `Manifold.Release.migrate/0`；Edge 的迁移入口也不能用于主数据库。
 
 后台 HTTP 存活检查：
@@ -168,7 +168,7 @@ docker compose exec -T postgres psql -U manifold -d manifold \
   -c 'SELECT version, inserted_at FROM schema_migrations ORDER BY version DESC LIMIT 5;'
 ```
 
-`/api/v1/health` 返回静态服务状态，不证明数据库、Oban 或 provider 正常。
+`/api/v1/health` 返回静态服务状态，不证明数据库、Styx 或 provider 正常。
 完整验收还应检查迁移结果、`/jobs` 中任务执行、账户同步状态及实际收件；发送时区分
 provider 接受与最终投递，不自动重发 `submission_uncertain` 的邮件。
 
@@ -344,7 +344,7 @@ MANIFOLD_EDGE_SOURCE_ID=edge-1
 `docker compose up -d --force-recreate main`；普通 `restart` 不会载入修改后的 Compose 环境。
 这只是重新创建应用容器，持久数据保持在挂载与数据库中。
 
-先配置本地活跃域名、账户及别名，再打开 `/cloud`，执行 **Publish routes** 并确认 Oban
+先配置本地活跃域名、账户及别名，再打开 `/cloud`，执行 **Publish routes** 并确认 Styx
 任务完成，然后执行 **Pull deliveries**。自动发布间隔为 5 分钟，拉取间隔为 1 分钟。
 `Configured` 只表示本地配置存在；用成功的签名交互和实际测试邮件证明链路可用。
 缺少或过期的路由快照会使 Edge 的 RCPT 接收暂时失败，默认路由有效期为 24 小时。
@@ -435,19 +435,19 @@ docker compose -p manifold-restore exec -T postgres pg_restore \
 
 先检查 schema、对象文件、待执行任务及账号身份，再用兼容版本执行迁移/启动步骤。
 恢复环境使用不同端口，不能与现有生产实例争用同一数据库或 storage。
-恢复的 Oban 任务在应用启动后会继续执行，应先核对待发送和不确定发送状态，再恢复对外服务。
+恢复的 Styx 任务在应用启动后会继续执行，应先核对待发送和不确定发送状态，再恢复对外服务。
 仅有数据库 dump 而丢失 raw、spool 或加密密钥不是完整恢复。
 
 ## 10. 升级与回退
 
 1. 阅读目标版本 Release notes、[当前进度与限制](PROGRESS.md) 和相关迁移说明，保留旧镜像/归档。
-2. 暂停新操作，处理队列中的发送与不确定提交；停止所有旧 Web、Connector、Oban 实例。
+2. 暂停新操作，处理队列中的发送与不确定提交；停止所有旧 Web、Connector 和任务消费者（Oban 或 Styx）实例。
    历史 Gmail/Microsoft 共享授权和 Settings cutover 要求 **非滚动升级**，见
    [README 迁移说明](../README.md#non-rolling-gmail-authorization-cutover)。
 3. 按第 9 节备份。在停止应用后先不要执行备份示例最后的应用启动命令。
 4. 修改 `.env` 中 `MANIFOLD_VERSION`，或改为目标镜像 digest；执行 `docker compose pull`。
 5. 执行对应主程序/Edge 的一次性迁移，然后 `docker compose up -d main` 或 `up -d edge`。
-6. 检查页面和 LiveView、静态资源、数据库、Oban、provider 同步，以及需要时的 Edge 收信/拉取链路。
+6. 检查页面和 LiveView、静态资源、数据库、Styx、provider 同步，以及需要时的 Edge 收信/拉取链路。
 
 固定版本镜像更新时仍要执行 `pull`；`latest` 不能作为可重复的升级基线。
 数据库没有变化或新 schema 明确向后兼容时，才可以仅切回旧二进制。
@@ -457,6 +457,41 @@ docker compose -p manifold-restore exec -T postgres pg_restore \
 
 需要数据库恢复时，恢复与旧版本配套的一致备份集。升级后若已经接受了新邮件或本地编辑，
 先保存这些数据并制定恢复/合并方案；直接覆盖成升级前的备份会丢失它们。
+
+### Oban 切换到 Styx
+
+使用 Styx 的版本需要执行 `20261021000000_migrate_oban_storage_to_styx.exs`。
+这是非滚动切换：暂停新请求和后台生产者，停止所有旧应用与消费者，再使用新版本执行第 4 节的一次性迁移。
+保留的 `:oban_enabled` 开关现在控制 Styx；迁移进程必须将它设为 `false`。
+
+迁移将原有任务完整复制到 `styx_jobs`，保留 ID、worker 名称、参数、状态、重试历史和时间，
+并延续旧序列的高水位。旧的 SQL NULL `meta`、`tags` 分别转为 `{}`、`[]`。
+旧 peer 租约不复制。空的 `oban_jobs_styx_rollback` 与 `oban_peers_styx_rollback`
+仅保留旧表结构供回迁使用，不能手动写入或删除。
+
+存在执行中的任务、独立 Styx 历史，或 `tags` / `attempted_by` 中超过 255 字符的元素时，
+迁移会拒绝切换。先核对原因与不确定发送状态，不要通过批量重置任务状态绕过检查。
+迁移成功后再启动新应用，检查 `/jobs`、账户同步和实际任务执行。
+
+从旧 Oban 数据库升级后若需要回退，先停止所有 Styx 实例，使用仍含 Styx 的新二进制只回退该迁移：
+
+```sh
+bin/manifold eval '
+Application.put_env(:manifold_data, :oban_enabled, false)
+{:ok, _} = Application.ensure_all_started(:manifold_data)
+path = Application.app_dir(:manifold_data, "priv/repo/migrations")
+{:ok, migrated, _} = Ecto.Migrator.with_repo(Manifold.Repo, fn repo ->
+  Ecto.Migrator.run(repo, path, :down, to: 20261021000000)
+end)
+IO.inspect(migrated, label: "rolled_back")
+'
+```
+
+Docker 安装用 `docker compose run --rm --no-deps main /app/bin/manifold eval` 执行相同表达式。
+回迁复制当前 Styx 任务，包括升级后新增的任务与最新终态，不恢复旧任务快照；
+旧 enum 不支持某个状态或检测到独立写入时，会拒绝回退。
+确认 `oban_jobs` 恢复且切换迁移已回退后，才启动旧二进制，不要继续回退历史 `AddOban`。
+全新安装直接创建 Styx 存储，没有旧 Oban 表结构；此回迁路径不为它创建 Oban 数据库。
 
 ## 11. 常见问题
 

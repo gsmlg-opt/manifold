@@ -2,7 +2,7 @@
 
 ## Boundary and ownership
 
-- `apps/manifold_data`: database schema, migrations, repository, Oban configuration.
+- `apps/manifold_data`: database schema, migrations, repository, Styx configuration.
 - `apps/manifold_accounts`: account/domain/mailbox core ownership and validation.
 - `apps/manifold_mail`: MIME projection and folder/thread/message modeling.
 - `apps/manifold_connectors`: external provider sync adapters and provider state models.

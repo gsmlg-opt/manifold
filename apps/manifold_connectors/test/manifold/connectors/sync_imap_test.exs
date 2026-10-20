@@ -229,7 +229,7 @@ defmodule Manifold.Connectors.SyncImapTest do
   end
 
   defp drain_remote_state_jobs do
-    Oban.Job
+    Styx.Job
     |> where([job], job.worker == ^inspect(ApplyRemoteState))
     |> where([job], job.state in ["available", "scheduled", "retryable"])
     |> Repo.all()
@@ -242,7 +242,7 @@ defmodule Manifold.Connectors.SyncImapTest do
     alias Manifold.Connectors.Jobs.PushRemoteRead
 
     jobs =
-      Oban.Job
+      Styx.Job
       |> where([job], job.worker == ^inspect(PushRemoteRead))
       |> where([job], job.state in ["available", "scheduled", "retryable"])
       |> order_by([job], asc: job.id)

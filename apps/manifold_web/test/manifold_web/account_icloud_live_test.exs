@@ -8,7 +8,7 @@ defmodule ManifoldWeb.AccountICloudLiveTest do
   alias Manifold.Repo
 
   setup do
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     {:ok, account} =
       Accounts.create_account(%{name: "Local Account", address: "local@example.test"})

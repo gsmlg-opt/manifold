@@ -3,7 +3,7 @@ defmodule Manifold.Ingest.Jobs.ProjectInboundMail do
   Projects an archived inbound delivery into mailbox-visible normalized mail.
   """
 
-  use Oban.Worker,
+  use Styx.Worker,
     queue: :mail_parse,
     max_attempts: 5,
     unique: [
@@ -16,8 +16,8 @@ defmodule Manifold.Ingest.Jobs.ProjectInboundMail do
   alias Manifold.Core.Error
   alias Manifold.Ingest
 
-  @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"inbound_delivery_id" => delivery_id} = args}) do
+  @impl Styx.Worker
+  def perform(%Styx.Job{args: %{"inbound_delivery_id" => delivery_id} = args}) do
     parser_version = Map.get(args, "parser_version", parser_version())
     sanitizer_version = Map.get(args, "sanitizer_version", sanitizer_version())
 

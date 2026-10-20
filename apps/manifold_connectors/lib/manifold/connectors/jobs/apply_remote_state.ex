@@ -1,7 +1,7 @@
 defmodule Manifold.Connectors.Jobs.ApplyRemoteState do
   @moduledoc false
 
-  use Oban.Worker,
+  use Styx.Worker,
     queue: :connectors,
     max_attempts: 20,
     unique: [
@@ -13,8 +13,8 @@ defmodule Manifold.Connectors.Jobs.ApplyRemoteState do
   alias Manifold.Connectors
   alias Manifold.Core.Error
 
-  @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"remote_message_id" => remote_message_id}}) do
+  @impl Styx.Worker
+  def perform(%Styx.Job{args: %{"remote_message_id" => remote_message_id}}) do
     case Connectors.apply_remote_state(remote_message_id) do
       :ok ->
         :ok

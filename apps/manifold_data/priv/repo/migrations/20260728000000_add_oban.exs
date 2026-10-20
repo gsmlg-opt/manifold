@@ -1,7 +1,8 @@
 defmodule Manifold.Repo.Migrations.AddOban do
   use Ecto.Migration
 
-  def up, do: Oban.Migrations.up()
+  # Keep the historical migration identity for databases that already ran it.
+  def up, do: Styx.Migration.up(prefix: prefix() || "public")
 
-  def down, do: Oban.Migrations.down()
+  def down, do: Styx.Migration.down(prefix: prefix() || "public")
 end

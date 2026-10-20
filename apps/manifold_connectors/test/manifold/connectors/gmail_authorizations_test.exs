@@ -210,7 +210,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert Repo.aggregate(ReceiveMethod, :count) == 0
     assert Repo.aggregate(SendMethod, :count) == 0
     assert Repo.aggregate(ConnectorEvent, :count) == 0
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
   end
 
   test "receive grant creates shared authorization and linked receive state", %{
@@ -251,7 +251,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert Map.get(connected_event, :oauth_authorization_id) == authorization.id
     assert is_nil(connected_event.external_account_id)
 
-    assert Repo.get_by!(Oban.Job,
+    assert Repo.get_by!(Styx.Job,
              worker: inspect(SyncAccount),
              args: %{"external_account_id" => receive.id}
            )
@@ -269,7 +269,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert send_method.email_address == address
     assert Repo.aggregate(ReceiveMethod, :count) == 0
     assert Repo.aggregate(SyncCursor, :count) == 0
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
 
     authorization = Repo.get!(OAuthAuthorization, send_method.oauth_authorization_id)
     assert authorization.granted_scopes == [GmailScopes.send()]
@@ -478,7 +478,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     assert {:ok, send_method} = complete(:send, account, address)
     before = Repo.get!(OAuthAuthorization, send_method.oauth_authorization_id)
     assert Repo.aggregate(SyncCursor, :count) == 0
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
 
     assert {:ok, receive} =
              complete(:receive, account, address,
@@ -735,7 +735,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
     event = Repo.get_by!(ConnectorEvent, event_type: "reconnect_required")
     assert Map.get(event, :oauth_authorization_id) == before.id
     refute inspect(event) =~ "raw-refresh-secret"
-    refute Enum.any?(Repo.all(Oban.Job), &(inspect(&1) =~ "raw-refresh-secret"))
+    refute Enum.any?(Repo.all(Styx.Job), &(inspect(&1) =~ "raw-refresh-secret"))
   end
 
   test "reconnect propagation makes pre-mark receive changesets stale", %{
@@ -1202,7 +1202,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
 
     assert Repo.aggregate(SendMethod, :count) == 0
 
-    for value <- Repo.all(ConnectorEvent) ++ Repo.all(Oban.Job) do
+    for value <- Repo.all(ConnectorEvent) ++ Repo.all(Styx.Job) do
       serialized = inspect(value)
       refute serialized =~ "raw-authorization-code"
       refute serialized =~ "raw-access-token"
@@ -1838,7 +1838,7 @@ defmodule Manifold.Connectors.GmailAuthorizationsTest do
 
   defp sync_job_count(receive_method_id) do
     Repo.aggregate(
-      from(job in Oban.Job,
+      from(job in Styx.Job,
         where:
           job.worker == ^inspect(SyncAccount) and
             fragment("?->>'external_account_id' = ?", job.args, ^receive_method_id)
@@ -2174,7 +2174,7 @@ defmodule Manifold.Connectors.GmailAuthorizationGenerationConcurrencyTest do
       |> Repo.all()
 
     Repo.delete_all(
-      from(job in Oban.Job,
+      from(job in Styx.Job,
         where: fragment("?->>'external_account_id' = ANY(?)", job.args, ^receive_ids)
       )
     )

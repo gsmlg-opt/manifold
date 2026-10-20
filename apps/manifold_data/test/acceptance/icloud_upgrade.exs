@@ -124,7 +124,7 @@ try do
     "Migration produced outbound revisions"
   )
 
-  check.(Repo.aggregate(Oban.Job, :count) == 0, "Migration queued uploads")
+  check.(Repo.aggregate(Styx.Job, :count) == 0, "Migration queued uploads")
 
   check.(
     is_nil(Repo.get!(ICloudConnection, ids.connection).account_id),

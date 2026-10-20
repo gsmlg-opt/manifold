@@ -3,7 +3,7 @@ defmodule Manifold.Ingest.Jobs.ArchiveRawEmail do
   Archives accepted raw messages from ready spool bundles into the raw store.
   """
 
-  use Oban.Worker,
+  use Styx.Worker,
     queue: :archive,
     max_attempts: 10,
     unique: [
@@ -16,8 +16,8 @@ defmodule Manifold.Ingest.Jobs.ArchiveRawEmail do
   alias Manifold.Core.Error
   alias Manifold.Ingest
 
-  @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"inbound_delivery_id" => delivery_id}}) do
+  @impl Styx.Worker
+  def perform(%Styx.Job{args: %{"inbound_delivery_id" => delivery_id}}) do
     case Ingest.archive_delivery(delivery_id) do
       :ok -> :ok
       {:error, %Error{class: :permanent, reason: reason}} -> {:cancel, reason}

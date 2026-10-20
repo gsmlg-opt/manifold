@@ -3,7 +3,7 @@ defmodule Manifold.Ingest.Jobs.EvaluateInboundSecurity do
   Evaluates an archived inbound delivery through the configured security adapters.
   """
 
-  use Oban.Worker,
+  use Styx.Worker,
     queue: :security,
     max_attempts: 10,
     unique: [
@@ -16,8 +16,8 @@ defmodule Manifold.Ingest.Jobs.EvaluateInboundSecurity do
   alias Manifold.Core.Error
   alias Manifold.Ingest
 
-  @impl Oban.Worker
-  def perform(%Oban.Job{
+  @impl Styx.Worker
+  def perform(%Styx.Job{
         args:
           %{
             "inbound_delivery_id" => delivery_id,

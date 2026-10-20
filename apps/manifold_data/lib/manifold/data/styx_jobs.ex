@@ -1,6 +1,6 @@
-defmodule Manifold.Data.ObanJobs do
+defmodule Manifold.Data.StyxJobs do
   @moduledoc """
-  Read-only helpers for listing and summarizing Oban jobs.
+  Read-only helpers for listing and summarizing Styx jobs.
   """
 
   import Ecto.Query
@@ -23,7 +23,7 @@ defmodule Manifold.Data.ObanJobs do
 
   @spec queues() :: [String.t()]
   def queues do
-    case :manifold_data |> Application.get_env(Oban, []) |> Keyword.get(:queues, []) do
+    case :manifold_data |> Application.get_env(Styx, []) |> Keyword.get(:queues, []) do
       queues when is_list(queues) and queues != [] ->
         queues
         |> Enum.map(fn
@@ -38,11 +38,11 @@ defmodule Manifold.Data.ObanJobs do
     end
   end
 
-  @spec list_jobs(filters()) :: [Oban.Job.t()]
+  @spec list_jobs(filters()) :: [Styx.Job.t()]
   def list_jobs(filters \\ %{}) do
     limit = Map.get(filters, :limit, @default_limit)
 
-    Oban.Job
+    Styx.Job
     |> filter_state(filters)
     |> filter_queue(filters)
     |> order_by([job], desc: job.id)
@@ -53,7 +53,7 @@ defmodule Manifold.Data.ObanJobs do
   @spec summary() :: %{String.t() => non_neg_integer()}
   def summary do
     counts =
-      Oban.Job
+      Styx.Job
       |> group_by([job], job.state)
       |> select([job], {job.state, count(job.id)})
       |> Repo.all()

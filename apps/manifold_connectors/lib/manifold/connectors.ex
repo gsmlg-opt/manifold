@@ -690,10 +690,10 @@ defmodule Manifold.Connectors do
 
   @spec sync_job_running?(Ecto.UUID.t()) :: boolean()
   def sync_job_running?(account_id) when is_binary(account_id) do
-    match?(%Oban.Job{}, incomplete_sync_job(Repo, account_id))
+    match?(%Styx.Job{}, incomplete_sync_job(Repo, account_id))
   end
 
-  @spec enqueue_sync(Ecto.UUID.t()) :: {:ok, Oban.Job.t()} | {:error, Error.t() | term()}
+  @spec enqueue_sync(Ecto.UUID.t()) :: {:ok, Styx.Job.t()} | {:error, Error.t() | term()}
   def enqueue_sync(account_id) do
     Repo.transaction(fn ->
       mailbox_id =
@@ -994,7 +994,7 @@ defmodule Manifold.Connectors do
     end)
     |> Multi.run(:cancel_jobs, fn repo, %{method: method} ->
       {_count, _} =
-        Oban.Job
+        Styx.Job
         |> where([job], job.worker == ^inspect(SyncAccount))
         |> where([job], job.state in ~w(available scheduled retryable suspended))
         |> where(
@@ -1112,7 +1112,7 @@ defmodule Manifold.Connectors do
   def push_imap_read(remote_message_id, read?), do: push_remote_read(remote_message_id, read?)
 
   defp replace_push_read_job(repo, remote_message_id, read?) do
-    Oban.Job
+    Styx.Job
     |> where([job], job.worker == ^inspect(PushRemoteRead))
     |> where([job], job.state in ~w(available scheduled retryable))
     |> where(
@@ -1176,7 +1176,7 @@ defmodule Manifold.Connectors do
   end
 
   defp incomplete_sync_job(repo, account_id) do
-    Oban.Job
+    Styx.Job
     |> where([job], job.worker == ^inspect(SyncAccount))
     |> where([job], job.state in ~w(available scheduled executing retryable suspended))
     |> where(
@@ -2544,7 +2544,7 @@ defmodule Manifold.Connectors do
   end
 
   defp account_job_query(mailbox_id) do
-    Oban.Job
+    Styx.Job
     |> where([job], job.state in ~w(available scheduled executing retryable suspended cancelled))
     |> where(
       [job],
@@ -2601,7 +2601,7 @@ defmodule Manifold.Connectors do
 
   defp delete_account_jobs(repo, ids) do
     {count, _rows} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.id in ^ids)
       |> repo.delete_all()
 
@@ -2612,9 +2612,9 @@ defmodule Manifold.Connectors do
 
   defp cancel_executing_account_jobs(ids) do
     {:ok, count} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.id in ^ids and job.state == "executing")
-      |> Oban.cancel_all_jobs()
+      |> Styx.cancel_all_jobs()
 
     count
   end

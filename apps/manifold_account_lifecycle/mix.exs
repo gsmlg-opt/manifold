@@ -28,7 +28,7 @@ defmodule Manifold.AccountLifecycle.MixProject do
       {:manifold_security, in_umbrella: true},
       {:manifold_storage, in_umbrella: true},
       {:manifold_data, in_umbrella: true},
-      {:oban, "~> 2.23"}
+      {:styx, "== 0.1.1"}
     ]
   end
 end

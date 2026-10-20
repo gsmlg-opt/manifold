@@ -1,7 +1,7 @@
 defmodule Manifold.Connectors.Jobs.PushRemoteRead do
   @moduledoc false
 
-  use Oban.Worker,
+  use Styx.Worker,
     queue: :connectors,
     max_attempts: 10,
     unique: [
@@ -14,8 +14,8 @@ defmodule Manifold.Connectors.Jobs.PushRemoteRead do
   alias Manifold.Connectors.Provider.Error, as: ProviderError
   alias Manifold.Core.Error
 
-  @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"remote_message_id" => remote_message_id, "read" => read}})
+  @impl Styx.Worker
+  def perform(%Styx.Job{args: %{"remote_message_id" => remote_message_id, "read" => read}})
       when is_boolean(read) do
     case Connectors.push_remote_read(remote_message_id, read) do
       :ok ->

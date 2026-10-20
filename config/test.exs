@@ -10,7 +10,7 @@ config :manifold_data, Manifold.Repo,
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: System.schedulers_online() * 2
 
-config :manifold_data, Oban, testing: :manual, queues: false, plugins: false
+config :manifold_data, Styx, testing: :manual, queues: false, plugins: false
 
 config :manifold_connectors,
   encryption_key: "A/6Bm4le6HQiXyh+gE1NQr2+RLEcEpZ/JSPBt4y1Lrk=",

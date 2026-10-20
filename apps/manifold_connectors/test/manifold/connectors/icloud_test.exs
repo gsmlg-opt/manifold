@@ -22,11 +22,11 @@ defmodule Manifold.Connectors.ICloudTest do
              Crypto.decrypt(stored.password_ciphertext, "icloud:#{public.id}:app_password")
 
     assert {:error, _} = Crypto.decrypt(stored.password_ciphertext, "icloud:wrong:app_password")
-    assert [job] = Repo.all(Oban.Job)
+    assert [job] = Repo.all(Styx.Job)
     assert job.args == %{"connection_id" => public.id, "generation" => 1}
     assert {:ok, repeated} = ICloud.sync_now(public.id)
     assert repeated.id == job.id
-    assert length(Repo.all(Oban.Job)) == 1
+    assert length(Repo.all(Styx.Job)) == 1
   end
 
   test "configuration errors never carry app passwords and credentials change generation" do
@@ -54,10 +54,10 @@ defmodule Manifold.Connectors.ICloudTest do
     {:ok, a} = connect(%{apple_id: "one@example.test", app_password: "password"})
     {:ok, b} = connect(%{apple_id: "two@example.test", app_password: "password"})
     {:ok, _} = ICloud.set_enabled(b.id, false)
-    Repo.delete_all(Oban.Job)
+    Repo.delete_all(Styx.Job)
     Repo.update_all(ICloudConnection, set: [next_sync_at: DateTime.add(DateTime.utc_now(), -10)])
     assert {:ok, 1} = ICloud.enqueue_due_syncs()
-    assert [job] = Repo.all(Oban.Job)
+    assert [job] = Repo.all(Styx.Job)
     assert job.args["connection_id"] == a.id
     assert {:ok, 0} = ICloud.enqueue_due_syncs()
   end

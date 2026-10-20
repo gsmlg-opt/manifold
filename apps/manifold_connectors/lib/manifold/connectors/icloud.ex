@@ -390,7 +390,7 @@ defmodule Manifold.Connectors.ICloud do
   defp queue_locked(c) do
     existing =
       Repo.one(
-        from j in Oban.Job,
+        from j in Styx.Job,
           where:
             j.worker == "Manifold.Connectors.Jobs.SyncICloud" and j.state in ^@incomplete and
               fragment("?->>'connection_id' = ?", j.args, ^c.id) and
@@ -409,7 +409,7 @@ defmodule Manifold.Connectors.ICloud do
 
   defp cancel_pending(id) do
     Repo.update_all(
-      from(j in Oban.Job,
+      from(j in Styx.Job,
         where:
           j.worker == "Manifold.Connectors.Jobs.SyncICloud" and
             j.state in ["available", "scheduled", "retryable"] and

@@ -33,7 +33,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     old_config = Application.get_env(:manifold_outbound, :provider_config)
 
     Application.put_env(:manifold_outbound, :provider_adapter, ConfiguredProvider)
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     on_exit(fn ->
       restore_env(:provider_adapter, old_adapter)
@@ -54,7 +54,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     assert Repo.get!(OutboundMessage, message.id).state == "accepted_by_provider"
   end
 
-  test "returns transient errors to Oban for retry" do
+  test "returns transient errors to Styx for retry" do
     message = queued_message_fixture()
 
     Application.put_env(
@@ -114,7 +114,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
          }}
     )
 
-    result = Oban.drain_queue(queue: :outbound)
+    result = Styx.drain_queue(queue: :outbound)
     assert result.success == 1
     assert result.failure == 0
     assert result.discard == 0
@@ -140,8 +140,8 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     assert event_count(message.id, "submission_retryable") == 0
     assert Repo.aggregate(active_submit_jobs(message.id), :count) == 0
 
-    assert %Oban.Job{state: "completed", attempt: 8, max_attempts: 9} =
-             Repo.get!(Oban.Job, persisted_job.id)
+    assert %Styx.Job{state: "completed", attempt: 8, max_attempts: 9} =
+             Repo.get!(Styx.Job, persisted_job.id)
 
     assert {:cancel, "submission_not_retryable"} =
              SubmitOutbound.perform(job(message.id, attempt: 9, max_attempts: 9))
@@ -252,7 +252,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
 
     reinsert_submission!(submission, request_sha256: String.duplicate("0", 64))
 
-    result = Oban.drain_queue(queue: :outbound)
+    result = Styx.drain_queue(queue: :outbound)
     assert result.success == 1
     assert result.failure == 0
     assert result.discard == 0
@@ -319,7 +319,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
       |> HTTPClient.Test.json(%{"error" => %{"code" => "ServiceUnavailable"}})
     end)
 
-    result = Oban.drain_queue(queue: :outbound)
+    result = Styx.drain_queue(queue: :outbound)
     assert result.success == 1
 
     persisted = Repo.get!(OutboundMessage, message.id)
@@ -373,7 +373,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     end)
 
     snooze_started_at = DateTime.utc_now()
-    first_drain = Oban.drain_queue(queue: :outbound)
+    first_drain = Styx.drain_queue(queue: :outbound)
     snooze_finished_at = DateTime.utc_now()
     assert first_drain.snoozed == 1
     assert first_drain.success == 0
@@ -386,7 +386,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     assert Repo.get!(ProviderSubmission, submission.id).attempt_count == 1
     assert explicit_request_payload(submission.id) == payload
 
-    assert [%Oban.Job{} = scheduled] = Repo.all(submit_jobs(message.id))
+    assert [%Styx.Job{} = scheduled] = Repo.all(submit_jobs(message.id))
     assert scheduled.id == original_job.id
     assert scheduled.state == "scheduled"
     assert scheduled.attempt == original_job.attempt
@@ -415,13 +415,13 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     assert retryable.state == "available"
 
     # Making the job available early must not bypass mailbox cooldown or spend a send attempt.
-    early_drain = Oban.drain_queue(queue: :outbound)
+    early_drain = Styx.drain_queue(queue: :outbound)
     assert early_drain.snoozed == 1
     assert early_drain.success == 0
     assert Repo.get!(ProviderSubmission, submission.id).attempt_count == 1
     assert Repo.get!(OutboundMessage, message.id).state == "queued"
 
-    Repo.get!(Oban.Job, scheduled.id)
+    Repo.get!(Styx.Job, scheduled.id)
     |> Ecto.Changeset.change(state: "available", scheduled_at: DateTime.utc_now())
     |> Repo.update!()
 
@@ -433,7 +433,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
       Plug.Conn.send_resp(conn, 202, "")
     end)
 
-    second_drain = Oban.drain_queue(queue: :outbound)
+    second_drain = Styx.drain_queue(queue: :outbound)
     assert second_drain.success == 1
     assert second_drain.snoozed == 0
 
@@ -449,7 +449,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     assert Repo.get!(OutboundMessage, message.id).state == "accepted_by_provider"
     assert Repo.aggregate(active_submit_jobs(message.id), :count) == 0
 
-    assert [%Oban.Job{id: job_id, state: "completed"}] = Repo.all(submit_jobs(message.id))
+    assert [%Styx.Job{id: job_id, state: "completed"}] = Repo.all(submit_jobs(message.id))
     assert job_id == scheduled.id
   end
 
@@ -470,7 +470,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
       |> HTTPClient.Test.json(%{"error" => %{"code" => "TooManyRequests"}})
     end)
 
-    result = Oban.drain_queue(queue: :outbound)
+    result = Styx.drain_queue(queue: :outbound)
     assert result.success == 1
     assert result.snoozed == 0
     assert result.failure == 0
@@ -492,8 +492,8 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
     assert event_count(message.id, "submission_retryable") == 0
     assert Repo.aggregate(active_submit_jobs(message.id), :count) == 0
 
-    assert %Oban.Job{state: "completed", attempt: 8, max_attempts: 12} =
-             Repo.get!(Oban.Job, persisted_job.id)
+    assert %Styx.Job{state: "completed", attempt: 8, max_attempts: 12} =
+             Repo.get!(Styx.Job, persisted_job.id)
 
     assert {:cancel, "submission_not_retryable"} =
              SubmitOutbound.perform(job(message.id, attempt: 9, max_attempts: 12))
@@ -692,7 +692,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
   end
 
   defp job(message_id, attrs \\ []) do
-    struct!(Oban.Job, Keyword.merge([args: %{"outbound_message_id" => message_id}], attrs))
+    struct!(Styx.Job, Keyword.merge([args: %{"outbound_message_id" => message_id}], attrs))
   end
 
   defp queued_message_fixture do
@@ -921,7 +921,7 @@ defmodule Manifold.Outbound.Jobs.SubmitOutboundTest do
   end
 
   defp submit_jobs(message_id) do
-    from(job in Oban.Job,
+    from(job in Styx.Job,
       where:
         job.worker == ^inspect(SubmitOutbound) and
           fragment("?->>'outbound_message_id' = ?", job.args, ^message_id)

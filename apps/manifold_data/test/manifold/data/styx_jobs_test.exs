@@ -1,18 +1,18 @@
-defmodule Manifold.Data.ObanJobsTest do
+defmodule Manifold.Data.StyxJobsTest do
   use Manifold.DataCase, async: true
 
-  alias Manifold.Data.ObanJobs
+  alias Manifold.Data.StyxJobs
 
   test "list_jobs filters by state and queue and returns newest first" do
     available = insert_job!("available", "connectors")
     completed = insert_job!("completed", "outbound")
     _other = insert_job!("completed", "connectors")
 
-    assert Enum.map(ObanJobs.list_jobs(%{state: "available"}), & &1.id) == [available.id]
+    assert Enum.map(StyxJobs.list_jobs(%{state: "available"}), & &1.id) == [available.id]
 
-    assert Enum.map(ObanJobs.list_jobs(%{queue: "outbound"}), & &1.id) == [completed.id]
+    assert Enum.map(StyxJobs.list_jobs(%{queue: "outbound"}), & &1.id) == [completed.id]
 
-    ids = Enum.map(ObanJobs.list_jobs(%{limit: 2}), & &1.id)
+    ids = Enum.map(StyxJobs.list_jobs(%{limit: 2}), & &1.id)
     assert length(ids) == 2
     assert ids == Enum.sort(ids, :desc)
   end
@@ -22,7 +22,7 @@ defmodule Manifold.Data.ObanJobsTest do
     insert_job!("completed", "connectors")
     insert_job!("completed", "outbound")
 
-    summary = ObanJobs.summary()
+    summary = StyxJobs.summary()
 
     assert summary["available"] == 1
     assert summary["completed"] == 2
@@ -30,9 +30,9 @@ defmodule Manifold.Data.ObanJobsTest do
     assert summary["executing"] == 0
   end
 
-  test "queues falls back to known names when Oban queues are disabled" do
-    assert "connectors" in ObanJobs.queues()
-    assert "outbound" in ObanJobs.queues()
+  test "queues falls back to known names when Styx queues are disabled" do
+    assert "connectors" in StyxJobs.queues()
+    assert "outbound" in StyxJobs.queues()
   end
 
   defp insert_job!(state, queue) do
@@ -55,7 +55,7 @@ defmodule Manifold.Data.ObanJobsTest do
       completed_at: if(state == "completed", do: now, else: nil)
     }
 
-    %Oban.Job{}
+    %Styx.Job{}
     |> Ecto.Changeset.change(attrs)
     |> Repo.insert!()
   end

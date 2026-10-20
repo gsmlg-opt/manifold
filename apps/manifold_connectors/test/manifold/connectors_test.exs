@@ -180,7 +180,7 @@ defmodule Manifold.ConnectorsTest do
 
     assert is_nil(event.external_account_id)
 
-    assert Repo.get_by!(Oban.Job,
+    assert Repo.get_by!(Styx.Job,
              worker: inspect(SyncAccount),
              args: %{"external_account_id" => account.id}
            )
@@ -314,7 +314,7 @@ defmodule Manifold.ConnectorsTest do
     assert persisted_remote.external_account_id == receive_method.id
     assert persisted_remote.provider_message_id == provider_message_id
 
-    assert Repo.get!(Oban.Job, job.id).args == %{"external_account_id" => receive_method.id}
+    assert Repo.get!(Styx.Job, job.id).args == %{"external_account_id" => receive_method.id}
 
     assert Enum.all?(Repo.all(ConnectorEvent), fn event ->
              event.oauth_authorization_id == authorization.id and
@@ -331,7 +331,7 @@ defmodule Manifold.ConnectorsTest do
     assert Repo.aggregate(Credential, :count) == 0
     assert Repo.aggregate(SyncCursor, :count) == 0
     assert Repo.aggregate(ConnectorEvent, :count) == 0
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
   end
 
   test "account list is a public projection without encrypted fields", %{
@@ -384,7 +384,7 @@ defmodule Manifold.ConnectorsTest do
     assert {:ok, _job} = Connectors.enqueue_sync(account.id)
 
     assert Repo.aggregate(
-             from(job in Oban.Job,
+             from(job in Styx.Job,
                where:
                  job.worker == ^inspect(SyncAccount) and
                    fragment("?->>'external_account_id' = ?", job.args, ^account.id)
@@ -412,7 +412,7 @@ defmodule Manifold.ConnectorsTest do
     assert is_nil(Repo.get(ReceiveMethod, account.id))
 
     assert Repo.aggregate(
-             from(job in Oban.Job,
+             from(job in Styx.Job,
                where:
                  job.worker == ^inspect(SyncAccount) and
                    fragment("?->>'external_account_id' = ?", job.args, ^account.id)
@@ -466,13 +466,13 @@ defmodule Manifold.ConnectorsTest do
     assert {:ok, account} =
              Connectors.complete_authorization("microsoft", "valid-code", consumed(mailbox.id))
 
-    Repo.delete_all(Oban.Job)
+    Repo.delete_all(Styx.Job)
 
-    assert :ok = PollAccounts.perform(%Oban.Job{args: %{}})
-    assert :ok = PollAccounts.perform(%Oban.Job{args: %{}})
+    assert :ok = PollAccounts.perform(%Styx.Job{args: %{}})
+    assert :ok = PollAccounts.perform(%Styx.Job{args: %{}})
 
     query =
-      from(job in Oban.Job,
+      from(job in Styx.Job,
         where:
           job.worker == ^inspect(SyncAccount) and
             fragment("?->>'external_account_id' = ?", job.args, ^account.id)
@@ -481,8 +481,8 @@ defmodule Manifold.ConnectorsTest do
     assert Repo.aggregate(query, :count) == 1
 
     assert {:ok, _account} = Connectors.disconnect(account.id)
-    Repo.delete_all(Oban.Job)
-    assert :ok = PollAccounts.perform(%Oban.Job{args: %{}})
+    Repo.delete_all(Styx.Job)
+    assert :ok = PollAccounts.perform(%Styx.Job{args: %{}})
     assert Repo.aggregate(query, :count) == 0
   end
 
@@ -513,7 +513,7 @@ defmodule Manifold.ConnectorsTest do
       refute Repo.get!(RemoteMessage, remote.id).remote_read
 
       refute Repo.exists?(
-               from(job in Oban.Job,
+               from(job in Styx.Job,
                  where:
                    job.worker == ^inspect(PushRemoteRead) and
                      fragment("?->>'remote_message_id' = ?", job.args, ^remote.id)
@@ -561,7 +561,7 @@ defmodule Manifold.ConnectorsTest do
     refute Repo.get!(RemoteMessage, purging_remote.id).remote_read
 
     assert Repo.exists?(
-             from(job in Oban.Job,
+             from(job in Styx.Job,
                where:
                  job.worker == ^inspect(PushRemoteRead) and
                    fragment("?->>'remote_message_id' = ?", job.args, ^active_remote.id)
@@ -569,7 +569,7 @@ defmodule Manifold.ConnectorsTest do
            )
 
     refute Repo.exists?(
-             from(job in Oban.Job,
+             from(job in Styx.Job,
                where:
                  job.worker == ^inspect(PushRemoteRead) and
                    fragment("?->>'remote_message_id' = ?", job.args, ^purging_remote.id)
@@ -582,14 +582,14 @@ defmodule Manifold.ConnectorsTest do
              Connectors.complete_authorization("microsoft", "valid-code", consumed(mailbox.id))
 
     # OAuth completion enqueues SyncAccount; clear so we assert from a known empty state
-    Repo.delete_all(Oban.Job)
+    Repo.delete_all(Styx.Job)
     refute Connectors.sync_job_running?(account.id)
 
     assert {:ok, _job} = Connectors.enqueue_sync(account.id)
     assert Connectors.sync_job_running?(account.id)
 
     {count, _} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.worker == ^inspect(Manifold.Connectors.Jobs.SyncAccount))
       |> where(
         [job],
@@ -718,9 +718,9 @@ defmodule Manifold.ConnectorsTest do
 
     assert_mailbox_not_active(fn -> Connectors.enqueue_sync(receive.id) end)
 
-    Repo.delete_all(Oban.Job)
+    Repo.delete_all(Styx.Job)
     assert {:ok, 0} = Connectors.enqueue_due_syncs()
-    refute Repo.exists?(from(job in Oban.Job, where: job.worker == ^inspect(SyncAccount)))
+    refute Repo.exists?(from(job in Styx.Job, where: job.worker == ^inspect(SyncAccount)))
 
     {1, nil} =
       Account
@@ -739,7 +739,7 @@ defmodule Manifold.ConnectorsTest do
     domain: domain,
     mailbox: mailbox
   } do
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     target_methods =
       for suffix <- ~w(one two three) do
@@ -782,17 +782,17 @@ defmodule Manifold.ConnectorsTest do
     assert Enum.all?(results, &(&1.cancelled <= 2))
     assert Enum.map(results, & &1.done?) == [false, false, false, true]
 
-    assert Repo.get_by!(Oban.Job,
+    assert Repo.get_by!(Styx.Job,
              worker: inspect(SyncAccount),
              args: %{"external_account_id" => other_method.id}
            ).state == "available"
 
-    assert Repo.get_by!(Oban.Job,
+    assert Repo.get_by!(Styx.Job,
              worker: inspect(ApplyRemoteState),
              args: %{"remote_message_id" => other_remote.id}
            ).state == "available"
 
-    assert Repo.get_by!(Oban.Job, worker: inspect(PollAccounts)).state == "available"
+    assert Repo.get_by!(Styx.Job, worker: inspect(PollAccounts)).state == "available"
 
     executing =
       hd(target_methods).id
@@ -800,18 +800,18 @@ defmodule Manifold.ConnectorsTest do
       |> Repo.insert!()
 
     {1, nil} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.id == ^executing.id)
       |> Repo.update_all(set: [state: "executing"])
 
     assert {:snooze, 5} = Connectors.cancel_account_jobs(mailbox.id, 2)
-    assert Repo.get!(Oban.Job, executing.id).state == "cancelled"
+    assert Repo.get!(Styx.Job, executing.id).state == "cancelled"
     assert %{cancelled: 1, done?: true} = Connectors.cancel_account_jobs(mailbox.id, 2)
-    refute Repo.get(Oban.Job, executing.id)
+    refute Repo.get(Styx.Job, executing.id)
   end
 
   test "cancel_account_jobs treats suspended matching jobs as incomplete", %{mailbox: mailbox} do
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
     method = insert_receive_method(mailbox.id, "suspended")
 
     job =
@@ -820,18 +820,18 @@ defmodule Manifold.ConnectorsTest do
       |> Repo.insert!()
 
     {1, nil} =
-      Oban.Job
+      Styx.Job
       |> where([candidate], candidate.id == ^job.id)
       |> Repo.update_all(set: [state: "suspended"])
 
     assert %{cancelled: 1, done?: true} = Connectors.cancel_account_jobs(mailbox.id, 10)
-    refute Repo.get(Oban.Job, job.id)
+    refute Repo.get(Styx.Job, job.id)
   end
 
   test "cancel_account_jobs keeps account ownership matching inside the job query", %{
     mailbox: mailbox
   } do
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     [target_method | _] =
       for index <- 1..25 do
@@ -856,13 +856,13 @@ defmodule Manifold.ConnectorsTest do
       capture_repo_queries(fn -> Connectors.cancel_account_jobs(mailbox.id, 10) end)
 
     assert %{cancelled: 1, done?: true} = result
-    refute Repo.get(Oban.Job, valid_job.id)
-    assert Enum.all?(malformed_jobs, &(Repo.get!(Oban.Job, &1.id).state == "available"))
+    refute Repo.get(Styx.Job, valid_job.id)
+    assert Enum.all?(malformed_jobs, &(Repo.get!(Styx.Job, &1.id).state == "available"))
 
     ownership_queries = Enum.filter(queries, &String.contains?(&1, "connector_accounts"))
     assert ownership_queries != []
 
-    assert Enum.all?(ownership_queries, &String.contains?(&1, "oban_jobs"))
+    assert Enum.all?(ownership_queries, &String.contains?(&1, "styx_jobs"))
     refute Enum.any?(ownership_queries, &String.contains?(&1, "receive_method.id::text"))
     refute Enum.any?(ownership_queries, &String.contains?(&1, "remote_message.id::text"))
 
@@ -1293,7 +1293,7 @@ defmodule Manifold.ConnectorsPollingRaceTest do
     assert {:ok, 0} = Task.await(poller)
 
     refute Repo.exists?(
-             from(job in Oban.Job,
+             from(job in Styx.Job,
                where:
                  job.worker == ^inspect(SyncAccount) and
                    fragment("?->>'external_account_id' = ?", job.args, ^method.id)
@@ -1325,7 +1325,7 @@ defmodule Manifold.ConnectorsPollingRaceTest do
 
     try do
       Repo.delete_all(
-        from(job in Oban.Job,
+        from(job in Styx.Job,
           where:
             job.worker == ^inspect(SyncAccount) and
               fragment("?->>'external_account_id' = ?", job.args, ^method_id)

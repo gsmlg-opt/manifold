@@ -54,7 +54,7 @@ defmodule Manifold.IngestTest do
     assert Repo.aggregate(MailboxEntry, :count) == 1
     assert Repo.one!(MailboxEntry).quarantined
     assert Repo.get_by!(MessageEvent, event_type: "accepted")
-    assert [%Oban.Job{worker: worker}] = Repo.all(Oban.Job)
+    assert [%Styx.Job{worker: worker}] = Repo.all(Styx.Job)
     assert worker == inspect(ArchiveRawEmail)
   end
 
@@ -103,7 +103,7 @@ defmodule Manifold.IngestTest do
              Ingest.accept(bundle, [route], fail_at: :after_delivery_insert_before_commit)
 
     refute Repo.get_by(InboundDelivery, ingest_id: "tx-failure")
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
   end
 
   test "frozen routes cannot accept mail after their mailbox is disabled" do
@@ -165,7 +165,7 @@ defmodule Manifold.IngestTest do
     assert Repo.aggregate(CloudIngressIdentity, :count) == 1
     assert Repo.aggregate(DeliveryRecipient, :count) == 1
     assert Repo.aggregate(MailboxEntry, :count) == 1
-    assert Repo.aggregate(Oban.Job, :count) == 1
+    assert Repo.aggregate(Styx.Job, :count) == 1
   end
 
   test "repeated edge import rejects conflicting content permanently" do
@@ -270,7 +270,7 @@ defmodule Manifold.IngestTest do
     assert inbound_delivery_id == delivery.id
     assert Repo.get_by!(MessageEvent, inbound_delivery_id: delivery.id, event_type: "accepted")
     assert Repo.get_by!(ExternalIngressIdentity, inbound_delivery_id: delivery.id)
-    assert Repo.get_by!(Oban.Job, worker: inspect(ArchiveRawEmail))
+    assert Repo.get_by!(Styx.Job, worker: inspect(ArchiveRawEmail))
 
     detail = Ingest.get_delivery_detail!(delivery.id)
     assert Enum.map(detail.mailboxes, & &1.id) == [mailbox.id]
@@ -289,7 +289,7 @@ defmodule Manifold.IngestTest do
     assert Repo.aggregate(InboundDelivery, :count) == 1
     assert Repo.aggregate(ExternalIngressIdentity, :count) == 1
     assert Repo.aggregate(MailboxEntry, :count) == 1
-    assert Repo.aggregate(Oban.Job, :count) == 1
+    assert Repo.aggregate(Styx.Job, :count) == 1
   end
 
   test "external acceptance can be recovered by trusted provider identity" do
@@ -371,7 +371,7 @@ defmodule Manifold.IngestTest do
 
     assert Repo.aggregate(InboundDelivery, :count) == 0
     assert Repo.aggregate(ExternalIngressIdentity, :count) == 0
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
     assert File.dir?(Path.join([Spool.spool_root(), "ready", source.ingest_id]))
   end
 
@@ -642,7 +642,7 @@ defmodule Manifold.IngestTest do
   end
 
   test "delivery job cancellation is bounded and preserves unrelated work" do
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     %{route: route} = route_fixture()
     assert {:ok, delivery} = accept_delivery([route])
@@ -655,7 +655,7 @@ defmodule Manifold.IngestTest do
       EvaluateInboundSecurity.new(%{"inbound_delivery_id" => delivery.id}) |> Repo.insert!()
 
     {1, nil} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.id == ^suspended.id)
       |> Repo.update_all(set: [state: "suspended"])
 
@@ -672,18 +672,18 @@ defmodule Manifold.IngestTest do
 
     assert %{cancelled: 0, done?: true} = Ingest.cancel_delivery_jobs([delivery.id], 2)
 
-    assert Repo.get!(Oban.Job, unrelated.id).state == "available"
-    assert Repo.get!(Oban.Job, malformed.id).state == "available"
+    assert Repo.get!(Styx.Job, unrelated.id).state == "available"
+    assert Repo.get!(Styx.Job, malformed.id).state == "available"
   end
 
   test "executing delivery jobs require follow-up drain checks" do
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     %{route: route} = route_fixture()
     assert {:ok, delivery} = accept_delivery([route])
 
     first =
-      Oban.Job
+      Styx.Job
       |> where([job], job.worker == ^inspect(ArchiveRawEmail))
       |> where(
         [job],
@@ -694,7 +694,7 @@ defmodule Manifold.IngestTest do
     second = ProjectInboundMail.new(%{"inbound_delivery_id" => delivery.id}) |> Repo.insert!()
 
     {2, nil} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.id in [^first.id, ^second.id])
       |> Repo.update_all(set: [state: "executing"])
 
@@ -715,7 +715,7 @@ defmodule Manifold.IngestTest do
              Ingest.accept(bundle, [])
 
     refute Repo.get_by(InboundDelivery, ingest_id: "empty-routes")
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
   end
 
   test "acceptance rejects routes that differ from the durable manifest" do
@@ -730,7 +730,7 @@ defmodule Manifold.IngestTest do
              Ingest.accept(bundle, [changed_route])
 
     refute Repo.get_by(InboundDelivery, ingest_id: "route-mismatch")
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
   end
 
   test "repeated archival job is idempotent" do
@@ -763,8 +763,8 @@ defmodule Manifold.IngestTest do
 
     assert :ok = Ingest.archive_delivery(delivery.id)
 
-    assert %Oban.Job{} =
-             Repo.get_by(Oban.Job,
+    assert %Styx.Job{} =
+             Repo.get_by(Styx.Job,
                worker: inspect(ProjectInboundMail),
                args: %{
                  "inbound_delivery_id" => delivery.id,
@@ -773,8 +773,8 @@ defmodule Manifold.IngestTest do
                }
              )
 
-    assert %Oban.Job{} =
-             Repo.get_by(Oban.Job,
+    assert %Styx.Job{} =
+             Repo.get_by(Styx.Job,
                worker: inspect(EvaluateInboundSecurity),
                args: %{
                  "inbound_delivery_id" => delivery.id,
@@ -783,7 +783,7 @@ defmodule Manifold.IngestTest do
              )
 
     assert :ok =
-             ProjectInboundMail.perform(%Oban.Job{
+             ProjectInboundMail.perform(%Styx.Job{
                args: %{
                  "inbound_delivery_id" => delivery.id,
                  "parser_version" => parser_version,
@@ -807,7 +807,7 @@ defmodule Manifold.IngestTest do
     assert :ok = Ingest.archive_delivery(delivery.id)
 
     assert :ok =
-             EvaluateInboundSecurity.perform(%Oban.Job{
+             EvaluateInboundSecurity.perform(%Styx.Job{
                args: %{
                  "inbound_delivery_id" => delivery.id,
                  "evaluation_version" => 1
@@ -855,7 +855,7 @@ defmodule Manifold.IngestTest do
     assert message.parser_version == 1
 
     assert :ok =
-             ProjectInboundMail.perform(%Oban.Job{
+             ProjectInboundMail.perform(%Styx.Job{
                args: %{
                  "inbound_delivery_id" => delivery.id,
                  "parser_version" => 2,
@@ -956,7 +956,7 @@ defmodule Manifold.IngestTest do
     File.write!(Path.join(raw_dir, archived.raw_object_key), "corrupt")
 
     assert {:cancel, :raw_verification_failed} =
-             ProjectInboundMail.perform(%Oban.Job{
+             ProjectInboundMail.perform(%Styx.Job{
                args: %{
                  "inbound_delivery_id" => delivery.id,
                  "parser_version" => 1,
@@ -975,13 +975,13 @@ defmodule Manifold.IngestTest do
 
     ProjectInboundMail
     |> inspect()
-    |> then(fn worker -> from(job in Oban.Job, where: job.worker == ^worker) end)
+    |> then(fn worker -> from(job in Styx.Job, where: job.worker == ^worker) end)
     |> Repo.delete_all()
 
     assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
 
     assert Repo.aggregate(
-             from(job in Oban.Job,
+             from(job in Styx.Job,
                where:
                  job.worker == ^inspect(ProjectInboundMail) and
                    fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery.id)
@@ -998,14 +998,14 @@ defmodule Manifold.IngestTest do
     ProjectInboundMail
     |> inspect()
     |> then(fn worker ->
-      from(job in Oban.Job, where: job.worker == ^worker)
+      from(job in Styx.Job, where: job.worker == ^worker)
     end)
     |> Repo.delete_all()
 
     assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
 
     assert Repo.aggregate(
-             from(job in Oban.Job,
+             from(job in Styx.Job,
                where:
                  job.worker == ^inspect(ProjectInboundMail) and
                    fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery.id)
@@ -1022,14 +1022,14 @@ defmodule Manifold.IngestTest do
     EvaluateInboundSecurity
     |> inspect()
     |> then(fn worker ->
-      from(job in Oban.Job, where: job.worker == ^worker)
+      from(job in Styx.Job, where: job.worker == ^worker)
     end)
     |> Repo.delete_all()
 
     assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
 
     assert Repo.aggregate(
-             from(job in Oban.Job,
+             from(job in Styx.Job,
                where:
                  job.worker == ^inspect(EvaluateInboundSecurity) and
                    fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery.id)
@@ -1042,14 +1042,14 @@ defmodule Manifold.IngestTest do
     EvaluateInboundSecurity
     |> inspect()
     |> then(fn worker ->
-      from(job in Oban.Job, where: job.worker == ^worker)
+      from(job in Styx.Job, where: job.worker == ^worker)
     end)
     |> Repo.delete_all()
 
     assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
 
     assert Repo.aggregate(
-             from(job in Oban.Job, where: job.worker == ^inspect(EvaluateInboundSecurity)),
+             from(job in Styx.Job, where: job.worker == ^inspect(EvaluateInboundSecurity)),
              :count
            ) == 0
   end
@@ -1080,7 +1080,7 @@ defmodule Manifold.IngestTest do
       ProjectInboundMail
       |> inspect()
       |> then(fn worker ->
-        from(job in Oban.Job,
+        from(job in Styx.Job,
           where:
             job.worker == ^worker and
               fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery.id),
@@ -1090,8 +1090,8 @@ defmodule Manifold.IngestTest do
       |> Repo.all()
 
     assert [
-             %Oban.Job{args: %{"parser_version" => 1, "sanitizer_version" => 1}},
-             %Oban.Job{args: %{"parser_version" => 2, "sanitizer_version" => 2}} = upgraded_job
+             %Styx.Job{args: %{"parser_version" => 1, "sanitizer_version" => 1}},
+             %Styx.Job{args: %{"parser_version" => 2, "sanitizer_version" => 2}} = upgraded_job
            ] = jobs
 
     assert :ok = ProjectInboundMail.perform(upgraded_job)
@@ -1112,7 +1112,7 @@ defmodule Manifold.IngestTest do
     assert delivery.raw_storage_state == "spooled"
     assert File.exists?(delivery.spool_bundle_path)
 
-    assert :ok = ArchiveRawEmail.perform(%Oban.Job{args: %{"inbound_delivery_id" => delivery.id}})
+    assert :ok = ArchiveRawEmail.perform(%Styx.Job{args: %{"inbound_delivery_id" => delivery.id}})
   end
 
   test "retry repairs a corrupt raw object before committing archived state" do
@@ -1176,7 +1176,7 @@ defmodule Manifold.IngestTest do
     assert :ok = Reconciler.reconcile_once(root: Spool.spool_root())
 
     assert Repo.aggregate(
-             from(job in Oban.Job,
+             from(job in Styx.Job,
                where:
                  job.worker == ^inspect(ArchiveRawEmail) and
                    fragment("?->>'inbound_delivery_id' = ?", job.args, ^delivery.id)
@@ -1291,7 +1291,7 @@ defmodule Manifold.IngestTest do
 
     assert delivery.raw_storage_state == "spooled"
     assert File.exists?(delivery.spool_bundle_path)
-    assert Repo.aggregate(Oban.Job, :count) == 1
+    assert Repo.aggregate(Styx.Job, :count) == 1
   end
 
   test "crash boundary: raw copy before archived update is safe to retry" do
@@ -1443,7 +1443,7 @@ defmodule Manifold.IngestTest do
   defp target_job_state_counts(delivery_id) do
     workers = Enum.map([ArchiveRawEmail, ProjectInboundMail, EvaluateInboundSecurity], &inspect/1)
 
-    Oban.Job
+    Styx.Job
     |> where([job], job.worker in ^workers)
     |> where(
       [job],

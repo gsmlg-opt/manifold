@@ -26,7 +26,7 @@ defmodule Manifold.Connectors.MixProject do
       {:manifold_accounts, in_umbrella: true},
       {:manifold_ingest, in_umbrella: true},
       {:manifold_mail, in_umbrella: true},
-      {:oban, "~> 2.23"},
+      {:styx, "== 0.1.1"},
       {:saxy, "~> 1.6"},
       {:ex_ssl, "== 0.21.10"},
       {:jason, "~> 1.4"},

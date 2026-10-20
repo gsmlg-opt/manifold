@@ -3,6 +3,7 @@ import Config
 config :elixir, :time_zone_database, Tzdata.TimeZoneDatabase
 config :tzdata, :autoupdate, :disabled
 
+# Preserve the maintenance switch used to disable job consumers during migrations.
 config :manifold_data,
   ecto_repos: [Manifold.Repo],
   oban_enabled: config_env() != :test,
@@ -13,7 +14,7 @@ config :manifold_data, Manifold.Repo,
   migration_foreign_key: [type: :binary_id],
   migration_timestamps: [type: :utc_datetime_usec]
 
-config :manifold_data, Oban,
+config :manifold_data, Styx,
   repo: Manifold.Repo,
   queues: [
     archive: 10,
@@ -25,8 +26,8 @@ config :manifold_data, Oban,
     account_purge: 1
   ],
   plugins: [
-    {Oban.Plugins.Pruner, max_age: 86_400},
-    {Oban.Plugins.Cron,
+    {Styx.Plugins.Pruner, max_age: 86_400},
+    {Styx.Plugins.Cron,
      crontab: [
        {"*/5 * * * *", Manifold.Cloud.Jobs.PublishRoutes},
        {"* * * * *", Manifold.Cloud.Jobs.PullDeliveries},

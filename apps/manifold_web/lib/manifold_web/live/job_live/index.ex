@@ -3,7 +3,7 @@ defmodule ManifoldWeb.JobLive.Index do
 
   import ManifoldWeb.OperationsComponents
 
-  alias Manifold.Data.ObanJobs
+  alias Manifold.Data.StyxJobs
 
   @refresh_ms 5_000
 
@@ -15,8 +15,8 @@ defmodule ManifoldWeb.JobLive.Index do
         state_filter: "",
         queue_filter: "",
         expanded_id: nil,
-        queues: ObanJobs.queues(),
-        states: ObanJobs.states()
+        queues: StyxJobs.queues(),
+        states: StyxJobs.states()
       )
       |> refresh()
 
@@ -63,8 +63,8 @@ defmodule ManifoldWeb.JobLive.Index do
   def render(assigns) do
     ~H"""
     <.ops_shell current={:jobs}>
-      <h1>Oban Jobs</h1>
-      <dl class="ops-summary" aria-label="Oban jobs summary">
+      <h1>Styx Jobs</h1>
+      <dl class="ops-summary" aria-label="Styx jobs summary">
         <div>
           <dt>Total</dt><dd>{@summary["total"]}</dd>
         </div>
@@ -177,7 +177,7 @@ defmodule ManifoldWeb.JobLive.Index do
       |> maybe_put(:state, socket.assigns.state_filter)
       |> maybe_put(:queue, socket.assigns.queue_filter)
 
-    assign(socket, jobs: ObanJobs.list_jobs(filters), summary: ObanJobs.summary())
+    assign(socket, jobs: StyxJobs.list_jobs(filters), summary: StyxJobs.summary())
   end
 
   defp schedule_refresh do

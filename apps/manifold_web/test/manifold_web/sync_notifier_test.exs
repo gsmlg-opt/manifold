@@ -45,17 +45,17 @@ defmodule ManifoldWeb.SyncNotifierTest do
     topic = SyncNotifier.topic(account_id)
     Phoenix.PubSub.subscribe(Manifold.PubSub, topic)
 
-    job = %Oban.Job{
+    job = %Styx.Job{
       worker: inspect(SyncAccount),
       args: %{"external_account_id" => account_id}
     }
 
-    :ok = SyncNotifier.handle_event([:oban, :job, :start], %{}, %{job: job}, nil)
+    :ok = SyncNotifier.handle_event([:styx, :job, :start], %{}, %{job: job}, nil)
     assert_receive {:sync_job_changed, ^account_id, true}
 
     # create_imap_account enqueues a sync job; complete it so stop reports false
     {count, _} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.worker == ^inspect(SyncAccount))
       |> where(
         [job],
@@ -65,7 +65,7 @@ defmodule ManifoldWeb.SyncNotifierTest do
 
     assert count >= 1
 
-    :ok = SyncNotifier.handle_event([:oban, :job, :stop], %{}, %{job: job}, nil)
+    :ok = SyncNotifier.handle_event([:styx, :job, :stop], %{}, %{job: job}, nil)
     assert_receive {:sync_job_changed, ^account_id, false}
   end
 
@@ -73,12 +73,12 @@ defmodule ManifoldWeb.SyncNotifierTest do
     account_id = Ecto.UUID.generate()
     Phoenix.PubSub.subscribe(Manifold.PubSub, SyncNotifier.topic(account_id))
 
-    job = %Oban.Job{
+    job = %Styx.Job{
       worker: "Manifold.Connectors.Jobs.PollAccounts",
       args: %{"external_account_id" => account_id}
     }
 
-    :ok = SyncNotifier.handle_event([:oban, :job, :start], %{}, %{job: job}, nil)
+    :ok = SyncNotifier.handle_event([:styx, :job, :start], %{}, %{job: job}, nil)
     refute_receive {:sync_job_changed, _, _}, 50
   end
 
@@ -88,12 +88,12 @@ defmodule ManifoldWeb.SyncNotifierTest do
 
     Phoenix.PubSub.subscribe(Manifold.PubSub, SyncNotifier.topic(account_id))
 
-    job = %Oban.Job{
+    job = %Styx.Job{
       worker: inspect(SyncAccount),
       args: %{"external_account_id" => account_id}
     }
 
-    :ok = SyncNotifier.handle_event([:oban, :job, :exception], %{}, %{job: job}, nil)
+    :ok = SyncNotifier.handle_event([:styx, :job, :exception], %{}, %{job: job}, nil)
     assert_receive {:sync_job_changed, ^account_id, true}
   end
 

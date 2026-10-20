@@ -877,7 +877,7 @@ defmodule Manifold.Outbound do
   end
 
   defp account_job_query(mailbox_id) do
-    Oban.Job
+    Styx.Job
     |> where(
       [job],
       job.worker == ^inspect(SubmitOutbound) and
@@ -910,7 +910,7 @@ defmodule Manifold.Outbound do
 
   defp delete_account_jobs(repo, ids) do
     {count, _rows} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.id in ^ids)
       |> repo.delete_all()
 
@@ -921,9 +921,9 @@ defmodule Manifold.Outbound do
 
   defp cancel_executing_account_jobs(ids) do
     {:ok, count} =
-      Oban.Job
+      Styx.Job
       |> where([job], job.id in ^ids and job.state == "executing")
-      |> Oban.cancel_all_jobs()
+      |> Styx.cancel_all_jobs()
 
     count
   end

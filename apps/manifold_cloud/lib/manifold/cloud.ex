@@ -58,23 +58,23 @@ defmodule Manifold.Cloud do
   @spec configured?() :: boolean()
   def configured?, do: not is_nil(configured_source())
 
-  @spec enqueue_route_publication() :: {:ok, Oban.Job.t()} | {:error, term()} | :disabled
+  @spec enqueue_route_publication() :: {:ok, Styx.Job.t()} | {:error, term()} | :disabled
   def enqueue_route_publication do
     if configured?() do
       %{}
       |> PublishRoutes.new()
-      |> Oban.insert()
+      |> Styx.insert()
     else
       :disabled
     end
   end
 
-  @spec enqueue_pull() :: {:ok, Oban.Job.t()} | {:error, term()} | :disabled
+  @spec enqueue_pull() :: {:ok, Styx.Job.t()} | {:error, term()} | :disabled
   def enqueue_pull do
     if configured?() do
       %{}
       |> PullDeliveries.new()
-      |> Oban.insert()
+      |> Styx.insert()
     else
       :disabled
     end

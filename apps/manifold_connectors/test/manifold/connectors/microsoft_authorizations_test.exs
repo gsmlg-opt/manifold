@@ -274,7 +274,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert Repo.aggregate(SendMethod, :count) == 0
     assert Repo.aggregate(ConnectorEvent, :count) == 0
     assert Repo.aggregate(SyncCursor, :count) == 0
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
   end
 
   for {label, sequence, expected_scopes, receive_count, send_count} <- [
@@ -339,7 +339,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
       case receive_methods do
         [%ReceiveMethod{} = receive] -> assert sync_job_count(receive.id) == 1
-        [] -> assert Repo.aggregate(Oban.Job, :count) == 0
+        [] -> assert Repo.aggregate(Styx.Job, :count) == 0
       end
     end
   end
@@ -510,7 +510,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
       inspect(%{
         telemetry: [start_telemetry, connected, upgraded, rejected, refreshed, reconnect],
         connector_events: Enum.map(Repo.all(ConnectorEvent), & &1.metadata),
-        job_args: Enum.map(Repo.all(Oban.Job), & &1.args)
+        job_args: Enum.map(Repo.all(Styx.Job), & &1.args)
       })
 
     Enum.each(sentinels, &refute(inspected_safe_surfaces =~ &1))
@@ -1489,7 +1489,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
     assert Repo.aggregate(ReceiveMethod, :count) == 0
     assert Repo.aggregate(SyncCursor, :count) == 0
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
     assert Repo.aggregate(ConnectorEvent, :count) == events_before
   end
 
@@ -1633,7 +1633,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert Repo.get!(SendMethod, send_method.id).status == "connected"
     assert Repo.aggregate(ReceiveMethod, :count) == 0
     assert Repo.aggregate(SyncCursor, :count) == 0
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
     assert Repo.aggregate(ConnectorEvent, :count) == events_before + 2
   end
 
@@ -1710,7 +1710,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
     assert Repo.aggregate(ReceiveMethod, :count) == 0
     assert Repo.aggregate(SyncCursor, :count) == 0
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
     assert Repo.aggregate(ConnectorEvent, :count) == events_before
   end
 
@@ -1825,7 +1825,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
     assert Repo.get!(SendMethod, send_method.id).status == "connected"
     assert Repo.aggregate(ReceiveMethod, :count) == 0
     assert Repo.aggregate(SyncCursor, :count) == 0
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
     assert Repo.aggregate(ConnectorEvent, :count) == events_before + 1
   end
 
@@ -1862,7 +1862,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
     assert Repo.get!(SendMethod, send_method.id).status == "connected"
     assert Repo.aggregate(SyncCursor, :count) == 0
-    assert Repo.aggregate(Oban.Job, :count) == 0
+    assert Repo.aggregate(Styx.Job, :count) == 0
     assert Repo.aggregate(ConnectorEvent, :count) == events_before
   end
 
@@ -2385,7 +2385,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationsTest do
 
   defp sync_job_count(receive_method_id) do
     Repo.aggregate(
-      from(job in Oban.Job,
+      from(job in Styx.Job,
         where:
           job.worker == ^inspect(SyncAccount) and
             fragment("?->>'external_account_id' = ?", job.args, ^receive_method_id)
@@ -2654,7 +2654,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationCursorFenceTest do
 
   defp scoped_job_count(receive_method_id) do
     Repo.aggregate(
-      from(job in Oban.Job,
+      from(job in Styx.Job,
         where: fragment("?->>'external_account_id' = ?", job.args, ^receive_method_id)
       ),
       :count
@@ -2671,7 +2671,7 @@ defmodule Manifold.Connectors.MicrosoftAuthorizationCursorFenceTest do
   end
 
   defp cleanup_fixture!(fixture) do
-    Oban.Job
+    Styx.Job
     |> where(
       [job],
       fragment("?->>'external_account_id' = ?", job.args, ^fixture.receive.id)

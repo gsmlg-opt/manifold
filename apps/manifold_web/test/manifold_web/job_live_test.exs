@@ -12,7 +12,7 @@ defmodule ManifoldWeb.JobLiveTest do
     assert html =~ "Jobs"
 
     assert {:ok, _view, html} = live(conn, ~p"/jobs")
-    assert html =~ "Oban Jobs"
+    assert html =~ "Styx Jobs"
     assert html =~ "ops-nav"
     assert html =~ "is-current"
   end
@@ -74,7 +74,7 @@ defmodule ManifoldWeb.JobLiveTest do
       completed_at: if(state == "completed", do: now, else: nil)
     }
 
-    %Oban.Job{}
+    %Styx.Job{}
     |> Ecto.Changeset.change(attrs)
     |> Repo.insert!()
   end

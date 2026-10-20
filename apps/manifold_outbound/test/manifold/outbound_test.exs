@@ -72,7 +72,7 @@ defmodule Manifold.OutboundTest do
              )
   end
 
-  test "queueing freezes the draft and inserts exactly one Oban job transactionally" do
+  test "queueing freezes the draft and inserts exactly one Styx job transactionally" do
     %{mailbox: mailbox, address: address} = mailbox_fixture()
     method = send_method_fixture(mailbox.id, address, "gmail")
     draft = draft_fixture(mailbox.id, include_bcc: true)
@@ -83,7 +83,7 @@ defmodule Manifold.OutboundTest do
     assert queued.state == "queued"
     assert %DateTime{} = queued.queued_at
 
-    assert %Oban.Job{
+    assert %Styx.Job{
              worker: worker,
              args: %{"outbound_message_id" => outbound_message_id}
            } = Repo.one!(jobs_for(draft.id))
@@ -169,7 +169,7 @@ defmodule Manifold.OutboundTest do
     assert Repo.get!(OutboundMessage, draft.id).state == "draft"
     refute Repo.get_by(ProviderSubmission, outbound_message_id: draft.id)
 
-    refute Repo.get_by(Oban.Job,
+    refute Repo.get_by(Styx.Job,
              worker: inspect(SubmitOutbound),
              args: %{"outbound_message_id" => draft.id}
            )
@@ -272,7 +272,7 @@ defmodule Manifold.OutboundTest do
   end
 
   test "account job cancellation is bounded and preserves unrelated jobs" do
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     %{mailbox: mailbox, address: address} = mailbox_fixture()
     %{mailbox: other_mailbox, address: other_address} = mailbox_fixture()
@@ -290,7 +290,7 @@ defmodule Manifold.OutboundTest do
     assert {:ok, other_message} = Outbound.queue_draft(other_mailbox.id, other_draft.id)
 
     target_jobs =
-      Oban.Job
+      Styx.Job
       |> where([job], job.worker == ^inspect(SubmitOutbound))
       |> where(
         [job],
@@ -301,17 +301,17 @@ defmodule Manifold.OutboundTest do
 
     [suspended, _available, pending_execution, completed] = target_jobs
 
-    Oban.Job
+    Styx.Job
     |> where([job], job.id == ^suspended.id)
     |> Repo.update_all(set: [state: "suspended"])
 
-    Oban.Job
+    Styx.Job
     |> where([job], job.id == ^completed.id)
     |> Repo.update_all(set: [state: "completed"])
 
     unrelated =
       %{outbound_message_id: hd(target_messages).id}
-      |> Oban.Job.new(worker: "Manifold.UnrelatedWorker", queue: :outbound)
+      |> Styx.Job.new(worker: "Manifold.UnrelatedWorker", queue: :outbound)
       |> Repo.insert!()
 
     malformed =
@@ -325,7 +325,7 @@ defmodule Manifold.OutboundTest do
     assert target_incomplete_job_count(mailbox.id) == 1
     assert target_cancelled_job_count(mailbox.id) == 0
 
-    Oban.Job
+    Styx.Job
     |> where([job], job.id == ^pending_execution.id)
     |> Repo.update_all(set: [state: "executing"])
 
@@ -336,18 +336,18 @@ defmodule Manifold.OutboundTest do
     assert %{cancelled: 1, done?: true} = Outbound.cancel_account_jobs(mailbox.id, 2)
     assert target_cancelled_job_count(mailbox.id) == 0
 
-    assert Repo.get!(Oban.Job, completed.id).state == "completed"
-    assert Repo.get!(Oban.Job, unrelated.id).state == "available"
-    assert Repo.get!(Oban.Job, malformed.id).state == "available"
+    assert Repo.get!(Styx.Job, completed.id).state == "completed"
+    assert Repo.get!(Styx.Job, unrelated.id).state == "available"
+    assert Repo.get!(Styx.Job, malformed.id).state == "available"
 
-    assert Repo.get_by!(Oban.Job,
+    assert Repo.get_by!(Styx.Job,
              worker: inspect(SubmitOutbound),
              args: %{"outbound_message_id" => other_message.id}
            ).state == "available"
   end
 
   test "account job cancellation keeps bounded ownership selection in SQL" do
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     %{mailbox: mailbox, address: address} = mailbox_fixture()
     send_method_fixture(mailbox.id, address, "gmail")
@@ -367,7 +367,7 @@ defmodule Manifold.OutboundTest do
     ownership_query =
       Enum.find(queries, fn query ->
         String.starts_with?(query, "SELECT ") and
-          String.contains?(query, ~s("oban_jobs")) and
+          String.contains?(query, ~s("styx_jobs")) and
           String.contains?(query, ~s("outbound_messages")) and
           String.contains?(query, "ORDER BY") and
           String.contains?(query, "LIMIT $")
@@ -382,7 +382,7 @@ defmodule Manifold.OutboundTest do
   end
 
   test "account job cancellation locks selected jobs across state transitions" do
-    start_supervised!({Oban, Application.fetch_env!(:manifold_data, Oban)})
+    start_supervised!({Styx, Application.fetch_env!(:manifold_data, Styx)})
 
     {:ok, race_repo} =
       Repo.start_link(name: nil, pool: DBConnection.ConnectionPool, pool_size: 3)
@@ -402,7 +402,7 @@ defmodule Manifold.OutboundTest do
         assert {:ok, message} = Outbound.queue_draft(mailbox.id, draft.id)
 
         job =
-          Repo.get_by!(Oban.Job,
+          Repo.get_by!(Styx.Job,
             worker: inspect(SubmitOutbound),
             args: %{"outbound_message_id" => message.id}
           )
@@ -449,7 +449,7 @@ defmodule Manifold.OutboundTest do
         transition_task =
           Task.async(fn ->
             on_repo(race_repo, fn ->
-              Oban.Job
+              Styx.Job
               |> where([candidate], candidate.id == ^job.id and candidate.state == "available")
               |> Repo.update_all(set: [state: "executing"])
             end)
@@ -476,7 +476,7 @@ defmodule Manifold.OutboundTest do
     assert %{cancelled: 1, done?: true} = cancel_result
     assert {0, nil} = transition_result
 
-    refute on_repo(race_repo, fn -> Repo.get(Oban.Job, job.id) end)
+    refute on_repo(race_repo, fn -> Repo.get(Styx.Job, job.id) end)
     assert on_repo(race_repo, fn -> Repo.get!(OutboundMessage, message.id).id end) == message.id
 
     cleanup_race_fixture(race_repo, job.id, message.id, mailbox.id, domain.id)
@@ -718,7 +718,7 @@ defmodule Manifold.OutboundTest do
     assert request_payload =~ "Bcc: blind@example.net\r\n"
     assert submission.provider_rfc_message_id == "<#{queued.id}@manifold.local>"
 
-    assert [%Oban.Job{args: args}] = Repo.all(jobs_for(queued.id))
+    assert [%Styx.Job{args: args}] = Repo.all(jobs_for(queued.id))
     assert args == %{"outbound_message_id" => queued.id}
     refute inspect(args) =~ "blind@example.net"
     refute inspect(args) =~ "Private body"
@@ -1075,7 +1075,7 @@ defmodule Manifold.OutboundTest do
     if Process.alive?(repo) do
       try do
         on_repo(repo, fn ->
-          Oban.Job
+          Styx.Job
           |> where([candidate], candidate.id == ^job_id)
           |> Repo.delete_all()
 
@@ -1100,7 +1100,7 @@ defmodule Manifold.OutboundTest do
 
   defp selected_job_query?(query) do
     String.starts_with?(query, "SELECT ") and
-      String.contains?(query, ~s("oban_jobs")) and
+      String.contains?(query, ~s("styx_jobs")) and
       String.contains?(query, ~s("state")) and
       String.contains?(query, "ORDER BY") and
       String.contains?(query, "LIMIT $")
@@ -1121,7 +1121,7 @@ defmodule Manifold.OutboundTest do
   end
 
   defp account_job_query(mailbox_id) do
-    Oban.Job
+    Styx.Job
     |> join(:inner, [job], message in OutboundMessage,
       on: fragment("?->>'outbound_message_id' = ?::text", job.args, message.id)
     )
@@ -1267,7 +1267,7 @@ defmodule Manifold.OutboundTest do
   defp telemetry_terms(value), do: [value]
 
   defp jobs_for(message_id) do
-    from(job in Oban.Job,
+    from(job in Styx.Job,
       where: fragment("?->>'outbound_message_id'", job.args) == ^message_id
     )
   end
@@ -1452,7 +1452,7 @@ defmodule Manifold.OutboundSendMethodLockTest do
   end
 
   defp cleanup!(account, domain, message_id) do
-    Oban.Job
+    Styx.Job
     |> where(
       [job],
       fragment("?->>'outbound_message_id'", job.args) == ^message_id
