@@ -218,6 +218,383 @@ defmodule Manifold.Mail.ParserTest do
     assert parsed.html_body == "<p>Related root HTML body</p>"
   end
 
+  @tag :inline_body_regression
+  test "selects a standalone inline plain text body without an attachment" do
+    raw =
+      message("""
+      Subject: Inline plain
+      Content-Type: text/plain; charset=utf-8
+      Content-Disposition: inline
+
+      Inline plain body
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.text_body == "Inline plain body"
+    assert parsed.html_body == nil
+    assert parsed.attachments == []
+  end
+
+  @tag :inline_body_regression
+  test "selects a standalone inline HTML body even with a filename" do
+    raw =
+      message("""
+      Subject: Inline HTML
+      Content-Type: text/html; charset=utf-8
+      Content-Disposition: inline; filename=body.html
+
+      <p>Inline HTML body</p>
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.text_body == nil
+    assert parsed.html_body == "<p>Inline HTML body</p>"
+    assert parsed.attachments == []
+  end
+
+  @tag :inline_body_regression
+  test "selects unnamed inline alternatives without duplicating attachments" do
+    raw =
+      message("""
+      Subject: Inline alternatives
+      Content-Type: multipart/alternative; boundary=alternative
+
+      --alternative
+      Content-Type: text/plain
+      Content-Disposition: inline
+
+      Plain body
+      --alternative
+      Content-Type: text/html
+      Content-Disposition: inline
+
+      <p>HTML body</p>
+      --alternative--
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.text_body == "Plain body"
+    assert parsed.html_body == "<p>HTML body</p>"
+    assert parsed.attachments == []
+  end
+
+  @tag :inline_body_regression
+  test "selects named inline alternatives as bodies" do
+    raw =
+      message("""
+      Subject: Named inline alternatives
+      Content-Type: multipart/alternative; boundary=alternative
+
+      --alternative
+      Content-Type: text/plain; name=plain.txt
+      Content-Disposition: inline; filename=body.txt
+
+      Named plain body
+      --alternative
+      Content-Type: text/html; name=body.html
+      Content-Disposition: inline
+
+      <p>Named HTML body</p>
+      --alternative--
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.text_body == "Named plain body"
+    assert parsed.html_body == "<p>Named HTML body</p>"
+    assert parsed.attachments == []
+  end
+
+  @tag :inline_body_regression
+  test "treats empty and whitespace-only filenames and names as absent" do
+    for {filename, name} <- [{"", "   "}, {"   ", ""}] do
+      raw =
+        message("""
+        Subject: Blank names
+        Content-Type: text/plain; name="#{name}"
+        Content-Disposition: unspecified; filename="#{filename}"
+
+        Body without a filename
+        """)
+
+      assert {:ok, parsed} = Parser.parse(raw)
+      assert parsed.text_body == "Body without a filename"
+      assert parsed.attachments == []
+    end
+  end
+
+  @tag :inline_body_regression
+  test "falls back from a blank filename to a nonempty name and preserves the name" do
+    for filename <- ["", "   "] do
+      raw =
+        message("""
+        Subject: Filename fallback
+        Content-Type: text/plain; name="  report.txt  "
+        Content-Disposition: unspecified; filename="#{filename}"
+
+        Text file
+        """)
+
+      assert {:ok, parsed} = Parser.parse(raw)
+      assert parsed.text_body == nil
+      assert parsed.html_body == nil
+
+      assert [%{part_path: "1", filename: "  report.txt  ", bytes: bytes}] =
+               parsed.attachments
+
+      assert String.trim_trailing(bytes) == "Text file"
+    end
+  end
+
+  @tag :inline_body_regression
+  test "replaces each alternative body path while preserving superseded inline leaves" do
+    raw =
+      message("""
+      Subject: Competing inline alternatives
+      Content-Type: multipart/alternative; boundary=alternative
+
+      --alternative
+      Content-Type: text/plain
+      Content-Disposition: inline; filename=first.txt
+
+      First plain body
+      --alternative
+      Content-Type: text/html
+      Content-Disposition: inline; filename=first.html
+
+      <p>First HTML body</p>
+      --alternative
+      Content-Type: text/plain
+      Content-Disposition: inline; filename=last.txt
+
+      Last plain body
+      --alternative
+      Content-Type: text/html
+      Content-Disposition: inline; filename=last.html
+
+      <p>Last HTML body</p>
+      --alternative--
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.text_body == "Last plain body"
+    assert parsed.html_body == "<p>Last HTML body</p>"
+
+    assert [
+             %{part_path: "1", filename: "first.txt", disposition: "inline"},
+             %{part_path: "2", filename: "first.html", disposition: "inline"}
+           ] = parsed.attachments
+  end
+
+  @tag :inline_body_regression
+  test "selects a nested related root and preserves an unnamed inline CID image" do
+    # ASCII SVG isolates role selection from the existing binary charset conversion.
+    raw =
+      message("""
+      Subject: Nested inline related root
+      Content-Type: multipart/mixed; boundary=outer
+
+      --outer
+      Content-Type: multipart/related; boundary=related; start="<root@example.net>"
+
+      --related
+      Content-Type: image/svg+xml
+      Content-Disposition: inline
+      Content-ID: <logo@example.net>
+      Content-Transfer-Encoding: base64
+
+      PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4=
+      --related
+      Content-Type: multipart/alternative; boundary=alternative
+      Content-Disposition: inline
+      Content-ID: <root@example.net>
+
+      --alternative
+      Content-Type: text/plain
+      Content-Disposition: inline
+
+      Related plain body
+      --alternative
+      Content-Type: text/html
+      Content-Disposition: inline; filename=body.html
+
+      <p><img src="cid:logo@example.net">Related HTML body</p>
+      --alternative--
+      --related--
+      --outer--
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.text_body == "Related plain body"
+    assert parsed.html_body == "<p><img src=\"cid:logo@example.net\">Related HTML body</p>"
+
+    assert [
+             %{
+               part_path: "1.1",
+               filename: nil,
+               content_id: "<logo@example.net>",
+               media_type: "image/svg+xml",
+               disposition: "inline",
+               bytes: ~s(<svg xmlns="http://www.w3.org/2000/svg"/>)
+             }
+           ] = parsed.attachments
+  end
+
+  @tag :inline_body_regression
+  test "uses the first related part when start is absent and keeps inline siblings" do
+    raw =
+      message("""
+      Subject: Default related root
+      Content-Type: multipart/related; boundary=related
+
+      --related
+      Content-Type: text/html
+      Content-Disposition: inline
+
+      <p>Root HTML body</p>
+      --related
+      Content-Type: text/plain
+      Content-Disposition: inline
+      Content-ID: <resource@example.net>
+
+      Related resource
+      --related--
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.text_body == nil
+    assert parsed.html_body == "<p>Root HTML body</p>"
+
+    assert [%{part_path: "2", content_id: "<resource@example.net>", disposition: "inline"}] =
+             parsed.attachments
+  end
+
+  @tag :inline_body_regression
+  test "keeps unselected mixed inline siblings as attachments" do
+    raw =
+      message("""
+      Subject: Mixed inline siblings
+      Content-Type: multipart/mixed; boundary=mixed
+
+      --mixed
+      Content-Type: text/plain
+      Content-Disposition: inline
+
+      Primary body
+      --mixed
+      Content-Type: text/plain
+      Content-Disposition: inline
+
+      Secondary plain resource
+      --mixed
+      Content-Type: text/html
+      Content-Disposition: inline; filename=resource.html
+
+      <p>Secondary HTML resource</p>
+      --mixed--
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.text_body == "Primary body"
+    assert parsed.html_body == nil
+
+    assert [
+             %{part_path: "2", filename: nil, disposition: "inline"},
+             %{part_path: "3", filename: "resource.html", disposition: "inline"}
+           ] = parsed.attachments
+  end
+
+  @tag :inline_body_regression
+  test "excludes an explicit attachment subtree from body selection" do
+    raw =
+      message("""
+      Subject: Attached inline subtree
+      Content-Type: multipart/mixed; boundary=mixed
+
+      --mixed
+      Content-Type: multipart/alternative; boundary=attached
+      Content-Disposition: attachment
+
+      --attached
+      Content-Type: text/plain
+      Content-Disposition: inline; filename=attached.txt
+
+      Attached plain body
+      --attached
+      Content-Type: text/html
+      Content-Disposition: inline; filename=attached.html
+
+      <p>Attached HTML body</p>
+      --attached--
+      --mixed
+      Content-Type: text/plain
+      Content-Disposition: inline
+
+      Actual body
+      --mixed--
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.text_body == "Actual body"
+    assert parsed.html_body == nil
+
+    assert [
+             %{part_path: "1.1", filename: "attached.txt"},
+             %{part_path: "1.2", filename: "attached.html"}
+           ] = parsed.attachments
+  end
+
+  @tag :inline_body_regression
+  test "retains real text and HTML files while selecting inline body" do
+    raw =
+      message("""
+      Subject: Text file attachments
+      Content-Type: multipart/mixed; boundary=mixed
+
+      --mixed
+      Content-Type: text/plain; name=named.txt
+
+      Named text file
+      --mixed
+      Content-Type: text/html
+      Content-Disposition: attachment; filename="  page.html  "
+
+      <p>Attached HTML file</p>
+      --mixed
+      Content-Type: text/plain
+      Content-Disposition: inline
+
+      Actual body
+      --mixed--
+      """)
+
+    assert {:ok, parsed} = Parser.parse(raw)
+    assert parsed.text_body == "Actual body"
+    assert parsed.html_body == nil
+
+    assert [
+             %{part_path: "1", filename: "named.txt", disposition: "unspecified"},
+             %{part_path: "2", filename: "  page.html  ", disposition: "attachment"}
+           ] = parsed.attachments
+  end
+
+  @tag :inline_body_regression
+  test "applies the decoded body limit rather than the attachment limit to selected inline text" do
+    raw =
+      message("""
+      Subject: Inline body limits
+      Content-Type: text/plain
+      Content-Disposition: inline
+
+      Inline body exceeds five bytes
+      """)
+
+    assert {:ok, %{text_body: "Inline body exceeds five bytes", attachments: []}} =
+             Parser.parse(raw, max_attachment_bytes: 5)
+
+    assert {:error, %{reason: :decoded_content_too_large}} =
+             Parser.parse(raw, max_decoded_bytes: 5)
+  end
+
   test "preserves sender and bcc address collections" do
     raw =
       message("""

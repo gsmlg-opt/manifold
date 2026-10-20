@@ -869,6 +869,59 @@ defmodule Manifold.IngestTest do
     assert Repo.get!(InboundDelivery, delivery.id).processing_state == "processed"
   end
 
+  for failure <- [:raw_too_large, :parser_timeout] do
+    @tag :inline_body_regression
+    @tag parser_timeout_regression: failure == :parser_timeout
+    test "#{failure} reparse preserves a processed delivery and its original failure reason" do
+      %{route: route} = route_fixture()
+
+      {body, parser_opts} =
+        case unquote(failure) do
+          :raw_too_large ->
+            {"Body", [max_raw_bytes: 1]}
+
+          :parser_timeout ->
+            {String.duplicate("Timeout body\r\n", 150_000), [parse_timeout_ms: 0]}
+        end
+
+      raw = "Subject: hello\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" <> body
+      assert {:ok, delivery} = Ingest.accept_transport(raw, spool_attrs([route]), [route])
+      assert :ok = Ingest.archive_delivery(delivery.id)
+      assert :ok = Ingest.project_delivery(delivery.id, parser_version: 1, sanitizer_version: 1)
+
+      message = Repo.get_by!(Message, inbound_delivery_id: delivery.id)
+      entry = Repo.get_by!(MailboxEntry, inbound_delivery_id: delivery.id)
+      processed = Repo.get!(InboundDelivery, delivery.id)
+      parse_error = Atom.to_string(unquote(failure))
+      versions = [parser_version: 2, sanitizer_version: 1]
+
+      assert {:error,
+              %Manifold.Core.Error{
+                class: :temporary,
+                reason: :reprojection_parse_failed,
+                details: %{parse_error: ^parse_error}
+              }} = Ingest.project_delivery(delivery.id, versions ++ parser_opts)
+
+      assert Repo.get!(Message, message.id) == message
+      assert Repo.get!(MailboxEntry, entry.id) == entry
+      assert Repo.get!(InboundDelivery, delivery.id) == processed
+
+      refute Repo.get_by(MessageEvent,
+               inbound_delivery_id: delivery.id,
+               event_type: "projection_failed"
+             )
+
+      assert :ok = Ingest.project_delivery(delivery.id, versions)
+
+      assert %{id: message_id, parser_version: 2, parse_state: "parsed", text_body: text_body} =
+               Repo.get_by!(Message, inbound_delivery_id: delivery.id)
+
+      assert text_body == String.trim_trailing(body)
+      assert message_id == message.id
+      assert Repo.get!(InboundDelivery, delivery.id).processing_state == "processed"
+    end
+  end
+
   test "projection commit before ingest state update is safe to retry" do
     %{route: route} = route_fixture()
     assert {:ok, delivery} = accept_delivery([route])

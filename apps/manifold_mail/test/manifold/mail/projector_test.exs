@@ -1,6 +1,7 @@
 defmodule Manifold.Mail.ProjectorTest do
   use Manifold.DataCase, async: false
 
+  alias Manifold.Core.Error
   alias Manifold.Mail
   alias Manifold.Mail.InboundSource
 
@@ -150,6 +151,252 @@ defmodule Manifold.Mail.ProjectorTest do
     assert is_nil(message.received_at)
   end
 
+  @tag :inline_body_regression
+  test "provider_import reprojection preserves the corrected mailbox receive time", %{
+    tmp_dir: tmp_dir
+  } do
+    mailbox_id = mailbox_fixture()
+
+    source =
+      source_fixture(
+        tmp_dir,
+        mailbox_id,
+        plain_message("<corrected-import@example.net>", "Corrected import", "body"),
+        source_kind: "provider_import"
+      )
+
+    assert {:ok, first} = Mail.project_inbound(source, parser_version: 5, sanitizer_version: 1)
+    assert is_nil(Repo.get!(Message, first.message_id).received_at)
+    corrected_at = ~U[2025-03-04 05:06:07.123456Z]
+    assert :ok = Mail.set_received_at(source.inbound_delivery_id, corrected_at)
+
+    assert {:ok, rebuilt} =
+             Mail.project_inbound(source, parser_version: 6, sanitizer_version: 1)
+
+    assert rebuilt.message_id == first.message_id
+    assert Repo.get!(Message, first.message_id).received_at == corrected_at
+    entry = Repo.get_by!(MailboxEntry, inbound_delivery_id: source.inbound_delivery_id)
+    assert Repo.get!(Thread, entry.thread_id).last_message_at == corrected_at
+  end
+
+  @tag :inline_body_regression
+  test "failed reparsing preserves a valid projection and returns a safe retryable error", %{
+    tmp_dir: tmp_dir
+  } do
+    mailbox_id = mailbox_fixture()
+
+    source =
+      source_fixture(
+        tmp_dir,
+        mailbox_id,
+        multipart_message(
+          "<parse-failure@example.net>",
+          "Keep this projection",
+          "Private body must not appear in errors",
+          "keep.txt",
+          "Private attachment"
+        )
+      )
+
+    assert {:ok, _first} = Mail.project_inbound(source, parser_version: 5, sanitizer_version: 1)
+    before = projection_snapshot(source)
+
+    assert {:error,
+            %Error{
+              class: :temporary,
+              reason: :reprojection_parse_failed,
+              details: %{parse_error: "raw_too_large"} = details
+            }} =
+             Mail.project_inbound(source,
+               parser_version: 6,
+               sanitizer_version: 1,
+               max_raw_bytes: 1
+             )
+
+    assert details == %{parse_error: "raw_too_large"}
+    assert projection_snapshot(source) == before
+  end
+
+  @tag :inline_body_regression
+  @tag :parser_timeout_regression
+  test "an immediate parse deadline preserves a valid projection with parser_timeout", %{
+    tmp_dir: tmp_dir
+  } do
+    mailbox_id = mailbox_fixture()
+
+    source =
+      source_fixture(
+        tmp_dir,
+        mailbox_id,
+        plain_message(
+          "<parse-timeout@example.net>",
+          "Keep timed out projection",
+          String.duplicate("body ", 420_000)
+        )
+      )
+
+    assert {:ok, _first} = Mail.project_inbound(source, parser_version: 5, sanitizer_version: 1)
+    before = projection_snapshot(source)
+
+    # A real immediate deadline over a large valid message exercises timeout handling.
+    # This boundary check does not provide a scheduler-independent timeout proof.
+    assert {:error,
+            %Error{
+              class: :temporary,
+              reason: :reprojection_parse_failed,
+              details: %{parse_error: "parser_timeout"} = details
+            }} =
+             Mail.project_inbound(source,
+               parser_version: 6,
+               sanitizer_version: 1,
+               parse_timeout_ms: 0
+             )
+
+    assert details == %{parse_error: "parser_timeout"}
+    assert projection_snapshot(source) == before
+  end
+
+  @tag :inline_body_regression
+  test "reparsing protection checks the projection reread after the initial lookup", %{
+    tmp_dir: tmp_dir
+  } do
+    mailbox_id = mailbox_fixture()
+
+    source =
+      source_fixture(
+        tmp_dir,
+        mailbox_id,
+        plain_message("<reread-projection@example.net>", "Reread projection", "body")
+      )
+
+    assert {:ok, first} =
+             Mail.project_inbound(source,
+               parser_version: 5,
+               sanitizer_version: 1,
+               max_raw_bytes: 1
+             )
+
+    before = projection_snapshot(source)
+    assert before.message.parse_state == "fallback"
+
+    assert {:error,
+            %Error{
+              class: :temporary,
+              reason: :reprojection_parse_failed,
+              details: %{parse_error: "raw_too_large"}
+            }} =
+             Mail.project_inbound(source,
+               parser_version: 6,
+               sanitizer_version: 1,
+               max_raw_bytes: 1,
+               after_blob_storage_before_commit: fn ->
+                 # The persisted state changes after project/2's first lookup. This
+                 # transaction-local fixture is rolled back with the rejected publish.
+                 Repo.get!(Message, first.message_id)
+                 |> Message.changeset(%{parse_state: "parsed", parse_error: nil})
+                 |> Repo.update!()
+
+                 :ok
+               end
+             )
+
+    assert projection_snapshot(source) == before
+  end
+
+  @tag :inline_body_regression
+  @tag :parser_recovery
+  test "reprojection repairs legacy inline bodies without replacing mailbox identity or state", %{
+    tmp_dir: tmp_dir
+  } do
+    mailbox_id = mailbox_fixture()
+    source = source_fixture(tmp_dir, mailbox_id, inline_body_message())
+
+    assert {:ok, first} = Mail.project_inbound(source, parser_version: 5, sanitizer_version: 1)
+    legacy_inline_projection(first.message_id, tmp_dir)
+    entry = Repo.get_by!(MailboxEntry, inbound_delivery_id: source.inbound_delivery_id)
+    assert {:ok, 1} = Mail.mark_read(mailbox_id, [entry.id], true)
+    assert {:ok, 1} = Mail.set_starred(mailbox_id, [entry.id], true)
+    assert {:ok, 1} = Mail.archive(mailbox_id, [entry.id])
+    corrected_at = ~U[2025-03-04 05:06:07.123456Z]
+    assert :ok = Mail.set_received_at(source.inbound_delivery_id, corrected_at)
+    before = projection_snapshot(source)
+    assert is_nil(before.message.text_body)
+    assert is_nil(before.message.sanitized_html)
+    assert [%{disposition: "inline"}, %{disposition: "inline"}] = before.attachments
+
+    assert {:ok, rebuilt} =
+             Mail.project_inbound(source, parser_version: 6, sanitizer_version: 1)
+
+    assert rebuilt.message_id == first.message_id
+    after_rebuild = projection_snapshot(source)
+    assert after_rebuild.message.text_body == "Recovered inline body"
+    assert after_rebuild.message.sanitized_html =~ "<p>Recovered inline body</p>"
+    assert after_rebuild.message.parse_state == "parsed"
+    assert after_rebuild.message.parser_version == 6
+    assert after_rebuild.message.received_at == corrected_at
+    assert after_rebuild.message.sent_at == before.message.sent_at
+    assert after_rebuild.entries == before.entries
+    assert after_rebuild.attachments == []
+    assert [%{message_count: 1, last_message_at: ^corrected_at}] = after_rebuild.threads
+
+    assert {:ok, ^rebuilt} =
+             Mail.project_inbound(source, parser_version: 6, sanitizer_version: 1)
+
+    assert projection_snapshot(source) == after_rebuild
+    assert Repo.aggregate(Message, :count) == 1
+    assert Repo.aggregate(MailboxEntry, :count) == 1
+    assert Repo.aggregate(Thread, :count) == 1
+  end
+
+  for failure <- [:missing, :corrupt] do
+    @tag :inline_body_regression
+    test "#{failure} archived raw preserves every row of the existing projection", %{
+      tmp_dir: tmp_dir
+    } do
+      mailbox_id = mailbox_fixture()
+
+      source =
+        source_fixture(
+          tmp_dir,
+          mailbox_id,
+          multipart_message(
+            "<raw-failure@example.net>",
+            "Keep archived projection",
+            "Existing body",
+            "keep.txt",
+            "Existing attachment"
+          )
+        )
+
+      assert {:ok, _first} =
+               Mail.project_inbound(source, parser_version: 5, sanitizer_version: 1)
+
+      before = projection_snapshot(source)
+
+      expected_reason =
+        case unquote(failure) do
+          :missing ->
+            assert :ok = RawStore.delete(source.raw_object_key)
+            :object_store_failed
+
+          :corrupt ->
+            raw_path =
+              Path.join(
+                Application.fetch_env!(:manifold_storage, :raw_store_dir),
+                source.raw_object_key
+              )
+
+            File.write!(raw_path, String.duplicate("x", source.raw_size))
+            :raw_verification_failed
+        end
+
+      assert {:error, %Error{reason: ^expected_reason}} =
+               Mail.project_inbound(source, parser_version: 6, sanitizer_version: 1)
+
+      assert projection_snapshot(source) == before
+    end
+  end
+
   test "failure after blob storage but before projection commit is safe to retry", %{
     tmp_dir: tmp_dir
   } do
@@ -186,6 +433,7 @@ defmodule Manifold.Mail.ProjectorTest do
     assert Repo.aggregate(Attachment, :count) == 1
   end
 
+  @tag :inline_body_regression
   test "higher projection versions atomically rebuild derived rows in place", %{
     tmp_dir: tmp_dir
   } do
@@ -216,6 +464,8 @@ defmodule Manifold.Mail.ProjectorTest do
     |> Message.changeset(%{subject: "stale projection"})
     |> Repo.update!()
 
+    before_failed_transaction = projection_snapshot(source)
+
     assert {:error, %{reason: :after_blob_storage_before_commit}} =
              Mail.project_inbound(source,
                parser_version: 2,
@@ -226,6 +476,7 @@ defmodule Manifold.Mail.ProjectorTest do
     unchanged = Repo.get!(Message, first.message_id)
     assert unchanged.parser_version == 1
     assert unchanged.subject == "stale projection"
+    assert projection_snapshot(source) == before_failed_transaction
 
     assert {:ok, rebuilt} =
              Mail.project_inbound(source, parser_version: 2, sanitizer_version: 1)
@@ -505,6 +756,7 @@ defmodule Manifold.Mail.ProjectorTest do
            ]
   end
 
+  @tag :inline_body_regression
   test "malformed MIME creates a visible fallback projection without losing the raw source",
        %{tmp_dir: tmp_dir} do
     mailbox_id = mailbox_fixture()
@@ -525,6 +777,97 @@ defmodule Manifold.Mail.ProjectorTest do
              message_id
 
     assert {:ok, _stat} = RawStore.stat(source.raw_object_key)
+  end
+
+  defp projection_snapshot(source) do
+    message = Repo.get_by!(Message, inbound_delivery_id: source.inbound_delivery_id)
+
+    entries =
+      MailboxEntry
+      |> where([entry], entry.inbound_delivery_id == ^source.inbound_delivery_id)
+      |> order_by([entry], asc: entry.id)
+      |> Repo.all()
+
+    thread_ids = Enum.map(entries, & &1.thread_id)
+
+    %{
+      message: message,
+      entries: entries,
+      headers:
+        Repo.all(
+          from(header in MessageHeader,
+            where: header.message_id == ^message.id,
+            order_by: header.id
+          )
+        ),
+      addresses:
+        Repo.all(
+          from(address in MessageAddress,
+            where: address.message_id == ^message.id,
+            order_by: address.id
+          )
+        ),
+      attachments:
+        Repo.all(
+          from(attachment in Attachment,
+            where: attachment.message_id == ^message.id,
+            order_by: attachment.part_path
+          )
+        ),
+      threads:
+        Repo.all(from(thread in Thread, where: thread.id in ^thread_ids, order_by: thread.id))
+    }
+  end
+
+  defp legacy_inline_projection(message_id, tmp_dir) do
+    Repo.get!(Message, message_id)
+    |> Message.changeset(%{text_body: nil, sanitized_html: nil})
+    |> Repo.update!()
+
+    Repo.delete_all(from(attachment in Attachment, where: attachment.message_id == ^message_id))
+
+    for {media_type, bytes, part_path} <- [
+          {"text/plain", "Recovered inline body", "1"},
+          {"text/html", "<p>Recovered inline body</p>", "2"}
+        ] do
+      sha256 = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+      assert {:ok, object_key} = BlobStore.build_key(sha256)
+      path = Path.join(tmp_dir, "legacy-part-#{part_path}")
+      File.write!(path, bytes)
+
+      assert {:ok, _stat} =
+               BlobStore.put_from_path(object_key, path, expected_size: byte_size(bytes))
+
+      %Attachment{}
+      |> Attachment.changeset(%{
+        message_id: message_id,
+        part_path: part_path,
+        media_type: media_type,
+        disposition: "inline",
+        size: byte_size(bytes),
+        sha256: sha256,
+        object_key: object_key
+      })
+      |> Repo.insert!()
+    end
+  end
+
+  defp inline_body_message do
+    "From: Sender <sender@example.net>\r\n" <>
+      "To: inbox@mail.test\r\n" <>
+      "Subject: Inline body recovery\r\n" <>
+      "Message-ID: <inline-body-recovery@example.net>\r\n" <>
+      "Date: Tue, 4 Mar 2025 05:00:00 +0000\r\n" <>
+      "Content-Type: multipart/alternative; boundary=inline-body\r\n\r\n" <>
+      "--inline-body\r\n" <>
+      "Content-Type: text/plain; charset=utf-8\r\n" <>
+      "Content-Disposition: inline\r\n\r\n" <>
+      "Recovered inline body\r\n" <>
+      "--inline-body\r\n" <>
+      "Content-Type: text/html; charset=utf-8\r\n" <>
+      "Content-Disposition: inline\r\n\r\n" <>
+      "<p>Recovered inline body</p>\r\n" <>
+      "--inline-body--\r\n"
   end
 
   defp mailbox_fixture do

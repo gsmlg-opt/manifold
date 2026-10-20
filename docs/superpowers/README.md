@@ -14,6 +14,7 @@
 
 | 功能 / 当前归类 | 设计 | 执行计划 | 维护记录与验收入口 |
 | --- | --- | --- | --- |
+| Inline 邮件正文识别与历史邮件恢复：已实现，本地 133 项 scoped 测试通过；生产恢复尚未执行，HTML 保真单独设计 | [2026-10-20](specs/2026-10-20-mail-inline-body-recovery-design.md) | [2026-10-20](plans/2026-10-20-mail-inline-body-recovery.md) | [维护记录与验收](../../.agents/skills/develop/references/mail-body-rendering.md) |
 | HTTP client 迁移：全部业务消费者使用 native Fetch，0.21.10 修复最终上游阻塞 | [2026-10-14](specs/2026-10-14-http-fetch-client-design.md) | [2026-10-14](plans/2026-10-14-http-fetch-client.md) | [当前客户端契约与验收](../HTTP_CLIENT.md)、[维护记录](../../.agents/skills/develop/references/http-client-migration.md) |
 | Gmail 收件同步限流：已实现 | [2026-10-09](specs/2026-10-09-gmail-sync-rate-limiting-design.md) | [2026-10-09](plans/2026-10-09-gmail-sync-rate-limiting.md) | [Gmail 限流记录与验收](../../.agents/skills/develop/references/gmail-sync-rate-limiting.md)；真实采样不证明整邮箱同步完成 |
 | iCloud 通讯录 / 日历导入：已实现，Account 双向方案继承并扩展 | [2026-10-09](specs/2026-10-09-icloud-contacts-calendars-design.md) | [2026-10-10](plans/2026-10-10-icloud-contacts-calendars.md) | [当前 iCloud 维护记录](../../.agents/skills/develop/references/icloud-contacts-calendars.md)、[验收与发布记录](../ICLOUD_ACCEPTANCE.md) |

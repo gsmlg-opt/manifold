@@ -7,6 +7,8 @@ defmodule ManifoldWeb.MailLiveTest do
   alias Manifold.Accounts
   alias Manifold.Connectors
   alias Manifold.Connectors.Jobs.SyncAccount
+  alias Manifold.Ingest
+  alias Manifold.Ingest.ExternalSource
   alias Manifold.Mail
   alias Manifold.Mail.Schema.{MailboxEntry, Message, Thread}
   alias Manifold.Outbound
@@ -405,6 +407,150 @@ defmodule ManifoldWeb.MailLiveTest do
     _ = render(view)
 
     assert is_nil(Repo.get!(MailboxEntry, thread.entry.id).read_at)
+  end
+
+  @tag :inline_body_regression
+  @tag :tmp_dir
+  test "inline alternatives render HTML while preserving a real text attachment", %{
+    conn: conn,
+    tmp_dir: tmp_dir
+  } do
+    mailbox = mailbox_fixture()
+
+    raw = """
+    From: Sender <sender@example.test>
+    Subject: Inline alternatives
+    MIME-Version: 1.0
+    Content-Type: multipart/mixed; boundary=outer
+
+    --outer
+    Content-Type: multipart/alternative; boundary=alternatives
+
+    --alternatives
+    Content-Type: text/plain; charset=utf-8
+    Content-Disposition: inline
+
+    Readable plain body
+    --alternatives
+    Content-Type: text/html; charset=utf-8
+    Content-Disposition: inline
+
+    <p>Readable HTML body</p>
+    --alternatives--
+    --outer
+    Content-Type: text/plain; name=report.txt
+    Content-Disposition: attachment; filename=report.txt
+
+    Downloadable report
+    --outer--
+    """
+
+    entry = project_raw_message(mailbox, raw, tmp_dir)
+
+    assert {:ok, %{messages: [message]}} = Mail.get_conversation(mailbox.id, entry.thread_id)
+    assert message.has_html
+    assert message.text_body == "Readable plain body"
+    assert [%{id: attachment_id, filename: "report.txt"}] = message.attachments
+
+    assert {:ok, view, _html} =
+             live(
+               conn,
+               ~p"/mail/#{mailbox.id}/folders/#{entry.folder_id}/threads/#{entry.thread_id}"
+             )
+
+    body_path = ~p"/mailboxes/#{mailbox.id}/messages/#{message.id}/body"
+    assert has_element?(view, ".message-body iframe[src='#{body_path}'][sandbox='allow-popups']")
+    refute has_element?(view, ".message-body pre")
+    assert has_element?(view, ".attachment-list a", "report.txt")
+    refute has_element?(view, ".attachment-list a", "attachment")
+
+    body_conn = get(recycle(conn), body_path)
+    assert html_response(body_conn, 200) =~ "<p>Readable HTML body</p>"
+    assert Plug.Conn.get_resp_header(body_conn, "content-security-policy") != []
+
+    download_conn =
+      get(recycle(conn), ~p"/mailboxes/#{mailbox.id}/attachments/#{attachment_id}")
+
+    assert String.trim(response(download_conn, 200)) == "Downloadable report"
+  end
+
+  @tag :inline_body_regression
+  @tag :tmp_dir
+  test "inline plain text displays escaped markup", %{conn: conn, tmp_dir: tmp_dir} do
+    mailbox = mailbox_fixture()
+
+    entry =
+      project_raw_message(
+        mailbox,
+        "Subject: Inline plain\nContent-Type: text/plain; charset=utf-8\nContent-Disposition: inline\n\n<b>Literal text</b> & readable\n",
+        tmp_dir
+      )
+
+    assert {:ok, view, html} =
+             live(
+               conn,
+               ~p"/mail/#{mailbox.id}/folders/#{entry.folder_id}/threads/#{entry.thread_id}"
+             )
+
+    assert has_element?(view, ".message-body pre", "<b>Literal text</b> & readable")
+    refute has_element?(view, ".message-body b")
+    refute has_element?(view, ".message-body iframe")
+    refute has_element?(view, ".attachment-list")
+    assert html =~ "&lt;b&gt;Literal text&lt;/b&gt; &amp; readable"
+  end
+
+  @tag :inline_body_regression
+  @tag :tmp_dir
+  test "a genuine text attachment alone keeps the empty-body fallback", %{
+    conn: conn,
+    tmp_dir: tmp_dir
+  } do
+    mailbox = mailbox_fixture()
+
+    entry =
+      project_raw_message(
+        mailbox,
+        "Subject: File only\nContent-Type: text/plain; name=report.txt\nContent-Disposition: attachment; filename=report.txt\n\nFile content\n",
+        tmp_dir
+      )
+
+    assert {:ok, view, _html} =
+             live(
+               conn,
+               ~p"/mail/#{mailbox.id}/folders/#{entry.folder_id}/threads/#{entry.thread_id}"
+             )
+
+    assert has_element?(view, ".message-body pre", "(No readable body)")
+    refute has_element?(view, ".message-body iframe")
+    assert has_element?(view, ".attachment-list a", "report.txt")
+  end
+
+  defp project_raw_message(mailbox, raw, tmp_dir) do
+    for {key, directory} <- [spool_dir: "spool", raw_store_dir: "raw", blob_store_dir: "blobs"] do
+      previous = Application.fetch_env!(:manifold_storage, key)
+      Application.put_env(:manifold_storage, key, Path.join(tmp_dir, directory))
+      on_exit(fn -> Application.put_env(:manifold_storage, key, previous) end)
+    end
+
+    raw = String.replace(raw, "\n", "\r\n")
+
+    source = %ExternalSource{
+      provider: "gmail",
+      account_id: Ecto.UUID.generate(),
+      external_message_id: Ecto.UUID.generate(),
+      mailbox_id: mailbox.id,
+      storage_domain_id: mailbox.domain_id,
+      recipient_address: "inbox@#{mailbox.domain.normalized_domain}",
+      received_at: DateTime.utc_now(),
+      ingest_id: Ecto.UUID.generate()
+    }
+
+    assert {:ok, receipt} = Ingest.import_external(raw, source)
+    assert :ok = Ingest.archive_delivery(receipt.inbound_delivery_id)
+    assert :ok = Ingest.evaluate_security(receipt.inbound_delivery_id)
+    assert :ok = Ingest.project_delivery(receipt.inbound_delivery_id)
+
+    Repo.get_by!(MailboxEntry, inbound_delivery_id: receipt.inbound_delivery_id)
   end
 
   defp assert_mail_tooltip(view, selector, label) do

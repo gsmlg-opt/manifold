@@ -71,9 +71,8 @@ config :manifold_storage,
   blob_store_dir: Path.expand("../priv/blob_store/#{config_env()}", __DIR__)
 
 config :manifold_mail,
-  # Bumped for unlabeled GBK/CP936 Subject/From headers (no RFC 2047).
-  # v5 reprojects rows permanently mojibaked by the previous latin1 header fallback.
-  parser_version: 5,
+  # v6 reprojects inline text/plain and text/html parts previously stored as attachments.
+  parser_version: 6,
   sanitizer_version: 1,
   # Must cover base64-encoded attachments up to max_attachment_bytes (~4/3 expansion).
   max_raw_bytes: 100 * 1024 * 1024,

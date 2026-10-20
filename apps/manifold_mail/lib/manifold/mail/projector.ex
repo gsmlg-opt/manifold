@@ -340,20 +340,32 @@ defmodule Manifold.Mail.Projector do
 
     case Repo.get_by(Message, inbound_delivery_id: source.inbound_delivery_id) do
       %Message{} = existing ->
-        if projection_current?(existing, versions) do
-          existing
-        else
-          lock_delivery_mailboxes(source.inbound_delivery_id)
+        cond do
+          projection_current?(existing, versions) ->
+            existing
 
-          replace_projection(
-            existing,
-            source,
-            parsed,
-            parse_state,
-            parse_error,
-            stored_attachments,
-            versions
-          )
+          existing.parse_state == "parsed" and parse_state == "fallback" ->
+            Repo.rollback(
+              error(
+                :temporary,
+                :reprojection_parse_failed,
+                "mail reparsing failed; existing projection was preserved",
+                %{parse_error: parse_error}
+              )
+            )
+
+          true ->
+            lock_delivery_mailboxes(source.inbound_delivery_id)
+
+            replace_projection(
+              existing,
+              source,
+              parsed,
+              parse_state,
+              parse_error,
+              stored_attachments,
+              versions
+            )
         end
 
       nil ->
@@ -408,6 +420,7 @@ defmodule Manifold.Mail.Projector do
         parse_error,
         monotonic_versions(existing, versions)
       )
+      |> Map.put(:received_at, existing.received_at)
 
     with {:ok, message} <- Message.changeset(existing, attrs) |> Repo.update(),
          {_count, _rows} <-

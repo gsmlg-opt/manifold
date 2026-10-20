@@ -25,8 +25,9 @@ defmodule Manifold.Mail.Parser do
          {:ok, message} <- parse_mail(normalize_lines(raw)),
          {:ok, leaves} <- collect_leaves(message, limits),
          :ok <- check_decoded_size(leaves, limits.max_decoded_bytes),
-         {:ok, attachments} <- attachments(leaves, limits.max_attachment_bytes) do
-      {:ok, build_projection(message, headers, attachments)}
+         bodies = selected_bodies(message),
+         {:ok, attachments} <- attachments(leaves, bodies, limits.max_attachment_bytes) do
+      {:ok, build_projection(message, headers, bodies, attachments)}
     end
   end
 
@@ -153,10 +154,12 @@ defmodule Manifold.Mail.Parser do
     check_size(decoded_bytes, max_bytes, :decoded_content_too_large)
   end
 
-  defp attachments(leaves, max_attachment_bytes) do
+  defp attachments(leaves, bodies, max_attachment_bytes) do
+    body_paths = [bodies.text_path, bodies.html_path]
+
     leaves
     |> Enum.reduce_while({:ok, []}, fn leaf, {:ok, acc} ->
-      if attachment?(leaf.message) do
+      if attachment?(leaf.message) and leaf.path not in body_paths do
         bytes = body(leaf.message)
 
         case check_size(byte_size(bytes), max_attachment_bytes, :attachment_too_large) do
@@ -173,8 +176,8 @@ defmodule Manifold.Mail.Parser do
     end
   end
 
-  defp build_projection(message, headers, attachments) do
-    %{text_body: text_body, html_body: html_body} = selected_bodies(message)
+  defp build_projection(message, headers, bodies, attachments) do
+    %{text_body: text_body, html_body: html_body} = bodies
 
     %ParsedMessage{
       subject: binary_header(message, "subject"),
@@ -195,63 +198,77 @@ defmodule Manifold.Mail.Parser do
     }
   end
 
-  defp selected_bodies(%Message{multipart: true} = message) do
-    if attachment?(message) do
+  defp selected_bodies(message, path \\ [])
+
+  defp selected_bodies(%Message{multipart: true} = message, path) do
+    if excluded_body?(message) do
       empty_bodies()
     else
       case content_type(message) do
-        "multipart/alternative" -> alternative_bodies(message.parts)
-        "multipart/related" -> related_bodies(message)
-        _other -> first_body_branch(message.parts)
+        "multipart/alternative" -> alternative_bodies(message.parts, path)
+        "multipart/related" -> related_bodies(message, path)
+        _other -> first_body_branch(message.parts, path)
       end
     end
   end
 
-  defp selected_bodies(%Message{} = message) do
-    if attachment?(message) do
+  defp selected_bodies(%Message{} = message, path) do
+    if excluded_body?(message) do
       empty_bodies()
     else
+      part_path = if path == [], do: "1", else: Enum.join(path, ".")
+
       case content_type(message) do
-        "text/plain" -> %{text_body: normalized_body(message), html_body: nil}
-        "text/html" -> %{text_body: nil, html_body: normalized_body(message)}
-        _other -> empty_bodies()
+        "text/plain" ->
+          %{empty_bodies() | text_body: normalized_body(message), text_path: part_path}
+
+        "text/html" ->
+          %{empty_bodies() | html_body: normalized_body(message), html_path: part_path}
+
+        _other ->
+          empty_bodies()
       end
     end
   end
 
-  defp alternative_bodies(parts) do
-    Enum.reduce(parts, empty_bodies(), fn part, selected ->
-      merge_alternative(selected, selected_bodies(part))
+  defp alternative_bodies(parts, path) do
+    parts
+    |> Enum.with_index(1)
+    |> Enum.reduce(empty_bodies(), fn {part, index}, selected ->
+      merge_alternative(selected, selected_bodies(part, path ++ [index]))
     end)
   end
 
   defp merge_alternative(selected, alternative) do
     %{
       text_body: alternative.text_body || selected.text_body,
-      html_body: alternative.html_body || selected.html_body
+      html_body: alternative.html_body || selected.html_body,
+      text_path: alternative.text_path || selected.text_path,
+      html_path: alternative.html_path || selected.html_path
     }
   end
 
-  defp related_bodies(message) do
+  defp related_bodies(message, path) do
     message
     |> related_root()
     |> case do
       nil -> empty_bodies()
-      root -> selected_bodies(root)
+      {root, index} -> selected_bodies(root, path ++ [index])
     end
   end
 
   defp related_root(message) do
     start = parameter(Message.get_content_type(message), "start")
+    parts = Enum.with_index(message.parts, 1)
 
     if is_binary(start) do
       expected = normalize_content_id(start)
 
-      Enum.find(message.parts, fn part ->
+      Enum.find(parts, fn {part, _index} ->
         normalize_content_id(binary_header(part, "content-id")) == expected
-      end) || List.first(message.parts)
+      end) || List.first(parts)
     else
-      List.first(message.parts)
+      List.first(parts)
     end
   end
 
@@ -264,9 +281,11 @@ defmodule Manifold.Mail.Parser do
 
   defp normalize_content_id(_value), do: nil
 
-  defp first_body_branch(parts) do
-    Enum.find_value(parts, empty_bodies(), fn part ->
-      bodies = selected_bodies(part)
+  defp first_body_branch(parts, path) do
+    parts
+    |> Enum.with_index(1)
+    |> Enum.find_value(empty_bodies(), fn {part, index} ->
+      bodies = selected_bodies(part, path ++ [index])
 
       if has_body?(bodies), do: bodies
     end)
@@ -275,7 +294,7 @@ defmodule Manifold.Mail.Parser do
   defp has_body?(%{text_body: text_body, html_body: html_body}),
     do: not is_nil(text_body) or not is_nil(html_body)
 
-  defp empty_bodies, do: %{text_body: nil, html_body: nil}
+  defp empty_bodies, do: %{text_body: nil, html_body: nil, text_path: nil, html_path: nil}
 
   defp normalized_body(message), do: message |> body() |> String.trim_trailing()
 
@@ -298,6 +317,14 @@ defmodule Manifold.Mail.Parser do
     disposition(message) in ["attachment", "inline"] or not is_nil(filename(message))
   end
 
+  defp excluded_body?(message) do
+    case disposition(message) do
+      "attachment" -> true
+      "inline" -> false
+      "unspecified" -> not is_nil(filename(message))
+    end
+  end
+
   defp content_type(message) do
     case Message.get_content_type(message) do
       [type | _params] when is_binary(type) and type != "" -> String.downcase(type)
@@ -314,9 +341,15 @@ defmodule Manifold.Mail.Parser do
   end
 
   defp filename(message) do
-    parameter(Message.get_header(message, "content-disposition"), "filename") ||
-      parameter(Message.get_content_type(message), "name")
+    nonblank_filename(parameter(Message.get_header(message, "content-disposition"), "filename")) ||
+      nonblank_filename(parameter(Message.get_content_type(message), "name"))
   end
+
+  defp nonblank_filename(value) when is_binary(value) do
+    if String.trim(value) == "", do: nil, else: value
+  end
+
+  defp nonblank_filename(_value), do: nil
 
   defp parameter([_value | params], key) do
     Enum.find_value(params, fn
