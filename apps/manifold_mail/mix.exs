@@ -4,7 +4,7 @@ defmodule Manifold.Mail.MixProject do
   def project do
     [
       app: :manifold_mail,
-      version: "0.6.6",
+      version: "0.6.7",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps()
