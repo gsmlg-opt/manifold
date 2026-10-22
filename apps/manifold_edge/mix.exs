@@ -33,7 +33,7 @@ defmodule Manifold.Edge.MixProject do
       {:ecto_sql, "~> 3.14"},
       {:postgrex, "~> 0.22.3"},
       {:plug, "~> 1.18"},
-      {:gaoxy_http, "~> 0.11.0"},
+      {:gaoxy_http, "~> 0.12.1"},
       {:jason, "~> 1.4"}
     ]
   end

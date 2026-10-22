@@ -1,6 +1,6 @@
 # Business HTTP clients
 
-Business consumers use native Hex `http_fetch 0.21.15` through
+Business consumers use native Hex `http_fetch 0.21.16` through
 `Manifold.Core.HTTPClient`. Gmail/Graph connector and OAuth requests,
 Gmail/Graph/Resend submission, signed cloud ingress, DAV and EAS use this shared
 client. The initial 2026-10-15 migration for the v0.6.4 release candidate was
@@ -87,12 +87,28 @@ accepting HTTP/1 minor versions, following HTTP/1 compatibility semantics.
 
 ## Dependency and validation checkpoint
 
-The 2026-10-22 maintenance candidate declares exact Fetch and ex_ssl 0.21.15,
-with matching HTTP/TLS/QUIC packages. DuskMoon tooling is 10.0.2, UI is 10.0.10
-and Decimal is 3.2.0. All 1,635 tests across 17 apps, strict dev/test/prod compile,
-assets and fresh main/Edge packaged startup pass; see the
-[dependency maintenance record](../.agents/skills/develop/references/dependency-maintenance.md).
-The following results retain the original migration checkpoint.
+The 2026-10-22 refresh candidate declares exact Fetch and ex_ssl 0.21.16,
+with matching HTTP/TLS/QUIC packages. DuskMoon tooling is 10.0.2, UI is 10.0.11
+and Decimal is 3.2.0. The full umbrella passes **1,635 tests**, zero failures,
+across 17 apps in one invocation, seed 42. Strict dev/test/prod compilation,
+formatting, development/production assets and both fresh releases' actual
+HTTP startup pass. npm frozen installation and verification cover 330 packages;
+security audit reports zero vulnerabilities, with direct/all Hex and npm
+workspace audits complete. Published 0.21.16 changes HPACK documentation without
+changing HTTP/TLS client executable code or policy.
+
+The packaged/runtime HTTP/TLS cohort is 0.21.16 in both releases; Gaoxy is
+0.12.1. Web HTML, API health and signed Edge status return 200 with Mix
+unavailable and Bandit/ThousandIsland absent. The local smoke report is
+`tmp/gaoxy-release-smoke/run_1792682683_1ed5f51d/report.json`.
+Target deployment and credentialed provider staging remain separate.
+
+The preceding 0.21.15 / UI 10.0.10 checkpoint passed all 1,635 tests across
+17 apps, strict dev/test/prod compilation, assets and fresh main/Edge packaged
+startup. See the
+[dependency maintenance record](../.agents/skills/develop/references/dependency-maintenance.md)
+for version-specific results. The following results retain the original
+migration checkpoint.
 
 Originally, core declared exact Fetch 0.21.10 and connectors used matching ex_ssl 0.21.10; paired
 HTTP/TLS/QUIC packages align. DuskMoon bundler/runtime/npm/QuickBEAM tooling moves

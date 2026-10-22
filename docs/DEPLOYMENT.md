@@ -21,16 +21,22 @@
 Gaoxy 替换已在隔离分支 `codex/gaoxy-http-server` 以 `631cd7c` 提交，原始 0.9.0
 检查点通过 257 项测试及两个本地生产 release 的实际 HTTP 验证。后续依赖维护升级至
 0.11.0，全部 17 个应用的 1,635 项测试、生产构建及两个全新 release 的实际 HTTP
-启动验证再次通过；**尚未合并或部署**。
+启动验证再次通过。当前隔离分支 `codex/dependency-refresh-20261022` 升级至
+Gaoxy 0.12.1、HTTP/TLS 0.21.16 和 DuskMoon UI 10.0.11；全部 17 个应用单次运行
+1,635 项测试、严格 dev/test/prod 编译、开发及生产资产构建和两个全新 release 的实际
+HTTP 启动验证均通过。先前接入与依赖维护已合并至 main；当前刷新保留在独立分支，尚未合并或部署。
 先前的[大正文 LiveView 消息](https://github.com/gsmlg-dev/gaoxy/issues/9)
 和 [Edge 活跃请求关闭](https://github.com/gsmlg-dev/gaoxy/issues/10) 缺陷已由 0.9.0 修复并通过消费者回归。
 
 源码中的 Web/API Endpoint 使用 `Gaoxy.PhoenixAdapter`，Edge API 直接监督
-`Gaoxy.HTTP`，依赖 `gaoxy_http` 0.11.0。Phoenix 的 `websock_adapter` 依赖由同名 OTP
-应用的 `gaoxy_websock_adapter` 0.11.0 包提供；升级依赖时保留根 `mix.exs` 的 override。
+`Gaoxy.HTTP`，依赖 `gaoxy_http` 0.12.1。Phoenix 的 `websock_adapter` 依赖由同名 OTP
+应用的 `gaoxy_websock_adapter` 0.12.1 包提供；升级依赖时保留根 `mix.exs` 的 override。
 本节描述源码接入，旧版镜像仍以其发布内容为准。
 打包移除旧依赖的版本时使用新的 release 输出目录；`mix release --overwrite`
-可能保留旧库文件。本次已在全新输出中核验 Bandit/ThousandIsland 不存在。
+可能保留旧库文件。当前 0.12.1 候选已在全新输出中核验 Bandit/ThousandIsland 不存在；
+Web HTML、API health 和签名 Edge status 均返回 200，两个 runtime 的 Gaoxy 为
+0.12.1、包含的 HTTP/TLS 包为 0.21.16，且无法加载 Mix。证据见维护记录及
+`tmp/gaoxy-release-smoke/run_1792682683_1ed5f51d/report.json`；目标环境验收仍须单独执行。
 
 监听端口和启动开关仍由 `PORT`、`API_PORT`、`MANIFOLD_EDGE_API_PORT` 及现有 Release
 配置控制。容器内监听普通 HTTP，Caddy 终止外部 TLS，并转发 `/live` 的 WebSocket
@@ -43,13 +49,14 @@ Web 监听服务的字节预算为 64 MiB，API 为 16 MiB，Edge 默认为 8 Mi
 预算（至少 4 MiB，且为请求上限的四倍）及底层 body ceiling（至少 8 MiB，且比应用
 上限多一字节），让应用继续返回原有 JSON 413。
 
-Gaoxy 0.11.0 默认 HTTP 请求/响应总期限为 30 秒，header/read/write 期限为 5 秒，
+Gaoxy 0.12.1 默认 HTTP 请求/响应总期限仍为 30 秒，header/read/write 期限为 5 秒，
 分块附件下载也受这些期限约束。Web 的现有 Phoenix 配置保留 10,000,000 字节的
 WebSocket 帧上限，省略的消息上限在 0.9.0 中跟随帧上限；两者也受服务预算四分之一的约束。
 64 MiB Web 预算为原有容量留出余量，已通过 300 KiB 转义正文及 5 MiB ASCII 草稿回归。
 WebSocket 空闲期限仍为 60 秒、最大连接寿命 24 小时，普通 Phoenix 心跳和重连机制继续生效。
 需要更长 HTTP 下载期限时，在 Endpoint 的 `http`
 或 Edge 的 `Gaoxy.HTTP` 子配置中使用公开的 `http_limits`，并同时核对代理超时。
+0.12.1 提供显式 `request_timeout: :infinity` 选项，但本应用仍保留有限期限；本次依赖升级不改变传输策略。
 迁移范围和传输验证入口见[维护记录](../.agents/skills/develop/references/http-server-migration.md)。
 
 Web 和 API **没有应用级登录或权限隔离**。所有能访问它们的人都拥有整个实例的访问权。

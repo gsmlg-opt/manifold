@@ -14,7 +14,7 @@
 
 | 功能 / 当前归类 | 设计 | 执行计划 | 维护记录与验收入口 |
 | --- | --- | --- | --- |
-| Gaoxy HTTP 服务器：0.9.0 接入已提交；依赖维护升级至 0.11.0，全量 1,635 项测试及两个全新 release 实际 HTTP 启动通过；未合并部署 | [2026-10-22](specs/2026-10-22-gaoxy-http-server-design.md) | [2026-10-22](plans/2026-10-22-gaoxy-http-server.md) | [接入、运行限制与验收](../../.agents/skills/develop/references/http-server-migration.md)、[依赖维护](../../.agents/skills/develop/references/dependency-maintenance.md) |
+| Gaoxy HTTP 服务器：当前 0.12.1 候选全量 1,635 项测试、严格编译及两个全新 release 实际 HTTP 启动通过；先前接入已合并，当前刷新在独立分支，未部署 | [2026-10-22](specs/2026-10-22-gaoxy-http-server-design.md) | [2026-10-22](plans/2026-10-22-gaoxy-http-server.md) | [接入、运行限制与验收](../../.agents/skills/develop/references/http-server-migration.md)、[依赖维护](../../.agents/skills/develop/references/dependency-maintenance.md) |
 | Inline 邮件正文识别与历史邮件恢复：已合并推送 main，133 项 scoped 与远端 1,597 项测试通过；本地首批 500 封恢复通过，公共生产验收待部署，HTML 保真单独设计 | [2026-10-20](specs/2026-10-20-mail-inline-body-recovery-design.md) | [2026-10-20](plans/2026-10-20-mail-inline-body-recovery.md) | [维护记录与验收](../../.agents/skills/develop/references/mail-body-rendering.md) |
 | HTTP client 迁移：全部业务消费者使用 native Fetch，0.21.10 修复最终上游阻塞 | [2026-10-14](specs/2026-10-14-http-fetch-client-design.md) | [2026-10-14](plans/2026-10-14-http-fetch-client.md) | [当前客户端契约与验收](../HTTP_CLIENT.md)、[维护记录](../../.agents/skills/develop/references/http-client-migration.md) |
 | Gmail 收件同步限流：已实现 | [2026-10-09](specs/2026-10-09-gmail-sync-rate-limiting-design.md) | [2026-10-09](plans/2026-10-09-gmail-sync-rate-limiting.md) | [Gmail 限流记录与验收](../../.agents/skills/develop/references/gmail-sync-rate-limiting.md)；真实采样不证明整邮箱同步完成 |

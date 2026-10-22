@@ -28,7 +28,7 @@ defmodule Manifold.Connectors.MixProject do
       {:manifold_mail, in_umbrella: true},
       {:styx, "== 0.1.1"},
       {:saxy, "~> 1.6"},
-      {:ex_ssl, "== 0.21.15"},
+      {:ex_ssl, "== 0.21.16"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.3"}
     ]

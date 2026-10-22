@@ -7,21 +7,30 @@ Original implementation: committed as `631cd7c`; scoped acceptance and local
 packaged startup **PASS** with published Gaoxy 0.9.0. That release fixes
 [large LiveView message rejection](https://github.com/gsmlg-dev/gaoxy/issues/9)
 and [premature active Edge shutdown](https://github.com/gsmlg-dev/gaoxy/issues/10).
-The isolated candidate has 257 passing scoped tests and both production
-releases serve actual local HTTP traffic. No merge or deployment has occurred. The
+That candidate passed 257 scoped tests and both production releases served
+actual local HTTP traffic. The original implementation and subsequent
+maintenance (`bd46de3`) are now merged into `main`; no target deployment has
+been performed. The
 [maintenance record](../../../.agents/skills/develop/references/http-server-migration.md)
 contains current evidence and the resolved historical failures.
 
-Subsequent dependency maintenance selects Gaoxy 0.11.0 with unchanged listener
-contracts. All 1,635 tests across 17 applications pass, including the 257 server
-gates. Strict production compile, assets and both fresh releases' actual HTTP
-startup pass. Full results and the separate npm proxy feature follow-up
-are recorded in [dependency maintenance](../../../.agents/skills/develop/references/dependency-maintenance.md).
+Subsequent Gaoxy 0.11.0 / HTTP/TLS 0.21.15 / UI 10.0.10 maintenance passed
+all 1,635 tests across 17 applications, strict production compilation, assets
+and both fresh releases' actual HTTP startup. The current refresh selects
+Gaoxy 0.12.1, HTTP/TLS 0.21.16 and UI 10.0.11, retaining DuskMoon tooling 10.0.2
+and existing listener contracts. All 1,635 tests across 17 apps pass in one
+invocation, seed 42, along with strict dev/test/prod compilation, formatting,
+Hex/npm audits, development/production assets and both fresh releases' actual
+Web/API/signed Edge HTTP startup. Packaged/runtime Gaoxy is 0.12.1 and included
+HTTP/TLS applications are 0.21.16; Mix and Bandit/ThousandIsland are absent.
+This refresh remains on its separate branch, with no target deployment. Version-specific results and the npm proxy feature
+follow-up are recorded in
+[dependency maintenance](../../../.agents/skills/develop/references/dependency-maintenance.md).
 
 ## Integration
 
-Use published `gaoxy_http ~> 0.11.0` and the official
-`{:websock_adapter, "~> 0.11.0", hex: :gaoxy_websock_adapter, override: true}`
+Use published `gaoxy_http ~> 0.12.1` and the official
+`{:websock_adapter, "~> 0.12.1", hex: :gaoxy_websock_adapter, override: true}`
 distribution under its existing OTP application name. Web and API retain
 Endpoint-owned supervision with `Gaoxy.PhoenixAdapter`. Edge supervises
 `{Gaoxy.HTTP, id: :edge_api, plug: {Manifold.Edge.Router, []}, ip: ..., port: ...}`.

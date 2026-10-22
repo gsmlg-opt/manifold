@@ -44,7 +44,7 @@ defmodule ManifoldWeb.MixProject do
       {:telemetry, "~> 1.3"},
       {:phoenix_duskmoon, "~> 10.0"},
       {:jason, "~> 1.4"},
-      {:gaoxy_http, "~> 0.11.0"},
+      {:gaoxy_http, "~> 0.12.1"},
       {:duskmoon_bundler_runtime, "~> 10.0"},
       # TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#108
       {:duskmoon_bundler, "~> 10.0", runtime: Mix.env() == :dev}

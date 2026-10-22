@@ -26,15 +26,24 @@ the message-capacity and active-drain defects; Web/API and Edge integration has
 **257 scoped tests passing**, and both production releases are assembled.
 Packaged startup and actual local HTTP smoke pass; see the
 [migration record](../.agents/skills/develop/references/http-server-migration.md).
-No merge or deployment has occurred.
+The original implementation and subsequent dependency maintenance (`bd46de3`)
+are merged into `main`; target deployment has not been performed.
 
-Dependency maintenance checkpoint: **2026-10-22**, in the same isolated branch.
-Gaoxy is now 0.11.0, the HTTP/TLS cohort 0.21.15, DuskMoon tooling 10.0.2 and UI
-10.0.10. All 17 applications pass **1,635 tests**, including the 257 server
-gates. Frontend assets, final Hex/npm audits, strict production compile and both
-fresh releases' actual HTTP startup pass. See the
+Dependency maintenance checkpoint: **2026-10-22**. The preceding Gaoxy 0.11.0 /
+HTTP/TLS 0.21.15 / UI 10.0.10 checkpoint passed **1,635 tests** across all
+17 applications, frontend assets, Hex/npm audits, strict production compilation
+and both fresh releases' actual HTTP startup.
+
+The current refresh in `codex/dependency-refresh-20261022`, based on `bd46de3`,
+selects Gaoxy 0.12.1, HTTP/TLS 0.21.16, DuskMoon tooling 10.0.2 and UI 10.0.11.
+All **1,635 tests** across 17 apps pass in one invocation, seed 42, along with
+strict dev/test/prod compilation, formatting, npm frozen installation and
+verification (330 packages), Hex/npm audits and development/production assets.
+Both fresh releases pass actual Web/API/signed Edge HTTP startup with Gaoxy
+0.12.1 and the included HTTP/TLS cohort 0.21.16; Mix and Bandit are absent.
+The current refresh remains on its separate branch, with no target deployment. See the
 [maintenance record](../.agents/skills/develop/references/dependency-maintenance.md)
-for the npm proxy-feature exception and verification limits.
+for version-specific results, the npm proxy-feature exception and verification limits.
 
 Use [the documentation index](README.md) for current setup and architecture.
 Historical plan checkboxes and test totals are not a project-wide completion
@@ -45,8 +54,8 @@ the specific behavior, revision and environment being claimed.
 
 | Area | Current implementation | Evidence and limits |
 | --- | --- | --- |
-| Business HTTP clients | Shared native Fetch 0.21.15 for Gmail/Graph/OAuth, outbound Gmail/Graph/Resend, Cloud, DAV and EAS | [Migration and acceptance](HTTP_CLIENT.md): original 0.21.10 migration passed 910 affected tests; current dependency maintenance passes all 1,635 tests. Upstream #114/#115/#121 remain fixed; credentialed provider staging and runtime switching remain separate. |
-| HTTP servers | Isolated Gaoxy 0.11.0 migration for Web/API Endpoints and Edge; all direct Bandit dependencies removed | [Migration record](../.agents/skills/develop/references/http-server-migration.md): 257 scoped tests pass, including large composer messages and active Edge shutdown; both fresh packaged releases serve actual HTTP with no Bandit/ThousandIsland. No merge or deployment. |
+| Business HTTP clients | Shared native Fetch 0.21.16 for Gmail/Graph/OAuth, outbound Gmail/Graph/Resend, Cloud, DAV and EAS | [Migration and acceptance](HTTP_CLIENT.md): original 0.21.10 migration passed 910 affected tests; preceding 0.21.15 maintenance passed all 1,635 tests. Current 0.21.16 refresh passes all 1,635 tests, strict dev/test/prod compilation and packaged startup. Upstream #114/#115/#121 remain fixed; credentialed provider staging and runtime switching remain separate. |
+| HTTP servers | Gaoxy 0.12.1 candidate for Web/API Endpoints and Edge; all direct Bandit dependencies removed | [Migration record](../.agents/skills/develop/references/http-server-migration.md): original 0.9.0 and preceding 0.11.0 checkpoints passed 257 scoped tests and packaged HTTP startup. Current 0.12.1 refresh passes all 1,635 tests, strict dev/test/prod compilation and both fresh releases' actual HTTP startup. No target deployment. |
 | Foundation and inbound (M0–1) | Umbrella, PostgreSQL/Oban, recipient resolution, durable spool, atomic acceptance, archival and recovery | [Original plan](IMPLEMENTATION_PLAN.md), [crash boundaries](CRASH_BOUNDARIES.md); current SMTP listener runs in the optional edge release |
 | Mailbox (M2) | MIME projection, safe HTML display, inbound attachments, threading, search, folders and read/star/archive/trash actions | [M2](MILESTONE_2_PLAN.md); Gmail/Graph read changes remain local |
 | Outbound (M3 and later extensions) | Plain-text drafts, reply/forward, frozen queue payloads, Gmail API/Graph/SMTP submission, legacy Resend webhooks and uncertain-submission handling | [Current send contract](DESIGN.md#225-account-selected-outbound-methods); HTML composition and outbound attachments are pending extensions |
@@ -70,7 +79,7 @@ suggested order is advisory.
 | V4 | Before Calendar rollout | Joint Google/iCloud acceptance — Calendars, Connectors, Web | Use authorized disposable calendars to verify Calendar authorization, simultaneous CRUD, reconnection, exceptions and uncertain outcomes. Localhost HTTP and migration probes are recorded separately in [Calendar evidence](superpowers/implementation/calendar-validation.md); real-provider reads/writes for the new path are NOT RUN. |
 | V2 | First | Microsoft work/school and outbound staging — Connectors, Outbound, Web | Exercise work/school device login, receive/send grants, actual sending, authoritative Sent import, credential rotation and reconnect. [Personal Outlook login and 258 received messages were verified](../.agents/skills/develop/references/microsoft-device-oauth.md#personal-account-and-verification-url-repair-2026-10-09); work/school authorization and credentialed sending were not exercised. Use the current device flow instead of historical callback-only instructions. |
 | V3 | First | Gmail/SMTP lifecycle and backfill evidence — Connectors, Outbound, Web | Complete the [staging checklist](../.agents/skills/develop/references/gmail-receive-send-methods.md#staging-smoke-checklist) with the [current OAuth flow](OAUTH_SETUP.md), including real sending, reconnect and no blind resend after an uncertain outcome. Inspect current cursors/jobs before claiming Gmail or IMAP backfill completion; historical import samples do not establish today's state. Controlled tests cover cooldown; the [Gmail sample](../.agents/skills/develop/references/gmail-sync-rate-limiting.md#validation) did not trigger a real long cooldown. |
-| V5 | Before Gaoxy rollout | Target reverse-proxy/TLS acceptance — Web, API, Edge, operators | Local implementation and packaged startup pass on Gaoxy 0.11.0. Verify Caddy WebSocket/longpoll forwarding, TLS and production timeout/body limits on the authorized target; target deployment remains NOT RUN. [Consumer evidence and finite limits](../.agents/skills/develop/references/http-server-migration.md). |
+| V5 | Before Gaoxy rollout | Target reverse-proxy/TLS acceptance — Web, API, Edge, operators | Local implementation, all 1,635 tests and packaged startup pass on Gaoxy 0.12.1. Verify Caddy WebSocket/longpoll forwarding, TLS and production timeout/body limits on the authorized target; target deployment remains NOT RUN. [Consumer evidence and finite limits](../.agents/skills/develop/references/http-server-migration.md). |
 
 ## Engineering follow-ups
 

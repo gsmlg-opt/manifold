@@ -23,11 +23,14 @@ and EAS use native Fetch. The original v0.6.4 migration was developed in
   native chunk lines cap at 8 KiB and trailers at 128 fields / 64 KiB. Combined
   EAS initial/trailer limits remain 200 fields / 64 KiB; raw WBXML, verified TLS,
   no replay/fallback and request/body limits remain explicit.
-- Fetch/ex_ssl and paired HTTP/TLS/QUIC packages use exact 0.21.15. DuskMoon
-  tooling is 10.0.2, UI 10.0.10 and Decimal 3.2.0. The current dependency
-  maintenance passed all 1,635 tests across 17 apps, strict dev/test/prod compile,
-  assets and fresh packaged startup. See [dependency maintenance](dependency-maintenance.md)
-  for the current results and explicit npm installer exception.
+- Fetch/ex_ssl and paired HTTP/TLS/QUIC packages use exact 0.21.16. DuskMoon
+  tooling is 10.0.2, UI 10.0.11 and Decimal 3.2.0. The current refresh passes
+  all 1,635 tests across 17 apps in one invocation, seed 42, strict dev/test/prod
+  compilation, development/production assets and fresh packaged HTTP startup. The preceding 0.21.15 /
+  UI 10.0.10 checkpoint passed all 1,635 tests across 17 apps, strict
+  dev/test/prod compilation, assets and fresh packaged startup. See
+  [dependency maintenance](dependency-maintenance.md) for version-specific
+  results and the npm installer exception.
 - OTP TLS remains default. No global ex_ssl switch is authorized by this task.
 - Legacy `:req_options` containers remain; application sources/dependencies
   no longer use Req/Mint transports. Mint remains transitively for tooling.

@@ -1,17 +1,20 @@
 # Gaoxy HTTP server migration
 
 - Date: 2026-10-22.
-- Status: original 0.9.0 implementation committed as `631cd7c`. Subsequent
-  [dependency maintenance](dependency-maintenance.md) passed local acceptance
-  on published Gaoxy 0.11.0 in `codex/gaoxy-http-server`; no merge or deployment.
+- Status: current dependency refresh selects published Gaoxy 0.12.1 in
+  `codex/dependency-refresh-20261022`; all 1,635 tests across 17 apps, strict
+  dev/test/prod compilation, assets and both fresh releases' HTTP startup pass.
+  Original 0.9.0 implementation (`631cd7c`) and subsequent 0.11.0 maintenance
+  (`bd46de3`) are merged into `main`; this refresh remains on its separate
+  branch, with no target deployment. Historical acceptance remains below. See [dependency maintenance](dependency-maintenance.md).
 - Scope: Web/API Phoenix listeners and the Edge signed HTTP API. Remove all
   three direct Bandit dependencies; preserve SMTP and provider HTTP transports.
 
 ## Ownership
 
 - `apps/manifold_web/mix.exs`, `apps/manifold_api/mix.exs`,
-  `apps/manifold_edge/mix.exs`: `gaoxy_http ~> 0.11.0`.
-- Root `mix.exs`: `websock_adapter ~> 0.11.0` using the
+  `apps/manifold_edge/mix.exs`: `gaoxy_http ~> 0.12.1`.
+- Root `mix.exs`: `websock_adapter ~> 0.12.1` using the
   `gaoxy_websock_adapter` Hex distribution and `override: true`. The OTP
   application name remains `websock_adapter`; do not install both distributions.
 - `config/config.exs`: `Gaoxy.PhoenixAdapter`, a 64 MiB Web byte budget and a
@@ -52,7 +55,36 @@ exercise actual sockets: ConnTest and LiveViewTest bypass server adapters.
 
 ## Verification
 
-### Current Gaoxy 0.11.0 maintenance checkpoint
+### Current Gaoxy 0.12.1 refresh checkpoint
+
+Gaoxy 0.12.1 requires public `http_core >= 0.21.16`; the paired HTTP/TLS/QUIC
+cohort is 0.21.16. DuskMoon tooling remains 10.0.2 and UI advances to 10.0.11.
+The full umbrella passes **1,635 tests**, zero failures, across 17 apps in one
+invocation, seed 42. Strict dev/test/prod compilation, formatting, npm frozen
+installation and verification (330 packages), development/production assets,
+Hex direct/all audits and npm workspace audits pass. npm audit reports zero
+vulnerabilities; JavaScript checks report zero errors and two existing warnings.
+
+Both fresh production releases pass actual local HTTP startup: Web HTML, API
+health and signed Edge status return 200. Packaged/runtime Gaoxy is 0.12.1;
+the six included HTTP/TLS applications are 0.21.16. Mix is unavailable and
+Bandit/ThousandIsland are absent. Release closures contain 81 applications for
+main and 43 for Edge; these are packaged counts, not started application counts.
+The runtime helper starts 15 main roots after 38 migrations, and four Edge
+roots after one migration. Both VMs exit zero and the two disposable databases
+are removed. Current smoke report:
+`tmp/gaoxy-release-smoke/run_1792682683_1ed5f51d/report.json`.
+See [dependency maintenance](dependency-maintenance.md) for detailed commands,
+artifacts and cleanup verification. No target deployment was performed.
+
+The published upgrade preserves existing listener limits, adapter identity and
+shutdown budgets. HEAD now preserves application Content-Length metadata; the
+exact Phoenix administrative disconnect reason closes normally. The new
+`request_timeout: :infinity` option is not selected: Manifold retains its finite
+HTTP request policy. Native H2 now uses public HTTP Core HPACK; no H2 listener
+is enabled by this refresh.
+
+### Historical Gaoxy 0.11.0 maintenance checkpoint
 
 All 17 applications pass **1,635 tests**, seed 42, in two isolated groups:
 nonserver 1,378 and Web/API/Edge 257. The server counts remain API 8, Web 207,
@@ -63,7 +95,7 @@ Fresh main/Edge production releases at
 `tmp/dependency-maintenance-2026-10-22/releases/{manifold,manifold_edge}` pass
 actual Web HTML, API health and signed Edge status HTTP requests. Their packaged
 and runtime Gaoxy cohorts are 0.11.0 and included HTTP/TLS packages 0.21.15.
-Bandit/ThousandIsland remain absent. Current smoke report:
+Bandit/ThousandIsland were absent at that checkpoint. Historical smoke report:
 `tmp/gaoxy-release-smoke/run_1792645325_02405e7e/report.json`.
 See [dependency maintenance](dependency-maintenance.md) for the complete upgrade,
 validation and npm proxy-feature exception. The historical evidence below

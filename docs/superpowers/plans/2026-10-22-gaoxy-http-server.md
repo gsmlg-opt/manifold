@@ -15,16 +15,23 @@ supervises Gaoxy.HTTP around its existing Router. Caddy still terminates TLS.
 **PASS**, 257 tests with zero failures. Published
 0.9.0 resolves [LiveView message capacity](https://github.com/gsmlg-dev/gaoxy/issues/9)
 and [active Edge drain](https://github.com/gsmlg-dev/gaoxy/issues/10); both packaged
-releases pass local startup and actual HTTP smoke. Changes remain in the isolated worktree.
-No local dependency workaround, merge or deployment. Current evidence is in the
+releases passed local startup and actual HTTP smoke. The original implementation
+and subsequent maintenance (`bd46de3`) are now merged into `main`. No local
+dependency workaround or target deployment. Current evidence is in the
 [maintenance record](../../../.agents/skills/develop/references/http-server-migration.md).
 
-**Current dependency checkpoint:** Gaoxy 0.11.0, HTTP/TLS 0.21.15, DuskMoon
-tooling 10.0.2 and UI 10.0.10. The subsequent user-authorized dependency update
-passes all 1,635 tests across 17 applications, including the same 257 server
-gates. Strict production compile, assets and both fresh releases' actual HTTP
-startup pass. Full validation and the npm proxy feature follow-up are tracked
-separately in [dependency maintenance](../../../.agents/skills/develop/references/dependency-maintenance.md).
+**Current dependency checkpoint:** Gaoxy 0.12.1, HTTP/TLS 0.21.16, DuskMoon
+tooling 10.0.2 and UI 10.0.11. All 1,635 tests across 17 apps pass in one
+invocation, seed 42; strict dev/test/prod compilation, formatting, Hex/npm
+audits, development/production assets and both fresh releases' actual
+Web/API/signed Edge HTTP startup pass. Packaged/runtime versions match the
+selected cohorts, with Mix and Bandit/ThousandIsland absent. This refresh
+remains on its separate branch, with no target deployment. The preceding Gaoxy 0.11.0 / HTTP/TLS 0.21.15 / UI
+10.0.10 checkpoint passed all 1,635 tests across 17 applications, including the
+same 257 server gates, strict production compilation, assets and both fresh
+releases' actual HTTP startup. Version-specific validation and the npm proxy
+feature follow-up are tracked separately in
+[dependency maintenance](../../../.agents/skills/develop/references/dependency-maintenance.md).
 The checklist below preserves the original 0.9.0 acceptance.
 
 ## 1. Baseline and regression gates

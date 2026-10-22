@@ -1,11 +1,109 @@
 # Hex and npm dependency maintenance
 
 - Date: 2026-10-22.
-- Status: dependency upgrade and local validation passed on the isolated branch.
+- Status: follow-up dependency refresh passes local acceptance in
+  `codex/dependency-refresh-20261022`; this refresh remains on its separate branch.
 - Scope: umbrella dependency declarations/locks, web workspace manifests/lock,
   necessary consumer compatibility, and scoped tests/documentation.
 
-## Current checkpoint: 2026-10-22
+## Current refresh: 2026-10-22
+
+User-requested audits: `mix hex.outdated` and
+`npx npm-check-updates@latest -w`. Baseline `bd46de3` is now merged into `main`;
+this follow-up uses `.trees/dependency-refresh-20261022` on
+`codex/dependency-refresh-20261022` to preserve the main checkout's existing
+dependency/build caches. The first main-checkout Hex audit could not proceed
+because those caches predated the merge. Fresh `mix deps.get` in the isolated
+worktree allowed the exact audit to run.
+
+| Dependency group | Previous | Updated |
+| --- | --- | --- |
+| Gaoxy / gaoxy_http / gaoxy_websock_adapter | 0.11.0 | 0.12.1 |
+| Eight Fetch / HTTP / TLS / QUIC packages | 0.21.15 | 0.21.16 |
+| Phoenix DuskMoon UI, Hex and npm | 10.0.10 | 10.0.11 |
+
+Exactly 12 Hex lock entries change. Updated the public Gaoxy requirements and
+exact Fetch/ex_ssl pins together, retaining the official WebSockAdapter alias.
+Ran `mix deps.update --all` and `npx npm-check-updates@latest -w -u`.
+The first Hex download timed out fetching UI 10.0.11; the documented
+`HEX_HTTP_CONCURRENCY=1 HEX_HTTP_TIMEOUT=120` retry succeeded. No dependency
+source patches or new overrides are used.
+
+Published-source compatibility review found:
+
+- Gaoxy 0.12.1 requires HTTP Core `~> 0.21 and >= 0.21.16`, replacing direct
+  HPAX use with public `HTTP.HTTP2.HPACK`. Its adapter package, Phoenix listener
+  supervision, service budgets and shutdown code are unchanged.
+- Gaoxy fixes HEAD Content-Length preservation, the inclusive polling boundary
+  and Phoenix administrative-disconnect closure. Infinite request lifetime is
+  an explicit new opt-in; Manifold keeps its finite 30-second default and
+  existing header/read/write/WebSocket limits.
+- The HTTP/TLS 0.21.16 executable library sources are unchanged; HTTP Core's
+  diff is HPACK documentation. DuskMoon tooling 10.0.2 permits this cohort.
+- UI 10.0.11 synchronizes native dropdown `aria-expanded` state. Its npm
+  dependencies/exports are unchanged. Root npm dependencies and transitive
+  pins are unchanged; the npm lock changes only the UI pin/tarball/integrity.
+
+Upstream [duskmoon-bundler#4](https://github.com/duskmoon-dev/duskmoon-bundler/issues/4)
+was closed without implementing proxy selection; it is not a released fix.
+The existing documented standard npm workflow remains necessary in this
+environment. `npm install --package-lock-only`, normal `npm ci`, zero-vulnerability
+`npm audit --json` and the final exact npx workspace audit pass. This refresh
+does not rerun the known failing canonical installer or claim it now passes.
+
+### Current validation
+
+All commands use the original root's Devenv environment and the isolated
+refresh worktree. The single full-suite invocation unsets `TEST_DATABASE_URL`
+and uses `MIX_TEST_PARTITION=_dependency_refresh_20261022`, seed 42.
+
+- PASS: all 17 application test directories, **1,635 tests, zero failures**,
+  including Web 207, API 8 and Edge 42 actual transport regression gates.
+- PASS: strict development, test and production compilation; repository
+  `mix format --check-formatted` and scoped `git diff --check`.
+- PASS: normal `npm ci`, canonical read-only `mix npm.verify` (330 packages),
+  zero-vulnerability npm audit and final requested npx workspace audit.
+- PASS: JS check, zero errors and two existing unused catch-parameter warnings;
+  development and production `mix assets.deploy` rebuild/digest CSS and JS.
+- PASS: final `mix hex.outdated` and `mix hex.outdated --all`, both exit zero
+  with all direct/transitive packages current.
+- PASS: all 169 local Markdown targets/anchors across the nine changed documents.
+- PASS: both production releases assemble at application version 0.6.8 in
+  fresh worktree `tmp/dependency-maintenance-2026-10-22-refresh/releases/`
+  destinations, without overwriting prior release evidence.
+- PASS: packaged startup with Mix unavailable and synthetic configuration.
+  Web HTML, API health and signed Edge status all return 200; Edge has no
+  pending deliveries. Both packaged/runtime Gaoxy cohorts are 0.12.1, and each
+  release's six included HTTP/TLS packages are 0.21.16. Main starts 15 roots
+  with a release closure of 81 applications (79 actually started) and runs 38
+  migrations; Edge starts four roots with a closure of 43 (41 actually started)
+  and runs one migration. IEx/SASL are packaged but not started in the eval VMs.
+
+Smoke evidence: worktree
+`tmp/gaoxy-release-smoke/run_1792682683_1ed5f51d/report.json` and
+`cleanup-audit.json`. Independent inspection confirms no Bandit/ThousandIsland,
+ExUnit or test-helper/module artifacts, zero runtime warning/error log entries,
+both VM exit acknowledgements zero, all three HTTP ports closed and both
+disposable databases independently confirmed absent. The task-scoped process
+check finds no remaining release processes. An initial broader environment
+scan could not read unrelated process metadata; its rejected completeness
+assertion is retained in `cleanup-audit-attempt1.json`. The corrected audit
+checks this run's owned resources without changing permissions or repeating
+the passing smoke.
+
+The full test log retains fresh-database bootstrap connection messages before
+the shared helper initializes the isolated partition, existing migration-test
+compiler warnings and intentional negative-path logs. No test failed; no
+application or test source changes were required by this refresh.
+
+Npm lock SHA-256:
+`bea9636f281faf3d493471af41a1d5c8d0305072c5316e048363ce52a80ffa98`.
+Current diagnostics and the per-app/lock summary are under the original root's
+`tmp/dependency-maintenance-2026-10-22-refresh/`; source comparison and
+release-smoke evidence are retained in the isolated worktree's `tmp/`.
+The completed acceptance below belongs to the previous versions and commit.
+
+## Earlier checkpoint: 2026-10-22
 
 The Gaoxy server migration was committed separately as `631cd7c` before this
 maintenance update on `codex/gaoxy-http-server`. Started with the requested
