@@ -27,7 +27,9 @@ defmodule Manifold.Umbrella.MixProject do
   end
 
   defp deps do
-    []
+    [
+      {:websock_adapter, "~> 0.9.0", hex: :gaoxy_websock_adapter, override: true}
+    ]
   end
 
   defp aliases do

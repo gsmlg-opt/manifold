@@ -21,10 +21,17 @@ defmodule Manifold.Edge.Application do
 
   defp api_children do
     if Application.get_env(:manifold_edge, :api_server, false) do
+      max_request_bytes =
+        :manifold_edge
+        |> Application.fetch_env!(:api)
+        |> Keyword.fetch!(:max_request_bytes)
+
       [
-        {Bandit,
-         plug: Manifold.Edge.Router,
-         scheme: :http,
+        {Gaoxy.HTTP,
+         id: :edge_api,
+         plug: {Manifold.Edge.Router, []},
+         limits: %{max_bytes: max(4_194_304, 4 * max_request_bytes)},
+         http_limits: %{max_body_bytes: max(8_388_608, max_request_bytes + 1)},
          ip: parse_bind(Application.fetch_env!(:manifold_edge, :api_bind)),
          port: Application.fetch_env!(:manifold_edge, :api_port)}
       ]

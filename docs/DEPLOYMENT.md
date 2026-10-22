@@ -16,6 +16,40 @@
 主程序不包含入站 SMTP listener；设置 `MANIFOLD_SMTP_*` 不能在主程序中启用它。
 发信通过账户配置的 Gmail API、Microsoft Graph 或 SMTP relay，不直接投递到收件域名 MX。
 
+### HTTP 服务器
+
+Gaoxy 替换已在隔离分支 `codex/gaoxy-http-server` 通过 257 项 Web/API/Edge 测试，
+两个本地生产 release 已通过实际启动及 HTTP 请求验证；**尚未合并或部署**。
+先前的[大正文 LiveView 消息](https://github.com/gsmlg-dev/gaoxy/issues/9)
+和 [Edge 活跃请求关闭](https://github.com/gsmlg-dev/gaoxy/issues/10) 缺陷已由 0.9.0 修复并通过消费者回归。
+
+源码中的 Web/API Endpoint 使用 `Gaoxy.PhoenixAdapter`，Edge API 直接监督
+`Gaoxy.HTTP`，依赖 `gaoxy_http` 0.9.0。Phoenix 的 `websock_adapter` 依赖由同名 OTP
+应用的 `gaoxy_websock_adapter` 0.9.0 包提供；升级依赖时保留根 `mix.exs` 的 override。
+本节描述源码接入，旧版镜像仍以其发布内容为准。
+打包移除旧依赖的版本时使用新的 release 输出目录；`mix release --overwrite`
+可能保留旧库文件。本次已在全新输出中核验 Bandit/ThousandIsland 不存在。
+
+监听端口和启动开关仍由 `PORT`、`API_PORT`、`MANIFOLD_EDGE_API_PORT` 及现有 Release
+配置控制。容器内监听普通 HTTP，Caddy 终止外部 TLS，并转发 `/live` 的 WebSocket
+升级和 longpoll 请求。公开 URL 的 HTTPS 配置不会自动启用原生 TLS、HTTP/2 或 HTTP/3。
+
+Web 监听服务的字节预算为 64 MiB，API 为 16 MiB，Edge 默认为 8 MiB，供 Plug 聚合请求体及传输
+缓冲使用；它们不改变应用的请求大小上限，也不代表整个 BEAM 的内存上限。普通 JSON
+解析上限仍为 8,000,000 字节，Resend webhook 为 1,048,576 字节，Edge 默认签名请求
+为 2,097,152 字节。Edge 启动时从 `MANIFOLD_EDGE_MAX_REQUEST_BYTES` 自动计算服务
+预算（至少 4 MiB，且为请求上限的四倍）及底层 body ceiling（至少 8 MiB，且比应用
+上限多一字节），让应用继续返回原有 JSON 413。
+
+Gaoxy 0.9.0 默认 HTTP 请求/响应总期限为 30 秒，header/read/write 期限为 5 秒，
+分块附件下载也受这些期限约束。Web 的现有 Phoenix 配置保留 10,000,000 字节的
+WebSocket 帧上限，省略的消息上限在 0.9.0 中跟随帧上限；两者也受服务预算四分之一的约束。
+64 MiB Web 预算为原有容量留出余量，已通过 300 KiB 转义正文及 5 MiB ASCII 草稿回归。
+WebSocket 空闲期限仍为 60 秒、最大连接寿命 24 小时，普通 Phoenix 心跳和重连机制继续生效。
+需要更长 HTTP 下载期限时，在 Endpoint 的 `http`
+或 Edge 的 `Gaoxy.HTTP` 子配置中使用公开的 `http_limits`，并同时核对代理超时。
+迁移范围和传输验证入口见[维护记录](../.agents/skills/develop/references/http-server-migration.md)。
+
 Web 和 API **没有应用级登录或权限隔离**。所有能访问它们的人都拥有整个实例的访问权。
 使用 VPN、受限网络或有访问控制的可信反向代理；仅配置 HTTPS 不会增加用户认证。
 下文将后台端口绑定到宿主机 loopback，并给出 VPN 地址白名单的代理示例。

@@ -126,7 +126,9 @@ config :manifold_web,
 
 config :manifold_web, ManifoldWeb.Endpoint,
   url: [host: "localhost"],
-  adapter: Bandit.PhoenixAdapter,
+  adapter: Gaoxy.PhoenixAdapter,
+  # Retain WebSockAdapter's 10,000,000-byte frames and their accounting headroom.
+  http: [limits: %{max_bytes: 67_108_864}],
   render_errors: [
     formats: [html: ManifoldWeb.ErrorHTML, json: ManifoldWeb.ErrorJSON],
     layout: false
@@ -140,7 +142,9 @@ config :manifold_api,
 
 config :manifold_api, ManifoldAPI.Endpoint,
   url: [host: "localhost"],
-  adapter: Bandit.PhoenixAdapter,
+  adapter: Gaoxy.PhoenixAdapter,
+  # Plug may retain both chunks and a flattened body at its 8,000,000-byte limit.
+  http: [limits: %{max_bytes: 16_777_216}],
   render_errors: [
     formats: [json: ManifoldAPI.ErrorJSON],
     layout: false
