@@ -24,7 +24,7 @@ defmodule Manifold.Mail.MixProject do
       {:manifold_data, in_umbrella: true},
       {:manifold_storage, in_umbrella: true},
       {:mail, "~> 0.5.2"},
-      {:codepagex, "~> 0.1.13"},
+      {:codepagex, "~> 0.2.0"},
       {:html_sanitize_ex, "~> 1.5.2"},
       {:ex_marcel, "~> 0.2.0"},
       {:telemetry, "~> 1.3"}

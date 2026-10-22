@@ -20,12 +20,21 @@ and [scoped implementation evidence](superpowers/implementation/calendar-validat
 This checkpoint does not re-audit unrelated areas or claim deployment.
 
 HTTP-server migration checkpoint: **2026-10-22**, isolated
-`codex/gaoxy-http-server` candidate based on v0.6.8. Published Gaoxy 0.9.0 fixes
+`codex/gaoxy-http-server` candidate based on v0.6.8, committed as `631cd7c`.
+Published Gaoxy 0.9.0 fixes
 the message-capacity and active-drain defects; Web/API and Edge integration has
 **257 scoped tests passing**, and both production releases are assembled.
 Packaged startup and actual local HTTP smoke pass; see the
 [migration record](../.agents/skills/develop/references/http-server-migration.md).
 No merge or deployment has occurred.
+
+Dependency maintenance checkpoint: **2026-10-22**, in the same isolated branch.
+Gaoxy is now 0.11.0, the HTTP/TLS cohort 0.21.15, DuskMoon tooling 10.0.2 and UI
+10.0.10. All 17 applications pass **1,635 tests**, including the 257 server
+gates. Frontend assets, final Hex/npm audits, strict production compile and both
+fresh releases' actual HTTP startup pass. See the
+[maintenance record](../.agents/skills/develop/references/dependency-maintenance.md)
+for the npm proxy-feature exception and verification limits.
 
 Use [the documentation index](README.md) for current setup and architecture.
 Historical plan checkboxes and test totals are not a project-wide completion
@@ -36,8 +45,8 @@ the specific behavior, revision and environment being claimed.
 
 | Area | Current implementation | Evidence and limits |
 | --- | --- | --- |
-| Business HTTP clients | Shared native Fetch 0.21.10 for Gmail/Graph/OAuth, outbound Gmail/Graph/Resend, Cloud, DAV and EAS | [Migration and acceptance](HTTP_CLIENT.md): 910 affected tests passed; upstream #114/#115/#121 fixed and verified. Accepted for v0.6.4 integration into main; credentialed provider staging and runtime switching remain separate. |
-| HTTP servers | Isolated Gaoxy 0.9.0 migration for Web/API Endpoints and Edge; all direct Bandit dependencies removed | [Migration record](../.agents/skills/develop/references/http-server-migration.md): 257 scoped tests pass, including large composer messages and active Edge shutdown; both packaged releases serve actual HTTP with no Bandit/ThousandIsland. No merge or deployment. |
+| Business HTTP clients | Shared native Fetch 0.21.15 for Gmail/Graph/OAuth, outbound Gmail/Graph/Resend, Cloud, DAV and EAS | [Migration and acceptance](HTTP_CLIENT.md): original 0.21.10 migration passed 910 affected tests; current dependency maintenance passes all 1,635 tests. Upstream #114/#115/#121 remain fixed; credentialed provider staging and runtime switching remain separate. |
+| HTTP servers | Isolated Gaoxy 0.11.0 migration for Web/API Endpoints and Edge; all direct Bandit dependencies removed | [Migration record](../.agents/skills/develop/references/http-server-migration.md): 257 scoped tests pass, including large composer messages and active Edge shutdown; both fresh packaged releases serve actual HTTP with no Bandit/ThousandIsland. No merge or deployment. |
 | Foundation and inbound (M0–1) | Umbrella, PostgreSQL/Oban, recipient resolution, durable spool, atomic acceptance, archival and recovery | [Original plan](IMPLEMENTATION_PLAN.md), [crash boundaries](CRASH_BOUNDARIES.md); current SMTP listener runs in the optional edge release |
 | Mailbox (M2) | MIME projection, safe HTML display, inbound attachments, threading, search, folders and read/star/archive/trash actions | [M2](MILESTONE_2_PLAN.md); Gmail/Graph read changes remain local |
 | Outbound (M3 and later extensions) | Plain-text drafts, reply/forward, frozen queue payloads, Gmail API/Graph/SMTP submission, legacy Resend webhooks and uncertain-submission handling | [Current send contract](DESIGN.md#225-account-selected-outbound-methods); HTML composition and outbound attachments are pending extensions |
@@ -61,7 +70,7 @@ suggested order is advisory.
 | V4 | Before Calendar rollout | Joint Google/iCloud acceptance — Calendars, Connectors, Web | Use authorized disposable calendars to verify Calendar authorization, simultaneous CRUD, reconnection, exceptions and uncertain outcomes. Localhost HTTP and migration probes are recorded separately in [Calendar evidence](superpowers/implementation/calendar-validation.md); real-provider reads/writes for the new path are NOT RUN. |
 | V2 | First | Microsoft work/school and outbound staging — Connectors, Outbound, Web | Exercise work/school device login, receive/send grants, actual sending, authoritative Sent import, credential rotation and reconnect. [Personal Outlook login and 258 received messages were verified](../.agents/skills/develop/references/microsoft-device-oauth.md#personal-account-and-verification-url-repair-2026-10-09); work/school authorization and credentialed sending were not exercised. Use the current device flow instead of historical callback-only instructions. |
 | V3 | First | Gmail/SMTP lifecycle and backfill evidence — Connectors, Outbound, Web | Complete the [staging checklist](../.agents/skills/develop/references/gmail-receive-send-methods.md#staging-smoke-checklist) with the [current OAuth flow](OAUTH_SETUP.md), including real sending, reconnect and no blind resend after an uncertain outcome. Inspect current cursors/jobs before claiming Gmail or IMAP backfill completion; historical import samples do not establish today's state. Controlled tests cover cooldown; the [Gmail sample](../.agents/skills/develop/references/gmail-sync-rate-limiting.md#validation) did not trigger a real long cooldown. |
-| V5 | Before Gaoxy rollout | Target reverse-proxy/TLS acceptance — Web, API, Edge, operators | Local implementation and packaged startup pass on Gaoxy 0.9.0. Verify Caddy WebSocket/longpoll forwarding, TLS and production timeout/body limits on the authorized target; target deployment remains NOT RUN. [Consumer evidence and finite limits](../.agents/skills/develop/references/http-server-migration.md). |
+| V5 | Before Gaoxy rollout | Target reverse-proxy/TLS acceptance — Web, API, Edge, operators | Local implementation and packaged startup pass on Gaoxy 0.11.0. Verify Caddy WebSocket/longpoll forwarding, TLS and production timeout/body limits on the authorized target; target deployment remains NOT RUN. [Consumer evidence and finite limits](../.agents/skills/develop/references/http-server-migration.md). |
 
 ## Engineering follow-ups
 

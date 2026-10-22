@@ -1,12 +1,12 @@
 # Business HTTP clients
 
-The 2026-10-15 migration for the v0.6.4 release candidate, developed from
-`1d150fc` on `codex/http-fetch-client`, uses native Hex `http_fetch 0.21.10` through
+Business consumers use native Hex `http_fetch 0.21.15` through
 `Manifold.Core.HTTPClient`. Gmail/Graph connector and OAuth requests,
 Gmail/Graph/Resend submission, signed cloud ingress, DAV and EAS use this shared
-client in the migration worktree. The final dependency update includes the
-response-version fix for #121. All business client paths are accepted for
-integration into `main`; publication is tracked by the v0.6.4 release workflow.
+client. The initial 2026-10-15 migration for the v0.6.4 release candidate was
+developed from `1d150fc` on `codex/http-fetch-client` and accepted on 0.21.10,
+including the response-version fix for #121. The 2026-10-22 maintenance candidate
+updates dependencies without changing client or provider policies.
 
 | Consumer | Worktree transport | Remaining requirement |
 | --- | --- | --- |
@@ -87,7 +87,14 @@ accepting HTTP/1 minor versions, following HTTP/1 compatibility semantics.
 
 ## Dependency and validation checkpoint
 
-Core declares exact Fetch 0.21.10 and connectors use matching ex_ssl 0.21.10; paired
+The 2026-10-22 maintenance candidate declares exact Fetch and ex_ssl 0.21.15,
+with matching HTTP/TLS/QUIC packages. DuskMoon tooling is 10.0.2, UI is 10.0.10
+and Decimal is 3.2.0. All 1,635 tests across 17 apps, strict dev/test/prod compile,
+assets and fresh main/Edge packaged startup pass; see the
+[dependency maintenance record](../.agents/skills/develop/references/dependency-maintenance.md).
+The following results retain the original migration checkpoint.
+
+Originally, core declared exact Fetch 0.21.10 and connectors used matching ex_ssl 0.21.10; paired
 HTTP/TLS/QUIC packages align. DuskMoon bundler/runtime/npm/QuickBEAM tooling moves
 from 9.16.7 to 9.16.16 to resolve compatible Fetch constraints. Phoenix DuskMoon UI
 remains 9.16.7; the frontend source is unchanged. The npm lock records the previously missing

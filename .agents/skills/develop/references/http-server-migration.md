@@ -1,16 +1,17 @@
 # Gaoxy HTTP server migration
 
 - Date: 2026-10-22.
-- Status: implementation, scoped acceptance and local packaged startup passed
-  with published Gaoxy 0.9.0. Changes remain isolated on `codex/gaoxy-http-server`.
+- Status: original 0.9.0 implementation committed as `631cd7c`. Subsequent
+  [dependency maintenance](dependency-maintenance.md) passed local acceptance
+  on published Gaoxy 0.11.0 in `codex/gaoxy-http-server`; no merge or deployment.
 - Scope: Web/API Phoenix listeners and the Edge signed HTTP API. Remove all
   three direct Bandit dependencies; preserve SMTP and provider HTTP transports.
 
 ## Ownership
 
 - `apps/manifold_web/mix.exs`, `apps/manifold_api/mix.exs`,
-  `apps/manifold_edge/mix.exs`: `gaoxy_http ~> 0.9.0`.
-- Root `mix.exs`: `websock_adapter ~> 0.9.0` using the
+  `apps/manifold_edge/mix.exs`: `gaoxy_http ~> 0.11.0`.
+- Root `mix.exs`: `websock_adapter ~> 0.11.0` using the
   `gaoxy_websock_adapter` Hex distribution and `override: true`. The OTP
   application name remains `websock_adapter`; do not install both distributions.
 - `config/config.exs`: `Gaoxy.PhoenixAdapter`, a 64 MiB Web byte budget and a
@@ -51,6 +52,25 @@ exercise actual sockets: ConnTest and LiveViewTest bypass server adapters.
 
 ## Verification
 
+### Current Gaoxy 0.11.0 maintenance checkpoint
+
+All 17 applications pass **1,635 tests**, seed 42, in two isolated groups:
+nonserver 1,378 and Web/API/Edge 257. The server counts remain API 8, Web 207,
+Edge 42, including the larger composer and active Edge shutdown regressions.
+Strict dev/test/prod compilation, formatter and rebuilt production assets pass.
+
+Fresh main/Edge production releases at
+`tmp/dependency-maintenance-2026-10-22/releases/{manifold,manifold_edge}` pass
+actual Web HTML, API health and signed Edge status HTTP requests. Their packaged
+and runtime Gaoxy cohorts are 0.11.0 and included HTTP/TLS packages 0.21.15.
+Bandit/ThousandIsland remain absent. Current smoke report:
+`tmp/gaoxy-release-smoke/run_1792645325_02405e7e/report.json`.
+See [dependency maintenance](dependency-maintenance.md) for the complete upgrade,
+validation and npm proxy-feature exception. The historical evidence below
+belongs to the original 0.9.0 acceptance.
+
+### Original Gaoxy 0.9.0 acceptance
+
 Run from the umbrella root under `devenv shell`:
 
 ```sh
@@ -79,9 +99,10 @@ budget; configuring the public 16 MiB budget made both API wire tests pass.
 The initial combined run passed 255 tests before independent review expanded
 the composer gate beyond 256 KiB and added an active Edge drain gate.
 
-Final Gaoxy **0.9.0** scoped run, seed 42: **257 tests, zero failures**.
+Original Gaoxy **0.9.0** scoped acceptance, seed 42: **257 tests, zero failures**.
 API 8/8, Web 207/207 (198 existing and 9 new cases), Edge 42/42 (31 existing
-and 11 new). Existing HTTP client/TLS package versions remain 0.21.10.
+and 11 new). HTTP client/TLS packages were 0.21.10 at this acceptance checkpoint;
+current dependency versions and new verification are tracked in the maintenance record.
 
 | Status | Consumer gate | Evidence |
 | --- | --- | --- |
@@ -99,9 +120,10 @@ and 11 new). Existing HTTP client/TLS package versions remain 0.21.10.
 
 Both local production releases were assembled at version 0.6.8, then exercised
 through their installed `bin/<release> eval` command, production runtime config
-and complete root application closures. Main started 15 roots / 82 applications,
+and complete root application closures. Main started 15 roots with an
+82-application release closure,
 ran 38 migrations and served `/contacts` HTML and `/api/v1/health` JSON. Edge
-started four roots / 44 applications, ran one migration and served a real signed
+started four roots with a 44-application release closure, ran one migration and served a real signed
 `/api/v1/status` request; its SMTP application also started on loopback port zero.
 Both release manifests, packaged libraries and started applications omit Bandit
 and ThousandIsland. Each runtime Gaoxy cohort reports 0.9.0, and Mix is unavailable.

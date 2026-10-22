@@ -3,20 +3,29 @@
 > **For agentic workers:** Use subagent-driven-development for independent
 > Phoenix and Edge test work, with the parent owning dependencies/config/docs.
 
-**Goal:** Serve Web, API and Edge with published Gaoxy 0.9.0 and remove direct
+**Original goal:** Serve Web, API and Edge with published Gaoxy 0.9.0 and remove direct
 Bandit dependencies without changing application transport contracts.
 
 **Architecture:** Phoenix Endpoints own their Gaoxy listeners. Edge directly
 supervises Gaoxy.HTTP around its existing Router. Caddy still terminates TLS.
 
-**Tech Stack:** Elixir 1.18 / OTP 28, Phoenix 1.8, LiveView 1.2, Gaoxy 0.9.0.
+**Original tech stack:** Elixir 1.18 / OTP 28, Phoenix 1.8, LiveView 1.2, Gaoxy 0.9.0.
 
-**Status:** implementation and local acceptance **PASS**, 257 tests with zero failures. Published
+**Original status:** committed as `631cd7c`; implementation and local acceptance
+**PASS**, 257 tests with zero failures. Published
 0.9.0 resolves [LiveView message capacity](https://github.com/gsmlg-dev/gaoxy/issues/9)
 and [active Edge drain](https://github.com/gsmlg-dev/gaoxy/issues/10); both packaged
 releases pass local startup and actual HTTP smoke. Changes remain in the isolated worktree.
 No local dependency workaround, merge or deployment. Current evidence is in the
 [maintenance record](../../../.agents/skills/develop/references/http-server-migration.md).
+
+**Current dependency checkpoint:** Gaoxy 0.11.0, HTTP/TLS 0.21.15, DuskMoon
+tooling 10.0.2 and UI 10.0.10. The subsequent user-authorized dependency update
+passes all 1,635 tests across 17 applications, including the same 257 server
+gates. Strict production compile, assets and both fresh releases' actual HTTP
+startup pass. Full validation and the npm proxy feature follow-up are tracked
+separately in [dependency maintenance](../../../.agents/skills/develop/references/dependency-maintenance.md).
+The checklist below preserves the original 0.9.0 acceptance.
 
 ## 1. Baseline and regression gates
 

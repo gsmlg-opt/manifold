@@ -18,14 +18,16 @@
 
 ### HTTP 服务器
 
-Gaoxy 替换已在隔离分支 `codex/gaoxy-http-server` 通过 257 项 Web/API/Edge 测试，
-两个本地生产 release 已通过实际启动及 HTTP 请求验证；**尚未合并或部署**。
+Gaoxy 替换已在隔离分支 `codex/gaoxy-http-server` 以 `631cd7c` 提交，原始 0.9.0
+检查点通过 257 项测试及两个本地生产 release 的实际 HTTP 验证。后续依赖维护升级至
+0.11.0，全部 17 个应用的 1,635 项测试、生产构建及两个全新 release 的实际 HTTP
+启动验证再次通过；**尚未合并或部署**。
 先前的[大正文 LiveView 消息](https://github.com/gsmlg-dev/gaoxy/issues/9)
 和 [Edge 活跃请求关闭](https://github.com/gsmlg-dev/gaoxy/issues/10) 缺陷已由 0.9.0 修复并通过消费者回归。
 
 源码中的 Web/API Endpoint 使用 `Gaoxy.PhoenixAdapter`，Edge API 直接监督
-`Gaoxy.HTTP`，依赖 `gaoxy_http` 0.9.0。Phoenix 的 `websock_adapter` 依赖由同名 OTP
-应用的 `gaoxy_websock_adapter` 0.9.0 包提供；升级依赖时保留根 `mix.exs` 的 override。
+`Gaoxy.HTTP`，依赖 `gaoxy_http` 0.11.0。Phoenix 的 `websock_adapter` 依赖由同名 OTP
+应用的 `gaoxy_websock_adapter` 0.11.0 包提供；升级依赖时保留根 `mix.exs` 的 override。
 本节描述源码接入，旧版镜像仍以其发布内容为准。
 打包移除旧依赖的版本时使用新的 release 输出目录；`mix release --overwrite`
 可能保留旧库文件。本次已在全新输出中核验 Bandit/ThousandIsland 不存在。
@@ -41,7 +43,7 @@ Web 监听服务的字节预算为 64 MiB，API 为 16 MiB，Edge 默认为 8 Mi
 预算（至少 4 MiB，且为请求上限的四倍）及底层 body ceiling（至少 8 MiB，且比应用
 上限多一字节），让应用继续返回原有 JSON 413。
 
-Gaoxy 0.9.0 默认 HTTP 请求/响应总期限为 30 秒，header/read/write 期限为 5 秒，
+Gaoxy 0.11.0 默认 HTTP 请求/响应总期限为 30 秒，header/read/write 期限为 5 秒，
 分块附件下载也受这些期限约束。Web 的现有 Phoenix 配置保留 10,000,000 字节的
 WebSocket 帧上限，省略的消息上限在 0.9.0 中跟随帧上限；两者也受服务预算四分之一的约束。
 64 MiB Web 预算为原有容量留出余量，已通过 300 KiB 转义正文及 5 MiB ASCII 草稿回归。

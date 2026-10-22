@@ -26,6 +26,14 @@ defmodule Manifold.Mail.CharsetTest do
     assert Charset.decode("iso-8859-1", <<0xC0, 0xE9>>) == "Àé"
   end
 
+  test "keeps ASCII apostrophes and backticks unchanged" do
+    body = "It's `plain` ASCII."
+
+    for charset <- ["ascii", "us-ascii"] do
+      assert Charset.decode(charset, body) == body
+    end
+  end
+
   test "unknown charset still falls back without raising" do
     assert is_binary(Charset.decode("totally-unknown", @ribao_gbk))
   end

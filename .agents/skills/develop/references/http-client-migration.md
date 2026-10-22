@@ -1,11 +1,11 @@
 # HTTP client migration
 
-## Current implementation — 2026-10-15
+## Current implementation — 2026-10-22
 
 Status: Gmail/Graph connector/OAuth, Gmail/Graph/Resend outbound, Cloud and DAV
-and EAS use native Fetch for the v0.6.4 release candidate, developed in
-`codex/http-fetch-client`; the dependency is upgraded
-to the release fixing [http_fetch#121](https://github.com/gsmlg-dev/http_fetch/issues/121).
+and EAS use native Fetch. The original v0.6.4 migration was developed in
+`codex/http-fetch-client` on the release fixing
+[http_fetch#121](https://github.com/gsmlg-dev/http_fetch/issues/121).
 
 - Core owns `Manifold.Core.HTTPClient`, Response/TransportError normalization,
   request encoding, bounded raw/content decoding, lazy streams, cancellation
@@ -23,9 +23,11 @@ to the release fixing [http_fetch#121](https://github.com/gsmlg-dev/http_fetch/i
   native chunk lines cap at 8 KiB and trailers at 128 fields / 64 KiB. Combined
   EAS initial/trailer limits remain 200 fields / 64 KiB; raw WBXML, verified TLS,
   no replay/fallback and request/body limits remain explicit.
-- Fetch/ex_ssl and paired HTTP/TLS/QUIC packages use exact 0.21.10. DuskMoon
-  tooling stays 9.16.16, UI 9.16.7 and Decimal 3.1.1. The npm lock adds missing
-  transitive records without changing existing versions.
+- Fetch/ex_ssl and paired HTTP/TLS/QUIC packages use exact 0.21.15. DuskMoon
+  tooling is 10.0.2, UI 10.0.10 and Decimal 3.2.0. The current dependency
+  maintenance passed all 1,635 tests across 17 apps, strict dev/test/prod compile,
+  assets and fresh packaged startup. See [dependency maintenance](dependency-maintenance.md)
+  for the current results and explicit npm installer exception.
 - OTP TLS remains default. No global ex_ssl switch is authorized by this task.
 - Legacy `:req_options` containers remain; application sources/dependencies
   no longer use Req/Mint transports. Mint remains transitively for tooling.

@@ -29,7 +29,7 @@ defmodule ManifoldAPI.MixProject do
       {:absinthe, "~> 1.7"},
       {:absinthe_plug, "~> 1.5"},
       {:jason, "~> 1.4"},
-      {:gaoxy_http, "~> 0.9.0"},
+      {:gaoxy_http, "~> 0.11.0"},
       {:telemetry, "~> 1.3"}
     ]
   end

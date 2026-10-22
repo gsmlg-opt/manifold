@@ -28,7 +28,7 @@ defmodule Manifold.Umbrella.MixProject do
 
   defp deps do
     [
-      {:websock_adapter, "~> 0.9.0", hex: :gaoxy_websock_adapter, override: true}
+      {:websock_adapter, "~> 0.11.0", hex: :gaoxy_websock_adapter, override: true}
     ]
   end
 
@@ -37,6 +37,9 @@ defmodule Manifold.Umbrella.MixProject do
       setup: ["deps.get", "ecto.setup", "assets.setup"],
       "ecto.setup": ["ecto.create", "ecto.migrate", "run apps/manifold_data/priv/repo/seeds.exs"],
       "ecto.reset": ["ecto.drop", "ecto.setup"],
+      # TODO(upstream): duskmoon-dev/duskmoon-bundler#4
+      # WORKAROUND(upstream): duskmoon-dev/duskmoon-bundler#4
+      # Proxy-required installs use the npm workflow in dependency-maintenance.md.
       "assets.setup": ["npm.install"],
       "assets.build": ["duskmoon_bundler.build manifold_web --tailwind"],
       "assets.deploy": [

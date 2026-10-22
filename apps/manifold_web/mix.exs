@@ -42,12 +42,12 @@ defmodule ManifoldWeb.MixProject do
       {:lazy_html, "~> 0.1"},
       {:phoenix_pubsub, "~> 2.2"},
       {:telemetry, "~> 1.3"},
-      {:phoenix_duskmoon, "~> 9.9"},
+      {:phoenix_duskmoon, "~> 10.0"},
       {:jason, "~> 1.4"},
-      {:gaoxy_http, "~> 0.9.0"},
-      {:duskmoon_bundler_runtime, "~> 9.9"},
+      {:gaoxy_http, "~> 0.11.0"},
+      {:duskmoon_bundler_runtime, "~> 10.0"},
       # TODO(upstream): duskmoon-dev/phoenix-duskmoon-ui#108
-      {:duskmoon_bundler, "~> 9.9", runtime: Mix.env() == :dev}
+      {:duskmoon_bundler, "~> 10.0", runtime: Mix.env() == :dev}
     ]
   end
 

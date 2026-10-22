@@ -3,8 +3,8 @@
 Approved scope: replace Bandit in both Phoenix Endpoints and the separately
 supervised Edge Plug listener, removing the three direct Bandit dependencies.
 
-Implementation status: implementation, scoped acceptance and local packaged
-startup **PASS** with published Gaoxy 0.9.0. The release fixes
+Original implementation: committed as `631cd7c`; scoped acceptance and local
+packaged startup **PASS** with published Gaoxy 0.9.0. That release fixes
 [large LiveView message rejection](https://github.com/gsmlg-dev/gaoxy/issues/9)
 and [premature active Edge shutdown](https://github.com/gsmlg-dev/gaoxy/issues/10).
 The isolated candidate has 257 passing scoped tests and both production
@@ -12,10 +12,16 @@ releases serve actual local HTTP traffic. No merge or deployment has occurred. T
 [maintenance record](../../../.agents/skills/develop/references/http-server-migration.md)
 contains current evidence and the resolved historical failures.
 
+Subsequent dependency maintenance selects Gaoxy 0.11.0 with unchanged listener
+contracts. All 1,635 tests across 17 applications pass, including the 257 server
+gates. Strict production compile, assets and both fresh releases' actual HTTP
+startup pass. Full results and the separate npm proxy feature follow-up
+are recorded in [dependency maintenance](../../../.agents/skills/develop/references/dependency-maintenance.md).
+
 ## Integration
 
-Use published `gaoxy_http ~> 0.9.0` and the official
-`{:websock_adapter, "~> 0.9.0", hex: :gaoxy_websock_adapter, override: true}`
+Use published `gaoxy_http ~> 0.11.0` and the official
+`{:websock_adapter, "~> 0.11.0", hex: :gaoxy_websock_adapter, override: true}`
 distribution under its existing OTP application name. Web and API retain
 Endpoint-owned supervision with `Gaoxy.PhoenixAdapter`. Edge supervises
 `{Gaoxy.HTTP, id: :edge_api, plug: {Manifold.Edge.Router, []}, ip: ..., port: ...}`.
