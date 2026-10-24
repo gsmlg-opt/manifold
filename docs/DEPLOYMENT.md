@@ -111,6 +111,29 @@ Google/Microsoft OAuth 客户端凭证只在 **Settings → OAuth** 保存，不
 `.env`、`main.env` 和数据库备份包含敏感数据，放在仓库外，不提交到 GitHub。
 不要将完整的 `docker compose config`、容器环境或数据库 URL 贴入日志与问题报告。
 
+### 主程序 Web/API 监听地址
+
+主程序生产运行时可分别设置 `MANIFOLD_WEB_BIND` 和 `MANIFOLD_API_BIND`，默认均为
+`0.0.0.0`，保持现有安装行为。值必须是数字 IPv4 或 IPv6 地址，例如 `127.0.0.1`、
+`::1` 或 `2001:db8::2`；不接受主机名、URL、方括号或端口后缀。无效值会在启动时
+报出对应变量名并终止配置加载。IPv6 监听要求主机支持相应地址和网络栈。
+
+使用 Podman/Docker host 网络或直接运行 Release、且 Caddy 在同一主机时，在主程序
+环境文件中配置 loopback：
+
+```sh
+MANIFOLD_WEB_BIND=127.0.0.1
+MANIFOLD_API_BIND=127.0.0.1
+```
+
+`PORT` 和 `API_PORT` 仍分别控制 Web/API 端口（默认 `4290`/`4292`）；
+`PHX_HOST` 只控制公开 HTTPS URL，不决定监听地址。两个 bind 变量互不影响，也不影响
+开发/测试配置或 Edge/SMTP 监听。更新环境后重启主程序，再确认 Caddy 能连接上游。
+
+下文 Compose 使用 bridge 网络及宿主机 loopback 端口映射，容器内应保留默认
+`0.0.0.0`；容器内改用 `127.0.0.1` 会阻断端口映射和其他容器的连接。旧版镜像或
+Release 不支持这两个新变量，部署前核对所用版本的 `runtime.exs`。
+
 ## 3. 主程序：Docker Compose
 
 保存为 `compose.yaml`。固定版本标签便于升级和回退；需要不可变引用时，将 `image` 改为
