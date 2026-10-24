@@ -357,19 +357,31 @@ if not edge_release? do
       System.get_env("SECRET_KEY_BASE") ||
         raise "SECRET_KEY_BASE is missing. Generate one with mix phx.gen.secret."
 
+    bind_address! = fn env_name ->
+      address = System.get_env(env_name, "0.0.0.0")
+
+      case :inet.parse_strict_address(String.to_charlist(address)) do
+        {:ok, ip} ->
+          ip
+
+        {:error, _reason} ->
+          raise ArgumentError, "#{env_name} must be a numeric IPv4 or IPv6 address"
+      end
+    end
+
     host = System.get_env("PHX_HOST") || "localhost"
     port = String.to_integer(System.get_env("PORT", "4290"))
     api_port = String.to_integer(System.get_env("API_PORT", "4292"))
 
     config :manifold_web, ManifoldWeb.Endpoint,
       url: [host: host, port: 443, scheme: "https"],
-      http: [ip: {0, 0, 0, 0}, port: port],
+      http: [ip: bind_address!.("MANIFOLD_WEB_BIND"), port: port],
       secret_key_base: secret_key_base,
       server: true
 
     config :manifold_api, ManifoldAPI.Endpoint,
       url: [host: host, port: 443, scheme: "https"],
-      http: [ip: {0, 0, 0, 0}, port: api_port],
+      http: [ip: bind_address!.("MANIFOLD_API_BIND"), port: api_port],
       secret_key_base: secret_key_base,
       server: true
   end
