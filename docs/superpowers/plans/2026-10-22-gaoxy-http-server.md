@@ -26,7 +26,7 @@ invocation, seed 42; strict dev/test/prod compilation, formatting, Hex/npm
 audits, development/production assets and both fresh releases' actual
 Web/API/signed Edge HTTP startup pass. Packaged/runtime versions match the
 selected cohorts, with Mix and Bandit/ThousandIsland absent. This refresh
-remains on its separate branch, with no target deployment. The preceding Gaoxy 0.11.0 / HTTP/TLS 0.21.15 / UI
+is merged into `main` as `60eb5af` (2026-10-24), with no target deployment. The preceding Gaoxy 0.11.0 / HTTP/TLS 0.21.15 / UI
 10.0.10 checkpoint passed all 1,635 tests across 17 applications, including the
 same 257 server gates, strict production compilation, assets and both fresh
 releases' actual HTTP startup. Version-specific validation and the npm proxy

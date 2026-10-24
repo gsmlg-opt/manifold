@@ -41,7 +41,7 @@ strict dev/test/prod compilation, formatting, npm frozen installation and
 verification (330 packages), Hex/npm audits and development/production assets.
 Both fresh releases pass actual Web/API/signed Edge HTTP startup with Gaoxy
 0.12.1 and the included HTTP/TLS cohort 0.21.16; Mix and Bandit are absent.
-The current refresh remains on its separate branch, with no target deployment. See the
+The current refresh is merged into `main` as `60eb5af` (2026-10-24), with no target deployment. See the
 [maintenance record](../.agents/skills/develop/references/dependency-maintenance.md)
 for version-specific results, the npm proxy-feature exception and verification limits.
 
@@ -55,7 +55,7 @@ the specific behavior, revision and environment being claimed.
 | Area | Current implementation | Evidence and limits |
 | --- | --- | --- |
 | Business HTTP clients | Shared native Fetch 0.21.16 for Gmail/Graph/OAuth, outbound Gmail/Graph/Resend, Cloud, DAV and EAS | [Migration and acceptance](HTTP_CLIENT.md): original 0.21.10 migration passed 910 affected tests; preceding 0.21.15 maintenance passed all 1,635 tests. Current 0.21.16 refresh passes all 1,635 tests, strict dev/test/prod compilation and packaged startup. Upstream #114/#115/#121 remain fixed; credentialed provider staging and runtime switching remain separate. |
-| HTTP servers | Gaoxy 0.12.1 candidate for Web/API Endpoints and Edge; all direct Bandit dependencies removed | [Migration record](../.agents/skills/develop/references/http-server-migration.md): original 0.9.0 and preceding 0.11.0 checkpoints passed 257 scoped tests and packaged HTTP startup. Current 0.12.1 refresh passes all 1,635 tests, strict dev/test/prod compilation and both fresh releases' actual HTTP startup. No target deployment. |
+| HTTP servers | Gaoxy 0.12.1 for Web/API Endpoints and Edge on main; all direct Bandit dependencies removed | [Migration record](../.agents/skills/develop/references/http-server-migration.md): original 0.9.0 and preceding 0.11.0 checkpoints passed 257 scoped tests and packaged HTTP startup. Current 0.12.1 refresh passes all 1,635 tests, strict dev/test/prod compilation and both fresh releases' actual HTTP startup. No target deployment. |
 | Foundation and inbound (M0–1) | Umbrella, PostgreSQL/Oban, recipient resolution, durable spool, atomic acceptance, archival and recovery | [Original plan](IMPLEMENTATION_PLAN.md), [crash boundaries](CRASH_BOUNDARIES.md); current SMTP listener runs in the optional edge release |
 | Mailbox (M2) | MIME projection, safe HTML display, inbound attachments, threading, search, folders and read/star/archive/trash actions | [M2](MILESTONE_2_PLAN.md); Gmail/Graph read changes remain local |
 | Outbound (M3 and later extensions) | Plain-text drafts, reply/forward, frozen queue payloads, Gmail API/Graph/SMTP submission, legacy Resend webhooks and uncertain-submission handling | [Current send contract](DESIGN.md#225-account-selected-outbound-methods); HTML composition and outbound attachments are pending extensions |

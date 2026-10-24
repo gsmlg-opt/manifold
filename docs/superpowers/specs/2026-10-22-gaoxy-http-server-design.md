@@ -23,7 +23,7 @@ invocation, seed 42, along with strict dev/test/prod compilation, formatting,
 Hex/npm audits, development/production assets and both fresh releases' actual
 Web/API/signed Edge HTTP startup. Packaged/runtime Gaoxy is 0.12.1 and included
 HTTP/TLS applications are 0.21.16; Mix and Bandit/ThousandIsland are absent.
-This refresh remains on its separate branch, with no target deployment. Version-specific results and the npm proxy feature
+This refresh is merged into `main` as `60eb5af` (2026-10-24), with no target deployment. Version-specific results and the npm proxy feature
 follow-up are recorded in
 [dependency maintenance](../../../.agents/skills/develop/references/dependency-maintenance.md).
 

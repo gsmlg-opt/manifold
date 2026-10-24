@@ -21,10 +21,10 @@
 Gaoxy 替换已在隔离分支 `codex/gaoxy-http-server` 以 `631cd7c` 提交，原始 0.9.0
 检查点通过 257 项测试及两个本地生产 release 的实际 HTTP 验证。后续依赖维护升级至
 0.11.0，全部 17 个应用的 1,635 项测试、生产构建及两个全新 release 的实际 HTTP
-启动验证再次通过。当前隔离分支 `codex/dependency-refresh-20261022` 升级至
+启动验证再次通过。后续 `codex/dependency-refresh-20261022` 刷新升级至
 Gaoxy 0.12.1、HTTP/TLS 0.21.16 和 DuskMoon UI 10.0.11；全部 17 个应用单次运行
 1,635 项测试、严格 dev/test/prod 编译、开发及生产资产构建和两个全新 release 的实际
-HTTP 启动验证均通过。先前接入与依赖维护已合并至 main；当前刷新保留在独立分支，尚未合并或部署。
+HTTP 启动验证均通过。接入与两次依赖维护均已合并至 main（当前刷新为 `60eb5af`，2026-10-24）；尚未部署至目标环境。
 先前的[大正文 LiveView 消息](https://github.com/gsmlg-dev/gaoxy/issues/9)
 和 [Edge 活跃请求关闭](https://github.com/gsmlg-dev/gaoxy/issues/10) 缺陷已由 0.9.0 修复并通过消费者回归。
 

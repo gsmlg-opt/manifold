@@ -5,8 +5,8 @@
   `codex/dependency-refresh-20261022`; all 1,635 tests across 17 apps, strict
   dev/test/prod compilation, assets and both fresh releases' HTTP startup pass.
   Original 0.9.0 implementation (`631cd7c`) and subsequent 0.11.0 maintenance
-  (`bd46de3`) are merged into `main`; this refresh remains on its separate
-  branch, with no target deployment. Historical acceptance remains below. See [dependency maintenance](dependency-maintenance.md).
+  (`bd46de3`) and this refresh (`60eb5af`) are merged into `main` as of
+  2026-10-24, with no target deployment. Historical acceptance remains below. See [dependency maintenance](dependency-maintenance.md).
 - Scope: Web/API Phoenix listeners and the Edge signed HTTP API. Remove all
   three direct Bandit dependencies; preserve SMTP and provider HTTP transports.
 

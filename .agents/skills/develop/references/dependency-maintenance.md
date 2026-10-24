@@ -1,8 +1,8 @@
 # Hex and npm dependency maintenance
 
 - Date: 2026-10-22.
-- Status: follow-up dependency refresh passes local acceptance in
-  `codex/dependency-refresh-20261022`; this refresh remains on its separate branch.
+- Status: follow-up dependency refresh passes local acceptance and is merged
+  into `main` as `60eb5af` (2026-10-24); target deployment has not been performed.
 - Scope: umbrella dependency declarations/locks, web workspace manifests/lock,
   necessary consumer compatibility, and scoped tests/documentation.
 
