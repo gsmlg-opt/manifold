@@ -21,6 +21,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH: ${{ github.workspace }}/.nif-cache/rustler
+  ZIGLER_PRECOMPILED_GLOBAL_CACHE_PATH: ${{ github.workspace }}/.nif-cache/zigler
+  ELIXIR_MAKE_CACHE_DIR: ${{ github.workspace }}/.nif-cache/elixir_make
   MIX_ENV: prod
   RELEASE_VERSION: ${{ inputs.version }}
 
@@ -69,6 +72,9 @@ jobs:
       - name: Fetch dependencies
         run: mix deps.get --only prod
 
+      - name: Prefetch verified native archives
+        run: elixir scripts/prefetch_nifs.exs
+
       - name: Configure build-only runtime secrets
         run: |
           echo "SECRET_KEY_BASE=$(openssl rand -hex 64)" >> "$GITHUB_ENV"
@@ -83,10 +89,11 @@ jobs:
 
       - name: Build release artifact
         run: |
-          mix release manifold --overwrite
-          mix release manifold_edge --overwrite
-          tar -C _build/prod/rel -czf manifold-${RELEASE_VERSION}.tar.gz manifold
-          tar -C _build/prod/rel -czf manifold-edge-${RELEASE_VERSION}.tar.gz manifold_edge
+          release_root="$(mktemp -d "${RUNNER_TEMP}/manifold-release.XXXXXX")"
+          mix release manifold --path "${release_root}/manifold"
+          mix release manifold_edge --path "${release_root}/manifold_edge"
+          tar -C "${release_root}" -czf manifold-${RELEASE_VERSION}.tar.gz manifold
+          tar -C "${release_root}" -czf manifold-edge-${RELEASE_VERSION}.tar.gz manifold_edge
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v6

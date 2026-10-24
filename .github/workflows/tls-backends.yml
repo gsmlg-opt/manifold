@@ -11,6 +11,9 @@ permissions:
   contents: read
 
 env:
+  RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH: ${{ github.workspace }}/.nif-cache/rustler
+  ZIGLER_PRECOMPILED_GLOBAL_CACHE_PATH: ${{ github.workspace }}/.nif-cache/zigler
+  ELIXIR_MAKE_CACHE_DIR: ${{ github.workspace }}/.nif-cache/elixir_make
   MIX_ENV: test
   DATABASE_URL: postgres://manifold_dev:manifold_dev@localhost:5432/manifold_dev
   TEST_DATABASE_URL: postgres://manifold_dev:manifold_dev@localhost:5432/manifold_test
@@ -51,6 +54,8 @@ jobs:
             ${{ runner.os }}-mix-tls-
       - name: Fetch pinned dependencies
         run: mix deps.get
+      - name: Prefetch verified native archives
+        run: elixir scripts/prefetch_nifs.exs
       - name: Compile with warnings as errors
         run: mix compile --warnings-as-errors
       - name: Create isolated test database

@@ -12,6 +12,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH: ${{ github.workspace }}/.nif-cache/rustler
+  ZIGLER_PRECOMPILED_GLOBAL_CACHE_PATH: ${{ github.workspace }}/.nif-cache/zigler
+  ELIXIR_MAKE_CACHE_DIR: ${{ github.workspace }}/.nif-cache/elixir_make
   MIX_ENV: test
 
 jobs:
@@ -43,6 +46,9 @@ jobs:
 
       - name: Fetch dependencies
         run: mix deps.get
+
+      - name: Prefetch verified native archives
+        run: elixir scripts/prefetch_nifs.exs
 
       - name: Check formatting
         run: mix format --check-formatted
@@ -76,6 +82,9 @@ jobs:
       - name: Fetch dependencies
         run: mix deps.get
 
+      - name: Prefetch verified native archives
+        run: elixir scripts/prefetch_nifs.exs
+
       - name: Compile with warnings as errors
         run: mix compile --warnings-as-errors
 
@@ -108,6 +117,9 @@ jobs:
 
       - name: Fetch dependencies
         run: mix deps.get
+
+      - name: Prefetch verified native archives
+        run: elixir scripts/prefetch_nifs.exs
 
       - name: Check JavaScript
         run: mix duskmoon_bundler.js.check
