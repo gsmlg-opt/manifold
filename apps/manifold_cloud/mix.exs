@@ -4,7 +4,7 @@ defmodule Manifold.Cloud.MixProject do
   def project do
     [
       app: :manifold_cloud,
-      version: "0.6.8",
+      version: "0.6.9",
       build_path: "../../_build",
       config_path: "../../config/config.exs",
       deps_path: "../../deps",

@@ -4,7 +4,7 @@ defmodule ManifoldAPI.MixProject do
   def project do
     [
       app: :manifold_api,
-      version: "0.6.8",
+      version: "0.6.9",
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
