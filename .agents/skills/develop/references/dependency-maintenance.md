@@ -1,12 +1,34 @@
 # Hex and npm dependency maintenance
 
+## Duskmoon Web 2.0 RC migration (2026-11-21)
+
+- Duskmoon Phoenix and Core now come from the
+  [Duskmoon Web monorepo](https://github.com/duskmoon-dev/duskmoon-web/tree/v2.0.0-rc.2).
+  Keep Hex and npm `duskmoon_phoenix` and npm `@duskmoon-dev/core` on the same
+  exact Web release. RC.2 requires `phoenix_html ~> 4.4` and LiveView `~> 1.2`.
+- `ManifoldWeb` imports `DuskmoonPhoenix.Component`. The asset entry registers
+  `DuskmoonPopover` for the mailbox dropdown alongside the local hooks. The
+  Tailwind build uses the published Duskmoon Phoenix source stylesheet and scans
+  the Hex package's `lib` plus the application templates. The source stylesheet
+  includes the Sunshine and Moonlight themes.
+- Calendar and contact actions use the native `dm_btn` renderer. Keep ordinary
+  `phx-click` bindings and send application values via `phx-value-*`. Use
+  `type="submit"` for form actions. Add Elements packages only when a surface
+  renders a component that requires one.
+- Verify the frozen npm install, `mix assets.build`, and Web LiveView tests
+  against a migrated test database. In a browser, check that the Appearance
+  preference survives a reload and that canceling a calendar deletion leaves
+  the event in place.
+
+## Previous dependency refresh
+
 - Date: 2026-10-22.
 - Status: follow-up dependency refresh passes local acceptance and is merged
   into `main` as `60eb5af` (2026-10-24); target deployment has not been performed.
 - Scope: umbrella dependency declarations/locks, web workspace manifests/lock,
   necessary consumer compatibility, and scoped tests/documentation.
 
-## Current refresh: 2026-10-22
+### Dependency changes (2026-10-22)
 
 User-requested audits: `mix hex.outdated` and
 `npx npm-check-updates@latest -w`. Baseline `bd46de3` is now merged into `main`;

@@ -61,7 +61,10 @@ defmodule ManifoldWeb.CalendarLiveTest do
     view |> element("#edit-event") |> render_click()
     view |> form("#event-form", event: %{summary: "Updated"}) |> render_submit()
     assert Calendars.get_event(event.id).summary == "Updated"
-    render_click(view, "delete-event", %{"scope" => "occurrence"})
+
+    delete_event = "button#delete-event-occurrence[type='button'][phx-value-scope='occurrence']"
+    assert has_element?(view, delete_event, "Delete event")
+    view |> element(delete_event) |> render_click()
     assert is_nil(Calendars.get_event(event.id))
     assert Repo.get!(CalendarEvent, event.id).deleted_at
     view |> element("#edit-calendar") |> render_click()

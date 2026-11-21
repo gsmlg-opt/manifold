@@ -1,10 +1,7 @@
 import "phoenix_html";
-import "@duskmoon-dev/el-badge/register";
-import "@duskmoon-dev/el-card/register";
-import "@duskmoon-dev/el-button/register";
 import { Socket } from "phoenix";
 import { LiveSocket } from "phoenix_live_view";
-import * as DuskmoonHooks from "phoenix_duskmoon/hooks";
+import { DuskmoonPopover } from "duskmoon_phoenix/hooks";
 import "./datetime.js";
 import { ConversationRow } from "./conversation_row.js";
 
@@ -83,7 +80,7 @@ let csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("
 
 let liveSocket = new LiveSocket("/live", Socket, {
   params: { _csrf_token: csrfToken },
-  hooks: { ...DuskmoonHooks, ThemePreference, ConversationRow },
+  hooks: { DuskmoonPopover, ThemePreference, ConversationRow },
 });
 
 liveSocket.connect();

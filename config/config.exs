@@ -204,7 +204,7 @@ config :duskmoon_bundler, :manifold_web,
     sources: [
       %{base: Path.expand("../apps/manifold_web/lib", __DIR__), pattern: "**/*.{ex,exs,heex}"},
       %{
-        base: Path.expand("../deps/phoenix_duskmoon/lib/phoenix_duskmoon", __DIR__),
+        base: Path.expand("../deps/duskmoon_phoenix/lib", __DIR__),
         pattern: "**/*.{ex,heex}"
       },
       %{

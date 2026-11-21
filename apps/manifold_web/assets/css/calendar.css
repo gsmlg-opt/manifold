@@ -65,7 +65,7 @@
 .calendar-contextbar { display: flex; align-items: center; gap: 8px; padding: 0 26px 15px; font-size: 12px; min-height: 39px; }
 .calendar-contextbar strong { font-weight: 550; }
 .calendar-context-source { color: var(--color-on-surface-variant); font-size: 11px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.calendar-contextbar el-dm-button, .calendar-contextbar > a { margin-left: auto; }
+.calendar-contextbar button.btn, .calendar-contextbar > a { margin-left: auto; }
 .calendar-canvas { flex: 1; border-top: 1px solid var(--color-outline-variant); }
 .calendar-month-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); height: 100%; grid-template-rows: 32px repeat(6, minmax(100px, 1fr)); }
 .calendar-weekday { font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: .08em; color: var(--color-on-surface-variant); display: flex; justify-content: center; align-items: center; border-bottom: 1px solid var(--color-outline-variant); }
@@ -122,7 +122,7 @@
 .calendar-detail-fields dd { font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .calendar-copy-form { margin-top: 26px; padding-top: 20px; border-top: 1px solid var(--color-outline-variant); display: flex; flex-direction: column; gap: 12px; }
 .calendar-editor > form { margin-top: 20px; }
-.calendar-editor > el-dm-button { margin-top: 28px; }
+.calendar-editor > button.btn { margin-top: 28px; }
 .calendar-workspace #event-conflict { background: var(--color-error-container); color: var(--color-on-error-container); border-radius: 9px; padding: 14px; font-size: 12px; line-height: 1.6; }
 .calendar-workspace #event-sync-status { display: inline-flex; font-size: 10px; font-weight: 550; padding: 5px 9px; background: var(--color-surface-container-highest); border-radius: 6px; }
 .calendar-workspace a:focus-visible, .calendar-workspace button:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 3px; }

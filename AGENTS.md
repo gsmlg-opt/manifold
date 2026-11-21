@@ -29,7 +29,7 @@ Use `devenv shell` first for dependencies and consistent toolchains.
 
 ## Web UI Design
 
-`manifold_web` styling is constrained by [`DESIGN.md`](DESIGN.md): phoenix_duskmoon tokens only, themes `sunshine` / `moonlight`, appbar on `primary`, theme switcher persistence. Do not hardcode hex/Tailwind palette colors for app chrome. Product/architecture design remains in [`docs/DESIGN.md`](docs/DESIGN.md).
+`manifold_web` styling is constrained by [`DESIGN.md`](DESIGN.md): Duskmoon tokens only, themes `sunshine` / `moonlight`, appbar on `primary`, theme switcher persistence. Do not hardcode hex/Tailwind palette colors for app chrome. Product/architecture design remains in [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Testing Guidelines
 

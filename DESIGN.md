@@ -2,7 +2,7 @@
 
 Visual and styling constraints for `manifold_web`. Product/architecture design lives in [`docs/DESIGN.md`](docs/DESIGN.md).
 
-**Stack:** Phoenix LiveView + [phoenix_duskmoon](https://hex.pm/packages/phoenix_duskmoon) + Duskmoon Bundler + Tailwind.
+**Stack:** Phoenix LiveView + [duskmoon_phoenix](https://hex.pm/packages/duskmoon_phoenix) + Duskmoon Bundler + Tailwind.
 
 **Themes:** `sunshine` (light) and `moonlight` (dark). Auto resolves via `prefers-color-scheme` when the user has not picked an explicit theme.
 
@@ -15,15 +15,10 @@ Agents and contributors must follow this document when adding or changing HEEX, 
 ### CSS entry (`apps/manifold_web/assets/css/app.css`)
 
 ```css
-@import "tailwindcss";
-@plugin "@duskmoon-dev/core/plugin";
-@import "@duskmoon-dev/core/themes/sunshine";
-@import "@duskmoon-dev/core/themes/moonlight";
-@import "@duskmoon-dev/core/components";
-@import "../../../../deps/phoenix_duskmoon/assets/css/element-theme-bridge.css";
+@import "../../../../deps/duskmoon_phoenix/assets/css/duskmoon_phoenix.css";
 ```
 
-Both themes must stay imported. Do not remove either, and do not invent a third named theme.
+The Duskmoon Phoenix source stylesheet imports Tailwind, Core, and both supported themes for a single Tailwind build.
 
 ### HTML root
 
@@ -134,7 +129,7 @@ One clear `primary` CTA. Cancel / secondary use `ghost`, `outline`, or `secondar
 
 ## 4. Component defaults (Manifold)
 
-Prefer `dm_*` components from phoenix_duskmoon when one exists.
+Prefer `dm_*` components from `duskmoon_phoenix` when one exists.
 
 | Surface | Pattern |
 |---------|---------|
@@ -231,4 +226,4 @@ Keep one gap scale per view. Do not mix decorative card grids into the mail clie
 | `apps/manifold_web/lib/manifold_web/live/settings_live/appearance.ex` | Theme switcher |
 | `apps/manifold_web/lib/manifold_web/hooks/theme.ex` | `theme_changed` hook (no forced default theme) |
 | `apps/manifold_web/assets/js/app.js` | LiveSocket + ThemePreference / localStorage preference |
-| `config/config.exs` | Tailwind content paths including phoenix_duskmoon |
+| `config/config.exs` | Tailwind content paths including `duskmoon_phoenix` |

@@ -56,7 +56,7 @@ defmodule ManifoldWeb do
 
   defp html_helpers do
     quote do
-      use PhoenixDuskmoon.Component
+      use DuskmoonPhoenix.Component
 
       import Phoenix.HTML
       import ManifoldWeb.CoreComponents

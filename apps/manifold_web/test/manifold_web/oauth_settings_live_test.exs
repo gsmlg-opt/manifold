@@ -158,22 +158,15 @@ defmodule ManifoldWeb.OAuthSettingsLiveTest do
     refute html =~ "Administrators"
   end
 
-  test "OAuth cards register their DuskMoon elements and retain a block fallback" do
-    app_js =
-      __DIR__
-      |> Path.join("../../assets/js/app.js")
-      |> File.read!()
+  test "initial OAuth HTML renders native provider cards and status badges", %{conn: conn} do
+    html = conn |> get(~p"/settings/oauth") |> html_response(200) |> LazyHTML.from_document()
 
-    app_css =
-      __DIR__
-      |> Path.join("../../assets/css/app.css")
-      |> File.read!()
+    for provider <- ~w(gmail microsoft) do
+      badge =
+        LazyHTML.query(html, "article#oauth-provider-#{provider}.card span.badge[data-status]")
 
-    assert app_js =~ ~s(import "@duskmoon-dev/el-card/register";)
-    assert app_js =~ ~s(import "@duskmoon-dev/el-badge/register";)
-    assert app_css =~ ".oauth-provider-card {"
-    assert app_css =~ "display: block;"
-    assert app_css =~ ".oauth-provider-card:not(:defined) {"
+      assert String.trim(LazyHTML.text(badge)) == "Not configured"
+    end
   end
 
   test "Microsoft device configuration saves with only a client ID and can be removed", %{
